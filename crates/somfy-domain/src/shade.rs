@@ -59,13 +59,23 @@ pub enum ShadeCommand {
     SetMy(Option<Pos>),
 }
 
-/// A single shade: its config, a dead-reckoned lift/tilt [`Motion`] pair, and
-/// the stored favorite ("My") position.
+/// A single shade: its config, a dead-reckoned lift [`Motion`], and the stored
+/// favorite ("My") position.
+///
+/// `tilt` is a NON-FUNCTIONAL placeholder for the tilt plan: no command drives
+/// it yet, so [`Shade::tilt_pos`] always reports [`Pos::ZERO`]. It reserves the
+/// state slot for tilt-capable shades (`tilt_first` sequencing, EuroMode)
+/// without committing to semantics this task does not port.
 pub struct Shade {
     pub config: ShadeConfig,
     lift: Motion,
     tilt: Motion,
     my_pos: Option<Pos>,
+    /// Port of the C++ `settingPos` flag: true only while seeking an
+    /// explicitly-set position target (`moveToTarget`, Somfy.cpp:3068). The
+    /// mid-range arrival stop (Somfy.cpp:1166/1218) fires only when this is
+    /// set — Step targets and native motor moves never schedule a stop.
+    stop_on_arrival: bool,
 }
 
 impl Shade {
@@ -76,6 +86,7 @@ impl Shade {
             lift: Motion::new(Pos::ZERO),
             tilt: Motion::new(Pos::ZERO),
             my_pos: None,
+            stop_on_arrival: false,
         }
     }
 
@@ -101,23 +112,28 @@ impl Shade {
     /// re-target math anchors on the current estimate — the C++ `currentPos` is
     /// continuously updated by `checkMovement` before any command is processed.
     pub fn handle(&mut self, cmd: ShadeCommand, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
-        self.sync(now_ms);
+        self.sync(now_ms, out);
         match cmd {
             // Up/Down always seek a hard limit; the motor self-stops there so
-            // no My is scheduled (Somfy.cpp:2893-2927).
+            // no My is scheduled (Somfy.cpp:2893-2927, settingPos stays false).
             ShadeCommand::Up => {
+                self.stop_on_arrival = false;
                 self.lift.set_target(Pos::ZERO, now_ms);
                 self.push(out, Command::Up);
             }
             ShadeCommand::Down => {
+                self.stop_on_arrival = false;
                 self.lift.set_target(Pos::FULL, now_ms);
                 self.push(out, Command::Down);
             }
             // My while moving => stop (freeze estimate) + TX My; My while idle
             // with a favorite => go to it; My while idle without one => no-op
-            // (Somfy.cpp:2929-2942 + moveToMyPosition at :2863).
+            // (Somfy.cpp:2929-2942 + moveToMyPosition at :2863). The favorite
+            // recall uses GoTo semantics (the C++ simMy() branch,
+            // moveToMyPosition -> moveToTarget at :2884).
             ShadeCommand::My => {
                 if self.lift.direction() != Direction::Idle {
+                    self.stop_on_arrival = false;
                     self.lift
                         .halt(now_ms, self.config.up_time_ms, self.config.down_time_ms);
                     self.push(out, Command::My);
@@ -134,33 +150,38 @@ impl Shade {
         }
     }
 
-    /// Advance motion. On arriving at a **mid-range** target, plan the `My`
-    /// stop frame (Somfy.cpp:1166-1170 down / :1221-1227 up: the motor only
-    /// self-stops at the hard limits, so a mid-range target needs an explicit
-    /// `My`). Hard limits (0 / FULL) need no stop.
+    /// Advance motion. On arriving at a **mid-range** target of an explicit
+    /// position seek, plan the `My` stop frame (Somfy.cpp:1166-1170 down /
+    /// :1218-1227 up, guarded by `settingPos`: the motor only self-stops at
+    /// the hard limits, so a seeked mid-range target needs an explicit `My`).
+    /// Hard limits (0 / FULL) and Step-originated targets need no stop.
     pub fn tick(&mut self, now_ms: u64, out: &mut Vec<PlannedTx, 4>) -> MotionSnapshot {
         let snap = self
             .lift
             .tick(now_ms, self.config.up_time_ms, self.config.down_time_ms);
-        if snap.arrived && snap.pos != Pos::ZERO && snap.pos != Pos::FULL {
-            self.push(out, Command::My);
+        if snap.arrived {
+            if self.stop_on_arrival && snap.pos != Pos::ZERO && snap.pos != Pos::FULL {
+                self.push(out, Command::My);
+            }
+            self.stop_on_arrival = false;
         }
         snap
     }
 
-    /// Advance the live estimate to `now_ms` without emitting any TX. Mid-range
-    /// stop frames are the responsibility of [`Shade::tick`]; a command that
-    /// immediately re-targets does not re-emit them.
-    fn sync(&mut self, now_ms: u64) {
-        let _ = self
-            .lift
-            .tick(now_ms, self.config.up_time_ms, self.config.down_time_ms);
+    /// Advance the live estimate to `now_ms` before applying a command, so the
+    /// re-target math anchors on the current position — the C++ `checkMovement`
+    /// runs continuously before any command is processed. A pending mid-range
+    /// arrival crossed during the sync still emits its stop frame (in the C++
+    /// that `My` would already have been sent by the movement loop).
+    fn sync(&mut self, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
+        let _ = self.tick(now_ms, out);
     }
 
     /// Seek an arbitrary target from the (already-synced) live position. Emits
     /// `Up`/`Down` toward it; the mid-range stop is scheduled by [`Shade::tick`]
-    /// on arrival. Seeking the current position is a no-op with no TX
-    /// (Somfy.cpp GoTo path skips motors already at target).
+    /// on arrival (`settingPos = true`, Somfy.cpp:3068). Seeking the current
+    /// position is a no-op with no TX (Somfy.cpp GoTo path skips motors
+    /// already at target).
     fn seek(&mut self, target: Pos, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
         let current = self.lift.pos();
         if current == target {
@@ -171,6 +192,7 @@ impl Shade {
         } else {
             Command::Up
         };
+        self.stop_on_arrival = true;
         self.lift.set_target(target, now_ms);
         self.push(out, cmd);
     }
@@ -191,6 +213,10 @@ impl Shade {
             return;
         }
         let step_raw = (FULL_RAW * STEP_TRAVEL_MS / travel_ms).min(FULL_RAW) as u16;
+        // Step targets are not `settingPos` targets (Somfy.cpp:2443-2525 never
+        // set the flag): the motor self-stops after its increment, so tick
+        // must not schedule a My at arrival.
+        self.stop_on_arrival = false;
         let current = self.lift.pos().raw();
         let (target, command) = match dir {
             Direction::Up => (
@@ -206,10 +232,16 @@ impl Shade {
         self.push(out, command);
     }
 
+    /// Queue one frame. Capacity 4 is generous: a single `handle`/`tick` call
+    /// plans at most 2 frames (a sync-crossed arrival stop plus the command's
+    /// own frame). Overflow would mean the caller is not draining `out`
+    /// between calls; the frame is dropped rather than panicking on-device,
+    /// but debug builds assert.
     fn push(&self, out: &mut Vec<PlannedTx, 4>, command: Command) {
-        let _ = out.push(PlannedTx {
+        let pushed = out.push(PlannedTx {
             address: self.config.address,
             command,
         });
+        debug_assert!(pushed.is_ok(), "PlannedTx buffer overflow: out not drained");
     }
 }

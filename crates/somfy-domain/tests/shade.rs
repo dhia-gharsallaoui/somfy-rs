@@ -101,12 +101,59 @@ fn step_commands_nudge_target_and_emit_extended_commands() {
     out.clear();
     s.handle(ShadeCommand::StepDown, 5_000, &mut out);
     assert_eq!(tx(&out), [Command::StepDown]);
+    out.clear();
     let snap = s.tick(20_000, &mut out);
     // C++ Somfy.cpp:2481/2522: step target = pos +/- 100/(travel/(stepSize*frameStep)).
     // Shipped defaults (stepSize=100 @ Somfy.cpp:701 / Somfy.h:317, frameStep=1
     // @ Somfy.cpp:2452/2493, travel=10000ms) resolve to a 1% (100-raw) nudge --
     // not the brief's 5% guess. See report cross-check for the derivation.
     assert_eq!(snap.pos, Pos::from_raw(5_100)); // 50% + 1% step
+
+    // Step targets are NOT `settingPos` targets: the C++ Step branches
+    // (Somfy.cpp:2443-2525) never set settingPos, so the mid-range My at
+    // Somfy.cpp:1166/1218 is skipped -- the motor self-stops after its
+    // increment. No stop frame may follow a step arrival.
+    assert!(out.is_empty());
+}
+
+#[test]
+fn step_up_nudges_toward_open_and_clamps_at_zero() {
+    let mut s = shade();
+    let mut out = Vec::new();
+    s.handle(ShadeCommand::GoTo(Pos::from_percent(50)), 0, &mut out);
+    s.tick(5_000, &mut out);
+    out.clear();
+    s.handle(ShadeCommand::StepUp, 5_000, &mut out);
+    assert_eq!(tx(&out), [Command::StepUp]);
+    let snap = s.tick(20_000, &mut out);
+    assert_eq!(snap.pos, Pos::from_raw(4_900)); // 50% - 1% step
+
+    // At the hard limit the C++ still transmits the step frame (emitCommand
+    // is unconditional, Somfy.cpp:2483) but the position cannot move.
+    let mut s = shade(); // fresh shade at ZERO
+    out.clear();
+    s.handle(ShadeCommand::StepUp, 0, &mut out);
+    assert_eq!(tx(&out), [Command::StepUp]);
+    assert_eq!(s.pos(), Pos::ZERO);
+    assert_eq!(s.direction(), Direction::Idle);
+}
+
+#[test]
+fn set_my_none_clears_favorite() {
+    let mut s = shade();
+    let mut out = Vec::new();
+    s.handle(
+        ShadeCommand::SetMy(Some(Pos::from_percent(30))),
+        0,
+        &mut out,
+    );
+    assert_eq!(s.my_pos(), Some(Pos::from_percent(30)));
+    s.handle(ShadeCommand::SetMy(None), 0, &mut out);
+    assert_eq!(s.my_pos(), None);
+    assert!(out.is_empty());
+    s.handle(ShadeCommand::My, 0, &mut out); // cleared favorite: My is a no-op
+    assert!(out.is_empty());
+    assert_eq!(s.direction(), Direction::Idle);
 }
 
 #[test]
