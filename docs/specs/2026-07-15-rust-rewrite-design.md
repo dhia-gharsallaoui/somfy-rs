@@ -93,9 +93,10 @@ somfy-rs/
   obfuscation (XOR chaining) and checksum.
 - Rolling-code state machine (increment-on-send semantics identical to C++).
 - Pulse layer: frame ⇄ OOK pulse train (level + duration pairs: wakeup,
-  hardware sync, software sync, 604 µs Manchester half-symbols, inter-frame
-  gap, repeat frames with reduced sync). Pure data in/out — no GPIO or timer
-  knowledge.
+  hardware sync, software sync, 640 µs (SYMBOL) Manchester half-symbols
+  (erratum: earlier draft said 604 µs — folklore; Somfy.cpp SYMBOL=640 is
+  authoritative), inter-frame gap, repeat frames with reduced sync). Pure data
+  in/out — no GPIO or timer knowledge.
 - RX decoder: the C++ `somfy_rx_t` state machine reimplemented
   (sync detection → Manchester decode → checksum → repeat dedupe), consuming
   duration sequences from any capture source.

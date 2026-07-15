@@ -3,7 +3,7 @@ use somfy_rts::{decode56, encode56, render_pulses, Command, Frame, FrameKind, Pu
 
 fn tx_pulses(f: &Frame, kind: FrameKind) -> Vec<Pulse, 320> {
     let mut out = Vec::new();
-    render_pulses(&encode56(f), kind, &mut out);
+    render_pulses(&encode56(f).unwrap(), kind, &mut out);
     out
 }
 

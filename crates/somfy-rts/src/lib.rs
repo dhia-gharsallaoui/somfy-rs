@@ -21,9 +21,10 @@
 //!   migrated values need a `+1`; the caller must persist before transmitting
 //!   (see [`RollingCode`] docs).
 //! - **TX** — [`render_pulses`] turns a frame into an OOK pulse train (wake-up,
-//!   hardware/software sync, 604µs Manchester half-symbols, inter-frame gap,
-//!   reduced-sync repeats). Timing constants live in [`TIMINGS`], ported
-//!   verbatim from the C++ transmitter with per-constant source lines.
+//!   hardware/software sync, 640µs Manchester half-symbols (`SYMBOL`,
+//!   Somfy.cpp:23), inter-frame gap, reduced-sync repeats). Timing constants
+//!   live in [`TIMINGS`], ported verbatim from the C++ transmitter with
+//!   per-constant source lines.
 //! - **RX** — [`RxDecoder`] is a single level-aware state machine that decodes
 //!   **both** pulse representations: merged edge-to-edge streams (what real
 //!   `CHANGE`-interrupt hardware and the firmware's `rx.pulses[]` captures

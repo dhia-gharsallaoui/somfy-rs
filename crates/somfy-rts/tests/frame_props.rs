@@ -33,7 +33,7 @@ proptest! {
         addr in 0u32..0x0100_0000,
     ) {
         let f = Frame { key: 0xA0 | key_low, command: cmd, rolling_code: code, address: addr };
-        let back = decode56(&encode56(&f)).unwrap();
+        let back = decode56(&encode56(&f).unwrap()).unwrap();
         prop_assert_eq!(back, f);
     }
 
@@ -45,7 +45,7 @@ proptest! {
         bit in 0u8..8,
     ) {
         let f = Frame { key: 0xA7, command: Command::Up, rolling_code: code, address: addr };
-        let mut bytes = encode56(&f);
+        let mut bytes = encode56(&f).unwrap();
         bytes[byte_idx] ^= 1 << bit;
         // Either rejected, or (checksum is only 4 bits) decodes to *something* —
         // but never silently to the original frame with a different meaning.

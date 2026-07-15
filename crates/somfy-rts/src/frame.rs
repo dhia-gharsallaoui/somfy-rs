@@ -14,12 +14,34 @@ pub struct Frame {
 pub enum FrameError {
     BadChecksum,
     UnknownCommand,
+    /// An extended command (StepUp/Favorite/Stop) was passed to [`encode56`].
+    /// Extended commands only exist on 80-bit frames; see [`encode56`] docs.
+    ExtendedCommand,
 }
 
+/// Encode a 56-bit RTS frame (7 bytes).
+///
 /// Layout before obfuscation (matches ESPSomfy-RTS src/Somfy.cpp encodeFrame,
 /// lines 335-341): [0]=key [1]=cmd<<4|cksum [2..3]=rolling code big-endian
 /// (hi byte first) [4..6]=24-bit address big-endian (MSB at [4], LSB at [6]).
-pub fn encode56(f: &Frame) -> [u8; 7] {
+///
+/// # Extended commands are rejected
+///
+/// Extended commands — `StepUp`, `Favorite`, `Stop` ([`Command::is_extended`]) —
+/// require [`encode80`]: their identity lives in the un-obfuscated 80-bit tail,
+/// not in the 4-bit command field. A 56-bit frame can only carry the *base*
+/// nibble, which for these three is the OPPOSITE or a wrong command
+/// (`StepUp 0x8B -> StepDown 0xB`; `Favorite 0xC1` and `Stop 0xF1 -> My 0x1`).
+/// Rather than emit that silent misfire, `encode56` returns
+/// [`FrameError::ExtendedCommand`].
+///
+/// Any 56-bit *downgrade* policy (e.g. the C++ reference deliberately maps
+/// `Stop -> My` before its 56-bit encoder, Somfy.cpp:2944) is a domain-layer
+/// decision, not this crate's: the caller must pick a base command explicitly.
+pub fn encode56(f: &Frame) -> Result<[u8; 7], FrameError> {
+    if f.command.is_extended() {
+        return Err(FrameError::ExtendedCommand);
+    }
     let mut b = [0u8; 7];
     b[0] = f.key;
     b[1] = f.command.nibble() << 4;
@@ -31,7 +53,7 @@ pub fn encode56(f: &Frame) -> [u8; 7] {
 
     b[1] |= checksum(&b);
     obfuscate(&mut b);
-    b
+    Ok(b)
 }
 
 pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
@@ -72,7 +94,20 @@ pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
 /// | StepUp (0x8B)  | 132 (0x84) | `((step&0x70)>>4)|0x38`   | `(step&0x0F)<<4`  |
 /// | Favorite(0xC1) | 196 (0xC4) | 44 (0x2C)                | 0x9_             |
 /// | Stop   (0xF1)  | 196 (0xC4) | 47 (0x2F)                | 0xF_             |
-/// | base cmds      | 132 (0x84) | 0                        | 0x1_             |
+/// | base cmds      | 132 (0x84) | 0                        | 0x1_ (placeholder)|
+///
+/// **Caveats.**
+/// - The three EXTENDED rows (`StepUp`/`Favorite`/`Stop`) are C++-exact for
+///   **first frames** (`repeat == 0`).
+/// - **The `base cmds` row is a PLACEHOLDER, not the C++ wire bytes.** This
+///   crate emits `[7]=132, [8]=0, [9] hi=0x1` for every base command so it
+///   round-trips through [`decode80`]; the reference firmware instead gives
+///   Up/Down/Toggle/etc. distinct tails and uses `[7]=196` as its My-family
+///   default (Somfy.cpp:322-325).
+/// - **No per-repeat progression.** C++ re-encodes byte 7 each repeat
+///   (`196 + 4*repeat`, with Favorite/Stop flipping `196->132` on later
+///   repeats). This repeat-less API cannot express that: `encode80` must grow a
+///   `repeat` parameter before hardware TX of these frames (Plan 4 contract).
 ///
 /// StepUp defaults `step` to 1 (Somfy.cpp:268) -> `[8]=0x38, [9]=0x10`. The
 /// selector recovered at decode is: for base `My (0x1)`,
@@ -152,9 +187,18 @@ fn encode80_tail(b: &mut [u8; 10], cmd: Command) {
             b[8] = 47;
             b[9] = 0xF0;
         }
-        // Base commands: the My-family default (Somfy.cpp:322-325). A zero low
-        // nibble in [8] keeps the My (0x1) and StepDown (0xB) nibbles
-        // un-translated at decode, so any base command round-trips.
+        // Base commands: PLACEHOLDER tail that round-trips through this crate's
+        // own decode80 but does NOT match the C++ wire bytes. The reference
+        // firmware does not emit a single fixed base tail: `encode80BitFrame`
+        // gives Up/Down/Toggle/etc. distinct tails, uses `[7]=196` (not 132) as
+        // its My-family default (Somfy.cpp:322-325), and progresses byte 7 per
+        // repeat (`196 + 4*repeat`, with Favorite/Stop flipping 196->132 on
+        // later repeats). This crate's repeat-less API cannot express that
+        // progression yet — encode80 must grow a `repeat` parameter before any
+        // hardware TX of base commands as 80-bit (recorded Plan 4 contract).
+        // (The three EXTENDED arms above ARE C++-exact for first frames.) A zero
+        // low nibble in [8] keeps the My (0x1) and StepDown (0xB) nibbles
+        // un-translated at decode, so any base command still round-trips here.
         _ => {
             b[7] = 132;
             b[8] = 0;

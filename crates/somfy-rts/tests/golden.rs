@@ -103,7 +103,7 @@ fn synthetic_up_pulses() -> std::vec::Vec<Pulse> {
         address: 0x00C0DE,
     };
     let mut raw: HVec<Pulse, 320> = HVec::new();
-    render_pulses(&encode56(&f), FrameKind::Repeat, &mut raw);
+    render_pulses(&encode56(&f).unwrap(), FrameKind::Repeat, &mut raw);
     let mut merged: std::vec::Vec<Pulse> = std::vec::Vec::new();
     for p in &raw {
         if let Some(last) = merged.last_mut() {

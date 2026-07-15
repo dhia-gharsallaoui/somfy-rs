@@ -28,6 +28,24 @@ Later plans (per [`docs/specs/`](docs/specs/)):
 | 6 | Persistence + OTA (A/B partitions, rollback) |
 | 7 | Web UI (Preact) served from flash |
 
+## Contracts for later plans
+
+Boundaries deliberately left to downstream plans so the protocol engine stays
+policy-free:
+
+- **Plan 2 (domain layer)** owns the extended→56-bit *downgrade* policy. The
+  `somfy-rts` `encode56` rejects extended commands outright
+  (`FrameError::ExtendedCommand`); mapping `Stop → My` for a 56-bit motor (per
+  Somfy.cpp:2944) is a product decision the domain layer makes explicitly. Plan
+  2 also owns the C++ address / rolling-code plausibility guards
+  (Somfy.cpp:169-170), which `somfy-rts` does not enforce.
+- **Plan 4 (firmware TX)** requires `encode80` to grow a `repeat` parameter
+  before transmitting extended *or* base commands as 80-bit on hardware: the C++
+  reference re-encodes byte 7 per repeat (`196 + 4*repeat`, with Favorite/Stop
+  flipping `196→132` on later repeats). Today's repeat-less `encode80` emits only
+  the first-frame form (C++-exact for extended commands; a placeholder tail for
+  base commands — see `frame.rs`).
+
 ## Workspace crates
 
 | Crate | `no_std` | Description |
