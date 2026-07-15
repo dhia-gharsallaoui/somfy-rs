@@ -42,18 +42,28 @@ pub mod TIMINGS {
     pub const INTER_FRAME_GAP: u32 = 27_434;
 }
 
-/// Render an encoded frame (7 bytes for 56-bit) to OOK pulses.
+/// Render an encoded frame to OOK pulses. The frame size selects the protocol:
+/// 7 bytes = 56-bit, 10 bytes = 80-bit.
 ///
 /// Manchester polarity verified against Somfy.cpp:4351-4364: bit `1` = low
 /// half then high half, bit `0` = high half then low half, bits sent MSB-first
-/// (`frame[i/8] >> (7 - i%8)`, Somfy.cpp:4352). Sync counts verified against
-/// the 56-bit callers (Somfy.cpp:4000/4004 and 4014/4019): the first frame
-/// sends a wake-up pulse + 2 hardware syncs (`sync == 2` triggers the wake-up
-/// at Somfy.cpp:4314); repeats send 7 hardware syncs and no wake-up.
+/// (`frame[i/8] >> (7 - i%8)`, Somfy.cpp:4352).
+///
+/// Sync counts and the trailing gap are byte-length driven, mirroring the C++
+/// callers and transmitter:
+/// - **56-bit**: first frame = wake-up + 2 hardware syncs, repeat = 7 syncs
+///   (Somfy.cpp:4000/4004/4014/4019); every frame ends with the inter-frame
+///   gap.
+/// - **80-bit**: first frame = wake-up + 12 hardware syncs, repeat = 6 syncs
+///   (same callers, `bitLength == 80` arm); the inter-frame gap is **suppressed**
+///   (`if(bitLength != 80)`, Somfy.cpp:4379). The wake-up still fires on the
+///   first frame because `sendFrame` triggers it for `sync == 2 || sync == 12`
+///   (Somfy.cpp:4314).
 ///
 /// Adjacent same-level half-symbols are intentionally NOT merged here; that is
 /// the concern of a later RMT-encoding layer.
 pub fn render_pulses(bytes: &[u8], kind: FrameKind, out: &mut Vec<Pulse, 320>) {
+    let is_80 = bytes.len() == 10;
     let hw_syncs = match kind {
         FrameKind::First => {
             out.push(Pulse {
@@ -66,9 +76,19 @@ pub fn render_pulses(bytes: &[u8], kind: FrameKind, out: &mut Vec<Pulse, 320>) {
                 micros: TIMINGS::WAKEUP_LOW,
             })
             .unwrap();
-            2
+            if is_80 {
+                12
+            } else {
+                2
+            }
         }
-        FrameKind::Repeat => 7,
+        FrameKind::Repeat => {
+            if is_80 {
+                6
+            } else {
+                7
+            }
+        }
     };
     for _ in 0..hw_syncs {
         out.push(Pulse {
@@ -108,9 +128,13 @@ pub fn render_pulses(bytes: &[u8], kind: FrameKind, out: &mut Vec<Pulse, 320>) {
             .unwrap();
         }
     }
-    out.push(Pulse {
-        high: false,
-        micros: TIMINGS::INTER_FRAME_GAP,
-    })
-    .unwrap();
+    // Inter-frame silence for 56-bit only; suppressed for 80-bit
+    // (Somfy.cpp:4379).
+    if !is_80 {
+        out.push(Pulse {
+            high: false,
+            micros: TIMINGS::INTER_FRAME_GAP,
+        })
+        .unwrap();
+    }
 }

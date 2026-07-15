@@ -1,0 +1,78 @@
+use heapless::Vec;
+use somfy_rts::{
+    decode80, encode80, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder, TIMINGS,
+};
+
+#[test]
+fn roundtrip_80_extended_commands() {
+    for cmd in [Command::StepUp, Command::Favorite, Command::Stop] {
+        let f = Frame {
+            key: 0xA5,
+            command: cmd,
+            rolling_code: 100,
+            address: 0x654321,
+        };
+        let back = decode80(&encode80(&f)).unwrap();
+        assert_eq!(back, f, "roundtrip failed for {:?}", cmd);
+    }
+}
+
+#[test]
+fn rx_decoder_recognizes_80_bit_frames() {
+    let f = Frame {
+        key: 0xA5,
+        command: Command::StepUp,
+        rolling_code: 5,
+        address: 0x111111,
+    };
+    let mut pulses: Vec<Pulse, 320> = Vec::new();
+    render_pulses(&encode80(&f), FrameKind::Repeat, &mut pulses);
+    let mut rx = RxDecoder::new();
+    let mut got = None;
+    for p in &pulses {
+        if let Some(fr) = rx.push(*p) {
+            got = Some(fr);
+        }
+    }
+    let rxf = got.expect("80-bit frame decoded");
+    assert_eq!(rxf.bit_length, 80);
+    let back = decode80(rxf.bytes.as_slice().try_into().unwrap()).unwrap();
+    assert_eq!(back, f);
+}
+
+/// The pulse layer must key its sync counts and gap emission off frame size:
+/// per Somfy.cpp:4000/4004/4014/4019 an 80-bit frame sends 12 hardware syncs on
+/// the first frame and 6 on repeats (vs 2 / 7 for 56-bit), and Somfy.cpp:4379
+/// suppresses the inter-frame gap entirely for `bitLength == 80`.
+#[test]
+fn pulse_layer_uses_80_bit_sync_counts_and_no_gap() {
+    let f = Frame {
+        key: 0xA5,
+        command: Command::Stop,
+        rolling_code: 9,
+        address: 0x222222,
+    };
+    let bytes = encode80(&f);
+
+    // First frame: wakeup pulse then 12 hardware syncs (24 half-pulses).
+    let mut first: Vec<Pulse, 320> = Vec::new();
+    render_pulses(&bytes, FrameKind::First, &mut first);
+    assert!(first[0].high && first[0].micros == TIMINGS::WAKEUP_HIGH);
+    assert!(!first[1].high && first[1].micros == TIMINGS::WAKEUP_LOW);
+    for p in &first[2..26] {
+        assert_eq!(p.micros, TIMINGS::HW_SYNC_HALF);
+    }
+    assert_eq!(first[26].micros, TIMINGS::SW_SYNC_HIGH);
+
+    // Repeat frame: no wakeup, 6 hardware syncs (12 half-pulses).
+    let mut repeat: Vec<Pulse, 320> = Vec::new();
+    render_pulses(&bytes, FrameKind::Repeat, &mut repeat);
+    for p in &repeat[0..12] {
+        assert_eq!(p.micros, TIMINGS::HW_SYNC_HALF);
+    }
+    assert_eq!(repeat[12].micros, TIMINGS::SW_SYNC_HIGH);
+
+    // No inter-frame gap for 80-bit: the last pulse is a data half-symbol, not
+    // the long INTER_FRAME_GAP silence a 56-bit frame ends with.
+    assert_ne!(repeat.last().unwrap().micros, TIMINGS::INTER_FRAME_GAP);
+}

@@ -33,7 +33,16 @@ impl Command {
     }
 
     pub fn from_nibble(n: u8) -> Option<Command> {
-        Some(match n & 0x0F {
+        Command::from_u8(n & 0x0F)
+    }
+
+    /// Map a full command byte back to a `Command`. Accepts both the base
+    /// nibble values (0x1..=0xF) and the three extended 80-bit values
+    /// (`Somfy.h:49-51`). Unlike [`Command::from_nibble`] this does NOT mask to
+    /// four bits, so `decode80` can reconstruct e.g. `0x8B` -> `StepUp` without
+    /// it collapsing to `StepDown`.
+    pub fn from_u8(v: u8) -> Option<Command> {
+        Some(match v {
             0x1 => Command::My,
             0x2 => Command::Up,
             0x3 => Command::MyUp,
@@ -48,6 +57,9 @@ impl Command {
             0xC => Command::Toggle,
             0xE => Command::Sensor,
             0xF => Command::RtwProto,
+            0x8B => Command::StepUp,
+            0xC1 => Command::Favorite,
+            0xF1 => Command::Stop,
             _ => return None,
         })
     }

@@ -129,8 +129,10 @@ impl RxDecoder {
     }
 
     /// Detect frame bit length from the accumulated hardware-sync count, per the
-    /// C++ switch at `Somfy.cpp:4414-4419`. Only 56-bit frames are exercised in
-    /// Task 6; the 80-bit arms are carried over for fidelity and Task 7.
+    /// C++ switch at `Somfy.cpp:4414-4419`. Both lengths are exercised: a 56-bit
+    /// repeat yields 14 hw-sync halves, an 80-bit repeat 12 (see
+    /// [`crate::render_pulses`]), so the `12 | 13 => 80` arm is what makes an
+    /// 80-bit transmission decode with `bit_length == 80`.
     fn detect_bit_length(&self) -> u8 {
         match self.hw_syncs {
             0..=7 => 56,
