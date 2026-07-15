@@ -1,12 +1,14 @@
 #![cfg_attr(not(test), no_std)]
 
 mod command;
+mod dedupe;
 mod frame;
 mod pulse;
 mod rolling;
 mod rx;
 
 pub use command::Command;
+pub use dedupe::RxDeduper;
 pub use frame::{decode56, decode80, encode56, encode80, Frame, FrameError};
 pub use pulse::{render_pulses, FrameKind, Pulse, TIMINGS};
 pub use rolling::RollingCode;
