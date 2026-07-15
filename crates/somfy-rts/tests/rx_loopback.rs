@@ -7,6 +7,23 @@ fn tx_pulses(f: &Frame, kind: FrameKind) -> Vec<Pulse, 320> {
     out
 }
 
+/// Collapse adjacent same-level pulses into single summed-duration pulses —
+/// the edge-to-edge form an interrupt-driven receiver (and the C++ firmware's
+/// `rx.pulses[]` captures) actually produces.
+fn merge_pulses(pulses: &[Pulse]) -> Vec<Pulse, 320> {
+    let mut out: Vec<Pulse, 320> = Vec::new();
+    for p in pulses {
+        if let Some(last) = out.last_mut() {
+            if last.high == p.high {
+                last.micros += p.micros;
+                continue;
+            }
+        }
+        out.push(*p).unwrap();
+    }
+    out
+}
+
 fn decode_stream(pulses: &[Pulse]) -> Option<somfy_rts::RxFrame> {
     let mut rx = RxDecoder::new();
     let mut got = None;
@@ -84,4 +101,59 @@ fn noise_before_frame_is_ignored() {
     let rxf = decode_stream(&stream).expect("frame found after noise");
     let back = decode56(rxf.bytes.as_slice().try_into().unwrap()).unwrap();
     assert_eq!(back, f);
+}
+
+/// Real hardware measures edge-to-edge durations, so consecutive same-level
+/// half-symbols arrive merged into ~1280us segments (this is the shape of the
+/// C++ firmware's `rx.pulses[]` captures). The decoder must accept that
+/// stream, not just the unmerged synthetic one.
+#[test]
+fn merged_edge_to_edge_stream_decodes() {
+    let f = Frame {
+        key: 0xA7,
+        command: Command::Down,
+        rolling_code: 4242,
+        address: 0x0BCDEF,
+    };
+    for kind in [FrameKind::First, FrameKind::Repeat] {
+        let unmerged = tx_pulses(&f, kind);
+        let merged = merge_pulses(&unmerged);
+        assert!(
+            merged.len() < unmerged.len(),
+            "payload must contain 0<->1 transitions for this test to bite"
+        );
+        let rxf = decode_stream(&merged).expect("merged stream decoded");
+        assert_eq!(rxf.bit_length, 56);
+        let back = decode56(rxf.bytes.as_slice().try_into().unwrap()).unwrap();
+        assert_eq!(back, f, "kind {kind:?}");
+    }
+}
+
+/// The tolerance window is +/-25%: a data half-pulse stretched +24% still
+/// decodes; at +26% the decoder abandons the frame.
+#[test]
+fn tolerance_window_boundaries() {
+    let f = Frame {
+        key: 0xA7,
+        command: Command::My,
+        rolling_code: 55,
+        address: 0x314159,
+    };
+    // Repeat layout: 14 hw-sync halves (0..=13), sw sync (14), start-0 (15),
+    // data halves (16..=127), gap (128). Index 40 is a mid-payload half.
+    let base = tx_pulses(&f, FrameKind::Repeat);
+
+    let mut ok = base.clone();
+    ok[40].micros = 640 + 640 * 24 / 100; // 793 <= 800 upper bound
+    let rxf = decode_stream(&ok).expect("+24% half-pulse still decodes");
+    let back = decode56(rxf.bytes.as_slice().try_into().unwrap()).unwrap();
+    assert_eq!(back, f);
+
+    let mut bad = base.clone();
+    bad[40].micros = 640 + 640 * 26 / 100; // 806 > 800 upper bound
+    assert_eq!(
+        decode_stream(&bad),
+        None,
+        "+26% half-pulse must abort the frame"
+    );
 }

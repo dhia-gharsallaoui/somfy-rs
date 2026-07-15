@@ -7,25 +7,34 @@
 //! counting, `>= 4` before accepting the software sync, and the `bit_length`
 //! selection switch) mirrors the C++ verbatim.
 //!
-//! The data-phase decode intentionally *diverges* from the C++ ISR, and the
-//! reason is the pulse representation. The C++ ISR runs off a `CHANGE`
-//! interrupt, so it only ever measures *edge-to-edge* durations: physically
-//! adjacent same-level half-symbols are already merged into one segment by the
-//! hardware, which is why the C++ decodes transitions (toggling `previous_bit`
-//! on a full 2*SYMBOL segment) and ignores pulse polarity. Our TX layer
-//! ([`render_pulses`]) deliberately does *not* merge adjacent same-level
-//! half-symbols (see its doc comment), so the loopback stream this decoder
-//! consumes is a sequence of discrete `SYMBOL`-length half-pulses whose
-//! polarity is meaningful. Decoding that stream by transition-toggling would
-//! collapse every bit to the same value; instead we read the Manchester bit
-//! straight off the second half-symbol's level (`bit == second half is high`,
-//! MSB-first), exactly matching the polarity [`render_pulses`] emits.
+//! The data phase is the C++ transition algorithm (`Somfy.cpp:4440-4458`) made
+//! level-aware, so ONE decoder accepts both pulse representations:
 //!
-//! This unmerged form is strictly more informative than the merged one: it
-//! preserves the boundary between a frame's final `0` half-symbol and the
-//! inter-frame gap, which a merging decoder would lose. A future real-radio RX
-//! driver that only sees edges would need the C++ transition algorithm (or a
-//! merge shim in front of this decoder).
+//! 1. **Merged edge-to-edge streams** — what real hardware produces. The C++
+//!    ISR runs off a `CHANGE` interrupt, so adjacent same-level half-symbols
+//!    arrive pre-merged as single ~`2 * SYMBOL` (~1280µs) segments. The
+//!    firmware's `rx.pulses[]` captures have this form.
+//! 2. **Unmerged synthetic streams** — what this crate's [`render_pulses`]
+//!    emits (it deliberately keeps every half-symbol separate; see its doc).
+//!
+//! How: the C++ stores each Manchester bit upon consuming that bit's *first*
+//! half-symbol. A full-symbol (~1280µs) duration spans "second half of bit n +
+//! first half of bit n+1" and the C++ stores `previous_bit ^ 1`; the second
+//! ~640µs pulse of a half-pair is bit n+1's first half and the C++ stores
+//! `previous_bit` unchanged. That duration-only rule is sound in the C++ only
+//! because an edge-derived stream can never contain two consecutive same-level
+//! segments. Our [`Pulse`] carries the level, which permits the strictly more
+//! general rule used here: at every first-half event, `bit = !level` (a bit's
+//! first half carries the inverted bit; polarity per [`render_pulses`]: bit 1
+//! = low half then high half, MSB-first). On merged streams `!level`
+//! reproduces the C++ toggle exactly — a merged segment's level is bit n,
+//! which equals `!bit n+1`. On unmerged streams it reads the bit directly,
+//! where the duration-only toggle would see no full-symbol segments at all.
+//!
+//! Storing at the first half also means the final bit completes the frame
+//! before its second half arrives, so a last-bit-0 low half that merges into
+//! the inter-frame silence (one long out-of-family low segment) can never cost
+//! a data bit; whatever trails the frame lands harmlessly in `WaitingSync`.
 
 use crate::pulse::{Pulse, TIMINGS};
 use heapless::Vec;
@@ -53,14 +62,12 @@ pub struct RxDecoder {
     bit_length: u8,
     bits: u16,
     payload: [u8; 10],
-    /// `false` = the next half-symbol is the first half of a Manchester
-    /// symbol (advance only); `true` = it is the second half (its level is
-    /// the bit).
+    /// Same meaning as the C++ `waiting_half_symbol`: `true` after a lone
+    /// half-symbol pulse has been consumed, i.e. the *next* half-symbol event
+    /// is a bit's first half (the storage point). Entering the data phase
+    /// with `false` lets the TX "start 0" low half flow through as the
+    /// opening half of the pairing, exactly as in the C++ (`Somfy.cpp:4411`).
     waiting_half: bool,
-    /// The "start 0" low half-symbol that `render_pulses` emits between the
-    /// software sync and the first data bit must be consumed without being
-    /// paired; this flag skips exactly that one half-symbol.
-    skip_start: bool,
 }
 
 /// Minimum hardware-sync half-pulses (edges) required before a software sync is
@@ -68,11 +75,11 @@ pub struct RxDecoder {
 /// a first frame emits 2 hardware syncs (4 half-pulses), a repeat 7 (14).
 const MIN_HW_SYNCS: u8 = 4;
 
-/// `±25%` tolerance window, the brief's simplification of the C++ RX
-/// `TOLERANCE_MIN 0.7 / MAX 1.3` windows (`Somfy.cpp:4218-4234`). Kept because
-/// it comfortably covers the ±10% jitter the loopback tests inject while still
-/// separating the `HALF_SYMBOL` (640), `HW_SYNC_HALF` (2560) and
-/// `SW_SYNC_HIGH` (4850) families.
+/// `±25%` tolerance window, a simplification of the C++ RX
+/// `TOLERANCE_MIN 0.7 / MAX 1.3` windows (`Somfy.cpp:4218-4234`). It
+/// comfortably covers ±10% real-world jitter while keeping the `HALF_SYMBOL`
+/// (640), full-symbol (1280), `HW_SYNC_HALF` (2560) and `SW_SYNC_HIGH` (4850)
+/// families separated.
 fn within(actual: u32, expected: u32) -> bool {
     let lo = expected - expected / 4;
     let hi = expected + expected / 4;
@@ -88,7 +95,6 @@ impl RxDecoder {
             bits: 0,
             payload: [0; 10],
             waiting_half: false,
-            skip_start: false,
         }
     }
 
@@ -136,7 +142,7 @@ impl RxDecoder {
     }
 
     /// Feed one measured pulse. Returns a complete frame on the pulse that
-    /// delivers the final data bit.
+    /// delivers the final data bit (its first half — see module docs).
     pub fn push(&mut self, p: Pulse) -> Option<RxFrame> {
         match self.state {
             State::WaitingSync => {
@@ -153,7 +159,6 @@ impl RxDecoder {
                     self.bits = 0;
                     self.payload = [0; 10];
                     self.waiting_half = false;
-                    self.skip_start = true;
                 } else {
                     // Anything else (noise, the wake-up pulse, its silence)
                     // breaks a partial sync run, matching the C++ reset.
@@ -162,26 +167,29 @@ impl RxDecoder {
                 None
             }
             State::ReceivingData => {
-                if within(p.micros, TIMINGS::HALF_SYMBOL) {
-                    if self.skip_start {
-                        // Consume the lone "start 0" half-symbol; leave the
-                        // pairing phase (`waiting_half == false`) untouched so
-                        // the next pulse begins the first real symbol.
-                        self.skip_start = false;
-                        return None;
-                    }
+                // C++ `Somfy.cpp:4443-4458`, level-aware (see module docs).
+                if !self.waiting_half && within(p.micros, 2 * TIMINGS::HALF_SYMBOL) {
+                    // Merged segment: second half of the previous bit plus
+                    // the first half of the next bit; its level is the
+                    // inverted new bit (equivalent to the C++
+                    // `previous_bit ^ 1` toggle).
+                    self.store_bit(!p.high as u8);
+                    self.complete()
+                } else if within(p.micros, TIMINGS::HALF_SYMBOL) {
                     if self.waiting_half {
-                        // Second half of a symbol: its level is the bit value
-                        // (Manchester: bit 1 = low then high).
-                        self.store_bit(p.high as u8);
+                        // Second pulse of a half-pair == a bit's first half:
+                        // its level is the inverted bit.
+                        self.store_bit(!p.high as u8);
                         self.waiting_half = false;
-                        return self.complete();
+                        self.complete()
+                    } else {
+                        self.waiting_half = true;
+                        None
                     }
-                    self.waiting_half = true;
-                    None
                 } else {
-                    // Out-of-family duration (inter-frame gap or corruption):
-                    // abandon this frame and re-acquire sync.
+                    // Out-of-family duration (inter-frame gap, a full symbol
+                    // arriving mid-pair, or corruption): abandon this frame
+                    // and re-acquire sync, as the C++ does.
                     self.reset();
                     None
                 }
