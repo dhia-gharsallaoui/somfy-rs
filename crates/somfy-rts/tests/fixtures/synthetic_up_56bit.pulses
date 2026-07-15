@@ -1,0 +1,122 @@
+# SYNTHETIC golden capture — NOT a real device capture.
+#
+# Generated from `render_pulses(&encode56(&f), FrameKind::Repeat)` merged to
+# edge-to-edge form, then written durations-only. Reproduce with the helper
+# in tests/golden.rs (`synthetic_up_pulses`); see the "Synthetic fixtures"
+# section of README.md for the full recipe.
+#
+# Frame: Command::Up, key=0xA7, rolling_code=0x000A, address=0x00C0DE.
+# Format: durations-only (one <duration_us> per line). The loader reconstructs
+# levels by alternation from HIGH (first hardware-sync pulse is HIGH).
+#
+# Exercises loader parsing (comments + blank line below), level
+# reconstruction, glitch filtering, and end-to-end decode.
+
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+2560
+4850
+1280
+1280
+1280
+1280
+640
+640
+1280
+640
+640
+640
+640
+640
+640
+1280
+640
+640
+640
+640
+1280
+640
+640
+1280
+1280
+640
+640
+1280
+640
+640
+640
+640
+1280
+640
+640
+1280
+1280
+# The next line is an injected sub-448us glitch (< bitMin=448, Somfy.cpp:4388).
+# The loader must DROP it; the C++ ISR records such glitches in rx.pulses[] but
+# does not advance last_time, so the following real duration already spans it.
+200
+640
+640
+1280
+640
+640
+640
+640
+640
+640
+1280
+640
+640
+640
+640
+640
+640
+1280
+640
+640
+640
+640
+640
+640
+1280
+640
+640
+640
+640
+1280
+1280
+1280
+640
+640
+640
+640
+1280
+640
+640
+640
+640
+640
+640
+1280
+640
+640
+1280
+640
+640
+1280
+640
+640
+1280
+640
+27434
