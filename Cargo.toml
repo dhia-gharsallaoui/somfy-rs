@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/somfy-rts"]
+members = ["crates/somfy-rts", "crates/somfy-domain"]
 
 [workspace.package]
 edition = "2021"
