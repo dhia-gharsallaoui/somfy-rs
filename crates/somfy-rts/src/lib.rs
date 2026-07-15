@@ -2,6 +2,8 @@
 
 mod command;
 mod frame;
+mod rolling;
 
 pub use command::Command;
 pub use frame::{decode56, encode56, Frame, FrameError};
+pub use rolling::RollingCode;
