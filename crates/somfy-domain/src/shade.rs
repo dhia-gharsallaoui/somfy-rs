@@ -76,6 +76,10 @@ pub struct Shade {
     /// mid-range arrival stop (Somfy.cpp:1166/1218) fires only when this is
     /// set — Step targets and native motor moves never schedule a stop.
     stop_on_arrival: bool,
+    /// Remotes (besides this shade's own address) whose RX frames drive the
+    /// estimate via [`Shade::apply_overheard`]. Bounded at
+    /// `SOMFY_MAX_LINKED_REMOTES` = 7 (Somfy.h:8, `linkedRemotes[]`).
+    linked: Vec<u32, 7>,
 }
 
 impl Shade {
@@ -87,6 +91,7 @@ impl Shade {
             tilt: Motion::new(Pos::ZERO),
             my_pos: None,
             stop_on_arrival: false,
+            linked: Vec::new(),
         }
     }
 
@@ -147,6 +152,70 @@ impl Shade {
             // Favorite set/clear is a pure state change; the C++ prog-button
             // My-set flow is a pairing-assistant concern (Plan 5+).
             ShadeCommand::SetMy(p) => self.my_pos = p,
+        }
+    }
+
+    /// Register a remote whose overheard RX frames should drive this shade's
+    /// estimate. Rejects the sentinel addresses (0 / 0xFFFFFF, same guard as
+    /// [`ShadeConfig::new`], Somfy.cpp:169-170), duplicates (including this
+    /// shade's own address), and overflow past `SOMFY_MAX_LINKED_REMOTES` = 7
+    /// (Somfy.h:8).
+    pub fn link_remote(&mut self, addr: u32) -> Result<(), crate::DomainError> {
+        use crate::DomainError;
+        if addr == 0 || addr >= 0xFF_FFFF {
+            return Err(DomainError::InvalidAddress);
+        }
+        if self.is_linked(addr) {
+            return Err(DomainError::DuplicateAddress);
+        }
+        self.linked
+            .push(addr)
+            .map_err(|_| DomainError::RegistryFull)
+    }
+
+    /// True if `addr` is this shade's own remote address or a linked remote.
+    /// Mirrors the C++ frame-ownership test (Somfy.cpp:2191-2199: own
+    /// `getRemoteAddress()` first, then the `linkedRemotes[]` scan).
+    pub fn is_linked(&self, addr: u32) -> bool {
+        addr == self.config.address || self.linked.contains(&addr)
+    }
+
+    /// Apply a (deduped) frame overheard on RX from this shade's own or a
+    /// linked remote — the wall remote already commanded the motor, so this
+    /// only tracks the estimate and NEVER plans a [`PlannedTx`] (retransmitting
+    /// would double-drive the motor). Port of `SomfyShade::processFrame` from a
+    /// non-internal source (Somfy.cpp:2186): `Up`/`Down` retarget the hard
+    /// limits (`p_target(0/100)`, :2360/:2388), `My` while moving freezes the
+    /// estimate (`p_target(currentPos)`, :2437), and `My` while idle recalls
+    /// the favorite (`p_target(myPos)`, :2429).
+    ///
+    /// The live estimate is advanced to `now_ms` first (like [`Shade::handle`]'s
+    /// `sync`) so retargets anchor on the current position. A remote frame also
+    /// aborts any of our own in-flight positioning — the C++ clears `settingPos`
+    /// unconditionally here (Somfy.cpp:2209) — so we drop the pending mid-range
+    /// stop by clearing `stop_on_arrival`; it is never transmitted.
+    pub fn apply_overheard(&mut self, cmd: Command, now_ms: u64) {
+        // Advance the estimate without emitting: `apply_overheard` has no TX
+        // channel, and the C++ abandons our positioning on a remote frame.
+        let _ = self
+            .lift
+            .tick(now_ms, self.config.up_time_ms, self.config.down_time_ms);
+        self.stop_on_arrival = false;
+        match cmd {
+            Command::Up => self.lift.set_target(Pos::ZERO, now_ms),
+            Command::Down => self.lift.set_target(Pos::FULL, now_ms),
+            Command::My => {
+                if self.lift.direction() != Direction::Idle {
+                    self.lift
+                        .halt(now_ms, self.config.up_time_ms, self.config.down_time_ms);
+                } else if let Some(fav) = self.my_pos {
+                    self.lift.set_target(fav, now_ms);
+                }
+            }
+            // Other commands (combo buttons, Step, Sensor, ...) do not move the
+            // lift estimate in v1.0 — the C++ routes them to telemetry-only
+            // branches (Somfy.cpp:2289-2297) with no `p_target` change.
+            _ => {}
         }
     }
 
