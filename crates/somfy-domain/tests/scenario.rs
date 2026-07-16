@@ -4,7 +4,8 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    Controller, Direction, PlannedTx, Pos, ShadeCommand, ShadeConfig, StateDelta, TX_CAPACITY,
+    Controller, Direction, PlannedTx, Pos, ShadeCommand, ShadeConfig, StateDelta, DELTA_CAPACITY,
+    TX_CAPACITY,
 };
 use somfy_rts::{Command, Frame};
 
@@ -26,7 +27,7 @@ fn full_scenario_tracks_position_through_mixed_control() {
     // always sized to the workspace constant so a shared buffer survives every
     // call shape (see the exported `TX_CAPACITY` contract).
     let mut tx: Vec<PlannedTx, TX_CAPACITY> = Vec::new();
-    let mut deltas: Vec<StateDelta, 32> = Vec::new();
+    let mut deltas: Vec<StateDelta, DELTA_CAPACITY> = Vec::new();
 
     // 08:00 — the web UI asks for 40%. From rest (0%) that is a downward seek,
     // and the sync tick crosses no pending arrival, so exactly one Down frame.
@@ -40,14 +41,31 @@ fn full_scenario_tracks_position_through_mixed_control() {
     .unwrap();
     assert_eq!(tx.len(), 1);
     assert_eq!(tx[0].command, Command::Down);
+    // The seek is reported immediately: one delta, shade moving Down (still 0%).
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].id, id);
+    assert_eq!(deltas[0].pos, Pos::ZERO);
+    assert_eq!(deltas[0].direction, Direction::Down);
 
     // Position advances and the arrival plans the My stop (mid-range target of
     // an explicit seek self-stops via My, not a hard limit).
     tx.clear();
+    deltas.clear();
     c.tick(4_000, &mut tx, &mut deltas);
     assert_eq!(c.registry.shade(id).unwrap().pos(), Pos::from_percent(40));
     assert_eq!(tx.len(), 1);
     assert_eq!(tx[0].command, Command::My);
+    // Arrival emits exactly one delta: parked at 40%, now idle.
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].pos, Pos::from_percent(40));
+    assert_eq!(deltas[0].direction, Direction::Idle);
+
+    // An idle tick right after arrival changes nothing: no delta, no TX.
+    tx.clear();
+    deltas.clear();
+    c.tick(4_500, &mut tx, &mut deltas);
+    assert!(deltas.is_empty(), "idle stretch emits no deltas");
+    assert!(tx.is_empty());
 
     // 12:00 — someone presses Down on the wall remote (3 repeats heard). The
     // deduper collapses the repeats (same address+rolling_code within 2 s) to a

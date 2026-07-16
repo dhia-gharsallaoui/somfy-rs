@@ -70,6 +70,17 @@ fn groups_collect_shades_and_forget_removed_ones() {
 }
 
 #[test]
+fn rooms_forget_removed_shades() {
+    let mut r = Registry::new();
+    let a = r.add_shade(cfg("A", 0x101)).unwrap();
+    let rm = r.add_room("Living").unwrap();
+    r.room_assign(rm, a).unwrap();
+    assert_eq!(r.room_shades(rm).count(), 1);
+    r.remove_shade(a).unwrap();
+    assert_eq!(r.room_shades(rm).count(), 0);
+}
+
+#[test]
 fn room_assignment_is_exclusive() {
     let mut r = Registry::new();
     let a = r.add_shade(cfg("A", 0x101)).unwrap();

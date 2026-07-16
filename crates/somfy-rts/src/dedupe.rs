@@ -18,8 +18,8 @@ const CAPACITY: usize = 8;
 /// window return `false`. Once the window elapses the pair is treated as a fresh
 /// event again (a remote reusing a rolling code after that long is a new press).
 ///
-/// The tracking map is bounded to [`CAPACITY`] entries; when it is full and a
-/// new pair arrives, the oldest entry is evicted to make room.
+/// The tracking map is bounded to a small fixed `CAPACITY` (8) entries; when it
+/// is full and a new pair arrives, the oldest entry is evicted to make room.
 pub struct RxDeduper {
     window_ms: u32,
     seen: FnvIndexMap<(u32, u16), u32, CAPACITY>,

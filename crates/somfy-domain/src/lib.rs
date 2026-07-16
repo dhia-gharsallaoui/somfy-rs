@@ -21,6 +21,15 @@
 //!   ~500 ms to disambiguate a My *recall* from a My *set* on the physical
 //!   button. The domain sees an already-decoded command, so no such wait
 //!   applies (see [`Shade::apply_overheard`]).
+//! - **`My`-while-idle favorite recall always *simulates*.** The C++ DEFAULT
+//!   (the `simMy` flag is off, Somfy.cpp:2880-2887) sends a raw `My`/Favorite
+//!   frame and lets the motor recall its own HARDWARE-stored favorite; this
+//!   crate always simulates the move from the software `my_pos` instead. So
+//!   `My`-while-idle with `my_pos == None` is a **no-op** here, whereas the C++
+//!   default would still transmit and drive the shade to a position the software
+//!   cannot predict. Reconciling this — a raw-`My` passthrough command or a
+//!   `simMy` config bit that toggles simulate-vs-passthrough — is a Plan 4
+//!   decision item (see [`Shade::handle`]'s `My` arm).
 //!
 //! ## Ownership boundaries
 //!
@@ -43,9 +52,9 @@ mod shade;
 mod tilt;
 mod types;
 
-pub use controller::{Controller, StateDelta, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
+pub use controller::{Controller, StateDelta, DELTA_CAPACITY, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
 pub use motion::{Motion, MotionSnapshot};
-pub use registry::{GroupId, Registry, RoomId, ShadeId};
+pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MAX_SHADES};
 pub use shade::{PlannedTx, Shade, ShadeCommand};
 pub use tilt::tilt_first;
 pub use types::{Direction, DomainError, Pos, ShadeConfig, ShadeKind, TiltMode};

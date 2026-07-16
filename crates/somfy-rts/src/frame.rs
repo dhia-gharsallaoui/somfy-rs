@@ -22,8 +22,9 @@ pub enum FrameError {
 /// Encode a 56-bit RTS frame (7 bytes).
 ///
 /// Layout before obfuscation (matches ESPSomfy-RTS src/Somfy.cpp encodeFrame,
-/// lines 335-341): [0]=key [1]=cmd<<4|cksum [2..3]=rolling code big-endian
-/// (hi byte first) [4..6]=24-bit address big-endian (MSB at [4], LSB at [6]).
+/// lines 335-341): `[0]`=key `[1]`=cmd<<4|cksum `[2..3]`=rolling code
+/// big-endian (hi byte first) `[4..6]`=24-bit address big-endian (MSB at `[4]`,
+/// LSB at `[6]`).
 ///
 /// # Extended commands are rejected
 ///

@@ -229,6 +229,13 @@ impl Registry {
             .get_mut(r.0 as usize)
             .and_then(Option::as_mut)
             .ok_or(DomainError::NotFound)?;
+        // Infallible in practice: `members` is capped at MAX_SHADES and holds
+        // DISTINCT shade ids (a shade lives in at most one room, and the retain
+        // above just removed `s` from every room, including this target). With
+        // at most MAX_SHADES distinct shades in existence, a room that no longer
+        // contains `s` always has a free slot for it, so this push cannot
+        // overflow. The `RegistryFull` map is a defensive backstop, not an
+        // expected path.
         room.members.push(s).map_err(|_| DomainError::RegistryFull)
     }
 

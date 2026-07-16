@@ -113,7 +113,7 @@ impl Shade {
 
     /// Apply a command: update the motion model AND queue any radio frame(s).
     ///
-    /// The live position is advanced to `now_ms` first ([`Shade::sync`]) so the
+    /// The live position is advanced to `now_ms` first (`sync`) so the
     /// re-target math anchors on the current estimate — the C++ `currentPos` is
     /// continuously updated by `checkMovement` before any command is processed.
     pub fn handle(&mut self, cmd: ShadeCommand, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
@@ -132,10 +132,16 @@ impl Shade {
                 self.push(out, Command::Down);
             }
             // My while moving => stop (freeze estimate) + TX My; My while idle
-            // with a favorite => go to it; My while idle without one => no-op
-            // (Somfy.cpp:2929-2942 + moveToMyPosition at :2863). The favorite
-            // recall uses GoTo semantics (the C++ simMy() branch,
-            // moveToMyPosition -> moveToTarget at :2884).
+            // with a favorite => simulate a move to it (GoTo semantics, the C++
+            // simMy() branch moveToMyPosition -> moveToTarget at :2883).
+            //
+            // My while idle WITHOUT a favorite (`my_pos == None`) is a NO-OP.
+            // DEVIATION (see crate docs): the C++ DEFAULT (simMy off,
+            // Somfy.cpp:2880-2887) instead sends a raw My frame, letting the
+            // motor recall its HARDWARE favorite and move even when no software
+            // favorite is known. We always simulate, so we cannot reproduce that
+            // hardware recall without either a raw-My passthrough or a simMy
+            // config bit — deferred to Plan 4.
             ShadeCommand::My => {
                 if self.lift.direction() != Direction::Idle {
                     self.stop_on_arrival = false;
@@ -186,8 +192,10 @@ impl Shade {
     /// would double-drive the motor). Port of `SomfyShade::processFrame` from a
     /// non-internal source (Somfy.cpp:2186): `Up`/`Down` retarget the hard
     /// limits (`p_target(0/100)`, :2360/:2388), `My` while moving freezes the
-    /// estimate (`p_target(currentPos)`, :2437), and `My` while idle recalls
-    /// the favorite (`p_target(myPos)`, :2429).
+    /// estimate (`p_target(currentPos)`, :2437), `My` while idle recalls the
+    /// favorite (`p_target(myPos)`, :2429), and `StepUp`/`StepDown` nudge the
+    /// estimate one step (the C++ step target math at :2443-2525 has no
+    /// internal-frame gate, so overheard steps move `currentPos` too).
     ///
     /// The live estimate is advanced to `now_ms` first (like [`Shade::handle`]'s
     /// `sync`) so retargets anchor on the current position. A remote frame also
@@ -212,9 +220,26 @@ impl Shade {
                     self.lift.set_target(fav, now_ms);
                 }
             }
-            // Other commands (combo buttons, Step, Sensor, ...) do not move the
-            // lift estimate in v1.0 — the C++ routes them to telemetry-only
-            // branches (Somfy.cpp:2289-2297) with no `p_target` change.
+            // Step frames move the estimate: the C++ StepUp/StepDown handling
+            // (Somfy.cpp:2443-2525) computes `p_target` with NO internal-frame
+            // gate, so an overheard step from a wall remote moves `currentPos`
+            // just like our own. We route it through the same `step_target`
+            // math (1%/press, direction-matched) but plan no TX — the buffer-less
+            // `apply_overheard` signature makes that structurally impossible —
+            // and leave `stop_on_arrival` false (cleared above): steps never
+            // arm the mid-range My stop (Somfy.cpp:2443-2525 never set
+            // `settingPos`).
+            Command::StepUp => {
+                self.step_target(Direction::Up, now_ms);
+            }
+            Command::StepDown => {
+                self.step_target(Direction::Down, now_ms);
+            }
+            // Remaining commands (combo buttons `MyUp`/`MyDown`/`MyUpDown`/
+            // `UpDown`/`Prog`, sun/wind sensors, ...) do not move the lift
+            // estimate in v1.0 — the C++ routes them to telemetry-only branches
+            // (e.g. Somfy.cpp:2289-2297 for the combo/prog buttons) with no
+            // `p_target` change.
             _ => {}
         }
     }
@@ -266,39 +291,62 @@ impl Shade {
         self.push(out, cmd);
     }
 
-    /// Nudge the target one step and emit the extended Step command. Port of
-    /// the non-tilt Step branch (Somfy.cpp:2481 up / :2522 down): the target
-    /// moves by `FULL_RAW * STEP_TRAVEL_MS / travel_ms` raw, clamped to the
-    /// limits, and the extended command is transmitted regardless of whether
-    /// the position changed (the C++ always calls `emitCommand`; only the
-    /// target math is conditional). Zero travel time is a no-op, matching the
-    /// C++ `return` guard (:2479/:2521).
+    /// Internal Step: nudge the target one step, arm no arrival stop, and emit
+    /// the extended Step command. The estimate math lives in [`Shade::step_target`]
+    /// (shared with overheard steps); this adds the TX the internal path owes.
+    ///
+    /// The C++ always calls `emitCommand` for a step whose travel time is
+    /// non-zero regardless of whether the clamped position actually changed
+    /// (only the target math is conditional), so we transmit whenever
+    /// `step_target` applied (i.e. travel time is non-zero, matching the C++
+    /// divide-by-zero `return` guard at :2479/:2521).
+    ///
+    /// NOTE (deliberate): a Step arriving mid-GoTo clears `stop_on_arrival`, so
+    /// it abandons the pending mid-range My stop of the in-flight seek. The C++
+    /// *internal* frames retain `settingPos`; we drop it instead, which is the
+    /// safer choice — a stray internal Step should not leave a phantom My
+    /// scheduled against a target the step has just moved.
     fn step(&mut self, dir: Direction, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
+        if self.step_target(dir, now_ms) {
+            self.stop_on_arrival = false;
+            let command = match dir {
+                Direction::Up => Command::StepUp,
+                _ => Command::StepDown,
+            };
+            self.push(out, command);
+        }
+    }
+
+    /// Move the lift target one step in `dir` from the (already-synced) live
+    /// position, WITHOUT any TX. Shared by the internal [`Shade::step`] and by
+    /// [`Shade::apply_overheard`] (overheard steps move the estimate the same
+    /// way the C++ does, Somfy.cpp:2443-2525).
+    ///
+    /// Port of the non-tilt Step target math (Somfy.cpp:2481 up / :2522 down):
+    /// the target moves by `FULL_RAW * STEP_TRAVEL_MS / travel_ms` raw, clamped
+    /// to the limits. `travel_ms` is the **direction-matched** travel time; the
+    /// C++ StepUp branch has a copy-paste bug — it guards `downTime == 0` but
+    /// divides by `upTime` (Somfy.cpp:2479-2480) — which we deliberately fix by
+    /// guarding and dividing by the same (up) time here. Zero travel time is a
+    /// no-op returning `false`, matching the C++ `return` guard (:2479/:2521).
+    ///
+    /// Returns `true` iff the step was applied (travel time non-zero).
+    fn step_target(&mut self, dir: Direction, now_ms: u64) -> bool {
         let travel_ms = match dir {
             Direction::Up => self.config.up_time_ms,
-            _ => self.config.down_time_ms,
+            Direction::Down | Direction::Idle => self.config.down_time_ms,
         };
         if travel_ms == 0 {
-            return;
+            return false;
         }
         let step_raw = (FULL_RAW * STEP_TRAVEL_MS / travel_ms).min(FULL_RAW) as u16;
-        // Step targets are not `settingPos` targets (Somfy.cpp:2443-2525 never
-        // set the flag): the motor self-stops after its increment, so tick
-        // must not schedule a My at arrival.
-        self.stop_on_arrival = false;
         let current = self.lift.pos().raw();
-        let (target, command) = match dir {
-            Direction::Up => (
-                Pos::from_raw(current.saturating_sub(step_raw)),
-                Command::StepUp,
-            ),
-            _ => (
-                Pos::from_raw(current.saturating_add(step_raw)),
-                Command::StepDown,
-            ),
+        let target = match dir {
+            Direction::Up => Pos::from_raw(current.saturating_sub(step_raw)),
+            Direction::Down | Direction::Idle => Pos::from_raw(current.saturating_add(step_raw)),
         };
         self.lift.set_target(target, now_ms);
-        self.push(out, command);
+        true
     }
 
     /// Queue one frame. Capacity 4 is generous: a single `handle`/`tick` call

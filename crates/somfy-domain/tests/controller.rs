@@ -4,7 +4,7 @@
 use heapless::Vec;
 use somfy_domain::{
     Controller, Direction, DomainError, GroupId, PlannedTx, Pos, ShadeCommand, ShadeConfig,
-    StateDelta, TX_CAPACITY,
+    StateDelta, DELTA_CAPACITY, TX_CAPACITY,
 };
 use somfy_rts::{Command, Frame};
 
@@ -17,7 +17,7 @@ fn setup() -> (Controller, somfy_domain::ShadeId) {
     (c, id)
 }
 
-fn bufs() -> (Vec<PlannedTx, TX_CAPACITY>, Vec<StateDelta, 32>) {
+fn bufs() -> (Vec<PlannedTx, TX_CAPACITY>, Vec<StateDelta, DELTA_CAPACITY>) {
     (Vec::new(), Vec::new())
 }
 

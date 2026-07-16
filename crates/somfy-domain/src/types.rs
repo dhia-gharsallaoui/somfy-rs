@@ -86,6 +86,18 @@ pub struct ShadeConfig {
     pub name: String<32>,
     pub address: u32,
     pub kind: ShadeKind,
+    /// Tilt mode. **TRAP: only [`TiltMode::None`] has command semantics in
+    /// Plan 2.** Every other variant is *config-carriage only* — it is stored
+    /// and round-tripped for backup/migration but drives no behavior yet: the
+    /// [`Shade`](crate::Shade) command path treats all shades as lift-only and
+    /// [`Shade::tilt_pos`](crate::Shade::tilt_pos) is always [`Pos::ZERO`].
+    ///
+    /// The C++ branches each tilt type differently — `tiltonly` and `euromode`
+    /// long-press or redirect Up/Down onto the tilt axis (Somfy.cpp:2357,
+    /// :2894-2899), `tiltmotor`/`euromode` defer half a second to disambiguate a
+    /// tilt (Somfy.cpp:2364) — so wiring these up is a real behavior port, not a
+    /// config toggle. Plan 3's API MUST NOT surface tilt as functional until
+    /// that port lands, or it will advertise moves the domain does not make.
     pub tilt_mode: TiltMode,
     pub up_time_ms: u32,
     pub down_time_ms: u32,
