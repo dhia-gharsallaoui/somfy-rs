@@ -7,7 +7,7 @@ mod shade;
 mod tilt;
 mod types;
 
-pub use controller::{Controller, StateDelta, RX_DEDUPE_WINDOW_MS};
+pub use controller::{Controller, StateDelta, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
 pub use motion::{Motion, MotionSnapshot};
 pub use registry::{GroupId, Registry, RoomId, ShadeId};
 pub use shade::{PlannedTx, Shade, ShadeCommand};

@@ -4,7 +4,7 @@
 use heapless::Vec;
 use somfy_domain::{
     Controller, Direction, DomainError, GroupId, PlannedTx, Pos, ShadeCommand, ShadeConfig,
-    StateDelta,
+    StateDelta, TX_CAPACITY,
 };
 use somfy_rts::{Command, Frame};
 
@@ -17,7 +17,7 @@ fn setup() -> (Controller, somfy_domain::ShadeId) {
     (c, id)
 }
 
-fn bufs() -> (Vec<PlannedTx, 8>, Vec<StateDelta, 32>) {
+fn bufs() -> (Vec<PlannedTx, TX_CAPACITY>, Vec<StateDelta, 32>) {
     (Vec::new(), Vec::new())
 }
 
@@ -165,6 +165,37 @@ fn reused_slot_emits_first_delta_for_new_shade() {
     );
     assert_eq!(deltas2[0].id, b);
     assert_eq!(deltas2[0].direction, Direction::Down);
+}
+
+#[test]
+fn large_group_fan_out_drops_no_frames() {
+    // No-drop guarantee at scale: 12 members x 1 frame each = 12 frames, which
+    // the old caller-facing capacity of 8 would have silently truncated. The
+    // TX_CAPACITY (= 32 x 2 = 64) buffer must hold every planned frame.
+    const MEMBERS: u32 = 12;
+    let mut c = Controller::new();
+    let g = c.registry.add_group("Big").unwrap();
+    for i in 0..MEMBERS {
+        let id = c
+            .registry
+            .add_shade(ShadeConfig::new("s", 0x200 + i).unwrap())
+            .unwrap();
+        c.registry.group_add_shade(g, id).unwrap();
+    }
+    let (mut tx, mut deltas) = bufs();
+    c.command_group(g, ShadeCommand::Down, 0, &mut tx, &mut deltas)
+        .unwrap();
+    assert_eq!(
+        tx.len(),
+        MEMBERS as usize,
+        "every member's frame must be planned — none dropped"
+    );
+    for i in 0..MEMBERS {
+        assert!(
+            tx.iter().any(|t| t.address == 0x200 + i),
+            "missing frame for member {i}"
+        );
+    }
 }
 
 #[test]

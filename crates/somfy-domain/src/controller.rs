@@ -24,6 +24,15 @@ use somfy_rts::{Frame, RxDeduper};
 /// deliberate second press.
 pub const RX_DEDUPE_WINDOW_MS: u32 = 2_000;
 
+/// Caller-facing TX buffer capacity, sized to the structural worst case so
+/// overflow is impossible rather than merely documented: a full group holds
+/// [`MAX_SHADES`](crate::registry::MAX_SHADES) = 32 members and
+/// [`Shade::handle`] plans at most 2 frames per shade (a sync-crossed arrival
+/// stop plus the command's own frame), so `command_group` can plan at most
+/// 32 x 2 = **64** frames in one call. `tick` is bounded lower (32 shades x
+/// at most 1 arrival-stop frame = 32) and `command_shade` at 2.
+pub const TX_CAPACITY: usize = crate::registry::MAX_SHADES * 2;
+
 /// The observable state every shade is assumed to start at (fully open, at
 /// rest). A shade sitting at this baseline produces no delta — deltas report
 /// *changes* from it, so a freshly added, untouched shade is silent until it
@@ -93,22 +102,31 @@ impl Controller {
     }
 
     /// Drain a shade's local [`PlannedTx`] buffer (capacity 4: `handle`/`tick`
-    /// plan at most 2 frames each) into the caller's `tx`.
-    fn drain(local: &Vec<PlannedTx, 4>, tx: &mut Vec<PlannedTx, 8>) {
+    /// plan at most 2 frames each) into the caller's `tx`. The caller buffer is
+    /// sized to [`TX_CAPACITY`], the structural worst case, so a failed push
+    /// means the capacity math itself regressed — scream in debug builds.
+    fn drain(local: &Vec<PlannedTx, 4>, tx: &mut Vec<PlannedTx, TX_CAPACITY>) {
         for t in local {
-            let _ = tx.push(*t);
+            let pushed = tx.push(*t);
+            debug_assert!(
+                pushed.is_ok(),
+                "PlannedTx buffer overflow — capacity math violated"
+            );
         }
     }
 
     /// Apply a command to one shade: update its motion model, queue any radio
     /// frame(s), and emit a delta if its state changed. [`DomainError::NotFound`]
     /// if the slot is empty or out of range.
+    ///
+    /// Plans at most 2 frames; `tx` is sized to [`TX_CAPACITY`] so a shared
+    /// buffer also survives the `command_group`/`tick` worst cases.
     pub fn command_shade(
         &mut self,
         id: ShadeId,
         cmd: ShadeCommand,
         now_ms: u64,
-        tx: &mut Vec<PlannedTx, 8>,
+        tx: &mut Vec<PlannedTx, TX_CAPACITY>,
         deltas: &mut Vec<StateDelta, 32>,
     ) -> Result<(), DomainError> {
         let shade = self.registry.shade_mut(id).ok_or(DomainError::NotFound)?;
@@ -123,16 +141,15 @@ impl Controller {
     /// if the group slot is empty or out of range; an existing but empty group
     /// is `Ok(())` with no work.
     ///
-    /// Note: `tx` is bounded at 8. A large group commanded at once can plan more
-    /// frames than that; the caller is expected to drain `tx` between calls or
-    /// command in smaller batches. Overflow drops the excess frame rather than
-    /// panicking on-device.
+    /// `tx` is sized to [`TX_CAPACITY`] = 32 members x 2 frames per
+    /// [`Shade::handle`] = 64, the structural worst case of a full group
+    /// commanded at once — overflow is impossible, no frame is ever dropped.
     pub fn command_group(
         &mut self,
         g: GroupId,
         cmd: ShadeCommand,
         now_ms: u64,
-        tx: &mut Vec<PlannedTx, 8>,
+        tx: &mut Vec<PlannedTx, TX_CAPACITY>,
         deltas: &mut Vec<StateDelta, 32>,
     ) -> Result<(), DomainError> {
         if !self.registry.group_exists(g) {
@@ -170,10 +187,14 @@ impl Controller {
 
     /// Advance every shade to `now_ms`: plan any arrival-stop frames and emit a
     /// delta for each shade whose state changed since its last reported one.
+    ///
+    /// Plans at most 32 frames (32 shades x at most 1 arrival-stop each from
+    /// [`Shade::tick`]); `tx` is sized to [`TX_CAPACITY`] = 64 so overflow is
+    /// impossible even in the larger `command_group` worst case.
     pub fn tick(
         &mut self,
         now_ms: u64,
-        tx: &mut Vec<PlannedTx, 8>,
+        tx: &mut Vec<PlannedTx, TX_CAPACITY>,
         deltas: &mut Vec<StateDelta, 32>,
     ) {
         let ids: Vec<ShadeId, { crate::registry::MAX_SHADES }> =
