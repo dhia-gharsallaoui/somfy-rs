@@ -164,6 +164,13 @@ impl Registry {
         group.members.push(s).map_err(|_| DomainError::RegistryFull)
     }
 
+    /// True if `g` names a live group slot. Lets a caller distinguish a
+    /// missing group (no such slot) from an existing but empty one, since
+    /// [`Registry::group_shades`] yields nothing for both.
+    pub fn group_exists(&self, g: GroupId) -> bool {
+        self.groups.get(g.0 as usize).is_some_and(Option::is_some)
+    }
+
     pub fn group_shades(&self, g: GroupId) -> impl Iterator<Item = ShadeId> + '_ {
         self.groups
             .get(g.0 as usize)

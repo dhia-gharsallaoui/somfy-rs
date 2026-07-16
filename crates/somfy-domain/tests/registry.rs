@@ -180,3 +180,11 @@ fn shades_iterates_live_slots_only() {
     let live: std::vec::Vec<_> = r.shades().map(|(id, _)| id).collect();
     assert_eq!(live, [b]);
 }
+
+#[test]
+fn group_exists_reflects_presence() {
+    let mut r = Registry::new();
+    let g = r.add_group("G").unwrap();
+    assert!(r.group_exists(g));
+    assert!(!r.group_exists(somfy_domain::GroupId(9)));
+}
