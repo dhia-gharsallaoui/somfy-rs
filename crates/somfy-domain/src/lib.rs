@@ -1,3 +1,39 @@
+//! # somfy-domain
+//!
+//! `no_std` domain model for somfy-rs: shade/group/room registries, the
+//! travel-time position estimator (port of the C++ `SomfyShade::checkMovement`
+//! dead-reckoning), command orchestration (commands in → [`PlannedTx`] radio
+//! work + [`StateDelta`] events out), and overheard-remote tracking.
+//!
+//! ## Intentional deviations from the C++ reference
+//!
+//! All documented in the design spec:
+//! - Positions are fixed-point ([`Pos`], hundredths of a percent) instead of
+//!   floats — deterministic, no accumulated rounding drift.
+//! - Sun/wind/dry-contact handling is deferred post-1.0 (spec §1.3); the tilt
+//!   estimator axis exists but full tilt command plumbing lands with the API
+//!   layer that exposes it.
+//! - The mid-range arrival stop is scheduled only for explicit position seeks
+//!   (`GoTo`/favorite recall), never for `Step` — the C++ `settingPos` analog:
+//!   Step targets and native motor moves self-stop, so no `My` is planned on
+//!   their arrival (see [`Shade::tick`]).
+//! - Overheard `My`-while-idle recalls the favorite immediately; the C++ defers
+//!   ~500 ms to disambiguate a My *recall* from a My *set* on the physical
+//!   button. The domain sees an already-decoded command, so no such wait
+//!   applies (see [`Shade::apply_overheard`]).
+//!
+//! ## Ownership boundaries
+//!
+//! This crate owns no clock, no channels, and no rolling codes: callers inject
+//! `now_ms` and drain the output buffers; rolling-code state stays in the
+//! radio/persistence layer (`somfy_rts::RollingCode`).
+//!
+//! The TX buffer contract is **per-call**: caller buffers are sized to
+//! [`TX_CAPACITY`] (the structural worst case of one call — a full group
+//! commanded at once) and must be drained between calls, not accumulated across
+//! them. A shade's internal buffer plans at most two frames per call (a
+//! sync-crossed arrival stop plus the command's own frame).
+
 #![cfg_attr(not(test), no_std)]
 
 mod controller;

@@ -8,21 +8,26 @@ full design specification lives in [`docs/specs/`](docs/specs/).
 
 ## Status
 
-**Plan 1 of 7 — protocol engine — complete.** The `somfy-rts` crate (frames,
-rolling codes, TX pulse rendering, RX decoding, repeat-frame dedupe) is
-implemented and green on the host. Golden-capture *validation* against real
-device pulses is **pending**: the fixture loader is exercised every CI run by a
-checked-in synthetic capture, but three fixture-backed tests are `#[ignore]`d
-until real captures from a running C++ device land (see
+**Plans 1–2 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
+codes, TX pulse rendering, RX decoding, repeat-frame dedupe) and the
+`somfy-domain` model (shade/group/room registries, travel-time position
+dead-reckoning, command orchestration, overheard-remote tracking) are
+implemented and green on the host. **Next: Plan 3** — API + migration DTOs
+(`somfy-api`, `somfy-migrate` backup parser).
+
+Golden-capture *validation* against real device pulses is still **pending**: the
+fixture loader is exercised every CI run by a checked-in synthetic capture, but
+three fixture-backed tests are `#[ignore]`d until real captures from a running
+C++ device land (see
 [`crates/somfy-rts/tests/fixtures/README.md`](crates/somfy-rts/tests/fixtures/README.md)).
 
-Later plans (per [`docs/specs/`](docs/specs/)):
+Plans (per [`docs/specs/`](docs/specs/)):
 
 | Plan | Scope |
 |------|-------|
-| 1 | Protocol engine (`somfy-rts`) — **this plan** |
-| 2 | Domain model: shades/groups/rooms + position/tilt engine |
-| 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) |
+| 1 | Protocol engine (`somfy-rts`) — **complete** |
+| 2 | Domain model: shades/groups/rooms + position/tilt engine — **complete** |
+| 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **next** |
 | 4 | Firmware radio: `esp-hal` RMT TX/RX, ESP targets |
 | 5 | Network: WiFi, MQTT, Home Assistant discovery |
 | 6 | Persistence + OTA (A/B partitions, rollback) |
@@ -51,9 +56,10 @@ policy-free:
 | Crate | `no_std` | Description |
 |-------|:--------:|-------------|
 | [`somfy-rts`](crates/somfy-rts) | yes | Somfy RTS protocol engine: 56/80-bit frame encode/decode, rolling codes, OOK pulse rendering (TX) and dual-stream pulse decoding (RX), repeat-frame dedupe. Hardware-free — pure pulse data in/out. |
+| [`somfy-domain`](crates/somfy-domain) | yes | Domain model: shade/group/room registries + position dead-reckoning. Travel-time position/tilt estimator, command orchestration (commands in → planned radio TX + state-delta events out), and overheard-remote tracking. Clock-free — callers inject `now_ms`. |
 
-Additional crates (`somfy-domain`, `somfy-api`, `somfy-migrate`, `firmware`) and
-the `ui/` app arrive in later plans.
+Additional crates (`somfy-api`, `somfy-migrate`, `firmware`) and the `ui/` app
+arrive in later plans.
 
 ## Build & test
 
