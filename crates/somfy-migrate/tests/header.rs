@@ -90,6 +90,17 @@ fn version_18_is_rejected() {
 }
 
 #[test]
+fn version_26_ceiling_is_rejected() {
+    // Ceiling is v25 (SHADE_HDR_VER); a future v26 could append fields and
+    // silently misalign the record parsers, so it is rejected up front.
+    let mut r = Reader::new(b"26,80,29,1,276,2,200,0,77,0,552,318,78,Srv26\n");
+    assert!(matches!(
+        parse_header(&mut r),
+        Err(MigrateError::UnsupportedVersion(26))
+    ));
+}
+
+#[test]
 fn truncated_header_is_eof() {
     // Header ends before serverId is read.
     let mut r = Reader::new(b"25,76,29,2,276,3,200,1,77,0");

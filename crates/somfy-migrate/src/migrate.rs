@@ -1,0 +1,155 @@
+//! Top-level backup assembly: header + record loops → [`MigrationData`].
+//!
+//! Ports the read order of C++ `ShadeConfigFile::loadFile`/`restoreFile`
+//! (`src/ConfigFile.cpp:886-940`, `:515-563`), which mirrors the write order of
+//! `save`/`backup` (`:315-383`): header, then `roomRecords` room records,
+//! `shadeRecords` shade records, `groupRecords` group records, then the
+//! repeater/settings/net/trans records this migrator does not model.
+//!
+//! ## Cleared-slot filtering
+//!
+//! The C++ writer never emits cleared slots — `save`/`backup` skip rooms with
+//! `roomId == 0` (`:332`), shades with `shadeId == 255` (`:337`), and groups
+//! with `groupId == 255` (`:342`) — and the record *counts* in the header are
+//! the live-entity counts (`roomCount`/`shadeCount`/`groupCount`,
+//! `Somfy.cpp:3705-3725`). On the read side, `loadFile`/`restore` load exactly
+//! those counts and `clear()` any slots not present in the file
+//! (`:913-918`, `:923-928`, `:542-547`). So a cleared sentinel record should
+//! never appear; if one does (a hand-edited or corrupt backup), it is filtered
+//! rather than surfaced as a live entity — matching the C++ intent.
+//!
+//! ## Trailing records
+//!
+//! The repeater (if `version >= 21`), settings, net, and transceiver records
+//! that follow the groups are not modeled in this migration pass. They are
+//! skipped by record end (`\n`) until EOF, trusting the separators rather than
+//! the advisory record-size fields in the header.
+
+use crate::header::{parse_header, BackupHeader};
+use crate::reader::{MigrateError, Reader};
+use crate::records::{
+    parse_group_record, parse_room_record, parse_shade_record, MigratedGroup, MigratedRoom,
+    MigratedShade,
+};
+use heapless::{String, Vec};
+
+/// Rooms per backup — C++ `SOMFY_MAX_ROOMS` (`Somfy.h:10`).
+const MAX_ROOMS: usize = 16;
+/// Shades per backup — C++ `SOMFY_MAX_SHADES` (`Somfy.h:6`).
+const MAX_SHADES: usize = 32;
+/// Groups per backup — C++ `SOMFY_MAX_GROUPS` (`Somfy.h:7`).
+const MAX_GROUPS: usize = 16;
+/// `serverId` capacity — C++ `char serverId[10]` (`ConfigFile.h:28`).
+const SERVER_ID_CAP: usize = 10;
+
+/// Everything a file-only backup migration can recover from a C++ backup.
+///
+/// The three collections are the live entities in slot order, with cleared
+/// sentinel slots filtered out (see the module docs). Rolling codes on shades
+/// and groups already carry the `+1` migration contract from their record
+/// parsers, so this struct is ready to hand to the domain layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationData {
+    /// Backup format version (`19..=25`).
+    pub version: u8,
+    /// Server identifier from the header (max 10 bytes).
+    pub server_id: String<SERVER_ID_CAP>,
+    /// Live rooms in slot order.
+    pub rooms: Vec<MigratedRoom, MAX_ROOMS>,
+    /// Live shades in slot order.
+    pub shades: Vec<MigratedShade, MAX_SHADES>,
+    /// Live groups in slot order.
+    pub groups: Vec<MigratedGroup, MAX_GROUPS>,
+}
+
+/// Parse a complete C++ backup buffer into [`MigrationData`].
+///
+/// Reads the header (rejecting versions outside `19..=25`), then the room,
+/// shade, and group records in the C++ `save`/`backup` order, resyncing to each
+/// record boundary defensively after every record (a faithful port of the C++
+/// `seekChar(CFG_REC_END)` net). Cleared sentinel records are filtered. Any
+/// trailing repeater/settings/net/trans records are skipped to EOF.
+///
+/// # Errors
+///
+/// - [`MigrateError::UnsupportedVersion`] if the header version is not `19..=25`.
+/// - [`MigrateError::UnexpectedEof`] if any declared record is truncated or the
+///   header record counts exceed the records actually present.
+/// - [`MigrateError::StringTooLong`] / [`MigrateError::BadRecord`] on a
+///   malformed field, or if the live-entity count exceeds the C++ slot capacity.
+pub fn parse_backup(data: &[u8]) -> Result<MigrationData, MigrateError> {
+    let mut r = Reader::new(data);
+    let header = parse_header(&mut r)?;
+
+    let rooms = parse_rooms(&mut r, &header)?;
+    let shades = parse_shades(&mut r, &header)?;
+    let groups = parse_groups(&mut r, &header)?;
+
+    // Trailing repeater/settings/net/trans records are not modeled; skip them by
+    // record end until EOF so a well-formed backup is consumed cleanly.
+    while !r.at_end() {
+        r.skip_record_end()?;
+    }
+
+    Ok(MigrationData {
+        version: header.version,
+        server_id: header.server_id,
+        rooms,
+        shades,
+        groups,
+    })
+}
+
+fn parse_rooms(
+    r: &mut Reader,
+    header: &BackupHeader,
+) -> Result<Vec<MigratedRoom, MAX_ROOMS>, MigrateError> {
+    let mut rooms = Vec::new();
+    for _ in 0..header.room_records {
+        let room = parse_room_record(r, header)?;
+        r.resync_record()?;
+        // roomId 0 is a cleared slot; the C++ writer never emits it (:332).
+        if room.room_id != 0 {
+            rooms
+                .push(room)
+                .map_err(|_| MigrateError::BadRecord("too_many_rooms"))?;
+        }
+    }
+    Ok(rooms)
+}
+
+fn parse_shades(
+    r: &mut Reader,
+    header: &BackupHeader,
+) -> Result<Vec<MigratedShade, MAX_SHADES>, MigrateError> {
+    let mut shades = Vec::new();
+    for _ in 0..header.shade_records {
+        let shade = parse_shade_record(r, header)?;
+        r.resync_record()?;
+        // shadeId 255 is a cleared slot; the C++ writer never emits it (:337).
+        if shade.shade_id != 255 {
+            shades
+                .push(shade)
+                .map_err(|_| MigrateError::BadRecord("too_many_shades"))?;
+        }
+    }
+    Ok(shades)
+}
+
+fn parse_groups(
+    r: &mut Reader,
+    header: &BackupHeader,
+) -> Result<Vec<MigratedGroup, MAX_GROUPS>, MigrateError> {
+    let mut groups = Vec::new();
+    for _ in 0..header.group_records {
+        let group = parse_group_record(r, header)?;
+        r.resync_record()?;
+        // groupId 255 is a cleared slot; the C++ writer never emits it (:342).
+        if group.group_id != 255 {
+            groups
+                .push(group)
+                .map_err(|_| MigrateError::BadRecord("too_many_groups"))?;
+        }
+    }
+    Ok(groups)
+}

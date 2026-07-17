@@ -1,4 +1,9 @@
-//! Shade-record parser — the migration-critical rolling-code carrier.
+//! Record parsers for the C++ backup body: rooms, shades, and groups.
+//!
+//! Each parser ports the matching C++ `read*Record`/`write*Record` pair and
+//! documents the discovered field map with citations. The shade parser is the
+//! migration-critical rolling-code carrier; the group parser is a second one
+//! (groups are their own virtual remotes) and carries the SAME `+1` contract.
 //!
 //! Ports C++ `ShadeConfigFile::readShadeRecord` (`src/ConfigFile.cpp:801-885`),
 //! cross-checked field-for-field against `writeShadeRecord` (`:970-1018`). The
@@ -19,6 +24,17 @@ use somfy_rts::RollingCode;
 
 /// Linked-remote slots per shade — C++ `SOMFY_MAX_LINKED_REMOTES` (`Somfy.h:8`).
 const MAX_LINKED_REMOTES: usize = 7;
+
+/// Member-shade slots per group — C++ `SOMFY_MAX_GROUPED_SHADES` (`Somfy.h:9`).
+const MAX_GROUPED_SHADES: usize = 32;
+
+/// Backup version whose group record carries `lastRollingCode` *before* the
+/// linked shades (`readGroupRecord` :747). v24+ moved it to the record end.
+const GROUP_ROLLING_MID_VERSION: u8 = 23;
+
+/// First backup version whose group record carries `lastRollingCode` at the
+/// record end, after `roomId` (`readGroupRecord` :763; `writeGroupRecord` :955).
+const GROUP_ROLLING_TAIL_VERSION: u8 = 24;
 
 /// One shade decoded from a C++ backup, carrying only the fields somfy-rs models.
 ///
@@ -250,6 +266,189 @@ pub fn parse_shade_record(
         flags_raw,
         bit_length,
         proto_raw,
+    })
+}
+
+/// One room decoded from a C++ backup.
+///
+/// C++ `SomfyRoom` (`Somfy.h:204-217`) also carries `sortOrder`, which is parsed
+/// positionally to keep the cursor aligned but not modeled here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedRoom {
+    /// Room identifier — C++ `roomId` `uint8` (`readRoomRecord` :791). A `0`
+    /// marks a cleared slot in the C++ file (`save` skips it, `ConfigFile.cpp:332`);
+    /// the caller decides whether to keep it.
+    pub room_id: u8,
+    /// Display name — C++ `name` `char[21]` (`:792`, `Somfy.h:207`), `_rtrim`med.
+    pub name: String<32>,
+}
+
+/// Parse one room record at the cursor, advancing to the next record.
+///
+/// Field order mirrors C++ `readRoomRecord` (`src/ConfigFile.cpp:789-798`),
+/// cross-checked against `writeRoomRecord` (`:964-968`). `readRoomRecord` has
+/// **no version gates** — the layout is identical across every accepted version
+/// — so `header` is accepted only for pipeline uniformity. The record is
+/// `ROOM_REC_SIZE` = 29 bytes fixed-width (`ConfigFile.cpp:15`).
+///
+/// ## Field map (wire order; `→` = modeled, `skip` = parsed then dropped)
+///
+/// | # | C++ field (`readRoomRecord`) | reader | destination |
+/// |---|------------------------------|--------|-------------|
+/// | 1 | `roomId` (:791)              | u8     | → `room_id` |
+/// | 2 | `name` `char[21]` (:792)    | str    | → `name` |
+/// | 3 | `sortOrder` (:793)          | u8     | skip (`\n`-terminated) |
+///
+/// # Errors
+///
+/// - [`MigrateError::UnexpectedEof`] if the record is truncated.
+/// - [`MigrateError::StringTooLong`] / [`MigrateError::BadRecord`] on a bad `name`.
+pub fn parse_room_record(
+    r: &mut Reader,
+    _header: &BackupHeader,
+) -> Result<MigratedRoom, MigrateError> {
+    let room_id = r.read_u8()?; // 1 roomId
+    let name = read_name(r)?; // 2 name (char[21], _rtrimmed)
+    let _sort_order = r.read_u8()?; // 3 sortOrder — not modeled (\n-terminated)
+    Ok(MigratedRoom { room_id, name })
+}
+
+/// One group decoded from a C++ backup.
+///
+/// A C++ `SomfyGroup` (`Somfy.h:380-419`) *is a `SomfyRemote`*: it has its own
+/// remote address and rolling code and transmits like a shade, so the same
+/// migration `+1` contract applies to `next_code`. Fields the record also
+/// serializes but somfy-rs does not model here (`groupType`, `proto`,
+/// `bitLength`, `repeats`, `sortOrder`, `flipCommands`, `roomId`) are parsed
+/// positionally, then dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedGroup {
+    /// Group identifier — C++ `groupId` `uint8` (`readGroupRecord` :741). `255`
+    /// marks a cleared slot (`save` skips it, `ConfigFile.cpp:342`); the caller
+    /// decides whether to keep it.
+    pub group_id: u8,
+    /// Display name — C++ `name` `char[21]` (`:744`, `Somfy.h:388`), `_rtrim`med.
+    pub name: String<32>,
+    /// Virtual-remote address — C++ `remoteAddress` `uint32` (`:743`).
+    pub address: u32,
+    /// Next rolling code to transmit. **Same migration contract as a shade:** the
+    /// C++ file stores the *last-sent* code (`lastRollingCode`); somfy-rs holds
+    /// the *next-to-send* value, so `next_code = RollingCode(last_sent + 1)` with
+    /// wrap at 65535. See [`MigratedShade::next_code`] and the version note on
+    /// [`parse_group_record`] for where the stored code lives per version.
+    pub next_code: RollingCode,
+    /// Non-zero member shade ids in slot order. The C++ file writes
+    /// `SOMFY_MAX_GROUPED_SHADES` (32) slots (`writeGroupRecord` :948-950);
+    /// `readGroupRecord` drops `0` slots and preserves order (`:750-754`).
+    pub member_shade_ids: Vec<u8, MAX_GROUPED_SHADES>,
+}
+
+/// Parse one group record at the cursor, advancing to the next record.
+///
+/// Field order and version gates mirror C++ `readGroupRecord`
+/// (`src/ConfigFile.cpp:738-776`), cross-checked against the v25 writer
+/// `writeGroupRecord` (`:941-957`). Unlike the shade record, the group record's
+/// **rolling-code position moves with the version** — the one true per-version
+/// layout difference in the accepted `19..=25` range:
+///
+/// - **v19–v22:** the file carries *no* group rolling code; the C++ sources it
+///   from NVS only (`:764-767`). A file-only migrator cannot recover it, so
+///   `next_code` defaults to `RollingCode(1)` (stored `0` → `+1`).
+/// - **v23:** `lastRollingCode` sits *before* the linked shades (`:747`).
+/// - **v24–v25:** `lastRollingCode` is the final, `\n`-terminated field, after
+///   `roomId` (`:763`; writer `:955`).
+///
+/// Even where the file supplies the code (v23+), the C++ then takes
+/// `max(nvs, file)` (`:766`); a file-only migrator uses the file value as the
+/// best recoverable source (documented on [`MigratedGroup::next_code`]).
+///
+/// ## Field map (wire order for v24/v25; `→` = modeled, `skip` = dropped)
+///
+/// | # | C++ field (`readGroupRecord`) | reader | destination |
+/// |---|-------------------------------|--------|-------------|
+/// | 1 | `groupId` (:741)             | u8     | → `group_id` |
+/// | 2 | `groupType` (:742)          | u8     | skip |
+/// | 3 | `remoteAddress` (:743)      | u32    | → `address` |
+/// | 4 | `name` `char[21]` (:744)    | str    | → `name` |
+/// | 5 | `proto` (:745)              | u8     | skip |
+/// | 6 | `bitLength` (:746)          | u8     | skip |
+/// | – | `lastRollingCode` (:747)    | u16    | → `next_code` (**v23 only**, `+1`) |
+/// | 7 | `linkedShades[0..32]` (:750-754) | 32×u8 | → `member_shade_ids` (non-zero) |
+/// | 8 | `repeats` (:755, v>=12)     | u8     | skip |
+/// | 9 | `sortOrder` (:756, v>=13)   | u8     | skip |
+/// |10 | `flipCommands` (:761, v>=18)| bool   | skip |
+/// |11 | `roomId` (:762, v>=19)      | u8     | skip |
+/// |12 | `lastRollingCode` (:763)    | u16    | → `next_code` (**v>=24**, `+1`, `\n`-terminated) |
+///
+/// # Errors
+///
+/// - [`MigrateError::UnexpectedEof`] if the record is truncated.
+/// - [`MigrateError::StringTooLong`] / [`MigrateError::BadRecord`] on a bad `name`.
+/// - [`MigrateError::BadRecord`] if more than 32 member shades are present.
+pub fn parse_group_record(
+    r: &mut Reader,
+    header: &BackupHeader,
+) -> Result<MigratedGroup, MigrateError> {
+    let v = header.version;
+
+    let group_id = r.read_u8()?; // 1 groupId
+    let _group_type = r.read_u8()?; // 2 groupType — not modeled
+    let address = r.read_u32()?; // 3 remoteAddress
+    let name = read_name(r)?; // 4 name (char[21], _rtrimmed)
+    let _proto = r.read_u8()?; // 5 proto — not modeled
+    let _bit_length = r.read_u8()?; // 6 bitLength — not modeled
+
+    // The file only carries the group rolling code from v23 up; below that it is
+    // NVS-only and unrecoverable here, so 0 (→ next_code 1) is the honest default.
+    let mut last_rolling_code = 0u16;
+
+    // v23 places lastRollingCode here, before the linked shades (:747).
+    if v == GROUP_ROLLING_MID_VERSION {
+        last_rolling_code = r.read_u16()?;
+    }
+
+    // 7 linkedShades: 32 slots; 0 = empty. readGroupRecord compacts to eliminate
+    // gaps (:750-754), so only non-zero ids are kept, in slot order.
+    let mut member_shade_ids: Vec<u8, MAX_GROUPED_SHADES> = Vec::new();
+    for _ in 0..MAX_GROUPED_SHADES {
+        let shade_id = r.read_u8()?;
+        if shade_id != 0 {
+            member_shade_ids
+                .push(shade_id)
+                .map_err(|_| MigrateError::BadRecord("linked_shades"))?;
+        }
+    }
+
+    // 8-11 additive gates (all taken for the accepted v19+ range), parsed then
+    // dropped so the cursor reaches the record end / trailing rolling code.
+    if v >= 12 {
+        r.read_u8()?; // 8 repeats — not modeled
+    }
+    if v >= 13 {
+        r.read_u8()?; // 9 sortOrder — not modeled
+    }
+    if v >= 18 {
+        r.read_bool()?; // 10 flipCommands — not modeled
+    }
+    if v >= 19 {
+        r.read_u8()?; // 11 roomId — not modeled
+    }
+
+    // 12 v24+ places lastRollingCode last, \n-terminated (:763; writer :955).
+    if v >= GROUP_ROLLING_TAIL_VERSION {
+        last_rolling_code = r.read_u16()?;
+    }
+
+    // THE migration contract, shared with shades: stored value is the last code
+    // SENT; the next transmit must be +1 (wrapping) or the motor desyncs.
+    let next_code = RollingCode(last_rolling_code.wrapping_add(1));
+
+    Ok(MigratedGroup {
+        group_id,
+        name,
+        address,
+        next_code,
+        member_shade_ids,
     })
 }
 

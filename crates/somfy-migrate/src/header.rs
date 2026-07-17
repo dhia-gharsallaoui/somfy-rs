@@ -29,6 +29,15 @@ use heapless::String;
 /// rather than mis-parsed.
 const MIN_SUPPORTED_VERSION: u8 = 19;
 
+/// Highest backup version this migrator has been verified against — the current
+/// firmware writer version `SHADE_HDR_VER` (`ConfigFile.cpp:10`).
+///
+/// A future version could append fields to a record and silently misalign every
+/// record parser below it (the record readers here reproduce the exact v19..=25
+/// field layouts). Rejecting an unknown-future version at the single header
+/// choke point guards the whole pipeline rather than mis-parsing it.
+const MAX_SUPPORTED_VERSION: u8 = 25;
+
 /// First version whose header carries the repeater record pair
 /// (`ConfigFile.cpp:81-84`).
 const REPEATER_MIN_VERSION: u8 = 21;
@@ -78,7 +87,8 @@ pub struct BackupHeader {
 /// Parse a backup header from the front of `r`.
 ///
 /// Reads the fields in exact C++ `writeHeader` order (`ConfigFile.cpp:47-60`).
-/// The version is read first: a value below [`MIN_SUPPORTED_VERSION`] yields
+/// The version is read first: a value outside the supported `19..=25` range
+/// (`MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION`) yields
 /// [`MigrateError::UnsupportedVersion`] before any further field is consumed.
 /// The repeater pair is only read for `version >= 21` (mirroring the
 /// `readHeader` gate at `ConfigFile.cpp:81-84`); for older accepted versions
@@ -87,13 +97,13 @@ pub struct BackupHeader {
 ///
 /// # Errors
 ///
-/// - [`MigrateError::UnsupportedVersion`] if `version < 19`.
+/// - [`MigrateError::UnsupportedVersion`] if `version < 19` or `version > 25`.
 /// - [`MigrateError::UnexpectedEof`] if the header is truncated.
 /// - [`MigrateError::StringTooLong`] if `serverId` exceeds 10 bytes.
 /// - [`MigrateError::BadRecord`] if `serverId` is not valid UTF-8.
 pub fn parse_header(r: &mut Reader) -> Result<BackupHeader, MigrateError> {
     let version = r.read_u8()?;
-    if version < MIN_SUPPORTED_VERSION {
+    if !(MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Err(MigrateError::UnsupportedVersion(version));
     }
     let length = r.read_u8()?;

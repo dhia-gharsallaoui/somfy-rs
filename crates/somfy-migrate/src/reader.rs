@@ -253,9 +253,12 @@ impl<'a> Reader<'a> {
 
     /// Advance past the next record terminator (`\n`).
     ///
-    /// Tolerant of already sitting on the newline (consumes it) and of EOF
-    /// (returns `Ok`). Used to skip a record's unparsed trailing fields before
-    /// reading the next record.
+    /// Scans forward, consuming bytes up to and including the next `\n`; returns
+    /// `Ok` at EOF without one. This always consumes a whole record's worth of
+    /// bytes, so it is the right tool for skipping an *unparsed* trailing record
+    /// (repeater/settings/net/trans). To defensively realign after parsing a
+    /// record's fields, prefer [`Reader::resync_record`], which is a no-op when
+    /// the cursor already sits on a record boundary.
     pub fn skip_record_end(&mut self) -> Result<(), MigrateError> {
         let data = self.data;
         while self.pos < data.len() {
@@ -264,6 +267,35 @@ impl<'a> Reader<'a> {
             if b == REC_END {
                 return Ok(());
             }
+        }
+        Ok(())
+    }
+
+    /// `true` when the cursor sits at the start of a record — at the very
+    /// beginning of the input, or immediately after a consumed record end
+    /// (`\n`), or at EOF reached exactly on a terminator.
+    ///
+    /// This is the variable-width analogue of the C++ record-boundary check
+    /// `file.position() == startPos + recordSize` (`ConfigFile.cpp:880`): since
+    /// this reader tolerates non-fixed-width fields, alignment is expressed as
+    /// "the last terminator consumed was a record end" rather than a byte count.
+    pub fn at_record_boundary(&self) -> bool {
+        self.pos == 0 || self.data[self.pos - 1] == REC_END
+    }
+
+    /// Realign to the next record boundary, but only if the cursor is mid-record.
+    ///
+    /// Faithful port of the defensive `seekChar(CFG_REC_END)` the C++ record
+    /// readers run *only* when a record was not fully consumed
+    /// (`ConfigFile.cpp:794-797`, `:880-883`, `:771-774`): if the last field
+    /// read ended on a value separator — more trailing fields remain in the
+    /// record — this advances past the record end; if the last read already
+    /// consumed the record end this is a no-op, so it never eats into the
+    /// following record (which an unconditional [`Reader::skip_record_end`]
+    /// would).
+    pub fn resync_record(&mut self) -> Result<(), MigrateError> {
+        if !self.at_record_boundary() {
+            self.skip_record_end()?;
         }
         Ok(())
     }

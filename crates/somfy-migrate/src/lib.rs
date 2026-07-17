@@ -21,9 +21,14 @@
 //! substituting defaults the way the on-device reader does.
 
 mod header;
+mod migrate;
 mod reader;
 mod records;
 
 pub use header::{parse_header, BackupHeader};
+pub use migrate::{parse_backup, MigrationData};
 pub use reader::{MigrateError, Reader};
-pub use records::{parse_shade_record, MigratedShade};
+pub use records::{
+    parse_group_record, parse_room_record, parse_shade_record, MigratedGroup, MigratedRoom,
+    MigratedShade,
+};

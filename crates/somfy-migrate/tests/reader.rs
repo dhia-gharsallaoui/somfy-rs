@@ -153,3 +153,45 @@ fn at_end_tracks_cursor() {
     r.read_u8().unwrap();
     assert!(r.at_end());
 }
+
+// ---- Added: record-boundary resync (port of seekChar defensive net) ----
+
+#[test]
+fn at_record_boundary_after_record_end() {
+    // At start (pos 0) and after consuming a '\n' the cursor is on a boundary;
+    // after consuming a ',' (mid-record) it is not.
+    let mut r = Reader::new(b"1,2\n3\n");
+    assert!(r.at_record_boundary()); // pos 0
+    r.read_u8().unwrap(); // consumes '1' + ','
+    assert!(!r.at_record_boundary()); // mid-record (last terminator was ',')
+    r.read_u8().unwrap(); // consumes '2' + '\n'
+    assert!(r.at_record_boundary()); // record end consumed
+}
+
+#[test]
+fn resync_record_skips_unparsed_trailing_fields() {
+    // A record with fields beyond what the caller read: resync advances to the
+    // next record without the caller knowing the field count.
+    let mut r = Reader::new(b"1,extra,extra\n2\n");
+    assert_eq!(r.read_u8().unwrap(), 1); // only the first field is modeled
+    r.resync_record().unwrap(); // skip the two trailing fields + '\n'
+    assert_eq!(r.read_u8().unwrap(), 2);
+}
+
+#[test]
+fn resync_record_is_noop_when_already_aligned() {
+    // When the last read consumed the record end, resync must NOT consume the
+    // following record (an unconditional skip_record_end would).
+    let mut r = Reader::new(b"1\n2\n");
+    assert_eq!(r.read_u8().unwrap(), 1); // consumes '1' + '\n' -> aligned
+    r.resync_record().unwrap(); // no-op
+    assert_eq!(r.read_u8().unwrap(), 2); // second record intact
+}
+
+#[test]
+fn resync_record_at_eof_is_ok() {
+    let mut r = Reader::new(b"1\n");
+    assert_eq!(r.read_u8().unwrap(), 1);
+    r.resync_record().unwrap();
+    assert!(r.at_end());
+}
