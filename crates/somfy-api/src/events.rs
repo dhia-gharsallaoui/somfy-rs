@@ -22,6 +22,22 @@ use somfy_domain::StateDelta;
 /// Keeping the payload flat lets the UI consume it without unwrapping a nested
 /// object.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// The wire form is a flat, internally-tagged object (`{"ev":"shadeState", ...}`)
+// produced by the manual `Serialize`/`Deserialize` below. `WsEvent` carries no
+// `#[serde]` container attribute (the tagging is hand-rolled), so ts-rs cannot
+// infer the shape and MUST be told explicitly: tag on `ev`, camelCase tag
+// values. The newtype variant `ShadeState(ShadeStateEvent)` inlines its inner
+// struct's fields alongside the tag, matching `WsEventWire`.
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        tag = "ev",
+        rename_all = "camelCase"
+    )
+)]
 pub enum WsEvent {
     ShadeState(ShadeStateEvent),
 }
@@ -29,6 +45,15 @@ pub enum WsEvent {
 /// Live shade state pushed on the WebSocket. Positions are whole percent
 /// (0-100); `direction` uses the C++ sign convention (-1 up, 0 idle, +1 down).
 #[derive(Debug, Clone, PartialEq, Eq, DeriveSerialize, DeriveDeserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ShadeStateEvent {
     pub id: u8,

@@ -5,7 +5,10 @@
 //! (0-100), `kind`/`tiltMode` are the C++ numeric discriminants, and
 //! `direction` uses the C++ sign convention (-1 up, 0 idle, +1 down).
 
-use heapless::{String, Vec};
+// NB: heapless `String`/`Vec` are referenced fully qualified rather than
+// imported. The `ts` feature derives `ts_rs::TS`, whose generated code uses the
+// std prelude `String` (e.g. `fn ident() -> String`); a `use heapless::String`
+// here would shadow it and break the derive.
 use serde::{Deserialize, Serialize};
 use somfy_domain::{Shade, ShadeId};
 
@@ -14,10 +17,22 @@ use somfy_domain::{Shade, ShadeId};
 /// `kind`/`tiltMode` are the C++ numeric discriminants; `direction`
 /// uses the C++ sign convention (-1 up, 0 idle, +1 down).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ShadeDto {
     pub id: u8,
-    pub name: String<32>,
+    // `heapless::String<N>` does not implement `TS`; on the wire it is a plain
+    // JSON string, so override the emitted type.
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub name: heapless::String<32>,
     pub address: u32,
     pub kind: u8,
     pub tilt_mode: u8,
@@ -56,18 +71,40 @@ impl ShadeDto {
 
 /// A named group of shade ids for REST/WS payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDto {
     pub id: u8,
-    pub name: String<32>,
-    pub shade_ids: Vec<u8, 32>,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub name: heapless::String<32>,
+    #[cfg_attr(feature = "ts", ts(type = "number[]"))]
+    pub shade_ids: heapless::Vec<u8, 32>,
 }
 
 /// A named room of shade ids for REST/WS payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomDto {
     pub id: u8,
-    pub name: String<32>,
-    pub shade_ids: Vec<u8, 32>,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub name: heapless::String<32>,
+    #[cfg_attr(feature = "ts", ts(type = "number[]"))]
+    pub shade_ids: heapless::Vec<u8, 32>,
 }

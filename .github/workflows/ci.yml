@@ -18,6 +18,13 @@ jobs:
       - run: cargo test --workspace
       - name: release-mode tests (catch overflow/debug-assert divergence)
         run: cargo test -p somfy-domain --release --lib
+      - name: TypeScript bindings up to date
+        run: |
+          cargo test -p somfy-api --features ts
+          # `git add -N` surfaces newly generated (untracked) bindings so a new
+          # DTO without a committed .ts also trips the diff, not just edits.
+          git add -N ui/src/api/generated
+          git diff --exit-code ui/src/api/generated
       - name: no_std check
         run: |
           rustup target add thumbv7em-none-eabihf

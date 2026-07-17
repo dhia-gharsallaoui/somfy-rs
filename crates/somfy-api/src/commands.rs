@@ -25,6 +25,24 @@ use somfy_domain::{Pos, ShadeCommand};
 /// only (see [`somfy_domain::ShadeConfig::tilt_mode`]), so the API MUST NOT
 /// surface a tilt command until the domain ports tilt behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// The wire form is a flat, internally-tagged object (`{"action":"up"}`,
+// `{"action":"goTo","position":42}`, ...) parsed by the manual `Deserialize`
+// below via `CommandWire`. `CommandDto` carries no `#[serde]` container
+// attribute (the tagging is hand-rolled), so ts-rs cannot infer the shape and
+// MUST be told explicitly: tag on `action`, camelCase tag values. Unit variants
+// emit `{ action: "up" }`; struct variants merge their fields alongside the tag,
+// yielding `position: number` (required for `goTo`) and `position: number | null`
+// (optional for `setMy`) — exactly the JSON the manual deserializer accepts.
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        tag = "action",
+        rename_all = "camelCase"
+    )
+)]
 pub enum CommandDto {
     Up,
     Down,
