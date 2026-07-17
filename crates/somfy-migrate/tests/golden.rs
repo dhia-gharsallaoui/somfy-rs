@@ -19,7 +19,10 @@
 //!    `tests/fixtures/real_device.backup` — see that directory's README. The
 //!    file is gitignored: it carries radio addresses and rolling codes.
 
-use somfy_migrate::{parse_backup, MigratedGroup, MigratedRoom, MigratedShade, MigrationData};
+use somfy_migrate::{
+    parse_backup, MigratedGroup, MigratedRoom, MigratedShade, MigrationData, MAX_SUPPORTED_VERSION,
+    MIN_SUPPORTED_VERSION,
+};
 use somfy_rts::RollingCode;
 
 // ---------------------------------------------------------------------------
@@ -183,6 +186,8 @@ fn expected_migration_data() -> MigrationData {
             next_code: RollingCode(8), // 7 + 1
             member_shade_ids: hvec(&[10, 11]),
         }]),
+        // A byte-perfect synthetic backup aligns every record exactly.
+        skipped_resyncs: 0,
     }
 }
 
@@ -197,8 +202,10 @@ fn pipeline_locks_full_migration_data() {
 // Layer 2: ignored real-device golden test
 // ---------------------------------------------------------------------------
 
-/// Upper bound of the 24-bit Somfy RTS remote-address space (inclusive).
-const MAX_RTS_ADDRESS: u32 = 0xFF_FFFF;
+/// The `0xFFFFFF` sentinel — the exclusive upper bound of the valid Somfy RTS
+/// remote-address space. `ShadeConfig::new` rejects both `0` and `0xFFFFFF`
+/// (`Somfy.cpp:169-170`), so a real device's addresses fall in `1..0xFF_FFFF`.
+const ADDRESS_SENTINEL: u32 = 0xFF_FFFF;
 
 #[test]
 #[ignore = "requires a real device backup — see fixtures README"]
@@ -221,8 +228,8 @@ fn real_device_backup_satisfies_structural_invariants() {
     // Version inside the supported window. parse_backup already enforces this,
     // but pinning it documents the golden contract at the assertion site.
     assert!(
-        (19..=25).contains(&data.version),
-        "version {} outside supported 19..=25",
+        (MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&data.version),
+        "version {} outside supported {MIN_SUPPORTED_VERSION}..={MAX_SUPPORTED_VERSION}",
         data.version
     );
 
@@ -231,8 +238,8 @@ fn real_device_backup_satisfies_structural_invariants() {
 
     for shade in &data.shades {
         assert!(
-            (1..=MAX_RTS_ADDRESS).contains(&shade.address),
-            "shade {} address {:#x} outside 1..=0xFFFFFF",
+            (1..ADDRESS_SENTINEL).contains(&shade.address),
+            "shade {} address {:#x} outside 1..0xFFFFFF (exclusive)",
             shade.shade_id,
             shade.address
         );
@@ -246,8 +253,8 @@ fn real_device_backup_satisfies_structural_invariants() {
     // Groups are virtual remotes: same address/name invariants when present.
     for group in &data.groups {
         assert!(
-            (1..=MAX_RTS_ADDRESS).contains(&group.address),
-            "group {} address {:#x} outside 1..=0xFFFFFF",
+            (1..ADDRESS_SENTINEL).contains(&group.address),
+            "group {} address {:#x} outside 1..0xFFFFFF (exclusive)",
             group.group_id,
             group.address
         );

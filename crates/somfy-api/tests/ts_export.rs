@@ -38,12 +38,21 @@ fn read(name: &str) -> String {
 /// Regenerate every binding. `export_all` also writes transitive dependencies
 /// (e.g. `WsEvent` pulls in `ShadeStateEvent`). Idempotent: re-running produces
 /// byte-identical files, which is what the CI `git diff --exit-code` relies on.
+///
+/// The three tests in this file run in parallel and each need the bindings
+/// present, but concurrent `export_all` calls would race on the same files (one
+/// test truncating a file mid-read of another). A `Once` collapses them to a
+/// single generation; `call_once` blocks the other threads until it completes, so
+/// every test then reads fully-written files.
 fn regenerate() {
-    somfy_api::ShadeDto::export_all().expect("export ShadeDto");
-    somfy_api::GroupDto::export_all().expect("export GroupDto");
-    somfy_api::RoomDto::export_all().expect("export RoomDto");
-    somfy_api::CommandDto::export_all().expect("export CommandDto");
-    somfy_api::WsEvent::export_all().expect("export WsEvent");
+    static REGEN: std::sync::Once = std::sync::Once::new();
+    REGEN.call_once(|| {
+        somfy_api::ShadeDto::export_all().expect("export ShadeDto");
+        somfy_api::GroupDto::export_all().expect("export GroupDto");
+        somfy_api::RoomDto::export_all().expect("export RoomDto");
+        somfy_api::CommandDto::export_all().expect("export CommandDto");
+        somfy_api::WsEvent::export_all().expect("export WsEvent");
+    });
 }
 
 #[test]

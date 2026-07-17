@@ -55,14 +55,32 @@ policy-free:
   contract. The `ts-rs`-generated TypeScript in `ui/src/api/generated/` is the
   UI's source of truth; regenerate it (build with `--features ts`) whenever a DTO
   changes so UI/firmware drift stays a compile error rather than a runtime bug.
-- **Plan 6 (persistence)** owns applying `somfy-migrate` output. Two obligations:
+- **Plan 6 (persistence)** owns applying `somfy-migrate` output. Four
+  obligations:
   (1) persist `MigrationData` (shades, rooms, groups) into the new config store,
   surfacing v19–v22 groups and linked remotes whose rolling codes could not be
-  recovered from the backup so the user re-pairs or sets them manually; and
+  recovered from the backup so the user re-pairs or sets them manually;
   (2) **import MQTT settings**, which `somfy-migrate` deliberately defers — the
   C++ settings record (`ConfigFile.cpp` `writeSettingsRecord`, :1019) parses
   cleanly, but Plan 3 has nowhere to store it until Plan 6 persistence exists.
-  This is a recorded deviation from design spec §3.4, not a dropped requirement.
+  This is a recorded deviation from design spec §3.4, not a dropped requirement;
+  (3) **default unknown shade kinds to `Roller` and warn the user.**
+  `ShadeKind::from_raw`/`TiltMode::from_raw` return `None` for a valid C++ kind
+  outside the v1.0 subset (garage/gate/drycontact) or an invalid byte; Plan 6
+  imports such a shade with `kind` defaulted to `ShadeKind::Roller` and surfaces a
+  warning rather than dropping the shade or guessing a behavior; and
+  (4) **warn when `MigrationData::skipped_resyncs` is nonzero.** A nonzero count
+  means one or more records did not align exactly (e.g. an unescaped comma in a
+  name shifted every field, which can yield a *plausible but wrong* rolling code),
+  so Plan 6 must show the user the imported values for confirmation instead of
+  silently applying them.
+- **Group commands stay per-shade fan-out in v1.0.** The domain executes a group
+  command by fanning it out to each member shade (Plan 2 `Controller::command_group`),
+  not by transmitting a single group virtual-remote frame. Even so, group
+  virtual-remote identities (`address` + `next_code` from `MigratedGroup`) MUST
+  still be persisted by Plan 6 for future group-TX support and to preserve the
+  option of pairing-compatible group frames. The v19–v22 fabricated-code warning
+  applies only if/when group-TX is implemented.
 
 ## Workspace crates
 

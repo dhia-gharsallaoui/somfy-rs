@@ -410,6 +410,8 @@ fn full_backup_parses_all_entities() {
 
     assert_eq!(m.version, 25);
     assert_eq!(m.server_id.as_str(), "SrvBackup");
+    // A well-formed backup aligns every record exactly: no data-skipping resyncs.
+    assert_eq!(m.skipped_resyncs, 0);
 
     // Rooms
     assert_eq!(m.rooms.len(), 2);
@@ -502,6 +504,13 @@ fn record_with_extra_trailing_field_is_resynced() {
     assert_eq!(m.rooms[0].name.as_str(), "Kitchen");
     assert_eq!(m.rooms[1].room_id, 2);
     assert_eq!(m.rooms[1].name.as_str(), "Bedroom");
+    // The extra trailing field on room 1 forced a resync that skipped real bytes;
+    // the well-formed room 2 did not. The counter surfaces the misalignment so
+    // Plan 6 can warn instead of silently trusting the parse.
+    assert_eq!(
+        m.skipped_resyncs, 1,
+        "one record needed a data-skipping resync"
+    );
 }
 
 // ---------------------------------------------------------------------------

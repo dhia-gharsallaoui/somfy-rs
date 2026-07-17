@@ -21,6 +21,14 @@ the same header + record stream the migrator reads.
 3. You get a `.backup` file. That file *is* the `shades.cfg` format — no
    conversion is needed.
 
+> **Export the backup IMMEDIATELY before migrating.** A stale export replays
+> rolling codes: any command the device sends between the export and the
+> migration advances the real code past the value in the file, so a motor paired
+> after a stale migration rejects the first frames as replayed. The C++ firmware
+> papers over this by taking `max(nvs, file)` when it reloads, but a file-only
+> migrator has no NVS to fall back on — the file is the only source of truth, so
+> it must be fresh.
+
 ## Placement
 
 Save the exported file here, under this exact name:
@@ -37,8 +45,8 @@ cargo test -p somfy-migrate --test golden -- --ignored
 
 It parses the file through `parse_backup` and asserts the structural invariants
 documented in `../golden.rs`: supported version range (19..=25), at least one
-shade, radio addresses in range (1..=0xFFFFFF), and non-empty shade/group/room
-names. No expected values are hard-coded — the test adapts to whatever your
+shade, radio addresses in range 1..0xFFFFFF (exclusive of the 0/0xFFFFFF
+sentinels `ShadeConfig::new` rejects), and non-empty shade/group/room names. No expected values are hard-coded — the test adapts to whatever your
 device holds — so any committer with a device can validate the parser against
 real data without editing the test.
 

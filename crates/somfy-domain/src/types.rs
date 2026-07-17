@@ -42,6 +42,29 @@ pub enum ShadeKind {
     DraperyCenter = 0x08,
 }
 
+impl ShadeKind {
+    /// Map a raw C++ `shade_types` discriminant (Somfy.h:56-74) to a v1.0
+    /// [`ShadeKind`].
+    ///
+    /// `None` = valid C++ kind not in the v1.0 subset OR invalid byte — Plan 6
+    /// policy: import such shades with kind defaulted to Roller and surface a
+    /// warning to the user (decision recorded in README contracts). The C++ kinds
+    /// not yet supported are garage `0x05`/`0x06`, drycontact `0x09`/`0x0A`, and
+    /// gate `0x0B`–`0x10`.
+    pub fn from_raw(raw: u8) -> Option<ShadeKind> {
+        match raw {
+            0x00 => Some(ShadeKind::Roller),
+            0x01 => Some(ShadeKind::Blind),
+            0x02 => Some(ShadeKind::DraperyLeft),
+            0x03 => Some(ShadeKind::Awning),
+            0x04 => Some(ShadeKind::Shutter),
+            0x07 => Some(ShadeKind::DraperyRight),
+            0x08 => Some(ShadeKind::DraperyCenter),
+            _ => None,
+        }
+    }
+}
+
 /// Tilt modes (Somfy.h:75-81).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -51,6 +74,26 @@ pub enum TiltMode {
     Integrated = 0x02,
     TiltOnly = 0x03,
     EuroMode = 0x04,
+}
+
+impl TiltMode {
+    /// Map a raw C++ `tilt_types` discriminant (Somfy.h:75-81) to a [`TiltMode`].
+    ///
+    /// `None` = valid C++ kind not in the v1.0 subset OR invalid byte — Plan 6
+    /// policy: import such shades with kind defaulted to Roller and surface a
+    /// warning to the user (decision recorded in README contracts). Every C++
+    /// `tilt_types` value `0x00`–`0x04` is modeled, so only bytes outside that
+    /// range return `None`.
+    pub fn from_raw(raw: u8) -> Option<TiltMode> {
+        match raw {
+            0x00 => Some(TiltMode::None),
+            0x01 => Some(TiltMode::TiltMotor),
+            0x02 => Some(TiltMode::Integrated),
+            0x03 => Some(TiltMode::TiltOnly),
+            0x04 => Some(TiltMode::EuroMode),
+            _ => None,
+        }
+    }
 }
 
 /// Movement direction. Signs match the C++ ints: -1 toward 0 (open),

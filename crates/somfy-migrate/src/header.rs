@@ -27,7 +27,7 @@ use heapless::String;
 /// Below this the record layout differs (older `readHeader` branches at
 /// `ConfigFile.cpp:73-79` read narrower fields); such backups are rejected
 /// rather than mis-parsed.
-const MIN_SUPPORTED_VERSION: u8 = 19;
+pub const MIN_SUPPORTED_VERSION: u8 = 19;
 
 /// Highest backup version this migrator has been verified against — the current
 /// firmware writer version `SHADE_HDR_VER` (`ConfigFile.cpp:10`).
@@ -36,7 +36,7 @@ const MIN_SUPPORTED_VERSION: u8 = 19;
 /// record parser below it (the record readers here reproduce the exact v19..=25
 /// field layouts). Rejecting an unknown-future version at the single header
 /// choke point guards the whole pipeline rather than mis-parsing it.
-const MAX_SUPPORTED_VERSION: u8 = 25;
+pub const MAX_SUPPORTED_VERSION: u8 = 25;
 
 /// First version whose header carries the repeater record pair
 /// (`ConfigFile.cpp:81-84`).

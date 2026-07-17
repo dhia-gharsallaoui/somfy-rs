@@ -33,7 +33,7 @@
 //! `std`/`ts` features enable host-side `ts-rs` TypeScript generation into
 //! `ui/src/api/generated/`, making UI/firmware drift a compile error.
 
-#![cfg_attr(not(any(test, feature = "ts")), no_std)]
+#![cfg_attr(not(any(test, feature = "std", feature = "ts")), no_std)]
 
 mod commands;
 mod entities;

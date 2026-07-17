@@ -85,9 +85,9 @@ pub struct MigratedShade {
     /// "My"/favorite position in centi-percent — C++ `myPos` (`:837`). The C++
     /// unset sentinel `-1.0` arrives as `-100`.
     pub my_position_centi: i32,
-    /// Room assignment — C++ `roomId` `uint8` (`:879`), reinterpreted as `i8`
-    /// (values `0..=15` are unchanged; a `255` sentinel would surface as `-1`).
-    pub room_id: i8,
+    /// Room assignment — C++ `roomId` `uint8` (`readUInt8`, `:879`); `255` marks
+    /// an unassigned shade in the C++ file.
+    pub room_id: u8,
     /// Non-zero linked-remote addresses in slot order. The C++ file writes
     /// `SOMFY_MAX_LINKED_REMOTES` (7) address slots (`writeShadeRecord` :988-991);
     /// a `0` slot is empty. **Linked-remote rolling codes are NOT in the backup
@@ -147,7 +147,7 @@ pub struct MigratedShade {
 /// |24 | `gpioUp`,`gpioDown` (:860-863, v>14) | 2×u8 | skip |
 /// |25 | `gpioMy` (:864-865, v>15)   | u8     | skip |
 /// |26 | `gpioFlags` (:866-867, v>16)| u8     | skip |
-/// |27 | `roomId` (:879, v>=19)      | i8     | → `room_id` (`\n`-terminated) |
+/// |27 | `roomId` (:879, v>=19)      | u8     | → `room_id` (`\n`-terminated) |
 ///
 /// # Errors
 ///
@@ -242,10 +242,11 @@ pub fn parse_shade_record(
     }
 
     // 27 roomId (v>=19): the final field, terminated by the record end (\n), so
-    // this read realigns the cursor to the start of the next record.
-    let mut room_id = 0i8;
+    // this read realigns the cursor to the start of the next record. C++ reads it
+    // with readUInt8 (:879).
+    let mut room_id = 0u8;
     if v >= 19 {
-        room_id = r.read_i8()?;
+        room_id = r.read_u8()?;
     }
 
     Ok(MigratedShade {

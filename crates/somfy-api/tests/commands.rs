@@ -34,6 +34,13 @@ fn unknown_action_is_rejected() {
 }
 
 #[test]
+fn goto_without_position_is_rejected() {
+    // `goTo` MUST carry a target; a missing `position` is a malformed request,
+    // not a silent default (the manual deserializer errors on missing_field).
+    assert!(serde_json::from_str::<CommandDto>(r#"{"action":"goTo"}"#).is_err());
+}
+
+#[test]
 fn goto_position_over_100_clamps_via_pos() {
     let dto: CommandDto = serde_json::from_str(r#"{"action":"goTo","position":250}"#).unwrap();
     assert_eq!(dto.to_domain(), somfy_domain::ShadeCommand::GoTo(Pos::FULL));

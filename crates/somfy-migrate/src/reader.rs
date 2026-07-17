@@ -148,7 +148,9 @@ impl<'a> Reader<'a> {
                     ended_on_rec = true;
                     break;
                 }
-                QUOTE => quotes += 1,
+                // saturating: only the `>= 2` threshold matters, so a field with
+                // hundreds of quotes must not overflow the u8 counter in debug.
+                QUOTE => quotes = quotes.saturating_add(1),
                 _ => buf.push(b).map_err(|_| MigrateError::StringTooLong)?,
             }
         }
@@ -293,11 +295,31 @@ impl<'a> Reader<'a> {
     /// consumed the record end this is a no-op, so it never eats into the
     /// following record (which an unconditional [`Reader::skip_record_end`]
     /// would).
-    pub fn resync_record(&mut self) -> Result<(), MigrateError> {
-        if !self.at_record_boundary() {
-            self.skip_record_end()?;
+    ///
+    /// Returns the number of leftover **content** bytes skipped (the trailing
+    /// record end is structure, not data, so it is excluded). A nonzero return
+    /// means the record carried fields this parser did not consume — a real
+    /// misalignment risk (e.g. an unescaped comma inside a name shifts every
+    /// field), so [`parse_backup`](crate::parse_backup) surfaces the count on
+    /// [`MigrationData::skipped_resyncs`](crate::MigrationData) rather than
+    /// silently trusting the parse. A no-op (already aligned) or a bare empty
+    /// trailing field returns `0`.
+    pub fn resync_record(&mut self) -> Result<usize, MigrateError> {
+        if self.at_record_boundary() {
+            return Ok(0);
         }
-        Ok(())
+        let start = self.pos;
+        self.skip_record_end()?;
+        // skip_record_end consumed the leftover field bytes plus the record end
+        // (or ran to EOF). The trailing `\n`, when present, is a separator, not
+        // misparsed data, so report only the leftover content bytes.
+        let consumed = self.pos - start;
+        let content = if self.pos > start && self.data[self.pos - 1] == REC_END {
+            consumed - 1
+        } else {
+            consumed
+        };
+        Ok(content)
     }
 }
 

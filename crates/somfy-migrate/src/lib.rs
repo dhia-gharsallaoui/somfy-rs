@@ -87,7 +87,7 @@ mod migrate;
 mod reader;
 mod records;
 
-pub use header::{parse_header, BackupHeader};
+pub use header::{parse_header, BackupHeader, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION};
 pub use migrate::{parse_backup, MigrationData};
 pub use reader::{MigrateError, Reader};
 pub use records::{

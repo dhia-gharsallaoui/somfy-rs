@@ -184,6 +184,16 @@ fn every_modeled_field_maps() {
     assert_eq!(shade.proto_raw, 1);
 }
 
+#[test]
+fn room_id_is_unsigned() {
+    // C++ reads shade roomId with readUInt8 (ConfigFile.cpp:879), so a high slot
+    // id must round-trip as an unsigned value, not wrap negative.
+    let mut f = base_fields();
+    f[33] = "200"; // roomId
+    let shade = parse(&f);
+    assert_eq!(shade.room_id, 200u8);
+}
+
 // --- Linked-remote edge cases --------------------------------------------
 
 #[test]

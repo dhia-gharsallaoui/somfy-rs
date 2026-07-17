@@ -60,6 +60,15 @@ pub struct MigrationData {
     pub shades: Vec<MigratedShade, MAX_SHADES>,
     /// Live groups in slot order.
     pub groups: Vec<MigratedGroup, MAX_GROUPS>,
+    /// Count of records whose fields did not align exactly, forcing the defensive
+    /// resync to skip leftover content bytes before the record end.
+    ///
+    /// **Nonzero means record fields didn't align exactly — data MAY be
+    /// misparsed** (e.g. an unescaped comma inside a name shifts every following
+    /// field, which can produce a *plausible but wrong* rolling code). Plan 6 must
+    /// warn and show the user the imported values for confirmation instead of
+    /// silently applying them. A well-formed backup always yields `0`.
+    pub skipped_resyncs: u16,
 }
 
 /// Parse a complete C++ backup buffer into [`MigrationData`].
@@ -81,12 +90,14 @@ pub fn parse_backup(data: &[u8]) -> Result<MigrationData, MigrateError> {
     let mut r = Reader::new(data);
     let header = parse_header(&mut r)?;
 
-    let rooms = parse_rooms(&mut r, &header)?;
-    let shades = parse_shades(&mut r, &header)?;
-    let groups = parse_groups(&mut r, &header)?;
+    let mut skipped_resyncs: u16 = 0;
+    let rooms = parse_rooms(&mut r, &header, &mut skipped_resyncs)?;
+    let shades = parse_shades(&mut r, &header, &mut skipped_resyncs)?;
+    let groups = parse_groups(&mut r, &header, &mut skipped_resyncs)?;
 
     // Trailing repeater/settings/net/trans records are not modeled; skip them by
-    // record end until EOF so a well-formed backup is consumed cleanly.
+    // record end until EOF so a well-formed backup is consumed cleanly. These are
+    // expected extra records, not misalignments, so they never touch the counter.
     while !r.at_end() {
         r.skip_record_end()?;
     }
@@ -97,17 +108,29 @@ pub fn parse_backup(data: &[u8]) -> Result<MigrationData, MigrateError> {
         rooms,
         shades,
         groups,
+        skipped_resyncs,
     })
+}
+
+/// Bump `skipped` when a defensive [`Reader::resync_record`] had to skip leftover
+/// content bytes — i.e. the record did not align exactly (see
+/// [`MigrationData::skipped_resyncs`]).
+fn note_resync(r: &mut Reader, skipped: &mut u16) -> Result<(), MigrateError> {
+    if r.resync_record()? > 0 {
+        *skipped = skipped.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn parse_rooms(
     r: &mut Reader,
     header: &BackupHeader,
+    skipped: &mut u16,
 ) -> Result<Vec<MigratedRoom, MAX_ROOMS>, MigrateError> {
     let mut rooms = Vec::new();
     for _ in 0..header.room_records {
         let room = parse_room_record(r, header)?;
-        r.resync_record()?;
+        note_resync(r, skipped)?;
         // roomId 0 is a cleared slot; the C++ writer never emits it (:332).
         if room.room_id != 0 {
             rooms
@@ -121,11 +144,12 @@ fn parse_rooms(
 fn parse_shades(
     r: &mut Reader,
     header: &BackupHeader,
+    skipped: &mut u16,
 ) -> Result<Vec<MigratedShade, MAX_SHADES>, MigrateError> {
     let mut shades = Vec::new();
     for _ in 0..header.shade_records {
         let shade = parse_shade_record(r, header)?;
-        r.resync_record()?;
+        note_resync(r, skipped)?;
         // shadeId 255 is a cleared slot; the C++ writer never emits it (:337).
         if shade.shade_id != 255 {
             shades
@@ -139,11 +163,12 @@ fn parse_shades(
 fn parse_groups(
     r: &mut Reader,
     header: &BackupHeader,
+    skipped: &mut u16,
 ) -> Result<Vec<MigratedGroup, MAX_GROUPS>, MigrateError> {
     let mut groups = Vec::new();
     for _ in 0..header.group_records {
         let group = parse_group_record(r, header)?;
-        r.resync_record()?;
+        note_resync(r, skipped)?;
         // groupId 255 is a cleared slot; the C++ writer never emits it (:342).
         if group.group_id != 255 {
             groups

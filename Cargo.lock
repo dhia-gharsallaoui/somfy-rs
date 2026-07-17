@@ -335,7 +335,6 @@ dependencies = [
  "serde",
  "serde_json",
  "somfy-domain",
- "somfy-rts",
  "ts-rs",
 ]
 
