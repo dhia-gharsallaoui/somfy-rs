@@ -36,11 +36,17 @@ cargo test -p somfy-migrate --test golden -- --ignored
 ```
 
 It parses the file through `parse_backup` and asserts the structural invariants
-documented in `../golden.rs` (supported version range, at least one shade, radio
-addresses in range, non-empty names, rolling codes advanced by the `+1`
-migration contract). No expected values are hard-coded — the test adapts to
-whatever your device holds — so any committer with a device can validate the
-parser against real data without editing the test.
+documented in `../golden.rs`: supported version range (19..=25), at least one
+shade, radio addresses in range (1..=0xFFFFFF), and non-empty shade/group/room
+names. No expected values are hard-coded — the test adapts to whatever your
+device holds — so any committer with a device can validate the parser against
+real data without editing the test.
+
+The rolling-code `+1` migration contract is deliberately **not** asserted here:
+it cannot be verified from the file alone (the stored last-sent code is the only
+input, and a code that wrapped past 65535 is legitimately `0`). That contract is
+pinned instead by the always-run pipeline-lock test in `../golden.rs`, which
+checks exact `next_code` values against a known synthetic backup.
 
 ## Privacy
 

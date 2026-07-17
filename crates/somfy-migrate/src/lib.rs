@@ -40,6 +40,21 @@
 //! frame and desync the motor. This applies to both shades and groups: a C++
 //! group *is* a virtual remote. See [`MigratedShade::next_code`].
 //!
+//! ## Recovered data shape
+//!
+//! - **Cleared-slot sentinels are filtered and empty slots compacted.** The C++
+//!   writer never emits cleared rooms (`roomId == 0`), shades (`shadeId == 255`),
+//!   or groups (`groupId == 255`); if one appears in a hand-edited or corrupt
+//!   backup it is dropped rather than surfaced as a live entity, and the `0`
+//!   linked-remote / member-shade slots the file pads with are compacted out. See
+//!   [`parse_backup`] (sentinel filtering) and [`MigratedShade::linked_addresses`]
+//!   / [`MigratedGroup::member_shade_ids`] (slot compaction).
+//! - **Domain normalization is deferred to the consumer.** The record parsers are
+//!   faithful *deserializers*: `kind_raw`/`tilt_mode_raw`/`*_centi` carry the raw
+//!   wire values, and the C++ post-load clamps (myPos/tilt normalization, tilt-only
+//!   fully-closed) are left to the domain layer that consumes [`MigrationData`].
+//!   That is why the `*_raw` fields exist — see [`MigratedShade`].
+//!
 //! ## What this pass does NOT migrate
 //!
 //! - **Repeater, settings, net, and transceiver records** are skipped to EOF.
