@@ -12,6 +12,10 @@
 
 #![cfg_attr(not(any(test, feature = "ts")), no_std)]
 
+mod commands;
 mod entities;
+mod events;
 
+pub use commands::CommandDto;
 pub use entities::{GroupDto, RoomDto, ShadeDto};
+pub use events::{ShadeStateEvent, WsEvent};
