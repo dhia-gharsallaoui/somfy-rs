@@ -46,7 +46,8 @@ cargo test -p somfy-migrate --test golden -- --ignored
 It parses the file through `parse_backup` and asserts the structural invariants
 documented in `../golden.rs`: supported version range (19..=25), at least one
 shade, radio addresses in range 1..0xFFFFFF (exclusive of the 0/0xFFFFFF
-sentinels `ShadeConfig::new` rejects), and non-empty shade/group/room names. No expected values are hard-coded — the test adapts to whatever your
+sentinels `ShadeConfig::new` rejects), non-empty shade/group/room names, and
+`skipped_resyncs == 0` (every record aligned exactly — no misparse). No expected values are hard-coded — the test adapts to whatever your
 device holds — so any committer with a device can validate the parser against
 real data without editing the test.
 

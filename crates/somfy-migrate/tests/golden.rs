@@ -273,4 +273,13 @@ fn real_device_backup_satisfies_structural_invariants() {
             room.room_id
         );
     }
+
+    // A real device backup is byte-perfect: every record must align exactly, so
+    // the defensive resync never skips data. A nonzero count means a field
+    // misaligned (e.g. an unescaped comma in a name) and the parse cannot be
+    // trusted verbatim.
+    assert_eq!(
+        data.skipped_resyncs, 0,
+        "record misalignment detected — see MigrationData::skipped_resyncs docs"
+    );
 }
