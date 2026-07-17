@@ -8,12 +8,13 @@ full design specification lives in [`docs/specs/`](docs/specs/).
 
 ## Status
 
-**Plans 1–2 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
-codes, TX pulse rendering, RX decoding, repeat-frame dedupe) and the
-`somfy-domain` model (shade/group/room registries, travel-time position
-dead-reckoning, command orchestration, overheard-remote tracking) are
-implemented and green on the host. **Next: Plan 3** — API + migration DTOs
-(`somfy-api`, `somfy-migrate` backup parser).
+**Plans 1–3 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
+codes, TX pulse rendering, RX decoding, repeat-frame dedupe), the `somfy-domain`
+model (shade/group/room registries, travel-time position dead-reckoning, command
+orchestration, overheard-remote tracking), and the Plan 3 contract layer —
+`somfy-api` (serde REST/WS DTOs with `ts-rs` TypeScript generation) and
+`somfy-migrate` (C++ backup-file parser) — are implemented and green on the host.
+**Next: Plan 4** — firmware radio (`esp-hal` RMT TX/RX on ESP targets).
 
 Golden-capture *validation* against real device pulses is still **pending**: the
 fixture loader is exercised every CI run by a checked-in synthetic capture, but
@@ -27,8 +28,8 @@ Plans (per [`docs/specs/`](docs/specs/)):
 |------|-------|
 | 1 | Protocol engine (`somfy-rts`) — **complete** |
 | 2 | Domain model: shades/groups/rooms + position/tilt engine — **complete** |
-| 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **next** |
-| 4 | Firmware radio: `esp-hal` RMT TX/RX, ESP targets |
+| 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **complete** |
+| 4 | Firmware radio: `esp-hal` RMT TX/RX, ESP targets — **next** |
 | 5 | Network: WiFi, MQTT, Home Assistant discovery |
 | 6 | Persistence + OTA (A/B partitions, rollback) |
 | 7 | Web UI (Preact) served from flash |
@@ -50,6 +51,18 @@ policy-free:
   flipping `196→132` on later repeats). Today's repeat-less `encode80` emits only
   the first-frame form (C++-exact for extended commands; a placeholder tail for
   base commands — see `frame.rs`).
+- **Plans 5 & 7 (network + UI)** consume the `somfy-api` DTOs as the single wire
+  contract. The `ts-rs`-generated TypeScript in `ui/src/api/generated/` is the
+  UI's source of truth; regenerate it (build with `--features ts`) whenever a DTO
+  changes so UI/firmware drift stays a compile error rather than a runtime bug.
+- **Plan 6 (persistence)** owns applying `somfy-migrate` output. Two obligations:
+  (1) persist `MigrationData` (shades, rooms, groups) into the new config store,
+  surfacing v19–v22 groups and linked remotes whose rolling codes could not be
+  recovered from the backup so the user re-pairs or sets them manually; and
+  (2) **import MQTT settings**, which `somfy-migrate` deliberately defers — the
+  C++ settings record (`ConfigFile.cpp` `writeSettingsRecord`, :1019) parses
+  cleanly, but Plan 3 has nowhere to store it until Plan 6 persistence exists.
+  This is a recorded deviation from design spec §3.4, not a dropped requirement.
 
 ## Workspace crates
 
@@ -57,9 +70,13 @@ policy-free:
 |-------|:--------:|-------------|
 | [`somfy-rts`](crates/somfy-rts) | yes | Somfy RTS protocol engine: 56/80-bit frame encode/decode, rolling codes, OOK pulse rendering (TX) and dual-stream pulse decoding (RX), repeat-frame dedupe. Hardware-free — pure pulse data in/out. |
 | [`somfy-domain`](crates/somfy-domain) | yes | Domain model: shade/group/room registries + position dead-reckoning. Travel-time position/tilt estimator, command orchestration (commands in → planned radio TX + state-delta events out), and overheard-remote tracking. Clock-free — callers inject `now_ms`. |
+| [`somfy-api`](crates/somfy-api) | yes¹ | Shared REST/WebSocket contract: serde DTOs mirroring the domain entities (camelCase wire, whole-percent `u8` positions, C++ numeric discriminants). The `ts` feature generates TypeScript types into `ui/src/api/generated/` so UI/firmware drift is a compile error. |
+| [`somfy-migrate`](crates/somfy-migrate) | yes | C++ ESPSomfy-RTS backup-file parser: reads an exported `.backup` into `MigrationData` (shades, rooms, groups) so an existing setup migrates without re-pairing. Applies the rolling-code `+1` (last-sent → next-to-send) contract; allocation-free. |
 
-Additional crates (`somfy-api`, `somfy-migrate`, `firmware`) and the `ui/` app
-arrive in later plans.
+¹ `somfy-api` is `no_std` by default; the `std`/`ts` features are host-only for
+TypeScript generation.
+
+The remaining `firmware` crate and the `ui/` app arrive in later plans.
 
 ## Build & test
 
