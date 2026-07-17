@@ -176,3 +176,11 @@ fn planned_tx_carries_shade_address() {
     s.handle(ShadeCommand::Down, 0, &mut out);
     assert_eq!(out[0].address, 0x123456);
 }
+
+#[test]
+fn target_accessor_reports_seek_destination() {
+    let mut s = shade();
+    let mut out = Vec::new();
+    s.handle(ShadeCommand::GoTo(Pos::from_percent(70)), 0, &mut out);
+    assert_eq!(s.target(), Pos::from_percent(70));
+}

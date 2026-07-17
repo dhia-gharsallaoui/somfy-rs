@@ -103,6 +103,11 @@ impl Shade {
         self.tilt.pos()
     }
 
+    /// Current lift target (dead-reckoned seek destination).
+    pub fn target(&self) -> Pos {
+        self.lift.target()
+    }
+
     pub fn my_pos(&self) -> Option<Pos> {
         self.my_pos
     }
