@@ -349,6 +349,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "somfy-migrate"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "somfy-domain",
+ "somfy-rts",
+]
+
+[[package]]
 name = "somfy-rts"
 version = "0.1.0"
 dependencies = [
