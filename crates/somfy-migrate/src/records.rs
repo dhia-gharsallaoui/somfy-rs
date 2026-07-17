@@ -336,6 +336,13 @@ pub struct MigratedGroup {
     /// the *next-to-send* value, so `next_code = RollingCode(last_sent + 1)` with
     /// wrap at 65535. See [`MigratedShade::next_code`] and the version note on
     /// [`parse_group_record`] for where the stored code lives per version.
+    ///
+    /// **⚠️ v19–v22 backups fabricate this value.** Those versions do not store a
+    /// group rolling code (it lives in NVS), so `next_code` is set to
+    /// `RollingCode(1)`. This type **cannot distinguish a fabricated code from a
+    /// real one.** A paired receiver WILL reject `RollingCode(1)` as replayed, so
+    /// Plan 6 must surface v19–v22 groups to the user (re-pair or set the code
+    /// manually) — see [`parse_group_record`].
     pub next_code: RollingCode,
     /// Non-zero member shade ids in slot order. The C++ file writes
     /// `SOMFY_MAX_GROUPED_SHADES` (32) slots (`writeGroupRecord` :948-950);
@@ -353,7 +360,7 @@ pub struct MigratedGroup {
 ///
 /// - **v19–v22:** the file carries *no* group rolling code; the C++ sources it
 ///   from NVS only (`:764-767`). A file-only migrator cannot recover it, so
-///   `next_code` defaults to `RollingCode(1)` (stored `0` → `+1`).
+///   `next_code` is **fabricated** as `RollingCode(1)` (stored `0` → `+1`).
 /// - **v23:** `lastRollingCode` sits *before* the linked shades (`:747`).
 /// - **v24–v25:** `lastRollingCode` is the final, `\n`-terminated field, after
 ///   `roomId` (`:763`; writer `:955`).
@@ -379,6 +386,18 @@ pub struct MigratedGroup {
 /// |10 | `flipCommands` (:761, v>=18)| bool   | skip |
 /// |11 | `roomId` (:762, v>=19)      | u8     | skip |
 /// |12 | `lastRollingCode` (:763)    | u16    | → `next_code` (**v>=24**, `+1`, `\n`-terminated) |
+///
+/// # ⚠️ Fabricated rolling codes (v19–v22)
+///
+/// A **v19–v22 backup cannot recover a group's rolling code** — the C++ keeps it
+/// in NVS, not the file (`:764-767`). This parser fabricates `next_code =
+/// RollingCode(1)`, and **[`MigratedGroup`] cannot distinguish a fabricated code
+/// from a real one.** A paired Somfy receiver tracks its own rolling code and
+/// **WILL reject `RollingCode(1)` as a replayed/stale frame**, so a group
+/// migrated from a v19–v22 backup will not actuate until it is re-paired or its
+/// code is set to the receiver's expected value. **Plan 6 must surface this to
+/// the user** (prompt to re-pair the group or enter the code manually) rather
+/// than silently importing a dead group. v23+ backups carry the real code.
 ///
 /// # Errors
 ///

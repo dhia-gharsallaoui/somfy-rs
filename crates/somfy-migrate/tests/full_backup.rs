@@ -144,6 +144,30 @@ fn group_fields_v23(
     f
 }
 
+/// A v19–v22 group record: the file carries NO rolling code at all
+/// (`readGroupRecord` sources it from NVS only, :764-767). `roomId` is the final,
+/// `\n`-terminated field; there is neither a mid-record (v23) nor a trailing
+/// (v24+) `lastRollingCode`.
+fn group_fields_v19(id: &str, addr: &str, name: &str, members: &[&str]) -> Vec<String> {
+    let mut f: Vec<String> = vec![
+        id.into(),   // groupId
+        "0".into(),  // groupType (skip)
+        addr.into(), // remoteAddress
+        name.into(), // name
+        "1".into(),  // proto (skip)
+        "56".into(), // bitLength (skip)
+    ];
+    // linkedShades: 32 slots, immediately after bitLength (no rolling code here).
+    for j in 0..32 {
+        f.push(members.get(j).copied().unwrap_or("0").into());
+    }
+    f.push("1".into()); // repeats (skip)
+    f.push("3".into()); // sortOrder (skip)
+    f.push("false".into()); // flipCommands (skip)
+    f.push("2".into()); // roomId (skip, terminal \n-terminated field)
+    f
+}
+
 fn line(fields: &[String]) -> Vec<u8> {
     let joined: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
     let mut out = joined.join(",").into_bytes();
@@ -152,9 +176,12 @@ fn line(fields: &[String]) -> Vec<u8> {
 }
 
 fn header_line(version: u8, rooms: u8, shades: u8, groups: u8) -> Vec<u8> {
-    // writeHeader order (ConfigFile.cpp:47-60), modern v21+ layout with the
-    // repeater pair. Fields not consulted by parse_backup use plausible sizes.
-    format!("{version},76,29,{rooms},276,{shades},200,{groups},77,1,552,318,78,SrvBackup\n")
+    // writeHeader order (ConfigFile.cpp:47-60). The repeater pair
+    // (repeaterSize,repeaterRecs) only exists for version >= 21; readHeader
+    // gates its read on the same version (:81-84), so v19/v20 lines must omit it
+    // or parse_header misaligns. Fields not consulted use plausible sizes.
+    let repeater = if version >= 21 { "77,1," } else { "" };
+    format!("{version},76,29,{rooms},276,{shades},200,{groups},{repeater}552,318,78,SrvBackup\n")
         .into_bytes()
 }
 
@@ -260,6 +287,58 @@ fn group_v23_reads_rolling_code_mid_record() {
     assert_eq!(g.group_id, 2);
     assert_eq!(g.member_shade_ids.as_slice(), &[4, 5]);
     assert_eq!(g.next_code, RollingCode(101));
+}
+
+#[test]
+fn group_v19_fabricates_rolling_code_and_stays_aligned() {
+    // THE named migration risk: a v19-22 group record carries NO rolling code
+    // (both gates false — v != 23 at :747, v < 24 at :763; the C++ sources it
+    // from NVS only, :764-767). `next_code` is therefore FABRICATED as
+    // RollingCode(1) (stored 0 -> +1). `roomId` is the terminal, \n-terminated
+    // field, so a following record must still parse (the resync/alignment net).
+    let g1 = group_fields_v19("2", "9000002", "OldGroup", &["4", "5"]);
+    let g2 = group_fields_v19("3", "9000003", "OtherGroup", &["6"]);
+    let mut bytes = line(&g1);
+    bytes.extend(line(&g2));
+
+    let mut r = Reader::new(&bytes);
+    let h = header(19, 0, 0, 2);
+    let a = parse_group_record(&mut r, &h).unwrap();
+    let b = parse_group_record(&mut r, &h).unwrap();
+
+    // First record fields align despite the absent rolling code.
+    assert_eq!(a.group_id, 2);
+    assert_eq!(a.name.as_str(), "OldGroup");
+    assert_eq!(a.address, 9000002);
+    assert_eq!(a.member_shade_ids.as_slice(), &[4, 5]);
+    assert_eq!(a.next_code, RollingCode(1), "fabricated: no code in file");
+
+    // Second record parsed cleanly => roomId's \n realigned the cursor.
+    assert_eq!(b.group_id, 3);
+    assert_eq!(b.name.as_str(), "OtherGroup");
+    assert_eq!(b.member_shade_ids.as_slice(), &[6]);
+    assert_eq!(b.next_code, RollingCode(1));
+    assert!(r.at_end(), "both v19 group records consumed exactly");
+}
+
+#[test]
+fn full_backup_with_v19_group_fabricates_code() {
+    // The same risk through the whole pipeline: a v19 backup's group surfaces a
+    // fabricated RollingCode(1), and the trailing record is still skipped cleanly.
+    let mut bytes = header_line(19, 0, 0, 1);
+    bytes.extend(line(&group_fields_v19(
+        "4",
+        "9000004",
+        "Legacy",
+        &["7", "8"],
+    )));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    let m = parse_backup(&bytes).expect("v19 backup parses");
+    assert_eq!(m.version, 19);
+    assert_eq!(m.groups.len(), 1);
+    assert_eq!(m.groups[0].group_id, 4);
+    assert_eq!(m.groups[0].member_shade_ids.as_slice(), &[7, 8]);
+    assert_eq!(m.groups[0].next_code, RollingCode(1));
 }
 
 #[test]
