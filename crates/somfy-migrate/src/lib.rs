@@ -22,6 +22,8 @@
 
 mod header;
 mod reader;
+mod records;
 
 pub use header::{parse_header, BackupHeader};
 pub use reader::{MigrateError, Reader};
+pub use records::{parse_shade_record, MigratedShade};
