@@ -20,6 +20,8 @@
 //! reference, but a migrator surfaces corruption rather than silently
 //! substituting defaults the way the on-device reader does.
 
+mod header;
 mod reader;
 
+pub use header::{parse_header, BackupHeader};
 pub use reader::{MigrateError, Reader};
