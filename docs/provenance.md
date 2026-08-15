@@ -96,6 +96,8 @@ prose name is what a reader actually searches for.
 | Integrated-tilt sequencing gate: with `TiltMode::Integrated`, the lift axis cannot move up until tilt is fully open, and cannot move down until tilt is fully closed | `somfy-domain/src/tilt.rs::tilt_first` | the reference firmware's integrated-tilt-motor sequencing rule | Verified by the `somfy-domain` tilt test suite |
 | Registry fixed capacity: 32 shades, 16 groups, 16 rooms, and at most 32 shades per group | `somfy-domain/src/registry.rs::MAX_SHADES`, `MAX_GROUPS`, `MAX_ROOMS` | the capacity bounds deployed configurations can contain | Verified by parsing a real v25 device backup with zero field misalignment (see "Hardware-verified values") |
 | Registry ids are stable slot indices that survive removal of other entries, with holes reused by the next add before growing | `somfy-domain/src/registry.rs::Registry` | the reference firmware's fixed-array addressing contract, needed because ids are stored elsewhere (group/room membership) and must not silently repoint | Verified by the `somfy-domain` registry test suite |
+| Overheard `My`-while-idle recall is immediate: the domain does not replicate a physical remote's ~500 ms tap-vs-hold disambiguation window, since it receives an already-decoded command rather than raw button timing | `somfy-domain/src/lib.rs` (module docs); behavior lives in `somfy-domain/src/shade.rs::Shade::apply_overheard` | the reference firmware's My-button hold-to-set timing logic, which distinguishes a tap (recall) from a hold (set new favorite) | Not independently verified; the resulting immediate-recall behavior is exercised by `somfy-domain/tests/overheard.rs::overheard_my_while_idle_tracks_favorite`, but the absence of a timing window is a design difference, not something a unit test can positively prove |
+| Step command (`StepUp`/`StepDown`) transmits its frame unconditionally, even when the position is already at the hard limit and cannot move further | `somfy-domain/src/shade.rs::Shade::handle` (the Step arms) | the reference firmware's unconditional step-frame transmission | Verified by `somfy-domain/tests/shade.rs::step_up_nudges_toward_open_and_clamps_at_zero` (asserts `Command::StepUp` is still transmitted from position ZERO) |
 
 <!-- filled by the somfy-domain cleanup pass -->
 
@@ -105,7 +107,11 @@ prose name is what a reader actually searches for.
 
 ## somfy-api
 
-<!-- filled by the somfy-api cleanup pass -->
+| Item | Where it lives now | Derived from | Verified |
+|---|---|---|---|
+| DTO wire shape (camelCase field names, whole-percent `u8` positions rather than floats) | `somfy-api/src/entities.rs::ShadeDto`, `GroupDto`, `RoomDto`; `somfy-api/src/events.rs::ShadeStateEvent` | the reference firmware's REST/WS payload shape, kept for backup/migration parity with deployed devices | Verified by `somfy-api/tests/entities.rs::shade_dto_serializes_to_stable_json` (camelCase keys, whole-percent values) and `shade_dto_roundtrips`; the TypeScript shape is cross-checked by `somfy-api/tests/ts_export.rs::entities_use_camelcase_and_heapless_overrides` |
+| `kind`/`tiltMode` reuse the numeric discriminants deployed devices already emit, rather than a string union | `somfy-api/src/entities.rs::ShadeDto` | the reference firmware's numeric `kind`/`tiltMode` wire fields (same discriminants recorded in the `somfy-domain` table above) | Verified by `somfy-api/tests/entities.rs::shade_dto_serializes_to_stable_json` and `somfy-api/tests/ts_export.rs::entities_use_camelcase_and_heapless_overrides` (asserts `kind`/`tiltMode` stay `number`, not a string union) |
+| `direction` reuses the same sign convention on the wire (-1 up, 0 idle, +1 down) | `somfy-api/src/entities.rs::ShadeDto`, `somfy-api/src/events.rs::ShadeStateEvent` | the reference firmware's direction sign convention on the wire (same convention recorded for `somfy_domain::Direction` above) | Verified by `somfy-api/tests/entities.rs::shade_dto_snapshots_live_state` / `shade_dto_serializes_to_stable_json` |
 
 ---
 

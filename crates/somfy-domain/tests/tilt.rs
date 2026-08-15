@@ -2,8 +2,8 @@ use somfy_domain::{tilt_first, Direction, Motion, Pos, TiltMode};
 
 #[test]
 fn integrated_mode_tilts_before_lifting() {
-    // Somfy.cpp:1072: direction -1 (up) with tilt != 0 => tilt first;
-    // direction +1 (down) with tilt != 100 => tilt first.
+    // Integrated-tilt sequencing rule: moving up with tilt != 0 tilts first;
+    // moving down with tilt != 100 tilts first.
     assert!(tilt_first(
         TiltMode::Integrated,
         Direction::Up,
@@ -46,8 +46,9 @@ fn idle_lift_never_requires_tilt_first() {
 
 #[test]
 fn tilt_axis_is_a_motion_with_tilt_time() {
-    // The tilt axis reuses Motion with tilt_time for both directions
-    // (C++ uses the single tiltTime for both, Somfy.cpp tilt branches).
+    // The tilt axis reuses Motion with tilt_time for both directions,
+    // matching deployed firmware's tilt branches, which use a single tilt
+    // time regardless of direction.
     let mut t = Motion::new(Pos::ZERO);
     t.set_target(Pos::FULL, 0);
     let s = t.tick(3_500, 7_000, 7_000);

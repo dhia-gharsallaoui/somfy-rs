@@ -114,7 +114,8 @@ fn entities_use_camelcase_and_heapless_overrides() {
     assert!(shade.contains("name: string"), "{shade}");
     assert!(shade.contains("tiltPosition: number"), "{shade}");
     assert!(shade.contains("myPosition: number | null"), "{shade}");
-    // Numeric C++ discriminants stay numbers, not string unions.
+    // Numeric discriminants (reused from deployed devices' wire values) stay
+    // numbers, not string unions.
     assert!(shade.contains("kind: number"), "{shade}");
     assert!(shade.contains("tiltMode: number"), "{shade}");
 

@@ -1,11 +1,13 @@
 //! # somfy-domain
 //!
 //! `no_std` domain model for somfy-rs: shade/group/room registries, the
-//! travel-time position estimator (port of the C++ `SomfyShade::checkMovement`
-//! dead-reckoning), command orchestration (commands in → [`PlannedTx`] radio
-//! work + [`StateDelta`] events out), and overheard-remote tracking.
+//! travel-time position estimator (dead-reckoning a shade's position from
+//! elapsed motion time — the same technique deployed motors use internally,
+//! since they have no absolute position sensor), command orchestration
+//! (commands in → [`PlannedTx`] radio work + [`StateDelta`] events out), and
+//! overheard-remote tracking.
 //!
-//! ## Intentional deviations from the C++ reference
+//! ## Intentional deviations from deployed firmware behaviour
 //!
 //! All documented in the design spec:
 //! - Positions are fixed-point ([`Pos`], hundredths of a percent) instead of
@@ -14,22 +16,24 @@
 //!   estimator axis exists but full tilt command plumbing lands with the API
 //!   layer that exposes it.
 //! - The mid-range arrival stop is scheduled only for explicit position seeks
-//!   (`GoTo`/favorite recall), never for `Step` — the C++ `settingPos` analog:
-//!   Step targets and native motor moves self-stop, so no `My` is planned on
-//!   their arrival (see [`Shade::tick`]).
-//! - Overheard `My`-while-idle recalls the favorite immediately; the C++ defers
-//!   ~500 ms to disambiguate a My *recall* from a My *set* on the physical
-//!   button. The domain sees an already-decoded command, so no such wait
-//!   applies (see [`Shade::apply_overheard`]).
-//! - **`My`-while-idle favorite recall always *simulates*.** The C++ DEFAULT
-//!   (the `simMy` flag is off, Somfy.cpp:2880-2887) sends a raw `My`/Favorite
-//!   frame and lets the motor recall its own HARDWARE-stored favorite; this
-//!   crate always simulates the move from the software `my_pos` instead. So
-//!   `My`-while-idle with `my_pos == None` is a **no-op** here, whereas the C++
-//!   default would still transmit and drive the shade to a position the software
-//!   cannot predict. Reconciling this — a raw-`My` passthrough command or a
-//!   `simMy` config bit that toggles simulate-vs-passthrough — is a Plan 4
-//!   decision item (see [`Shade::handle`]'s `My` arm).
+//!   (`GoTo`/favorite recall), tracked via a position-seek-in-progress flag —
+//!   never for `Step`: Step targets and native motor moves self-stop, so no
+//!   `My` is planned on their arrival (see [`Shade::tick`]).
+//! - Overheard `My`-while-idle recalls the favorite immediately; a physical
+//!   remote's My button defers ~500 ms before committing to a recall, so it
+//!   can tell a tap (recall) apart from a press-and-hold (set a new
+//!   favorite). The domain sees an already-decoded command, not raw button
+//!   timing, so no such wait applies (see [`Shade::apply_overheard`]).
+//! - **`My`-while-idle favorite recall always *simulates*.** Deployed
+//!   firmware ships with passthrough as the default: it sends a raw
+//!   `My`/Favorite frame and lets the motor recall its own HARDWARE-stored
+//!   favorite; this crate always simulates the move from the software
+//!   `my_pos` instead. So `My`-while-idle with `my_pos == None` is a
+//!   **no-op** here, whereas the deployed-firmware default would still
+//!   transmit and drive the shade to a position the software cannot predict.
+//!   Reconciling this — a raw-`My` passthrough command or a config bit that
+//!   toggles simulate-vs-passthrough — is a Plan 4 decision item (see
+//!   [`Shade::handle`]'s `My` arm).
 //!
 //! ## Ownership boundaries
 //!

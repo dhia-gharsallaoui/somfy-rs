@@ -1,9 +1,10 @@
 //! Serde DTOs mirroring the live [`somfy_domain`] entities on the wire.
 //!
 //! Wire contract (kept stable for the UI and for backup/migration parity with
-//! the C++ firmware): field names are camelCase, positions are whole percent
-//! (0-100), `kind`/`tiltMode` are the C++ numeric discriminants, and
-//! `direction` uses the C++ sign convention (-1 up, 0 idle, +1 down).
+//! deployed devices): field names are camelCase, positions are whole percent
+//! (0-100), `kind`/`tiltMode` reuse the numeric discriminants deployed
+//! devices already emit, and `direction` uses the same sign convention
+//! deployed devices use (-1 up, 0 idle, +1 down).
 
 // NB: heapless `String`/`Vec` are referenced fully qualified rather than
 // imported. The `ts` feature derives `ts_rs::TS`, whose generated code uses the
@@ -14,8 +15,9 @@ use somfy_domain::{Shade, ShadeId};
 
 /// Live snapshot of one shade for REST/WS payloads. Field names are
 /// camelCase on the wire; positions are whole percent (0-100);
-/// `kind`/`tiltMode` are the C++ numeric discriminants; `direction`
-/// uses the C++ sign convention (-1 up, 0 idle, +1 down).
+/// `kind`/`tiltMode` reuse the numeric discriminants deployed devices
+/// already emit; `direction` uses the same sign convention deployed
+/// devices use (-1 up, 0 idle, +1 down).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(

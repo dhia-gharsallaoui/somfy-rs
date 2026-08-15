@@ -67,7 +67,8 @@ fn halt_freezes_position() {
 
 #[test]
 fn zero_travel_time_jumps_instantly() {
-    // Somfy.cpp:1126-1129
+    // A direction with no configured travel time jumps instantly to the
+    // target instead of dividing by zero.
     let mut m = Motion::new(Pos::ZERO);
     m.set_target(Pos::FULL, 0);
     let s = m.tick(1, UP_MS, 0);

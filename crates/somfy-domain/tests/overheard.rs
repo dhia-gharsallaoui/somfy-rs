@@ -74,10 +74,10 @@ fn overheard_my_while_idle_tracks_favorite() {
 
 #[test]
 fn overheard_step_down_moves_estimate_by_one_step_without_tx() {
-    // The C++ StepUp/StepDown target math (Somfy.cpp:2443-2525) has NO
-    // internal-frame gate, so an overheard step from a linked remote moves the
-    // estimate. One press = 1% = 100 raw on the default 10 s travel, and the
-    // wall remote already drove the motor, so we NEVER retransmit.
+    // Deployed firmware's StepUp/StepDown target math has NO internal-frame
+    // gate, so an overheard step from a linked remote moves the estimate.
+    // One press = 1% = 100 raw on the default 10 s travel, and the wall
+    // remote already drove the motor, so we NEVER retransmit.
     let mut s = shade();
     s.link_remote(0x222222).unwrap();
     let mut out: Vec<PlannedTx, 4> = Vec::new();

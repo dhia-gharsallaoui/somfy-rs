@@ -22,15 +22,16 @@ fn direction_up_is_negative_and_down_is_positive() {
 #[test]
 fn shade_config_new_applies_default_travel_times() {
     let c = ShadeConfig::new("Kitchen", 0x1234).unwrap();
-    assert_eq!(c.up_time_ms, 10_000); // Somfy.h:314
-    assert_eq!(c.down_time_ms, 10_000); // Somfy.h:315
-    assert_eq!(c.tilt_time_ms, 7_000); // Somfy.h:316
+    assert_eq!(c.up_time_ms, 10_000); // default up-travel time deployed firmware ships with
+    assert_eq!(c.down_time_ms, 10_000); // default down-travel time deployed firmware ships with
+    assert_eq!(c.tilt_time_ms, 7_000); // default tilt time deployed firmware ships with
     assert_eq!(c.name.as_str(), "Kitchen");
 }
 
 #[test]
 fn address_plausibility_guard_rejects_sentinels() {
-    // Somfy.cpp:169-170: address must be in 1..0xFFFFFF (exclusive of both sentinels)
+    // Address must be in 1..0xFFFFFF (exclusive of both sentinels), matching
+    // deployed firmware's plausibility guard on the shade address.
     assert!(matches!(
         ShadeConfig::new("X", 0),
         Err(DomainError::InvalidAddress)
@@ -45,7 +46,7 @@ fn address_plausibility_guard_rejects_sentinels() {
 
 #[test]
 fn shade_kind_from_raw_round_trips_known_values() {
-    // The v1.0 subset of the C++ shade_types enum (Somfy.h:56-74).
+    // The v1.0 subset of deployed firmware's shade-kind enumeration.
     let known = [
         (0x00u8, ShadeKind::Roller),
         (0x01, ShadeKind::Blind),
@@ -62,7 +63,8 @@ fn shade_kind_from_raw_round_trips_known_values() {
 
 #[test]
 fn shade_kind_from_raw_rejects_unsupported_and_invalid() {
-    // Not-yet-supported C++ kinds: garage 0x05/0x06, drycontact/gate 0x09-0x10.
+    // Not-yet-supported deployed-firmware kinds: garage 0x05/0x06,
+    // drycontact/gate 0x09-0x10.
     for raw in [0x05u8, 0x06, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10] {
         assert_eq!(
             ShadeKind::from_raw(raw),

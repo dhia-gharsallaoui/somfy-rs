@@ -8,10 +8,10 @@
 //!
 //! - **Field names are camelCase** (`tiltMode`, `myPosition`, `upTimeMs`).
 //! - **Positions are whole percent as `u8`** (0–100) — never floats.
-//! - **`kind`/`tiltMode`/`direction` are the C++ numeric discriminants**
-//!   (`direction` keeps the C++ sign convention: -1 up, 0 idle, +1 down), so
-//!   payloads stay compact and consistent with the original firmware and with
-//!   migrated backups.
+//! - **`kind`/`tiltMode`/`direction` reuse the numeric discriminants deployed
+//!   devices already emit** (`direction` keeps the same sign convention:
+//!   -1 up, 0 idle, +1 down), so payloads stay compact and consistent with
+//!   deployed firmware and with migrated backups.
 //! - **No tilt *commands* exist this generation.** Tilt is config-carriage only
 //!   (see [`somfy_domain::ShadeConfig`]); [`CommandDto`] carries no tilt action.
 //! - **[`CommandDto`] is deserialize-only** — it is the inbound REST command the

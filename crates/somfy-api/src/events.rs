@@ -43,7 +43,8 @@ pub enum WsEvent {
 }
 
 /// Live shade state pushed on the WebSocket. Positions are whole percent
-/// (0-100); `direction` uses the C++ sign convention (-1 up, 0 idle, +1 down).
+/// (0-100); `direction` uses the same sign convention deployed devices use
+/// (-1 up, 0 idle, +1 down).
 #[derive(Debug, Clone, PartialEq, Eq, DeriveSerialize, DeriveDeserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
