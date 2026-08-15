@@ -2,10 +2,19 @@
 //! own chip features are mutually exclusive, so "all four chips" means four
 //! separate builds, never one.
 //!
-//! This skeleton only proves the build/link path end-to-end, so it doesn't
-//! yet wire up the CC1101 SPI bus — `SCK`/`MOSI`/`MISO` are unused until that
-//! lands, hence the blanket allow below rather than one per constant.
-#![allow(dead_code)]
+//! The pin numbers here are documentation and diagnostics; the pins the driver
+//! actually claims come from [`cc1101_pins!`], which names the same GPIOs as
+//! esp-hal singletons. The two must be edited together — a `u8` and a
+//! `peripherals.GPIOn` field cannot be tied to each other at compile time, so
+//! this is the one place in the crate where a mismatch would only show up as a
+//! misleading log line. `check_pin_map` in `main.rs` compares them at boot.
+//!
+//! Note there is no blanket `allow(dead_code)` here: the pin constants are all
+//! read by that check now, so an unused item in this file is once again worth
+//! hearing about. Only `GDO2_RX` carries an allow, and only until a receive
+//! path claims it.
+
+use esp_hal::gpio::AnyPin;
 
 #[cfg(not(any(
     feature = "chip-esp32",
@@ -72,7 +81,9 @@ pub mod pins {
     /// (JTAG source select); proven in production but the first suspect
     /// for any boot anomaly.
     pub const GDO0_TX: u8 = 3;
-    /// CC1101 GDO2 — RX data out.
+    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
+    /// is a later task.
+    #[allow(dead_code)]
     pub const GDO2_RX: u8 = 4;
 }
 
@@ -87,6 +98,9 @@ pub mod pins {
     pub const MISO: u8 = 19;
     pub const CSN: u8 = 5;
     pub const GDO0_TX: u8 = 13;
+    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
+    /// is a later task.
+    #[allow(dead_code)]
     pub const GDO2_RX: u8 = 12;
 }
 
@@ -98,6 +112,9 @@ pub mod pins {
     pub const MISO: u8 = 37;
     pub const CSN: u8 = 34;
     pub const GDO0_TX: u8 = 15;
+    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
+    /// is a later task.
+    #[allow(dead_code)]
     pub const GDO2_RX: u8 = 14;
 }
 
@@ -109,5 +126,88 @@ pub mod pins {
     pub const MISO: u8 = 17;
     pub const CSN: u8 = 14;
     pub const GDO0_TX: u8 = 13;
+    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
+    /// is a later task.
+    #[allow(dead_code)]
     pub const GDO2_RX: u8 = 12;
+}
+
+/// The CC1101's pins, type-erased so one signature serves every chip.
+///
+/// GDO2 (the receive-data pin) is deliberately absent: nothing drives or reads
+/// it yet, and claiming a pin the firmware does not use would suggest a
+/// receive path exists.
+pub struct Cc1101Pins<'d> {
+    pub sck: AnyPin<'d>,
+    pub mosi: AnyPin<'d>,
+    pub miso: AnyPin<'d>,
+    pub csn: AnyPin<'d>,
+    /// CC1101 GDO0 — transmit data in.
+    pub gdo0_tx: AnyPin<'d>,
+}
+
+/// Claims the CC1101's pins from an owned `Peripherals`.
+///
+/// A macro rather than a function because esp-hal's pin singletons are
+/// distinct types moved out of `Peripherals` field by field: a function would
+/// have to borrow the whole struct and would then keep `SPI2` and `RMT` locked
+/// away behind that borrow. Expanding at the call site moves only the five
+/// fields it names and leaves the rest usable.
+#[cfg(feature = "chip-s3")]
+#[macro_export]
+macro_rules! cc1101_pins {
+    ($peripherals:ident) => {
+        $crate::chip::Cc1101Pins {
+            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO12),
+            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO11),
+            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
+            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO10),
+            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO3),
+        }
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+#[cfg(feature = "chip-esp32")]
+#[macro_export]
+macro_rules! cc1101_pins {
+    ($peripherals:ident) => {
+        $crate::chip::Cc1101Pins {
+            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO18),
+            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO23),
+            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO19),
+            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO5),
+            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
+        }
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+#[cfg(feature = "chip-s2")]
+#[macro_export]
+macro_rules! cc1101_pins {
+    ($peripherals:ident) => {
+        $crate::chip::Cc1101Pins {
+            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO36),
+            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO35),
+            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO37),
+            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO34),
+            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO15),
+        }
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+#[cfg(feature = "chip-c3")]
+#[macro_export]
+macro_rules! cc1101_pins {
+    ($peripherals:ident) => {
+        $crate::chip::Cc1101Pins {
+            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO15),
+            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO16),
+            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO17),
+            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO14),
+            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
+        }
+    };
 }

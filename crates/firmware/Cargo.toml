@@ -25,8 +25,13 @@ esp-hal = { version = "1.1.1", features = ["unstable"] }
 esp-println = { version = "0.13", features = ["log"] }
 heapless = "0.8"
 embedded-hal = "1.0"
+# `ExclusiveDevice` needs a real `DelayNs` here, not `new_no_delay`: the CC1101
+# reset sequence holds chip select across a delay *inside* the SPI transaction,
+# and the no-delay constructor panics on exactly that.
+embedded-hal-bus = "0.3"
 somfy-rts = { path = "../somfy-rts" }
 somfy-rmt = { path = "../somfy-rmt" }
+somfy-cc1101 = { path = "../somfy-cc1101" }
 
 # No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
 # don't declare `#![no_std]`), so no feature selection lets them compile for

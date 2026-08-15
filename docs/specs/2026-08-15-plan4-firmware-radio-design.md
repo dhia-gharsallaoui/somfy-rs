@@ -103,26 +103,40 @@ air.
 
 ### 5.2 Buffer sizing — the tight constraint
 
-Worst-case pulse counts, from the timing model (worst case is an all-ones or
-all-zeros payload, where no adjacent half-symbols merge):
+**Measured** by sweeping every payload byte value through
+`somfy_rmt::build_symbols` on the host (`somfy-rmt/tests/build_symbols.rs`).
+The worst case in every row is an **all-zeros** payload: each `0` bit renders
+HIGH-then-LOW, so no bit's tail meets the next bit's head at the same level and
+nothing merges. An all-ones payload is one merge short of it — its first `1` bit
+opens LOW and absorbs the software sync's trailing LOW half.
 
-| Frame | Pulses | `PulseCode` symbols |
-|---|---:|---:|
-| 56-bit, first (wake-up + 2 hw syncs + gap) | 121 | 61 |
-| 80-bit, first (wake-up + 12 hw syncs, gap suppressed) | **188** | **94** |
+| Frame | Merged pulses | Packed symbols | + end marker |
+|---|---:|---:|---:|
+| 56-bit, first (wake-up + 2 hw syncs + gap) | 120 | 60 | 61 |
+| 56-bit, repeat (7 hw syncs + gap) | 128 | 64 | 65 |
+| 80-bit, repeat (6 hw syncs, gap suppressed) | 174 | 87 | 88 |
+| 80-bit, first (wake-up + 12 hw syncs, gap suppressed) | **188** | **94** | **95** |
 
-An RMT memory block holds 48 symbols on the S3 and C3 and 64 on the ESP32, so an
-80-bit first frame needs **two blocks (96 symbols) and leaves room for barely one
-end-marker**. That is uncomfortably tight and is the **first thing to measure on
-hardware**.
+The end-marker column is the one that matters. A zero-length entry is how the
+peripheral is told to stop; an odd pulse count leaves one for free in the last
+symbol's unused second half, but an **even** count fills every half and needs a
+whole extra symbol appended. Every row here is even, so each pays for one.
 
-Two caveats on those numbers. The S2's block size is **not verified** at the time
-of writing, and block size is chip-dependent generally — so the implementation
-must read it from `esp-hal`'s own constants and assert against the computed
-requirement at compile time. **Do not hardcode the figures from this document.**
-If two blocks prove insufficient on any chip, the fallback is RMT's wrap-around
-refill mode, feeding the channel in halves from an interrupt — more code, same
-external behaviour. Recorded as a risk in §11 rather than assumed away.
+An RMT memory block holds 48 symbols on the S3 and C3 and 64 on the ESP32 and
+S2. Two blocks is therefore 96 symbols at worst, and the largest frame is **95**
+— it fits on every chip, with exactly **one symbol spare**. `MEMSIZE_BLOCKS = 2`
+in `firmware/src/radio/rmt_tx.rs`, next to a `const` assertion of
+`MAX_SYMBOLS <= MEMSIZE_BLOCKS * esp_hal::rmt::CHANNEL_RAM_SIZE`. That assertion
+reads the block size from `esp-hal`'s own per-chip constant rather than from this
+document, and is checked on all four chip builds; one block fails it on all four.
+
+The fallback this section previously reserved is **not needed and not
+implemented**: `esp-hal`'s blocking `transmit` already streams data longer than
+the channel's RAM, refilling from the remainder on a threshold interrupt inside
+`TxTransaction::poll`, and the crate documents wrapping TX as supported on every
+device. (`transmit_continuously` is the one that genuinely caps at RMT RAM; this
+path does not use it.) Fitting entirely in RAM is still preferred, and asserted
+above, so that a real-time OOK stream never depends on that refill keeping up.
 
 ### 5.3 Repeats
 
@@ -253,7 +267,7 @@ format.
 
 | Risk | Mitigation |
 |---|---|
-| 80-bit frame (94 symbols) barely fits two RMT memory blocks | Measure first, on hardware, before building on it; fall back to wrap-around refill |
+| ~~80-bit frame barely fits two RMT memory blocks~~ **Closed.** Measured at 95 symbols including the end marker, against 96 on the smallest-block chips (§5.2) | One spare symbol, held by a `const` assertion against `esp-hal`'s own per-chip block size and checked on all four chip builds. The wrap-around fallback proved unnecessary: `esp-hal`'s blocking `transmit` already refills the channel from the remaining data |
 | RMT RX unsuitable for long frames | `PulseSource` trait with a GPIO-interrupt implementation ready (§6.1) |
 | Xtensa toolchain friction across three of the four chips | `espup`-pinned toolchain in a firmware-local `rust-toolchain.toml`; C3 stays the friction-free target |
 | TX to a real motor de-syncs a production shade | Golden captures pin the encoder **before** first TX (§12); rolling codes persist from frame one (§7.1) |

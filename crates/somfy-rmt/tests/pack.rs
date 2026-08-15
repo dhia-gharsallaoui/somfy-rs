@@ -106,17 +106,31 @@ fn rejects_a_pulse_longer_than_the_15_bit_field() {
     }
 }
 
-/// The longest real pulse is INTER_FRAME_GAP. If this ever fails, the timing
-/// model outgrew the RMT length field and rmt_tx must switch to wrap-around
-/// refill (design spec §5.2).
+/// The longest pulse that can actually reach the length field is the
+/// inter-frame gap *merged with* the LOW half-symbol that a trailing `0` bit
+/// ends on. Measured against a real frame rather than asserted from the
+/// constants, so the arithmetic and the pulse train have to agree.
 ///
-/// Both sides are `const`, so clippy sees this as trivially true; it is kept
-/// as a runtime test (in addition to the compile-time guard in `lib.rs`) so a
-/// future change to either constant shows up as a named test failure here.
+/// If this ever fails, the timing model outgrew the RMT length field and a
+/// single pulse can no longer be expressed at all — a protocol-level problem,
+/// not a buffering one.
 #[test]
-#[allow(clippy::assertions_on_constants)]
-fn inter_frame_gap_fits_the_length_field() {
-    assert!(somfy_rts::TIMINGS::INTER_FRAME_GAP <= MAX_TICKS);
+fn the_longest_merged_pulse_fits_the_length_field() {
+    let longest = merged_for(&[0x00u8; 7], FrameKind::First)
+        .iter()
+        .map(|p| p.micros)
+        .max()
+        .expect("a rendered frame has pulses");
+
+    assert_eq!(
+        longest,
+        somfy_rts::TIMINGS::INTER_FRAME_GAP + somfy_rts::TIMINGS::HALF_SYMBOL,
+        "the gap should have absorbed the final LOW half-symbol"
+    );
+    assert!(
+        longest <= MAX_TICKS,
+        "{longest} µs exceeds the length field"
+    );
 }
 
 #[test]
@@ -140,24 +154,28 @@ fn every_frame_shape_fits_in_max_symbols() {
     }
 }
 
-/// Worst case for symbol count: a payload where no adjacent halves merge.
+/// An all-ones 80-bit first frame: 187 merged pulses, so `pack` fills 94
+/// symbols and the odd count leaves the end marker in the last one for free.
+///
+/// This is one pulse short of the true worst case — an all-*zeros* payload
+/// merges nowhere at all, where all-ones lets its leading LOW half absorb the
+/// software sync's trailing LOW. The sizing decision rests on that case, and on
+/// the end marker `pack` deliberately does not append; both live with
+/// `build_symbols` in `tests/build_symbols.rs`.
+///
+/// Pinned exactly, not just bounded: a regression must fail loudly here rather
+/// than slide under the `<=` check unnoticed. If a legitimate change to the
+/// frame or timing model moves this number, re-derive and re-pin it
+/// consciously — do not just bump the constant to make the test pass.
 #[test]
-fn worst_case_80bit_payload_fits() {
+fn all_ones_80bit_payload_packs_to_94_symbols() {
     let merged = merged_for(&[0xFFu8; 10], FrameKind::First);
     let mut out: Vec<RmtSymbol, MAX_SYMBOLS> = Vec::new();
-    pack(&merged, &mut out).expect("worst-case 80-bit frame must fit MAX_SYMBOLS");
+    pack(&merged, &mut out).expect("an 80-bit first frame must fit MAX_SYMBOLS");
     assert!(out.len() <= MAX_SYMBOLS, "needed {}", out.len());
-    // Pinned exactly, not just bounded: this is a measurement, not a
-    // prediction, and it leaves only 2 symbols of headroom against
-    // MAX_SYMBOLS = 96 — the two-RMT-memory-block allocation this crate is
-    // sized for. That margin is a hardware design decision resting on this
-    // specific number, so a regression must fail loudly here rather than
-    // slide under the `<=` check above unnoticed. If a legitimate change to
-    // the frame or timing model moves this number, re-derive and re-pin it
-    // consciously — do not just bump the constant to make the test pass.
     assert_eq!(
         out.len(),
         94,
-        "worst-case symbol count changed — re-derive deliberately, see comment above"
+        "symbol count changed — re-derive deliberately, see comment above"
     );
 }
