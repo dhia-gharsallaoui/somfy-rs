@@ -11,7 +11,9 @@
 //! captures are ever swapped out.
 
 use heapless::Vec as HVec;
-use somfy_rts::{decode56, encode56, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder};
+use somfy_rts::{
+    decode56, encode56, merge_pulses, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder,
+};
 
 /// Glitch threshold. C++ `bitMin = SYMBOL * TOLERANCE_MIN = 640 * 0.7 = 448`
 /// (`Somfy.cpp:4238`); the ISR logs shorter segments into `rx.pulses[]` but
@@ -104,17 +106,9 @@ fn synthetic_up_pulses() -> std::vec::Vec<Pulse> {
     };
     let mut raw: HVec<Pulse, 320> = HVec::new();
     render_pulses(&encode56(&f).unwrap(), FrameKind::Repeat, &mut raw);
-    let mut merged: std::vec::Vec<Pulse> = std::vec::Vec::new();
-    for p in &raw {
-        if let Some(last) = merged.last_mut() {
-            if last.high == p.high {
-                last.micros += p.micros;
-                continue;
-            }
-        }
-        merged.push(*p);
-    }
-    merged
+    let mut merged: HVec<Pulse, 320> = HVec::new();
+    merge_pulses(&raw, &mut merged);
+    merged.iter().copied().collect()
 }
 
 /// End-to-end without hardware: a durations-only file (with comments, a blank

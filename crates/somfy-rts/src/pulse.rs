@@ -138,3 +138,19 @@ pub fn render_pulses(bytes: &[u8], kind: FrameKind, out: &mut Vec<Pulse, 320>) {
         .unwrap();
     }
 }
+
+/// Collapse runs of same-level pulses into single edge-to-edge segments.
+///
+/// [`render_pulses`] emits one entry per Manchester half-symbol, so a `1`
+/// followed by a `0` produces two adjacent HIGH halves. Both the RMT
+/// transmitter and a `CHANGE`-interrupt receiver see edges, not halves — this
+/// converts between the two representations. Total duration is preserved.
+pub fn merge_pulses(input: &[Pulse], out: &mut Vec<Pulse, 320>) {
+    out.clear();
+    for p in input {
+        match out.last_mut() {
+            Some(last) if last.high == p.high => last.micros += p.micros,
+            _ => out.push(*p).unwrap(),
+        }
+    }
+}

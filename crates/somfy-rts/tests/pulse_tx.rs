@@ -1,5 +1,5 @@
 use heapless::Vec;
-use somfy_rts::{encode56, render_pulses, Command, Frame, FrameKind, Pulse, TIMINGS};
+use somfy_rts::{encode56, merge_pulses, render_pulses, Command, Frame, FrameKind, Pulse, TIMINGS};
 
 fn bytes() -> [u8; 7] {
     encode56(&Frame {
@@ -75,4 +75,86 @@ fn timings_literals_are_pinned_to_cpp() {
     assert_eq!(TIMINGS::SW_SYNC_HIGH, 4_850);
     assert_eq!(TIMINGS::HALF_SYMBOL, 640);
     assert_eq!(TIMINGS::INTER_FRAME_GAP, 27_434);
+}
+
+#[test]
+fn merges_adjacent_same_level_runs() {
+    let input = [
+        Pulse {
+            high: true,
+            micros: 640,
+        },
+        Pulse {
+            high: true,
+            micros: 640,
+        },
+        Pulse {
+            high: false,
+            micros: 640,
+        },
+        Pulse {
+            high: true,
+            micros: 640,
+        },
+    ];
+    let mut out: Vec<Pulse, 320> = Vec::new();
+    merge_pulses(&input, &mut out);
+    assert_eq!(out.len(), 3);
+    assert_eq!(
+        out[0],
+        Pulse {
+            high: true,
+            micros: 1280
+        }
+    );
+    assert_eq!(
+        out[1],
+        Pulse {
+            high: false,
+            micros: 640
+        }
+    );
+    assert_eq!(
+        out[2],
+        Pulse {
+            high: true,
+            micros: 640
+        }
+    );
+}
+
+#[test]
+fn merged_output_strictly_alternates() {
+    let f = Frame {
+        key: 0xA7,
+        command: Command::Up,
+        rolling_code: 0x000A,
+        address: 0x00C0DE,
+    };
+    let mut rendered: Vec<Pulse, 320> = Vec::new();
+    render_pulses(&encode56(&f).unwrap(), FrameKind::First, &mut rendered);
+
+    let mut merged: Vec<Pulse, 320> = Vec::new();
+    merge_pulses(&rendered, &mut merged);
+
+    assert!(!merged.is_empty());
+    for pair in merged.windows(2) {
+        assert_ne!(pair[0].high, pair[1].high, "merged stream must alternate");
+    }
+    let total_in: u32 = rendered.iter().map(|p| p.micros).sum();
+    let total_out: u32 = merged.iter().map(|p| p.micros).sum();
+    assert_eq!(total_in, total_out, "merging must preserve total duration");
+}
+
+/// An all-ones payload is the worst case: Manchester renders `1` as (low, high)
+/// so no adjacent halves share a level and nothing merges.
+#[test]
+fn all_ones_payload_does_not_shrink() {
+    let bytes = [0xFFu8; 7];
+    let mut rendered: Vec<Pulse, 320> = Vec::new();
+    render_pulses(&bytes, FrameKind::First, &mut rendered);
+    let mut merged: Vec<Pulse, 320> = Vec::new();
+    merge_pulses(&rendered, &mut merged);
+    // Only the sync run and the gap boundary can merge; the 112 data halves cannot.
+    assert!(merged.len() >= 112, "got {}", merged.len());
 }
