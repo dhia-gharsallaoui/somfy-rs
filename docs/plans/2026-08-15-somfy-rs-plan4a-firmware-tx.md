@@ -1186,44 +1186,47 @@ git commit -m "feat: RMT TX path rendering Somfy frames to the CC1101"
 **Files:**
 - Create: `docs/hardware-checklist.md`
 
-**Constraint: there is only one radio.** No second device is available as a
-verification receiver, so the frame must be validated *before* transmission by
-self-reporting rather than by being overheard. That is achievable because every
-layer below the antenna is already host-tested, and the firmware can log exactly
-what it is about to emit.
+**A second working radio is available**, so verification happens where it belongs —
+in an independent receiver, not inside the firmware.
 
-- [ ] **Step 1: Make the firmware self-report the frame it is about to send**
+This matters architecturally. An earlier revision of this task had the firmware
+dump its own pipeline internals (merged pulse counts, symbol counts, raw
+durations) to serve as a substitute for a receiver. That is workaround-shaped code:
+it exists only because of a missing test fixture, yet it would live in the firmware
+forever. **Verification apparatus does not belong in the transmitter.**
 
-Before each transmission, log over serial: the 7 encoded frame bytes in hex, the
-merged pulse count, the packed symbol count, the first three pulse durations, and
-the total frame duration in µs. This is the substitute for a receiver — it exposes
-the entire pipeline output as data.
+The firmware therefore logs only what an operator would genuinely want at runtime —
+address, command, rolling code, frame kind — and nothing about the pulse pipeline.
+Everything below that is already covered by host tests.
 
-- [ ] **Step 2: Check the log against known-good values**
+- [ ] **Step 1: Put the reference device into listening mode**
 
-These come from the golden captures and the host tests, and are known before any
-hardware runs:
+Connect a websocket client to `ws://<reference-device>:8080` and send `join:0` to
+join its frame-emit room. Each decoded frame arrives as `42[remoteFrame,{...}]`
+(note: the event name is emitted unquoted, so the message is not strict JSON and
+must be split at the first comma before parsing).
 
-| Property | Expected (56-bit first frame) |
+- [ ] **Step 2: Transmit from the Rust firmware and assert on what was received**
+
+The receiver reports `address`, `command`, `rcode`, `bits`, `sync`, `valid` and
+`rssi`. Assert:
+
+| Field | Expected |
 |---|---|
-| Encoded frame | 7 bytes |
-| First pulse | ~10,920 µs HIGH (wake-up) |
-| Second pulse | ~7,357 µs LOW |
-| Merged pulse count | 120 |
-| Packed symbols | 60 |
-| Hardware syncs | 2 (a repeat frame emits 7) |
+| `address` | the transmitting shade's address |
+| `command` | the command sent |
+| `bits` | 56 |
+| `sync` | 4 on a first frame, 14 on a repeat |
+| `valid` | true |
 
-A real wall-remote capture measured its wake-up pulse at 10,229 µs, so the
-transmitted value being close to `WAKEUP_HIGH` is the right order of magnitude.
-**If the byte count, pulse count or symbol count disagrees, stop — the bug is
-upstream of the antenna and no amount of transmitting will diagnose it.**
+`sync` is the highest-value assertion: it confirms the hardware-sync count came out
+right, which is the part of the pulse train most likely to be wrong and least
+visible any other way. Captured wall-remote frames reported exactly 4 and 14, so
+these are measured expectations, not guesses.
 
-- [ ] **Step 3: Decode the firmware's own bytes on the host**
-
-Feed the logged hex bytes into `decode56` in a host test and assert they yield the
-intended command, address and rolling code. This closes the loop without a radio:
-if the bytes decode correctly and the pulse train derives from them by tested code,
-the frame is correct by construction.
+**If nothing is received at all, stop.** Either the transmitter is silent or the
+pulse train is malformed beyond recognition, and transmitting at a motor will
+teach nothing.
 
 - [ ] **Step 4: Transmit at the motor**
 
