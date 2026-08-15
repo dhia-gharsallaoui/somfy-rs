@@ -16,11 +16,19 @@ orchestration, overheard-remote tracking), and the Plan 3 contract layer —
 `somfy-migrate` (C++ backup-file parser) — are implemented and green on the host.
 **Next: Plan 4** — firmware radio (`esp-hal` RMT TX/RX on ESP targets).
 
-Golden-capture *validation* against real device pulses is still **pending**: the
-fixture loader is exercised every CI run by a checked-in synthetic capture, but
-three fixture-backed tests are `#[ignore]`d until real captures from a running
-C++ device land (see
-[`crates/somfy-rts/tests/fixtures/README.md`](crates/somfy-rts/tests/fixtures/README.md)).
+Golden-capture validation **landed 2026-08-15**: the `somfy-rts` RX path is
+pinned against pulses captured from a physical Somfy wall remote, and all three
+fixture-backed tests pass **unmodified** — the engine decoded genuine hardware on
+the first attempt. The capture independently confirmed the sync model (first
+frames `hwsync == 4`, repeats `hwsync == 14`). `somfy-migrate` is likewise
+validated against a real v25 device backup, though that test stays `#[ignore]`d
+because the backup itself is private (see
+[`crates/somfy-migrate/tests/fixtures/README.md`](crates/somfy-migrate/tests/fixtures/README.md)).
+
+> **Before this repository is made public**, the committed pulse fixtures must be
+> re-captured with a throwaway address or removed — they encode a real remote's
+> radio address and rolling codes. See
+> [`crates/somfy-rts/tests/fixtures/README.md`](crates/somfy-rts/tests/fixtures/README.md).
 
 Plans (per [`docs/specs/`](docs/specs/)):
 

@@ -277,9 +277,20 @@ preceded by a step that pins the frame against real captured hardware output.**
 
 ## 13. Open questions
 
-1. Does the C++ `printBuffer` dump carry enough resolution and framing to serve
-   as a golden fixture directly, or does the capture rig need a purpose-built
-   sketch? Settle during step 1 of §12 — it does not block anything before then.
-2. Which motor is the first TX target? A dedicated re-pairable test motor is
-   preferable to a production shade for the first frame, even with the invariant
-   honoured.
+1. ~~Does the C++ `printBuffer` dump serve as a golden fixture directly?~~
+   **Resolved 2026-08-15.** `printBuffer` is dead code in v2.5.6. The working
+   route is the `remoteFrame` websocket event (room `join:0` on port 8080),
+   whose `pulses[]` is a verbatim `rx.pulses[]` dump. Step 1 of §12 is complete:
+   all three golden tests pass against a real wall-remote capture, unmodified.
+2. ~~Which motor is the first TX target?~~ **Resolved 2026-08-15.** The office
+   roller shade, driven successfully from the spare S3 (Up fully opened it, Down
+   closed it) at rolling code 55. The motor accepted the first frame, confirming
+   no rolling-code desync.
+3. **Pre-public obligation (blocking on open-sourcing, not on Plan 4).** The
+   committed pulse fixtures encode a real remote's address and rolling codes.
+   Re-capture with a throwaway address — which needs two working radios — or
+   remove them before the repository goes public. Tracked in
+   `crates/somfy-rts/tests/fixtures/README.md`.
+4. Does the `PulseSource` trait need a third implementation for bring-up
+   (a file/replay source) so the radio task can be exercised on the host? Likely
+   yes, and it is nearly free given the trait already exists.

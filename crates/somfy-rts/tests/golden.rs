@@ -1,11 +1,14 @@
 //! Golden capture tests: decode real (and one synthetic) pulse streams the way
 //! the C++ reference firmware records them.
 //!
-//! The three `up`/`down`/`my` tests are `#[ignore]` until the author supplies
-//! real device captures (see `tests/fixtures/README.md`); the suite stays green
-//! without hardware. The remaining tests are always run and validate the loader
-//! itself — parsing, level reconstruction, glitch filtering, and end-to-end
-//! decode — against a checked-in synthetic fixture.
+//! The three `up`/`down`/`my` tests run against real captures taken from a
+//! physical Somfy wall remote on 2026-08-15 (see `tests/fixtures/README.md`).
+//! They pin the engine's timing constants, Manchester polarity, sync-count
+//! detection, checksum and XOR de-obfuscation against genuine hardware output.
+//! The remaining tests validate the loader itself — parsing, level
+//! reconstruction, glitch filtering, and end-to-end decode — against a
+//! checked-in synthetic fixture, so the loader stays covered even if the real
+//! captures are ever swapped out.
 
 use heapless::Vec as HVec;
 use somfy_rts::{decode56, encode56, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder};
@@ -75,19 +78,16 @@ fn decode_capture(name: &str) -> Frame {
 }
 
 #[test]
-#[ignore = "requires real-device captures — see tests/fixtures/README.md"]
 fn golden_up_capture_decodes_as_up() {
     assert_eq!(decode_capture("up_56bit_1.pulses").command, Command::Up);
 }
 
 #[test]
-#[ignore = "requires real-device captures — see tests/fixtures/README.md"]
 fn golden_down_capture_decodes_as_down() {
     assert_eq!(decode_capture("down_56bit_1.pulses").command, Command::Down);
 }
 
 #[test]
-#[ignore = "requires real-device captures — see tests/fixtures/README.md"]
 fn golden_my_capture_decodes_as_my() {
     assert_eq!(decode_capture("my_56bit_1.pulses").command, Command::My);
 }

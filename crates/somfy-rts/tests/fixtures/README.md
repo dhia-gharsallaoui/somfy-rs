@@ -53,14 +53,28 @@ Two behaviours change how a raw `pulses[]` dump must be interpreted:
 
 ## Capture procedure
 
-1. Enable the firmware's transceiver debug output (Radio settings → enable pulse
-   logging), **or** add a temporary dump of `rx.pulses[0..pulseCount]` in
-   `src/Somfy.cpp` right where a completed frame is processed
-   (`somfy_rx.status == complete`).
-2. Press a paired remote button near the device, once per capture file.
-3. Save one line per pulse. Either supported format is accepted (see below);
-   the durations-only format is the natural dump of `rx.pulses[]`.
-4. Do **not** hand-edit durations. If a capture will not decode, capture again —
+> **Do not use `printBuffer`.** The `transceiver_config_t::printBuffer` flag is
+> vestigial in v2.5.6 — its only assignment sits inside the commented-out block
+> that closes at `Somfy.cpp:4766`, so it can never be set and nothing reads it.
+> An earlier version of this document recommended it; that advice was wrong.
+
+The working route needs **no firmware modification**. The device already emits
+every decoded frame, with its full raw pulse array, over its websocket:
+
+1. Connect a websocket client to `ws://<device>:8080` and send the text frame
+   `join:0` to join `ROOM_EMIT_FRAME` (`Sockets.cpp:166-171`). `emitFrame` is
+   gated on that room having at least one client (`Somfy.cpp:4603`).
+2. Press a paired remote button near the device. Each decoded frame arrives as
+   `42[remoteFrame,{...}]` — socket.io-like, but note the event name is emitted
+   **unquoted** (`WResp.cpp:8`), so the message is not strict JSON and needs
+   splitting at the first comma before the payload can be parsed.
+3. The payload's `pulses` array is a verbatim `rx.pulses[]` dump; write one
+   entry per line. It also carries `command`, `bits`, `sync`, `rssi`, `address`
+   and `rcode`, so captures can be sorted by button automatically and each
+   file's expected decode is known without guesswork.
+4. Either supported format is accepted (see below); durations-only is the
+   natural dump of `rx.pulses[]`.
+5. Do **not** hand-edit durations. If a capture will not decode, capture again —
    the file is the authority, the code bends to it (see golden.rs Step 4).
 
 ## Supported file formats
@@ -101,23 +115,51 @@ Common rules for both formats:
 multiple captures of the same command. Each file's expected decode result is
 asserted in `../golden.rs`.
 
-## Expected fixtures (device captures — PENDING)
+## Device captures (LANDED 2026-08-15)
 
-These are **not yet committed**: they require one capture session on the
-author's running C++ ESPSomfy-RTS device. The corresponding tests in
-`../golden.rs` are marked `#[ignore]` until the files exist, so the suite stays
-green in the meantime. Un-ignore each test when its file lands.
+Captured from a **physical Somfy wall remote** received by an ESP32-S3 + CC1101
+running ESPSomfy-RTS v2.5.6, via its `remoteFrame` websocket event
+(`Somfy.cpp:4602-4625`), whose `pulses[]` array is a verbatim dump of
+`rx.pulses[]`. All three tests in `../golden.rs` pass unmodified — the engine
+decoded genuine Somfy hardware on the first attempt, with no code changes.
 
-| File                 | Expected decode      | Status  |
-|----------------------|----------------------|---------|
-| `up_56bit_1.pulses`  | `Command::Up`        | PENDING |
-| `down_56bit_1.pulses`| `Command::Down`      | PENDING |
-| `my_56bit_1.pulses`  | `Command::My`        | PENDING |
-| `*_80bit_1.pulses`   | 80-bit (if a compatible remote is available) | OPTIONAL / PENDING |
+| File                 | Expected decode | hwsync | pulses | Status |
+|----------------------|-----------------|--------|--------|--------|
+| `up_56bit_1.pulses`  | `Command::Up`   | 4      | 89     | LANDED |
+| `down_56bit_1.pulses`| `Command::Down` | 4      | 97     | LANDED |
+| `my_56bit_1.pulses`  | `Command::My`   | 4      | 84     | LANDED |
+| `*_80bit_1.pulses`   | 80-bit          | —      | —      | DEFERRED — no 80-bit-capable remote available |
 
-If no 80-bit-capable remote is available, note its absence here and defer the
-80-bit fixture; the 56-bit fixtures are sufficient to settle polarity, sync
-counts, and timing.
+The capture session also independently confirmed the sync model: first frames
+reported `hwsync == 4` and repeat frames `hwsync == 14`, exactly the 2-and-7
+hardware-sync counts `pulse.rs` renders and `rx.rs` expects.
+
+## ⚠️ BEFORE MAKING THIS REPOSITORY PUBLIC
+
+> **These three fixtures contain a real remote's radio address and rolling
+> codes.** The pulse train *is* the frame: address `1772642` and rolling codes
+> in the 8792–8809 range are recoverable by anyone who decodes these files —
+> the same class of secret that `somfy-migrate`'s fixtures README says to treat
+> like a key, and which is gitignored there for exactly that reason.
+>
+> The repository is private today, so nothing is exposed. **It is intended to
+> become public** (design spec §1.1, "community-adoptable"). Before that
+> happens, do one of:
+>
+> 1. **Re-capture with a throwaway address** (preferred). Configure a spare
+>    ESPSomfy-RTS device with a virtual remote address paired to nothing, have
+>    it transmit, and capture with a second device. This needs **two working
+>    radios** — one transmitting, one receiving — because a radio cannot hear
+>    its own transmission. Same test value, nothing sensitive.
+> 2. **Delete these files and re-`#[ignore]` the three tests**, falling back to
+>    the synthetic fixture for CI.
+>
+> Do **not** attempt to "anonymise" by rewriting the address in place: the
+> address is Manchester-coded inside the payload, so changing it requires
+> re-encoding through this crate's own encoder — which makes the golden test
+> circular (our encoder agreeing with our decoder, which the loopback property
+> tests already cover) and forfeits the checksum/obfuscation validation that
+> makes a real capture worth having.
 
 ## Synthetic fixtures (checked in, no hardware)
 
