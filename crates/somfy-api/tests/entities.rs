@@ -24,7 +24,7 @@ fn shade_dto_snapshots_live_state() {
     assert_eq!(dto.position, 20);
     assert_eq!(dto.target, 50);
     assert_eq!(dto.my_position, Some(30));
-    assert_eq!(dto.direction, 1); // C++ sign: down = +1
+    assert_eq!(dto.direction, 1); // down = +1
     assert_eq!(dto.up_time_ms, 10_000);
 }
 

@@ -68,7 +68,7 @@ fn frame_ends_with_inter_frame_gap() {
 /// stale earlier drafts and do NOT belong on the TX path. See the
 /// per-constant rationale in `pulse.rs`.
 #[test]
-fn timings_literals_are_pinned_to_cpp() {
+fn timings_literals_are_pinned_to_hardware_captures() {
     assert_eq!(TIMINGS::WAKEUP_HIGH, 10_920);
     assert_eq!(TIMINGS::WAKEUP_LOW, 7_357);
     assert_eq!(TIMINGS::HW_SYNC_HALF, 2_560);

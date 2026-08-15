@@ -89,7 +89,7 @@ impl<'a> Reader<'a> {
         while i < data.len() {
             match data[i] {
                 VALUE_SEP | REC_END => {
-                    self.pos = i + 1; // consume the terminator (C++ :110-114)
+                    self.pos = i + 1; // consume the terminator
                     return Ok(&data[start..i]);
                 }
                 _ => i += 1,

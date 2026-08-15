@@ -69,7 +69,7 @@ fn corrupted_frame_rejected() {
 }
 
 #[test]
-fn command_nibble_mapping_matches_cpp_enum() {
+fn command_nibble_values_match_rts_protocol() {
     // Command nibble values as defined by the RTS protocol's command encoding.
     assert_eq!(Command::My.nibble(), 0x1);
     assert_eq!(Command::Up.nibble(), 0x2);

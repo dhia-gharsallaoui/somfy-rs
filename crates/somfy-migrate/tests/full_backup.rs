@@ -363,7 +363,7 @@ fn padded_group_record_is_200_bytes() {
     s.push_str(&format!("{:3},", 2u32)); // roomId
     s.push_str(&format!("{:5}\n", 40u32)); // lastRollingCode + CFG_REC_END
     let bytes = s.into_bytes();
-    assert_eq!(bytes.len(), 200, "must equal C++ GROUP_REC_SIZE");
+    assert_eq!(bytes.len(), 200, "group record must be exactly 200 bytes");
 
     let mut r = Reader::new(&bytes);
     let g = parse_group_record(&mut r, &header(25, 0, 0, 1)).unwrap();

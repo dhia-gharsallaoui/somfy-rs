@@ -10,15 +10,17 @@ fn pos_is_clamped_and_converts() {
     assert!(Pos::ZERO < Pos::FULL);
 }
 
+/// Up's sign is negative (moves toward position 0, open); Down's sign is
+/// positive (moves toward position 100, closed).
 #[test]
-fn direction_signs_match_cpp() {
-    assert_eq!(Direction::Up.sign(), -1); // C++ -1 moves toward 0 (open)
+fn direction_up_is_negative_and_down_is_positive() {
+    assert_eq!(Direction::Up.sign(), -1); // -1 moves toward 0 (open)
     assert_eq!(Direction::Idle.sign(), 0);
-    assert_eq!(Direction::Down.sign(), 1); // C++ +1 moves toward 100 (closed)
+    assert_eq!(Direction::Down.sign(), 1); // +1 moves toward 100 (closed)
 }
 
 #[test]
-fn shade_config_defaults_match_cpp() {
+fn shade_config_new_applies_default_travel_times() {
     let c = ShadeConfig::new("Kitchen", 0x1234).unwrap();
     assert_eq!(c.up_time_ms, 10_000); // Somfy.h:314
     assert_eq!(c.down_time_ms, 10_000); // Somfy.h:315
@@ -27,7 +29,7 @@ fn shade_config_defaults_match_cpp() {
 }
 
 #[test]
-fn address_plausibility_guard_matches_cpp() {
+fn address_plausibility_guard_rejects_sentinels() {
     // Somfy.cpp:169-170: address must be in 1..0xFFFFFF (exclusive of both sentinels)
     assert!(matches!(
         ShadeConfig::new("X", 0),
@@ -65,7 +67,7 @@ fn shade_kind_from_raw_rejects_unsupported_and_invalid() {
         assert_eq!(
             ShadeKind::from_raw(raw),
             None,
-            "unsupported C++ kind {raw:#x}"
+            "unsupported shade kind {raw:#x}"
         );
     }
     // Arbitrary invalid bytes.

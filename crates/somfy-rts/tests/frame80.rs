@@ -57,7 +57,7 @@ fn favorite_and_stop_flip_byte7_on_later_repeats() {
 /// Base-command tails: the fixed byte 8 / byte 9 high-nibble values each
 /// base command encodes.
 #[test]
-fn base_command_tails_match_cpp() {
+fn base_command_tails_are_fixed_per_command() {
     let cases = [
         (Command::Up, 32u8, 0x00u8),
         (Command::Down, 44, 0x80),

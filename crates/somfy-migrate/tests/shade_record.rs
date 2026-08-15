@@ -329,7 +329,7 @@ fn padded_v25_record() -> Vec<u8> {
 #[test]
 fn parses_real_fixed_width_record() {
     let bytes = padded_v25_record();
-    assert_eq!(bytes.len(), 276, "must equal C++ SHADE_REC_SIZE");
+    assert_eq!(bytes.len(), 276, "shade record must be exactly 276 bytes");
 
     let mut r = Reader::new(&bytes);
     let shade = parse_shade_record(&mut r, &header(25)).unwrap();

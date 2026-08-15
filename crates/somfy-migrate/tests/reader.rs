@@ -43,7 +43,7 @@ fn read_float_as_centi_integer() {
 }
 
 #[test]
-fn empty_numeric_field_defaults_to_zero_like_cpp() {
+fn empty_numeric_field_defaults_to_zero() {
     let mut r = Reader::new(b",5\n");
     assert_eq!(r.read_u8().unwrap(), 0);
     assert_eq!(r.read_u8().unwrap(), 5);
@@ -94,7 +94,7 @@ fn read_f32_truncates_beyond_two_fraction_digits() {
 }
 
 #[test]
-fn read_bool_matches_cpp_writebool_format() {
+fn read_bool_accepts_true_false_and_digit_forms() {
     // C++ writeBool emits "true"/"false" (ConfigFile.cpp:242), NOT "1"/"0" as
     // the brief claimed; readBool checks the first byte for t/T/1
     // (ConfigFile.cpp:282-288).
@@ -114,7 +114,7 @@ fn read_i8_handles_negative_values() {
 }
 
 #[test]
-fn unsigned_reads_wrap_like_cpp_static_cast() {
+fn unsigned_reads_wrap_via_truncating_cast() {
     // atoi("-1") = -1; static_cast<uint8_t>(-1) = 255. Rust `as u8` matches.
     let mut r = Reader::new(b"-1,300\n");
     assert_eq!(r.read_u8().unwrap(), 255);
@@ -122,7 +122,7 @@ fn unsigned_reads_wrap_like_cpp_static_cast() {
 }
 
 #[test]
-fn read_var_str_unquoted_absorbs_commas_like_cpp() {
+fn read_var_str_unquoted_includes_embedded_commas() {
     // DIVERGENCE FROM BRIEF: an unquoted readVarString does NOT stop at commas;
     // with quotes < 2 the comma is stored as content and the field ends only at
     // '\n'/EOF (ConfigFile.cpp:162-167, 168-169). Faithful port of the C++.
