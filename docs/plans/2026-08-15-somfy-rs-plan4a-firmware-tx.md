@@ -15,7 +15,8 @@
 - Every commit message: conventional commits (`feat:`, `test:`, `fix:`, `docs:`, `chore:`). **No attribution footers.**
 - `cargo test --workspace` at the repo root must stay green **without any ESP toolchain installed**. The `firmware` crate is excluded from the root workspace for exactly this reason.
 - `somfy-rts` must remain hardware-free: **no GPIO, timer, RMT, or radio type may appear in its API.** This is documented in its crate docs and is load-bearing — that is why RMT symbol packing lives in `somfy-rmt`, not in `somfy-rts`.
-- All C++-derived constants must cite their source line in a comment (`Somfy.cpp:NNN`). **Never invent C++ behaviour** — if the reference is unclear, read `/home/dhia/Sources/personal/ESPSomfy-RTS/src/Somfy.cpp` rather than guessing.
+- **Source comments must not reference the C++ reference implementation.** somfy-rs is an independent project; its code stands on its own. Comments explain *what the code does and why*, in this project's own terms — never "ported from X" or a `Somfy.cpp:NNN` citation.
+- **Never invent behaviour.** Deriving a constant or an algorithm still means reading the reference at `/home/dhia/Sources/personal/ESPSomfy-RTS/src/Somfy.cpp` rather than guessing — the prohibition is on *citing* it in code, not on *verifying against* it. Record the derivation in `docs/provenance.md` (one row: what was derived, from where, when verified), so the value stays auditable without the code advertising its ancestry.
 - Timing constants are already ported and validated against real hardware captures; **do not change `TIMINGS`**.
 - RMT tick resolution is **1 µs** (80 MHz source, `clk_divider = 80`). RMT length fields are **15 bits** (max 32767 ticks); `INTER_FRAME_GAP` is 27,434 µs and must fit.
 - RMT base clock **must be 80 MHz on ESP32 and ESP32-S2** (esp-hal constraint).
