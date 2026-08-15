@@ -1,14 +1,16 @@
 use crate::{Direction, Pos, TiltMode};
 
-/// C++ integrated-tilt sequencing rule (Somfy.cpp:1072): an integrated
-/// tilt motor must fully tilt open (0) before the shade lifts, and
-/// fully tilt closed (FULL) before it lowers.
+/// Integrated-tilt sequencing rule: when the tilt axis and lift axis share
+/// one motor (`TiltMode::Integrated`), the motor cannot move the lift axis
+/// until the tilt axis has finished traveling to the end matching the lift
+/// direction — fully open (0) before lifting up, fully closed (`FULL`)
+/// before lowering down. For every other tilt mode this gate does not
+/// apply.
 ///
-/// Ports the exact predicate:
-/// `tiltType == integrated && ((direction == -1 && currentTiltPos != 0) ||
-/// (direction == 1 && currentTiltPos != 100))`, where `direction == -1`
-/// is [`Direction::Up`] (toward open/0) and `direction == 1` is
-/// [`Direction::Down`] (toward closed/100), per Somfy.cpp:1071.
+/// The predicate: for `Integrated` mode only, moving up ([`Direction::Up`],
+/// toward open/0) is blocked while tilt isn't yet fully open, and moving
+/// down ([`Direction::Down`], toward closed/100) is blocked while tilt
+/// isn't yet fully closed. Idle lift direction never blocks.
 ///
 /// The tilt axis itself needs no new type: it is a [`crate::Motion`]
 /// driven with `tilt_time_ms` as both travel times.

@@ -1,21 +1,27 @@
 //! Slot-stable registry for shades, groups, and rooms.
 //!
-//! Port of the fixed-array containers in `SomfyShadeController` (Somfy.h:6-11):
-//! `SOMFY_MAX_SHADES` 32, `SOMFY_MAX_GROUPS` 16, `SOMFY_MAX_ROOMS` 16, and
-//! `SOMFY_MAX_GROUPED_SHADES` 32. The C++ addresses shades by their fixed array
-//! slot, so an id must stay valid when *other* entries are removed. We model the
-//! same contract with `heapless::Vec<Option<T>, N>`: a [`ShadeId`]/[`GroupId`]/
-//! [`RoomId`] is the slot index, a hole (`None`) is a removed entry, and a fresh
-//! add reuses the lowest free slot before growing.
+//! Fixed capacity — 32 shades, 16 groups, 16 rooms, and at most 32 shades
+//! per group — sized to match what a deployed configuration can contain, so
+//! any setup migrated from a real device always fits without truncation.
+//! Ids are stable slot indices, not just array positions: a shade/group/
+//! room must keep the same id even when *other* entries are removed, since
+//! ids are stored elsewhere (group membership, backups) and must not
+//! silently repoint at a different entry. We implement that contract with
+//! `heapless::Vec<Option<T>, N>`: a [`ShadeId`]/[`GroupId`]/[`RoomId`] is
+//! the slot index, a hole (`None`) is a removed entry, and a fresh add
+//! reuses the lowest free slot before growing.
 
 use crate::{DomainError, Shade, ShadeConfig};
 use heapless::{String, Vec};
 
-/// Max shades (Somfy.h:6, `SOMFY_MAX_SHADES`).
+/// Max shades a deployed configuration can contain, so a migrated setup
+/// always fits.
 pub const MAX_SHADES: usize = 32;
-/// Max groups (Somfy.h:7, `SOMFY_MAX_GROUPS`).
+/// Max groups a deployed configuration can contain, so a migrated setup
+/// always fits.
 pub const MAX_GROUPS: usize = 16;
-/// Max rooms (Somfy.h:10, `SOMFY_MAX_ROOMS`).
+/// Max rooms a deployed configuration can contain, so a migrated setup
+/// always fits.
 pub const MAX_ROOMS: usize = 16;
 
 /// Stable slot index of a shade in the registry.
@@ -30,7 +36,9 @@ pub struct RoomId(pub u8);
 
 struct Group {
     name: String<32>,
-    /// Group membership, bounded at `SOMFY_MAX_GROUPED_SHADES` = 32 (Somfy.h:9).
+    /// Group membership, bounded at 32 members — the most shades a
+    /// deployed group configuration can contain, so a migrated group
+    /// always fits.
     members: Vec<ShadeId, MAX_SHADES>,
 }
 
@@ -40,9 +48,9 @@ struct Room {
     members: Vec<ShadeId, MAX_SHADES>,
 }
 
-/// Slot-array registry: ids are stable slot indices, like the C++ fixed arrays
-/// in `SomfyShadeController` (Somfy.h). Removing an entry leaves a hole that the
-/// next add of the same kind reuses, so live ids never shift.
+/// Slot-array registry: ids are stable slot indices into fixed-capacity
+/// storage. Removing an entry leaves a hole that the next add of the same
+/// kind reuses, so live ids never shift.
 #[derive(Default)]
 pub struct Registry {
     shades: Vec<Option<Shade>, MAX_SHADES>,
@@ -106,7 +114,7 @@ impl Registry {
     }
 
     /// Route an RX frame to a shade: matches the shade's own OR any linked
-    /// remote address (`Shade::is_linked`, Somfy.cpp:2191-2199). Pure read.
+    /// remote address (`Shade::is_linked`). Pure read.
     pub fn shade_by_address(&self, addr: u32) -> Option<ShadeId> {
         self.shades
             .iter()
@@ -148,7 +156,7 @@ impl Registry {
 
     /// Add a shade to a group (idempotent). Returns [`DomainError::NotFound`]
     /// if the shade or group slot is empty, [`DomainError::RegistryFull`] if the
-    /// group already holds `SOMFY_MAX_GROUPED_SHADES` members.
+    /// group already holds its maximum of 32 members.
     pub fn group_add_shade(&mut self, g: GroupId, s: ShadeId) -> Result<(), DomainError> {
         if self.shade(s).is_none() {
             return Err(DomainError::NotFound);

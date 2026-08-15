@@ -1,13 +1,17 @@
 use crate::{Direction, Pos};
 
-/// One axis of dead-reckoned movement. Port of the position math in
-/// `SomfyShade::checkMovement` (Somfy.cpp:1052-1234): direction is derived
-/// from position vs target every tick; while moving, the position is
-/// `start_offset + elapsed` as a ratio of the direction's travel time.
+/// One axis of open-loop dead-reckoned movement. RTS is a one-way protocol
+/// and the motor never reports its position back, so there is no feedback
+/// to correct against — the only option is to estimate position by timing:
+/// direction is derived from position vs target every tick, and while
+/// moving, the position is `start_offset + elapsed` as a ratio of the
+/// direction's travel time.
 ///
-/// Integer-only: all math in `u64` ms and `u16` hundredths-of-percent
-/// (intentional deviation from the C++ float model — see crate docs).
-/// Sun/wind/dry-contact/tilt logic from the C++ is deliberately excluded.
+/// Integer-only: all math in `u64` ms and `u16` hundredths-of-percent — a
+/// deterministic integer replacement for the floating-point percentage
+/// model deployed controllers use (see crate docs). Sun/wind/dry-contact/
+/// tilt inputs are deliberately out of scope here; this estimator only
+/// tracks lift position over time.
 #[derive(Debug, Clone, Copy)]
 pub struct Motion {
     pos: Pos,
@@ -45,10 +49,10 @@ impl Motion {
         self.target
     }
 
-    /// Direction is recomputed from live position vs target every tick.
-    /// Mirrors Somfy.cpp:1071:
-    /// `pos == target ? 0 : pos > target ? -1 : 1` where -1 is toward open
-    /// ([`Direction::Up`]) and +1 is toward closed ([`Direction::Down`]).
+    /// Direction is recomputed from live position vs target every tick,
+    /// rather than stored as state: `pos == target` is idle, `pos > target`
+    /// is moving toward open ([`Direction::Up`]), `pos < target` is moving
+    /// toward closed ([`Direction::Down`]).
     pub fn direction(&self) -> Direction {
         use core::cmp::Ordering::*;
         match self.pos.cmp(&self.target) {
@@ -58,29 +62,30 @@ impl Motion {
         }
     }
 
-    /// Records where and when movement began, like the C++
-    /// `setTarget` + `setMovement` pair (Somfy.cpp:2754-2764: `moveStart`
-    /// and `startPos` are captured when a non-idle move starts). The tick
-    /// math integrates forward from this anchor.
+    /// Records where and when movement began: the start position and start
+    /// time are captured whenever a non-idle move begins. The tick math
+    /// integrates forward from this anchor.
     pub fn set_target(&mut self, target: Pos, now_ms: u64) {
         self.target = target;
         self.start_pos = self.pos;
         self.move_start_ms = now_ms;
     }
 
-    /// Freeze at the live computed position. Mirrors the C++ `My`/stop path
-    /// (Somfy.cpp:2437: `p_target(currentPos)`), where the target collapses
-    /// onto the continuously-updated live position so the next tick derives
-    /// [`Direction::Idle`] and stops. We advance to the live position first,
-    /// then pin `target`/`start_pos` to it.
+    /// Freeze at the live computed position. The target collapses onto the
+    /// continuously-updated live position, so the next tick derives
+    /// [`Direction::Idle`] and the estimator stops there — this is how a
+    /// stop command (`My`) is applied to an in-progress estimate. We
+    /// advance to the live position first, then pin `target`/`start_pos`
+    /// to it.
     pub fn halt(&mut self, now_ms: u64, up_time_ms: u32, down_time_ms: u32) {
         let s = self.tick(now_ms, up_time_ms, down_time_ms);
         self.target = s.pos;
         self.start_pos = s.pos;
     }
 
-    /// Advance the estimate. Port of the down branch (Somfy.cpp:1125-1182)
-    /// and the mirrored up branch (Somfy.cpp:1183-1234).
+    /// Advance the estimate for one tick, applying the direction-specific
+    /// integration formula below (downward and upward travel are
+    /// integrated from opposite ends, see the branches inline).
     pub fn tick(&mut self, now_ms: u64, up_time_ms: u32, down_time_ms: u32) -> MotionSnapshot {
         let dir = self.direction();
         // Resolve the moving direction to a single flag; [`Direction::Idle`]
@@ -103,25 +108,43 @@ impl Motion {
         let start_raw = self.start_pos.raw() as u64;
 
         let new_pos = if travel_ms == 0 {
-            // Zero travel time = instant jump (Somfy.cpp:1126-1129 / 1184-1186).
+            // Zero travel time means the motor has no known travel duration
+            // for this direction, so treat the move as an instant jump to
+            // the target rather than dividing by zero.
             self.target
         } else if going_down {
-            // Somfy.cpp:1136-1143: msFrom0 = floor(startPos/100 * downTime)
-            // + elapsed, clamped to downTime.
+            // Moving down: express the start position as how many ms of
+            // travel it represents from fully open (ms_from_0), add the ms
+            // elapsed since this move started, and clamp to the full
+            // travel time so the estimate never overruns. Converting that
+            // clamped ms value back to a position ratio gives the new
+            // position.
             let ms_from_0 = start_raw * travel_ms / FULL_RAW + elapsed;
             let ratio = ms_from_0.min(travel_ms) * FULL_RAW / travel_ms;
             Pos::from_raw(ratio as u16)
         } else {
-            // Somfy.cpp:1193-1201: msFrom100 = upTime
-            // - floor(startPos/100 * upTime) + elapsed, clamped to upTime.
-            // Faithful floor placement (see report deviation note).
+            // Moving up: mirror the down-branch math from the closed end.
+            // `consumed` is how many ms of up-travel it took to reach the
+            // start position starting from fully closed; subtracting that
+            // from the full travel time and adding elapsed gives the
+            // remaining up-travel ms, clamped to the travel time. The
+            // clamped value is a ratio measured from the closed end, so
+            // flipping it (FULL_RAW - ratio) converts it back to this
+            // crate's fully-open-relative position scale. The integer-
+            // division floor here is placed deliberately, not simplified
+            // to an equivalent-looking expression (see report deviation
+            // note for why the placement matters).
             let consumed = start_raw * travel_ms / FULL_RAW;
             let ms_from_100 = travel_ms - consumed + elapsed;
             let ratio = ms_from_100.min(travel_ms) * FULL_RAW / travel_ms;
             Pos::from_raw((FULL_RAW - ratio) as u16)
         };
 
-        // Snap to target on crossing (Somfy.cpp:1161-1162 down, 1212-1213 up).
+        // The per-tick integration can overshoot the target between one
+        // tick and the next (a discrete step landing past a continuous
+        // target), so snap to the target exactly on crossing rather than
+        // reporting the overshot value — this is what lets the caller
+        // detect arrival cleanly.
         let crossed = if going_down {
             new_pos >= self.target
         } else {

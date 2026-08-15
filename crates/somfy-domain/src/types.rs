@@ -1,9 +1,11 @@
 use heapless::String;
 
 /// Fixed-point shade position in hundredths of a percent.
-/// 0 = fully up/open, 10000 = fully closed. Deterministic integer
-/// replacement for the C++ float positions (Somfy.h:295, 0.0-100.0);
-/// intentional deviation documented in the crate docs.
+/// 0 = fully up/open, 10000 = fully closed. Deployed controllers track
+/// position as a 0.0-100.0 floating-point percentage; this crate uses a
+/// fixed-point integer instead so position math is deterministic and
+/// reproducible without depending on float behavior — an intentional
+/// deviation documented in the crate docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos(u16);
 
@@ -28,8 +30,9 @@ impl Pos {
     }
 }
 
-/// v1.0 shade kinds (spec §1.2). Discriminants mirror the C++
-/// shade_types enum (Somfy.h:56-74) for backup migration.
+/// v1.0 shade kinds (spec §1.2). Discriminants match the shade-type byte
+/// values used in deployed device backups, so a migrated backup's raw
+/// byte maps directly onto a [`ShadeKind`] without a translation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ShadeKind {
@@ -43,14 +46,16 @@ pub enum ShadeKind {
 }
 
 impl ShadeKind {
-    /// Map a raw C++ `shade_types` discriminant (Somfy.h:56-74) to a v1.0
+    /// Map a raw shade-type byte from a device backup to a v1.0
     /// [`ShadeKind`].
     ///
-    /// `None` = valid C++ kind not in the v1.0 subset OR invalid byte — Plan 6
-    /// policy: import such shades with kind defaulted to Roller and surface a
-    /// warning to the user (decision recorded in README contracts). The C++ kinds
-    /// not yet supported are garage `0x05`/`0x06`, drycontact `0x09`/`0x0A`, and
-    /// gate `0x0B`–`0x10`.
+    /// `None` covers two cases: a shade kind that deployed devices support
+    /// but v1.0 does not yet model, or a byte that is not a valid
+    /// shade-type value at all — Plan 6 policy: import such shades with
+    /// kind defaulted to Roller and surface a warning to the user (decision
+    /// recorded in README contracts). The kinds not yet supported are
+    /// garage `0x05`/`0x06`, drycontact `0x09`/`0x0A`, and gate
+    /// `0x0B`–`0x10`.
     pub fn from_raw(raw: u8) -> Option<ShadeKind> {
         match raw {
             0x00 => Some(ShadeKind::Roller),
@@ -65,7 +70,8 @@ impl ShadeKind {
     }
 }
 
-/// Tilt modes (Somfy.h:75-81).
+/// Tilt modes, matching the tilt-type byte values used in deployed device
+/// backups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TiltMode {
@@ -77,13 +83,13 @@ pub enum TiltMode {
 }
 
 impl TiltMode {
-    /// Map a raw C++ `tilt_types` discriminant (Somfy.h:75-81) to a [`TiltMode`].
+    /// Map a raw tilt-type byte from a device backup to a [`TiltMode`].
     ///
-    /// `None` = valid C++ kind not in the v1.0 subset OR invalid byte — Plan 6
-    /// policy: import such shades with kind defaulted to Roller and surface a
-    /// warning to the user (decision recorded in README contracts). Every C++
-    /// `tilt_types` value `0x00`–`0x04` is modeled, so only bytes outside that
-    /// range return `None`.
+    /// `None` = invalid byte — Plan 6 policy: import such shades with kind
+    /// defaulted to Roller and surface a warning to the user (decision
+    /// recorded in README contracts). Every tilt-type value `0x00`-`0x04`
+    /// used by deployed devices is modeled here, so only bytes outside
+    /// that range return `None`.
     pub fn from_raw(raw: u8) -> Option<TiltMode> {
         match raw {
             0x00 => Some(TiltMode::None),
@@ -96,8 +102,9 @@ impl TiltMode {
     }
 }
 
-/// Movement direction. Signs match the C++ ints: -1 toward 0 (open),
-/// +1 toward 100 (closed), 0 idle (Somfy.cpp:1071).
+/// Movement direction. Signs match the convention deployed firmware uses
+/// for its position-tracking integer: -1 toward 0 (open), +1 toward 100
+/// (closed), 0 idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Up,
@@ -135,12 +142,14 @@ pub struct ShadeConfig {
     /// [`Shade`](crate::Shade) command path treats all shades as lift-only and
     /// [`Shade::tilt_pos`](crate::Shade::tilt_pos) is always [`Pos::ZERO`].
     ///
-    /// The C++ branches each tilt type differently — `tiltonly` and `euromode`
-    /// long-press or redirect Up/Down onto the tilt axis (Somfy.cpp:2357,
-    /// :2894-2899), `tiltmotor`/`euromode` defer half a second to disambiguate a
-    /// tilt (Somfy.cpp:2364) — so wiring these up is a real behavior port, not a
-    /// config toggle. Plan 3's API MUST NOT surface tilt as functional until
-    /// that port lands, or it will advertise moves the domain does not make.
+    /// Each tilt mode needs genuinely different behavior to actually move a
+    /// tilt axis: `TiltOnly` and `EuroMode` redirect a long-pressed Up/Down
+    /// onto the tilt axis instead of the lift axis, while `TiltMotor` and
+    /// `EuroMode` need a half-second hold before a press resolves into a
+    /// tilt command, to disambiguate it from a lift command. So wiring
+    /// these up is a real behavior port, not a config toggle. Plan 3's API
+    /// MUST NOT surface tilt as functional until that port lands, or it
+    /// will advertise moves the domain does not make.
     pub tilt_mode: TiltMode,
     pub up_time_ms: u32,
     pub down_time_ms: u32,
@@ -148,9 +157,10 @@ pub struct ShadeConfig {
 }
 
 impl ShadeConfig {
-    /// Defaults mirror Somfy.h:314-316 (10s/10s travel, 7s tilt).
-    /// Address guard mirrors Somfy.cpp:169-170: 0 and 0xFFFFFF are
-    /// invalid sentinels.
+    /// Defaults: 10s up, 10s down, 7s tilt — the same factory defaults
+    /// deployed devices ship with, so a migrated setup behaves identically.
+    /// Address guard: 0 and 0xFFFFFF are invalid sentinel addresses used by
+    /// deployed devices to mean "unset", so they must be rejected here too.
     pub fn new(name: &str, address: u32) -> Result<ShadeConfig, DomainError> {
         if address == 0 || address >= 0xFF_FFFF {
             return Err(DomainError::InvalidAddress);
