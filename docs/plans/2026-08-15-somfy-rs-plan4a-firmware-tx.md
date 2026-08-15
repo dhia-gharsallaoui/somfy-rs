@@ -1228,7 +1228,7 @@ these are measured expectations, not guesses.
 pulse train is malformed beyond recognition, and transmitting at a motor will
 teach nothing.
 
-- [ ] **Step 4: Transmit at the motor**
+- [ ] **Step 3: Transmit at the motor**
 
 Target the office roller shade (address `1032469`).
 
@@ -1238,10 +1238,24 @@ transmission, which is the one outcome that teaches us nothing. `Up` from a clos
 shade is unambiguous. It also starts from a physical limit, meaning the motor's
 true position is known rather than dead-reckoned.
 
-**Start the rolling code safely ahead of the last value the motor accepted** — it
-accepted 56, and the C++ spare had reached 57, so begin at 60 or above. A code
-behind the motor's stored value is rejected as a replay and looks exactly like a
-broken transmitter, which would send debugging in the wrong direction entirely.
+**Start the rolling code safely ahead of the last value the motor accepted.** A
+code behind the motor's stored value is rejected as a replay and looks exactly
+like a broken transmitter, which would send debugging in the wrong direction
+entirely.
+
+**Read the current value immediately before transmitting — do not trust a number
+written down here.** The reference device keeps burning codes through normal use,
+so any figure in this document is stale the moment it is written:
+
+```bash
+curl -s 'http://<reference-device>:8081/shade?shadeId=1' | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["lastRollingCode"])'
+```
+
+The field is `lastRollingCode` (not `rollingCode`), and it appears only on the
+per-shade endpoint — the `/controller` shade list omits it entirely. Transmit at
+that value plus a small margin. As of 2026-08-15 it read **72**, so ≥ 73 — but
+re-read it rather than reusing 73.
 
 Failure here is cheap and recoverable: a malformed frame is ignored by the motor
 and costs one rolling code, and the motor has already demonstrated it re-syncs
