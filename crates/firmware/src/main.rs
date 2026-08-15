@@ -29,6 +29,13 @@ use radio::rmt_tx::{self, tx_channel_config, RmtTx, TxError};
 use somfy_cc1101::{Cc1101, Cc1101Error};
 use somfy_rts::{encode56, Command, FrameError, FrameKind, RollingCode};
 
+// Emits the ESP-IDF application descriptor into the image. The second-stage
+// bootloader expects it, and espflash refuses to write a binary that lacks one
+// — so without this line the firmware builds and links cleanly and then cannot
+// be put on a device at all. It contributes no runtime behaviour, which is
+// exactly why its absence is invisible until the moment you try to flash.
+esp_bootloader_esp_idf::esp_app_desc!();
+
 /// Not a paired shade. See the module docs.
 const BRING_UP_ADDRESS: u32 = 0x00C0DE;
 

@@ -29,6 +29,11 @@ embedded-hal = "1.0"
 # reset sequence holds chip select across a delay *inside* the SPI transaction,
 # and the no-delay constructor panics on exactly that.
 embedded-hal-bus = "0.3"
+# Supplies the `esp_app_desc!()` macro. Not optional in practice: the ESP-IDF
+# second-stage bootloader expects an application descriptor in the image, and
+# espflash 4.x refuses to flash a binary without one. Without this the firmware
+# compiles and links perfectly and simply cannot be put on a device.
+esp-bootloader-esp-idf = "0.5"
 somfy-rts = { path = "../somfy-rts" }
 somfy-rmt = { path = "../somfy-rmt" }
 somfy-cc1101 = { path = "../somfy-cc1101" }
@@ -40,10 +45,10 @@ somfy-cc1101 = { path = "../somfy-cc1101" }
 
 [features]
 default = []
-chip-esp32 = ["esp-hal/esp32", "esp-println/esp32"]
-chip-s2 = ["esp-hal/esp32s2", "esp-println/esp32s2"]
-chip-s3 = ["esp-hal/esp32s3", "esp-println/esp32s3"]
-chip-c3 = ["esp-hal/esp32c3", "esp-println/esp32c3"]
+chip-esp32 = ["esp-hal/esp32", "esp-println/esp32", "esp-bootloader-esp-idf/esp32"]
+chip-s2 = ["esp-hal/esp32s2", "esp-println/esp32s2", "esp-bootloader-esp-idf/esp32s2"]
+chip-s3 = ["esp-hal/esp32s3", "esp-println/esp32s3", "esp-bootloader-esp-idf/esp32s3"]
+chip-c3 = ["esp-hal/esp32c3", "esp-println/esp32c3", "esp-bootloader-esp-idf/esp32c3"]
 
 [profile.release]
 opt-level = "s"
