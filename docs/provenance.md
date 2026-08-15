@@ -103,7 +103,33 @@ prose name is what a reader actually searches for.
 
 ## somfy-migrate
 
-<!-- filled by the somfy-migrate cleanup pass -->
+**This crate is a documented exception: it names the reference implementation
+freely, in code, and that is correct.**
+
+Every other crate here implements the Somfy RTS protocol, which is a property of
+the motors — the reference implementation was a source of knowledge about it, not
+the subject. `somfy-migrate` is different in kind. Its entire purpose is to read a
+backup file **produced by** the C++ ESPSomfy-RTS firmware, so an existing
+installation can move to somfy-rs without re-pairing motors at the wall.
+
+There, the other codebase *is* the subject matter. A comment saying which routine
+wrote a given field is describing the input this parser must accept, not confessing
+an implementation history. Stripping those names would make the crate harder to
+maintain and would obscure the one thing a reader most needs to know: what produced
+the bytes.
+
+The rest of this document therefore does not attempt to catalogue this crate's
+derivations — the code itself is the record, and it is allowed to be explicit.
+
+Two things still hold here:
+
+- **Verification outranks derivation.** The parser was validated against a real
+  backup exported from a live device (format version 25), which parsed with zero
+  field misalignment and no skipped resyncs. That evidence is stronger than any
+  reading of the writer's source.
+- **Nothing else may follow this crate's convention.** If a future crate wants to
+  name the reference, it needs its own entry in
+  [Inline exceptions](#inline-exceptions), justified on its own terms.
 
 ## somfy-api
 
@@ -123,7 +149,11 @@ is not listed here should be removed.
 
 | Location | Why it must stay |
 |---|---|
-| _(none yet)_ | |
+| **`crates/somfy-migrate/**` (whole crate)** | The crate reads backup files *produced by* the C++ ESPSomfy-RTS firmware. That codebase is the subject matter, not a source of borrowed knowledge — naming the routine that wrote a field describes the input, and removing it would obscure the single most important fact about the data. Scoped to this crate only; see [somfy-migrate](#somfy-migrate). |
+
+No other exception has been needed. The four protocol/domain/API crates were
+cleaned with **zero** retained references: every citation there proved
+restatable in this project's own terms.
 
 ---
 
