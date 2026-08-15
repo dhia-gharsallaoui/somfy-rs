@@ -50,7 +50,11 @@ pub enum PackError {
 /// unmerged half-symbols wastes half the symbol budget and can overflow.
 ///
 /// An odd pulse count leaves the trailing half zero-length, which is RMT's
-/// end-of-transmission marker — the desired behaviour, not padding.
+/// end-of-transmission marker — the desired behaviour, not padding. An
+/// **even** pulse count fills every half of every symbol with real data, so
+/// `pack` emits no terminator at all in that case: the caller is responsible
+/// for appending a zero-length `RmtSymbol` (or otherwise signalling
+/// end-of-transmission) before handing the buffer to the RMT peripheral.
 pub fn pack(merged: &[Pulse], out: &mut Vec<RmtSymbol, MAX_SYMBOLS>) -> Result<(), PackError> {
     out.clear();
     let needed = merged.len().div_ceil(2);

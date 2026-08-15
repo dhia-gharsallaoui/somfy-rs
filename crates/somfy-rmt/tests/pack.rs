@@ -66,6 +66,10 @@ fn packs_two_pulses_per_symbol() {
 
 /// An odd pulse count leaves the second half of the last symbol empty. A
 /// zero-length entry is RMT's end marker, so this is exactly what we want.
+///
+/// The asymmetric case (not covered by this test): an *even* pulse count
+/// fills every symbol completely and `pack` emits no terminator at all — the
+/// caller must append one. See `pack`'s doc comment.
 #[test]
 fn odd_pulse_count_zero_pads_final_symbol() {
     let input = [
@@ -143,4 +147,17 @@ fn worst_case_80bit_payload_fits() {
     let mut out: Vec<RmtSymbol, MAX_SYMBOLS> = Vec::new();
     pack(&merged, &mut out).expect("worst-case 80-bit frame must fit MAX_SYMBOLS");
     assert!(out.len() <= MAX_SYMBOLS, "needed {}", out.len());
+    // Pinned exactly, not just bounded: this is a measurement, not a
+    // prediction, and it leaves only 2 symbols of headroom against
+    // MAX_SYMBOLS = 96 — the two-RMT-memory-block allocation this crate is
+    // sized for. That margin is a hardware design decision resting on this
+    // specific number, so a regression must fail loudly here rather than
+    // slide under the `<=` check above unnoticed. If a legitimate change to
+    // the frame or timing model moves this number, re-derive and re-pin it
+    // consciously — do not just bump the constant to make the test pass.
+    assert_eq!(
+        out.len(),
+        94,
+        "worst-case symbol count changed — re-derive deliberately, see comment above"
+    );
 }
