@@ -139,6 +139,42 @@ Two things still hold here:
 | `kind`/`tiltMode` reuse the numeric discriminants deployed devices already emit, rather than a string union | `somfy-api/src/entities.rs::ShadeDto` | the reference firmware's numeric `kind`/`tiltMode` wire fields (same discriminants recorded in the `somfy-domain` table above) | Verified by `somfy-api/tests/entities.rs::shade_dto_serializes_to_stable_json` and `somfy-api/tests/ts_export.rs::entities_use_camelcase_and_heapless_overrides` (asserts `kind`/`tiltMode` stay `number`, not a string union) |
 | `direction` reuses the same sign convention on the wire (-1 up, 0 idle, +1 down) | `somfy-api/src/entities.rs::ShadeDto`, `somfy-api/src/events.rs::ShadeStateEvent` | the reference firmware's direction sign convention on the wire (same convention recorded for `somfy_domain::Direction` above) | Verified by `somfy-api/tests/entities.rs::shade_dto_snapshots_live_state` / `shade_dto_serializes_to_stable_json` |
 
+## somfy-cc1101
+
+Two different kinds of source meet in this crate, and the distinction matters.
+
+The **target radio parameters** — what frequency, what modulation, what
+bandwidth — came from the known-working reference configuration. They are a
+statement about what the motors in the field are listening to, so they are
+derived knowledge in exactly the sense the rules above describe, and they are
+recorded here rather than in the source.
+
+The **register byte values** were then worked out independently from the CC1101
+datasheet formulas, and the arithmetic sits in the source next to each constant.
+The datasheet is a primary vendor document for a part this project uses, not a
+borrowed codebase, so naming it in a comment is not a reference-implementation
+citation and Rule 1 does not apply to it. `docs/provenance.md` remains the only
+place the *reference firmware* is named.
+
+Where the two disagree, the disagreement is recorded rather than smoothed over.
+Two values in this crate are **not derived at all**, and say so in their own doc
+comments as well as here.
+
+| Item | Where it lives now | Derived from | Verified |
+|---|---|---|---|
+| Target radio parameters: 433.42 MHz carrier, deviation 47.6 kHz, "rxBandwidth" 99.97 kHz, TX power 11, ASK/OOK, asynchronous serial, CRC off, sync mode 4, address check off | Realised as register values throughout `somfy-cc1101/src/config.rs` | the reference firmware's transceiver configuration block | Hardware-verified: read back off a live production ESP32-S3 unit currently controlling three shades (see "Hardware-verified values") |
+| `FREQ2`/`FREQ1`/`FREQ0` = 0x10/0xAB/0x85 | `somfy-cc1101/src/config.rs::FREQ` | Derived, not borrowed: datasheet `f_carrier = (f_xosc / 2^16) * FREQ` at 26 MHz, rounded to nearest | Arithmetic asserted at compile time (`ACHIEVED_CARRIER_HZ == 433_419_952`, 0.11 ppm low) and pinned byte-for-byte by `init_writes_the_ook_async_serial_register_set` |
+| `DEVIATN` = 0x47 (DEVIATION_E = 4, DEVIATION_M = 7) | `somfy-cc1101/src/config.rs::DEVIATN` | Derived: datasheet `f_dev = (f_xosc / 2^17) * (8 + M) * 2^E`; E = 4, M = 7 is the only pair inside the field widths | Compile-time assertion `ACHIEVED_DEVIATION_HZ == 47_607` (7.4 Hz over the 47.60 kHz target). Inert in ASK/OOK — the datasheet states the setting has no effect in this modulation — and written only so the radio's state is wholly deliberate |
+| `MDMCFG4` channel-bandwidth half = CHANBW_E 3, CHANBW_M 0 → **101.5625 kHz, not the 99.97 kHz requested** | `somfy-cc1101/src/config.rs::CHANBW_E` | Derived: datasheet `BW = f_xosc / (8 * (4 + M) * 2^E)`. The two 2-bit fields admit exactly 16 bandwidths at 26 MHz and 99.97 kHz is not one of them | Compile-time assertion `ACHIEVED_CHANBW_HZ == 101_562`. **Deliberate divergence:** the requested figure is unreachable on this part; 101.5625 kHz is 1.6% high, the next setting down (81.25 kHz) is 18.7% low. Not yet confirmed on air |
+| `MDMCFG4` data-rate half + `MDMCFG3` = DRATE_E 5, DRATE_M 248 → 1562.1 baud | `somfy-cc1101/src/config.rs::DRATE_E`, `DRATE_M` | **Not from the reference at all** — chosen by this project. The reference configuration specifies no data rate, and one must be picked because the field shares a register with the bandwidth. Derived from this repo's own hardware-verified 640 µs RTS half-symbol (1562.5 chips/s) | Compile-time assertion that the achieved rate is within 0.1% of one chip per half-symbol. Unused in asynchronous-serial TX, where the modulator follows the pin; it only shapes the receive path, so it is untested on air |
+| `MDMCFG2` = 0x34 (MOD_FORMAT 3 = ASK/OOK, SYNC_MODE 4, Manchester off) | `somfy-cc1101/src/config.rs::MDMCFG2` | Derived: field values read straight off the datasheet's `MDMCFG2` bit table for the requested modulation and sync mode | Compile-time assertion on the composed byte; pinned by `init_writes_the_ook_async_serial_register_set` |
+| `PKTCTRL0` = 0x32 (async serial, CRC off, infinite length), `PKTCTRL1` = 0x00 (address check off), `ADDR` = 0x00 | `somfy-cc1101/src/config.rs` | Derived from the datasheet bit tables. Note both `WHITE_DATA` and `CRC_EN` reset to 1, so these writes actively disable them rather than confirming a default | Compile-time assertion on `PKTCTRL0`; all three pinned by the register-set test |
+| `FREND0` = 0x11 (PA_POWER = 1) | `somfy-cc1101/src/config.rs::FREND0` | Derived: the datasheet requires OOK to take its logic-0 level from `PATABLE[0]` and its logic-1 level from `PATABLE[PA_POWER]`, so PA_POWER must be non-zero. The byte 0x11 itself appears nowhere in the datasheet; it is composed from the two field values | Compile-time assertion on the composed byte |
+| `PATABLE` = [0x00, 0xC0] — **not derived** | `somfy-cc1101/src/config.rs::PATABLE_OOK` | A datasheet **table lookup**, not a formula: the PA register is a group of bias and ramp fields with no published relation to output power. 0xC0 is the tabulated setting for +10 dBm at 433 MHz | **Known gap.** The reference configuration asks for TX power 11 and the datasheet's only 433 MHz table has no +11 dBm row — it runs −30, −20, −15, −10, 0, +5, +7, +10 and stops. 0xC0 is that table's maximum. A +11 dBm row with the same byte 0xC0 exists in a different table, for 868/915 MHz parts with wire-wound inductors, so 0xC0 is the answer under either reading — but the exact provenance of the number 11 is unresolved. Not yet confirmed against measured output power |
+| `MCSM0` = 0x14 (FS_AUTOCAL = 1) | `somfy-cc1101/src/config.rs::MCSM0` | **Added by this project; the reference configuration does not mention it.** The datasheet makes the `STX` strobe conditional on this field — from IDLE it "performs calibration first if MCSM0.FS_AUTOCAL = 1" — and the field resets to 0, "never". Without it a driver that parks in IDLE between frames transmits on an uncalibrated VCO while every register read still reports a healthy chip | Compile-time assertion on the composed byte. The failure it prevents has not been reproduced on hardware; it is a reading of the datasheet's strobe table, not an observed fault |
+| Post-reset settle delay of 1 ms, taken with chip select still asserted — **not derived** | `somfy-cc1101/src/config.rs::RESET_SETTLE_NS` | Nothing: the datasheet bounds `SRES` completion only by a handshake (the chip drives MISO low when ready) and publishes no time. That handshake is unobservable through `embedded_hal::spi::SpiDevice`, which owns the chip-select line | **Margin choice, not a measurement.** Over an order of magnitude beyond the longest oscillator-settling figure the datasheet quotes anywhere (~600 µs), and paid once per boot. Not validated on hardware |
+| Accepted `VERSION` values {0x04, 0x14} | `somfy-cc1101/src/config.rs::KNOWN_VERSIONS` | Derived: 0x14 is the current datasheet reset value; 0x04 is what the datasheet published before revision I, for older silicon | Exercised by `init_accepts_every_known_silicon_version` and `init_rejects_an_unexpected_version`. **Trade-off recorded:** the datasheet annotates `VERSION` "subject to change without notice", so genuine future silicon could be rejected. An allowlist was chosen over a "not 0x00 or 0xFF" denylist because a miswired bus returning a plausible byte would otherwise pass as a working radio |
+
 ## firmware
 
 | Item | Where it lives now | Derived from | Verified |
@@ -175,3 +211,4 @@ Values confirmed against real hardware, which outrank any derivation:
 | ESP32-S3 CC1101 pin map (SCK=12, MOSI=11, MISO=13, CSN=10, GDO0_TX=3, GDO2_RX=4) | Read directly off a running production ESP32-S3 board's wiring | 2026-08-15 |
 | Wake-up pulse ≈ 10.9 ms HIGH | First pulse of a real capture measured 10229 µs | 2026-08-15 |
 | Backup file format and record layout | Parsed a real v25 device backup with zero field misalignment | 2026-08-15 |
+| Target radio configuration: 433.42 MHz, deviation 47.6, rxBandwidth 99.97, txPower 11, 56-bit frames | Read off a live production ESP32-S3 + CC1101 unit then controlling three shades, reporting `radioInit: true` | 2026-08-15 |
