@@ -1,5 +1,5 @@
-/// Somfy commands. Discriminants mirror ESPSomfy-RTS src/Somfy.h:31-52.
-/// Values > 0xF are "extended" commands that require 80-bit frames.
+/// Somfy commands, matching the discriminants used on the wire by real
+/// remotes. Values > 0xF are "extended" commands that require 80-bit frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Command {
@@ -37,10 +37,10 @@ impl Command {
     }
 
     /// Map a full command byte back to a `Command`. Accepts both the base
-    /// nibble values (0x1..=0xF) and the three extended 80-bit values
-    /// (`Somfy.h:49-51`). Unlike [`Command::from_nibble`] this does NOT mask to
-    /// four bits, so `decode80` can reconstruct e.g. `0x8B` -> `StepUp` without
-    /// it collapsing to `StepDown`.
+    /// nibble values (0x1..=0xF) and the three extended 80-bit values.
+    /// Unlike [`Command::from_nibble`] this does NOT mask to four bits, so
+    /// `decode80` can reconstruct e.g. `0x8B` -> `StepUp` without it
+    /// collapsing to `StepDown`.
     pub fn from_u8(v: u8) -> Option<Command> {
         Some(match v {
             0x1 => Command::My,

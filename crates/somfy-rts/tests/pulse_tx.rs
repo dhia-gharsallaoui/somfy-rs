@@ -60,13 +60,13 @@ fn frame_ends_with_inter_frame_gap() {
 
 /// Pin the exact TIMINGS literals so a silent regression to internet "folklore"
 /// values can never pass the suite. These are the authoritative TX-side numbers
-/// from the C++ reference `ESPSomfy-RTS/src/Somfy.cpp` (`sendFrame`,
-/// Somfy.cpp:4311-4383, with `#define SYMBOL 640` at Somfy.cpp:23).
+/// a real transmitter emits, cross-checked against hardware captures (see
+/// `docs/provenance.md`).
 ///
-/// Do NOT "correct" these from the widely-cited folklore values
+/// Do NOT "correct" these to the widely-cited folklore values
 /// (604 / 9415 / 89565 / 4550 / 30415): those are RX-detection tolerances or
-/// stale earlier drafts and do NOT belong on the TX path. See the per-constant
-/// source-line rationale in `pulse.rs`.
+/// stale earlier drafts and do NOT belong on the TX path. See the
+/// per-constant rationale in `pulse.rs`.
 #[test]
 fn timings_literals_are_pinned_to_cpp() {
     assert_eq!(TIMINGS::WAKEUP_HIGH, 10_920);

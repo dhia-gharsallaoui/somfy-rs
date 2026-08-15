@@ -8,8 +8,8 @@ fn tx_pulses(f: &Frame, kind: FrameKind) -> Vec<Pulse, 320> {
 }
 
 /// Collapse adjacent same-level pulses into single summed-duration pulses —
-/// the edge-to-edge form an interrupt-driven receiver (and the C++ firmware's
-/// `rx.pulses[]` captures) actually produces.
+/// the edge-to-edge form an interrupt-driven receiver actually produces when
+/// it captures pulse durations.
 fn merge_pulses(pulses: &[Pulse]) -> Vec<Pulse, 320> {
     let mut out: Vec<Pulse, 320> = Vec::new();
     for p in pulses {
@@ -104,8 +104,8 @@ fn noise_before_frame_is_ignored() {
 }
 
 /// Real hardware measures edge-to-edge durations, so consecutive same-level
-/// half-symbols arrive merged into ~1280us segments (this is the shape of the
-/// C++ firmware's `rx.pulses[]` captures). The decoder must accept that
+/// half-symbols arrive merged into ~1280us segments — this is the shape a
+/// real interrupt-driven capture produces. The decoder must accept that
 /// stream, not just the unmerged synthetic one.
 #[test]
 fn merged_edge_to_edge_stream_decodes() {

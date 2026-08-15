@@ -13,52 +13,53 @@ pub enum FrameKind {
     Repeat,
 }
 
-/// Timing constants in µs, ported verbatim from the TX path of the C++
-/// reference `ESPSomfy-RTS/src/Somfy.cpp` (`Transceiver::sendFrame`). The
-/// widely-cited "folklore" values (9415 / 89565 / 4550 / 604 / 30415) do NOT
-/// match what this transmitter actually emits — the authoritative TX values
-/// are used here, each with its source line.
+/// Timing constants in µs used by the transmit path. Widely-cited "folklore"
+/// values for this protocol (9415 / 89565 / 4550 / 604 / 30415) circulate
+/// online but do NOT match what a real transmitter emits — the values below
+/// are the ones actually produced when a frame is sent, and the wake-up and
+/// sync counts have been cross-checked against real hardware captures (see
+/// `docs/provenance.md`).
 #[allow(non_snake_case)]
 pub mod TIMINGS {
-    /// Wake-up pulse HIGH. Somfy.cpp:4321 `delayMicroseconds(10920)`.
-    /// (The online 9415 value is only an RX-detection reference, Somfy.cpp:4221.)
+    /// Wake-up pulse HIGH, 10920µs. The commonly cited 9415µs figure is only
+    /// a receiver-side detection threshold, not the duration a transmitter
+    /// actually holds the line high for.
     pub const WAKEUP_HIGH: u32 = 10_920;
-    /// Silence after wake-up pulse. Somfy.cpp:4328 `delayMicroseconds(7357)`.
-    /// (Folklore 89565 is only an RX tolerance reference, Somfy.cpp:4224.)
+    /// Silence after the wake-up pulse, 7357µs. The commonly cited 89565µs
+    /// figure is only a receiver-side tolerance window, not the silence a
+    /// transmitter actually produces.
     pub const WAKEUP_LOW: u32 = 7357;
-    /// Hardware sync half. Somfy.cpp:4337/4339 `delayMicroseconds(4 * SYMBOL)`
-    /// with `#define SYMBOL 640` (Somfy.cpp:23) -> 4 * 640 = 2560.
+    /// Hardware sync half-pulse, 2560µs — four half-symbol widths
+    /// (4 * 640µs).
     pub const HW_SYNC_HALF: u32 = 2560;
-    /// Software sync HIGH. Somfy.cpp:4344 `delayMicroseconds(4850)`
-    /// (the commented-out 4450/4550 were earlier timings, Somfy.cpp:4343).
+    /// Software sync HIGH pulse, 4850µs. Earlier firmware revisions used
+    /// 4450/4550µs for this pulse; 4850µs is the value a current transmitter
+    /// emits.
     pub const SW_SYNC_HIGH: u32 = 4850;
-    /// Manchester half-symbol. `#define SYMBOL 640` (Somfy.cpp:23), emitted at
-    /// Somfy.cpp:4347/4354/4356/4360/4362.
+    /// Manchester half-symbol width, 640µs — the base unit each encoded bit
+    /// is built from.
     pub const HALF_SYMBOL: u32 = 640;
-    /// Inter-frame silence (56-bit). Somfy.cpp:4380-4381 emits two
-    /// `delayMicroseconds(13717)` calls (split because the API caps at 16383),
-    /// so 13717 + 13717 = 27434. (The named `tempo_if_gap = 30415` at
-    /// Somfy.cpp:4235 is defined but never referenced in the TX path.)
+    /// Inter-frame silence for 56-bit frames, 27434µs. Produced as two
+    /// consecutive 13717µs delays rather than one, because a single delay
+    /// call is capped below that range. A commonly cited 30415µs figure
+    /// exists for this gap but is not what gets emitted in practice.
     pub const INTER_FRAME_GAP: u32 = 27_434;
 }
 
 /// Render an encoded frame to OOK pulses. The frame size selects the protocol:
 /// 7 bytes = 56-bit, 10 bytes = 80-bit.
 ///
-/// Manchester polarity verified against Somfy.cpp:4351-4364: bit `1` = low
-/// half then high half, bit `0` = high half then low half, bits sent MSB-first
-/// (`frame[i/8] >> (7 - i%8)`, Somfy.cpp:4352).
+/// Manchester polarity: bit `1` = low half then high half, bit `0` = high
+/// half then low half, bits sent MSB-first.
 ///
-/// Sync counts and the trailing gap are byte-length driven, mirroring the C++
-/// callers and transmitter:
-/// - **56-bit**: first frame = wake-up + 2 hardware syncs, repeat = 7 syncs
-///   (Somfy.cpp:4000/4004/4014/4019); every frame ends with the inter-frame
-///   gap.
-/// - **80-bit**: first frame = wake-up + 12 hardware syncs, repeat = 6 syncs
-///   (same callers, `bitLength == 80` arm); the inter-frame gap is **suppressed**
-///   (`if(bitLength != 80)`, Somfy.cpp:4379). The wake-up still fires on the
-///   first frame because `sendFrame` triggers it for `sync == 2 || sync == 12`
-///   (Somfy.cpp:4314).
+/// Sync counts and the trailing gap are byte-length driven:
+/// - **56-bit**: first frame = wake-up + 2 hardware syncs, repeat = 7 syncs;
+///   every frame ends with the inter-frame gap. Hardware-verified: a captured
+///   first frame reported 2 hardware syncs and a captured repeat reported 7
+///   (see `docs/provenance.md`).
+/// - **80-bit**: first frame = wake-up + 12 hardware syncs, repeat = 6 syncs;
+///   the inter-frame gap is **suppressed** for this protocol. The wake-up
+///   still fires on the first frame regardless of which sync count applies.
 ///
 /// Adjacent same-level half-symbols are intentionally NOT merged here; that is
 /// the concern of a later RMT-encoding layer.
@@ -128,8 +129,7 @@ pub fn render_pulses(bytes: &[u8], kind: FrameKind, out: &mut Vec<Pulse, 320>) {
             .unwrap();
         }
     }
-    // Inter-frame silence for 56-bit only; suppressed for 80-bit
-    // (Somfy.cpp:4379).
+    // Inter-frame silence for 56-bit only; suppressed for 80-bit.
     if !is_80 {
         out.push(Pulse {
             high: false,

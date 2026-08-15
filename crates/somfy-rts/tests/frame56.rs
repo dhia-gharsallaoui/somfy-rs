@@ -58,8 +58,9 @@ fn checksum_nibbles_xor_to_zero_before_obfuscation() {
 fn corrupted_frame_rejected() {
     // The RTS obfuscation is a cumulative forward XOR, so flipping any interior
     // obfuscated byte propagates the delta into two adjacent clear bytes; their
-    // nibble-XOR contributions cancel and the checksum stays valid (this matches
-    // the C++ reference, which would also accept such a frame). The only single
+    // nibble-XOR contributions cancel and the checksum stays valid. This is an
+    // inherent weakness of the checksum scheme itself, not a decoding bug — any
+    // correct decoder would also accept such a corrupted frame. The only single
     // byte whose corruption the nibble-XOR checksum can catch is the last one,
     // and only for a delta with nonzero nibble parity (0xFF cancels; 0x10 does not).
     let mut bytes = encode56(&sample()).unwrap();
@@ -69,7 +70,7 @@ fn corrupted_frame_rejected() {
 
 #[test]
 fn command_nibble_mapping_matches_cpp_enum() {
-    // Values from ESPSomfy-RTS src/Somfy.h:31-52
+    // Command nibble values as defined by the RTS protocol's command encoding.
     assert_eq!(Command::My.nibble(), 0x1);
     assert_eq!(Command::Up.nibble(), 0x2);
     assert_eq!(Command::Down.nibble(), 0x4);

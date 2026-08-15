@@ -12,21 +12,20 @@ fn frame(command: Command) -> Frame {
     }
 }
 
-/// Test-only reversal of the forward-XOR obfuscation over bytes 1-6 (mirrors
-/// `obfuscate`, Somfy.cpp:433-435), so tests can assert on raw wire bytes.
-/// Bytes 7-9 are never obfuscated in the first place (Somfy.cpp:130) — this
-/// only matters for bytes 0-6 — but it's applied to the whole buffer to
-/// mirror production code exactly. Kept local to this test file rather than
-/// exposed from the crate: the public API must not grow for test
-/// convenience.
+/// Test-only reversal of the forward-XOR chain obfuscation applied to bytes
+/// 1-6, so tests can assert on raw wire bytes. Bytes 7-9 are never obfuscated
+/// in the first place — this only matters for bytes 0-6 — but it walks the
+/// whole buffer to mirror the production encode/decode symmetry exactly.
+/// Kept local to this test file rather than exposed from the crate: the
+/// public API must not grow for test convenience.
 fn deobfuscate_for_test(b: &mut [u8; 10]) {
     for i in (1..7).rev() {
         b[i] ^= b[i - 1];
     }
 }
 
-/// `encode80Byte7(196, repeat)` = `196 + 4*repeat`, cycling by -15 whenever
-/// the sum would exceed 255 (Somfy.cpp:259-262).
+/// Byte 7 progresses as `196 + 4*repeat`, wrapping by -15 whenever the sum
+/// would exceed 255.
 #[test]
 fn byte7_progresses_by_four_per_repeat_and_wraps_at_15() {
     let b7 = |r: u8| {
@@ -42,7 +41,7 @@ fn byte7_progresses_by_four_per_repeat_and_wraps_at_15() {
     assert_eq!(b7(16), 200);
 }
 
-/// Favorite and Stop flip 196 -> 132 on any repeat > 0 (Somfy.cpp:284, 291).
+/// Favorite and Stop flip byte 7 from 196 to 132 on any repeat > 0.
 #[test]
 fn favorite_and_stop_flip_byte7_on_later_repeats() {
     for cmd in [Command::Favorite, Command::Stop] {
@@ -55,7 +54,8 @@ fn favorite_and_stop_flip_byte7_on_later_repeats() {
     }
 }
 
-/// Base-command tails, verbatim from Somfy.cpp:304-326.
+/// Base-command tails: the fixed byte 8 / byte 9 high-nibble values each
+/// base command encodes.
 #[test]
 fn base_command_tails_match_cpp() {
     let cases = [
@@ -128,9 +128,9 @@ fn rx_decoder_recognizes_80_bit_frames() {
 }
 
 /// The pulse layer must key its sync counts and gap emission off frame size:
-/// per Somfy.cpp:4000/4004/4014/4019 an 80-bit frame sends 12 hardware syncs on
-/// the first frame and 6 on repeats (vs 2 / 7 for 56-bit), and Somfy.cpp:4379
-/// suppresses the inter-frame gap entirely for `bitLength == 80`.
+/// an 80-bit frame sends 12 hardware syncs on the first frame and 6 on
+/// repeats (vs 2 / 7 for 56-bit), and the inter-frame gap is suppressed
+/// entirely for 80-bit frames.
 #[test]
 fn pulse_layer_uses_80_bit_sync_counts_and_no_gap() {
     let f = Frame {

@@ -5,17 +5,16 @@ use crate::{Command, Frame};
 /// persist the incremented value BEFORE transmitting the frame (design-doc
 /// invariant "persist before TX", docs/specs/2026-07-15-rust-rewrite-design.md §4).
 ///
-/// The *wire sequence* matches ESPSomfy-RTS `SomfyRemote::sendCommand`
-/// (src/Somfy.cpp:3934-3946): the key byte is `0xA0 | (code & 0x0F)` derived
-/// from the same rolling code placed in the frame, and each successive
-/// transmission uses `code + 1`. The *storage semantics* differ, however:
-/// the C++ firmware persists the LAST-SENT code (`lastRollingCode`), while
+/// The wire sequence real remotes use: the key byte is `0xA0 | (code & 0x0F)`
+/// derived from the same rolling code placed in the frame, and each
+/// successive transmission uses `code + 1`. Storage semantics can differ
+/// across implementations, however: some persist the LAST-SENT code, while
 /// `RollingCode` holds the NEXT-TO-SEND value.
 ///
-/// # Migrating from a C++ ESPSomfy-RTS backup / NVS value
+/// # Migrating a last-sent-style stored value
 ///
-/// Because of that off-by-one, anyone importing a stored C++ code must
-/// initialize with
+/// Because of that off-by-one, anyone importing a rolling code that was
+/// stored as last-sent must initialize with
 /// `RollingCode(stored_last_sent.wrapping_add(1))`,
 /// never `RollingCode(stored_last_sent)` — otherwise the first transmitted
 /// frame replays the last-sent code and desyncs the motor.

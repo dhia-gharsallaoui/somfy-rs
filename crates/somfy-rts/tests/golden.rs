@@ -1,5 +1,5 @@
-//! Golden capture tests: decode real (and one synthetic) pulse streams the way
-//! the C++ reference firmware records them.
+//! Golden capture tests: decode real (and one synthetic) pulse streams in the
+//! edge-to-edge form a physical receiver actually produces.
 //!
 //! The three `up`/`down`/`my` tests run against real captures taken from a
 //! physical Somfy wall remote on 2026-08-15 (see `tests/fixtures/README.md`).
@@ -15,10 +15,10 @@ use somfy_rts::{
     decode56, encode56, merge_pulses, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder,
 };
 
-/// Glitch threshold. C++ `bitMin = SYMBOL * TOLERANCE_MIN = 640 * 0.7 = 448`
-/// (`Somfy.cpp:4238`); the ISR logs shorter segments into `rx.pulses[]` but
-/// never advances `last_time` for them (`Somfy.cpp:4388-4395`), so the loader
-/// drops them without merging their duration into the next pulse.
+/// Glitch threshold: `HALF_SYMBOL * 0.7 = 640 * 0.7 = 448`. Sub-threshold
+/// pulses are logged by the capture ISR but never advance its edge clock, so
+/// the loader must drop them outright rather than merge their duration into
+/// the next pulse.
 const GLITCH_MIN_US: u32 = 448;
 
 /// Parse a `.pulses` file body into levelled [`Pulse`]s.

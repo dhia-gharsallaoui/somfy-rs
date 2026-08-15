@@ -16,15 +16,15 @@
 //!   checksum. [`Frame`] is the shared model; [`Command`] covers the RTS
 //!   command set (Up/Down/My plus the 80-bit StepUp/StepDown/Favorite/Stop
 //!   extensions).
-//! - **Rolling codes** — [`RollingCode`] mirrors the C++ increment-on-send wire
-//!   sequence. Storage is *next-to-send* (the C++ persists *last-sent*), so
-//!   migrated values need a `+1`; the caller must persist before transmitting
-//!   (see [`RollingCode`] docs).
+//! - **Rolling codes** — [`RollingCode`] implements the increment-on-send wire
+//!   sequence the protocol requires. Storage here is *next-to-send*; some
+//!   migrated backups instead persist *last-sent*, so migrated values need a
+//!   `+1` before use; the caller must persist before transmitting (see
+//!   [`RollingCode`] docs).
 //! - **TX** — [`render_pulses`] turns a frame into an OOK pulse train (wake-up,
-//!   hardware/software sync, 640µs Manchester half-symbols (`SYMBOL`,
-//!   Somfy.cpp:23), inter-frame gap, reduced-sync repeats). Timing constants
-//!   live in [`TIMINGS`], ported verbatim from the C++ transmitter with
-//!   per-constant source lines.
+//!   hardware/software sync, 640µs Manchester half-symbols, inter-frame gap,
+//!   reduced-sync repeats). Timing constants live in [`TIMINGS`]; see its docs
+//!   and `docs/provenance.md` for how each value was derived and verified.
 //! - **RX** — [`RxDecoder`] is a single level-aware state machine that decodes
 //!   **both** pulse representations: merged edge-to-edge streams (what real
 //!   `CHANGE`-interrupt hardware and the firmware's `rx.pulses[]` captures
@@ -38,12 +38,10 @@
 //!
 //! The suite runs entirely on the host: software TX/RX loopback, per-layer unit
 //! tests, and property tests. Golden fixtures under `tests/fixtures/` pin the
-//! engine against pulses the reference C++ firmware actually produced; a
+//! engine against pulses actually captured from real transmissions; a
 //! checked-in *synthetic* capture exercises the loader on every CI run, while
 //! the real-device captures (and their three `#[ignore]`d tests) are pending one
 //! capture session on a running device — see `tests/fixtures/README.md`.
-//!
-//! Reference implementation: ESPSomfy-RTS (C++ / Arduino).
 
 #![cfg_attr(not(test), no_std)]
 
