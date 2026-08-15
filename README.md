@@ -53,12 +53,12 @@ policy-free:
   Somfy.cpp:2944) is a product decision the domain layer makes explicitly. Plan
   2 also owns the C++ address / rolling-code plausibility guards
   (Somfy.cpp:169-170), which `somfy-rts` does not enforce.
-- **Plan 4 (firmware TX)** requires `encode80` to grow a `repeat` parameter
-  before transmitting extended *or* base commands as 80-bit on hardware: the C++
-  reference re-encodes byte 7 per repeat (`196 + 4*repeat`, with Favorite/Stop
-  flipping `196→132` on later repeats). Today's repeat-less `encode80` emits only
-  the first-frame form (C++-exact for extended commands; a placeholder tail for
-  base commands — see `frame.rs`).
+- **Plan 4 (firmware TX)** — **discharged 2026-08-15.** `encode80` now takes a
+  `repeat` parameter and re-encodes byte 7 per repeat exactly like the C++
+  reference (`196 + 4*repeat`, cycling by -15 past 255; Favorite/Stop flip
+  `196→132` on any repeat > 0), for both extended and base commands — see
+  `encode80_byte7`/`encode80_tail` in `frame.rs`. A transmitter MUST call
+  `encode80` once per frame sent with the matching repeat index.
 - **Plans 5 & 7 (network + UI)** consume the `somfy-api` DTOs as the single wire
   contract. The `ts-rs`-generated TypeScript in `ui/src/api/generated/` is the
   UI's source of truth; regenerate it (build with `--features ts`) whenever a DTO

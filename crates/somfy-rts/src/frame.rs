@@ -87,35 +87,8 @@ pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
 ///
 /// Bytes 7-9 are the extended payload from `encode80BitFrame`
 /// (Somfy.cpp:263-331) and are transmitted **un-obfuscated** ("the last 3 bytes
-/// are not encoded even on 80-bits", Somfy.cpp:130). Per command (this crate
-/// emits the first-frame / `repeat == 0` form):
-///
-/// | cmd            | `[7]`      | `[8]`                    | `[9]` (hi nibble) |
-/// |----------------|------------|--------------------------|-------------------|
-/// | StepUp (0x8B)  | 132 (0x84) | `((step&0x70)>>4)|0x38`   | `(step&0x0F)<<4`  |
-/// | Favorite(0xC1) | 196 (0xC4) | 44 (0x2C)                | 0x9_             |
-/// | Stop   (0xF1)  | 196 (0xC4) | 47 (0x2F)                | 0xF_             |
-/// | base cmds      | 132 (0x84) | 0                        | 0x1_ (placeholder)|
-///
-/// **Caveats.**
-/// - The three EXTENDED rows (`StepUp`/`Favorite`/`Stop`) are C++-exact for
-///   **first frames** (`repeat == 0`).
-/// - **The `base cmds` row is a PLACEHOLDER, not the C++ wire bytes.** This
-///   crate emits `[7]=132, [8]=0, [9] hi=0x1` for every base command so it
-///   round-trips through [`decode80`]; the reference firmware instead gives
-///   Up/Down/Toggle/etc. distinct tails and uses `[7]=196` as its My-family
-///   default (Somfy.cpp:322-325).
-/// - **No per-repeat progression.** C++ re-encodes byte 7 each repeat
-///   (`196 + 4*repeat`, with Favorite/Stop flipping `196->132` on later
-///   repeats). This repeat-less API cannot express that: `encode80` must grow a
-///   `repeat` parameter before hardware TX of these frames (Plan 4 contract).
-///
-/// StepUp defaults `step` to 1 (Somfy.cpp:268) -> `[8]=0x38, [9]=0x10`. The
-/// selector recovered at decode is: for base `My (0x1)`,
-/// `cmd = 0x1 | ((decoded[8] & 0x0F) << 4)` (Somfy.cpp:177; `0x0`=My,
-/// `0xC`=Favorite, `0xF`=Stop); for base `StepDown (0xB)`,
-/// `cmd = 0xB | ((decoded[8] & 0x08) << 4)` — bit `0x08` of `[8]` is what tells
-/// StepUp (`0x38`) from StepDown (`0x30`) (Somfy.cpp:179).
+/// are not encoded even on 80-bits", Somfy.cpp:130). See [`encode80_tail`] for
+/// the exact per-command byte map.
 ///
 /// Two checksums, both computed after the tail is filled:
 /// - `[1]` low nibble: the 56-bit nibble checksum over bytes 0-6 only
@@ -125,7 +98,14 @@ pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
 ///
 /// Finally the forward-XOR obfuscation is applied to bytes 1-6 only
 /// (`i in 1..7`, Somfy.cpp:433-435); bytes 7-9 stay raw.
-pub fn encode80(f: &Frame) -> [u8; 10] {
+///
+/// # Repeats
+///
+/// Encode an 80-bit frame for a given `repeat` index (0 = first frame). The
+/// reference re-encodes the tail per repeat, so a transmitter MUST call this
+/// once per frame it sends with the matching index — see `encode80BitFrame`
+/// (Somfy.cpp:263-331).
+pub fn encode80(f: &Frame, repeat: u8) -> [u8; 10] {
     let mut b = [0u8; 10];
     b[0] = f.key;
     b[1] = f.command.nibble() << 4;
@@ -134,7 +114,7 @@ pub fn encode80(f: &Frame) -> [u8; 10] {
     b[4] = (f.address >> 16) as u8;
     b[5] = (f.address >> 8) as u8;
     b[6] = f.address as u8;
-    encode80_tail(&mut b, f.command);
+    encode80_tail(&mut b, f.command, repeat);
 
     b[1] |= checksum(&b[..7]);
     obfuscate(&mut b);
@@ -168,41 +148,85 @@ pub fn decode80(bytes: &[u8; 10]) -> Result<Frame, FrameError> {
     })
 }
 
-/// Fill the un-obfuscated tail bytes 7-9 and their `calc80Checksum`
-/// (`encode80BitFrame`, Somfy.cpp:263-331). See [`encode80`] for the map.
-fn encode80_tail(b: &mut [u8; 10], cmd: Command) {
+/// Byte 7 progression across repeats (`encode80Byte7`, Somfy.cpp:259-262):
+///
+/// ```c
+/// while((repeat * 4) + start > 255) repeat -= 15;
+/// return start + (repeat * 4);
+/// ```
+///
+/// The subtraction cycles the sequence with period 15 rather than saturating.
+fn encode80_byte7(start: u8, repeat: u8) -> u8 {
+    let mut r = repeat as i32;
+    let s = start as i32;
+    while (r * 4) + s > 255 {
+        r -= 15;
+    }
+    (s + r * 4) as u8
+}
+
+/// Fill un-obfuscated tail bytes 7-9 plus the `calc80Checksum` low nibble of
+/// byte 9, verbatim from `encode80BitFrame` (Somfy.cpp:263-331).
+///
+/// `stepSize` is fixed at 1 here: the C++ defaults it to 1 when unset
+/// (Somfy.cpp:268, 276) and this crate has no step-size field. Callers needing
+/// a non-default step must extend `Frame` first.
+fn encode80_tail(b: &mut [u8; 10], cmd: Command, repeat: u8) {
+    const STEP_SIZE: u8 = 1;
     match cmd {
+        // Somfy.cpp:266-273. Byte 1 high nibble is rewritten to StepDown on the
+        // first frame only; decode80 reverses this via the byte-8 selector.
         Command::StepUp => {
-            // stepSize defaults to 1 (Somfy.cpp:268): [8]=0x38, [9] hi=0x10.
+            if repeat == 0 {
+                b[1] = (Command::StepDown.nibble() << 4) | (b[1] & 0x0F);
+            }
             b[7] = 132;
-            b[8] = 0x38;
-            b[9] = 0x10;
+            b[8] = ((STEP_SIZE & 0x70) >> 4) | 0x38;
+            b[9] = (STEP_SIZE & 0x0F) << 4;
         }
+        // Somfy.cpp:274-281.
+        Command::StepDown => {
+            if repeat == 0 {
+                b[1] = (Command::StepDown.nibble() << 4) | (b[1] & 0x0F);
+            }
+            b[7] = 132;
+            b[8] = ((STEP_SIZE & 0x70) >> 4) | 0x30;
+            b[9] = (STEP_SIZE & 0x0F) << 4;
+        }
+        // Somfy.cpp:282-288.
         Command::Favorite => {
-            b[7] = 196;
+            if repeat == 0 {
+                b[1] = (Command::My.nibble() << 4) | (b[1] & 0x0F);
+            }
+            b[7] = if repeat > 0 { 132 } else { 196 };
             b[8] = 44;
             b[9] = 0x90;
         }
+        // Somfy.cpp:289-295.
         Command::Stop => {
-            b[7] = 196;
+            if repeat == 0 {
+                b[1] = (Command::My.nibble() << 4) | (b[1] & 0x0F);
+            }
+            b[7] = if repeat > 0 { 132 } else { 196 };
             b[8] = 47;
             b[9] = 0xF0;
         }
-        // Base commands: PLACEHOLDER tail that round-trips through this crate's
-        // own decode80 but does NOT match the C++ wire bytes. The reference
-        // firmware does not emit a single fixed base tail: `encode80BitFrame`
-        // gives Up/Down/Toggle/etc. distinct tails, uses `[7]=196` (not 132) as
-        // its My-family default (Somfy.cpp:322-325), and progresses byte 7 per
-        // repeat (`196 + 4*repeat`, with Favorite/Stop flipping 196->132 on
-        // later repeats). This crate's repeat-less API cannot express that
-        // progression yet — encode80 must grow a `repeat` parameter before any
-        // hardware TX of base commands as 80-bit (recorded Plan 4 contract).
-        // (The three EXTENDED arms above ARE C++-exact for first frames.) A zero
-        // low nibble in [8] keeps the My (0x1) and StepDown (0xB) nibbles
-        // un-translated at decode, so any base command still round-trips here.
+        // Somfy.cpp:304-309.
+        Command::Up => {
+            b[7] = encode80_byte7(196, repeat);
+            b[8] = 32;
+            b[9] = 0x00;
+        }
+        // Somfy.cpp:310-315.
+        Command::Down => {
+            b[7] = encode80_byte7(196, repeat);
+            b[8] = 44;
+            b[9] = 0x80;
+        }
+        // My and the multi-button family share one tail (Somfy.cpp:316-326).
         _ => {
-            b[7] = 132;
-            b[8] = 0;
+            b[7] = encode80_byte7(196, repeat);
+            b[8] = 0x00;
             b[9] = 0x10;
         }
     }
@@ -238,4 +262,8 @@ fn deobfuscate(b: &mut [u8]) {
     for i in (1..7).rev() {
         b[i] ^= b[i - 1];
     }
+}
+
+pub(crate) fn deobfuscate_slice(b: &mut [u8; 10]) {
+    deobfuscate(b)
 }

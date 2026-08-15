@@ -3,6 +3,80 @@ use somfy_rts::{
     decode80, encode80, render_pulses, Command, Frame, FrameKind, Pulse, RxDecoder, TIMINGS,
 };
 
+fn frame(command: Command) -> Frame {
+    Frame {
+        key: 0xA7,
+        command,
+        rolling_code: 0x1234,
+        address: 0x00C0DE,
+    }
+}
+
+/// `encode80Byte7(196, repeat)` = `196 + 4*repeat`, cycling by -15 whenever
+/// the sum would exceed 255 (Somfy.cpp:259-262).
+#[test]
+fn byte7_progresses_by_four_per_repeat_and_wraps_at_15() {
+    let b7 = |r: u8| {
+        let mut b = encode80(&frame(Command::Up), r);
+        somfy_rts::deobfuscate_for_test(&mut b);
+        b[7]
+    };
+    assert_eq!(b7(0), 196);
+    assert_eq!(b7(1), 200);
+    assert_eq!(b7(14), 252);
+    // repeat 15 would be 256 -> repeat -= 15 -> 0 -> back to 196.
+    assert_eq!(b7(15), 196);
+    assert_eq!(b7(16), 200);
+}
+
+/// Favorite and Stop flip 196 -> 132 on any repeat > 0 (Somfy.cpp:284, 291).
+#[test]
+fn favorite_and_stop_flip_byte7_on_later_repeats() {
+    for cmd in [Command::Favorite, Command::Stop] {
+        let mut first = encode80(&frame(cmd), 0);
+        let mut later = encode80(&frame(cmd), 1);
+        somfy_rts::deobfuscate_for_test(&mut first);
+        somfy_rts::deobfuscate_for_test(&mut later);
+        assert_eq!(first[7], 196, "{cmd:?} first frame");
+        assert_eq!(later[7], 132, "{cmd:?} repeat frame");
+    }
+}
+
+/// Base-command tails, verbatim from Somfy.cpp:304-326.
+#[test]
+fn base_command_tails_match_cpp() {
+    let cases = [
+        (Command::Up, 32u8, 0x00u8),
+        (Command::Down, 44, 0x80),
+        (Command::My, 0x00, 0x10),
+    ];
+    for (cmd, b8, b9_hi) in cases {
+        let mut b = encode80(&frame(cmd), 0);
+        somfy_rts::deobfuscate_for_test(&mut b);
+        assert_eq!(b[8], b8, "{cmd:?} byte 8");
+        assert_eq!(b[9] & 0xF0, b9_hi, "{cmd:?} byte 9 high nibble");
+    }
+}
+
+#[test]
+fn roundtrips_at_every_repeat() {
+    for cmd in [
+        Command::Up,
+        Command::Down,
+        Command::My,
+        Command::Stop,
+        Command::Favorite,
+    ] {
+        for repeat in 0..=16u8 {
+            let bytes = encode80(&frame(cmd), repeat);
+            let got = decode80(&bytes).expect("decode");
+            assert_eq!(got.command, cmd, "cmd {cmd:?} repeat {repeat}");
+            assert_eq!(got.address, 0x00C0DE);
+            assert_eq!(got.rolling_code, 0x1234);
+        }
+    }
+}
+
 #[test]
 fn roundtrip_80_extended_commands() {
     for cmd in [Command::StepUp, Command::Favorite, Command::Stop] {
@@ -12,7 +86,7 @@ fn roundtrip_80_extended_commands() {
             rolling_code: 100,
             address: 0x654321,
         };
-        let back = decode80(&encode80(&f)).unwrap();
+        let back = decode80(&encode80(&f, 0)).unwrap();
         assert_eq!(back, f, "roundtrip failed for {:?}", cmd);
     }
 }
@@ -26,7 +100,7 @@ fn rx_decoder_recognizes_80_bit_frames() {
         address: 0x111111,
     };
     let mut pulses: Vec<Pulse, 320> = Vec::new();
-    render_pulses(&encode80(&f), FrameKind::Repeat, &mut pulses);
+    render_pulses(&encode80(&f, 0), FrameKind::Repeat, &mut pulses);
     let mut rx = RxDecoder::new();
     let mut got = None;
     for p in &pulses {
@@ -52,7 +126,7 @@ fn pulse_layer_uses_80_bit_sync_counts_and_no_gap() {
         rolling_code: 9,
         address: 0x222222,
     };
-    let bytes = encode80(&f);
+    let bytes = encode80(&f, 0);
 
     // First frame: wakeup pulse then 12 hardware syncs (24 half-pulses).
     let mut first: Vec<Pulse, 320> = Vec::new();
