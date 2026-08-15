@@ -1186,17 +1186,64 @@ git commit -m "feat: RMT TX path rendering Somfy frames to the CC1101"
 **Files:**
 - Create: `docs/hardware-checklist.md`
 
-- [ ] **Step 1: Verify against a receiver before touching a motor**
+**Constraint: there is only one radio.** No second device is available as a
+verification receiver, so the frame must be validated *before* transmission by
+self-reporting rather than by being overheard. That is achievable because every
+layer below the antenna is already host-tested, and the firmware can log exactly
+what it is about to emit.
 
-Put a second ESPSomfy-RTS device in listening mode (websocket room `join:0` on port 8080) and transmit from the Rust firmware. Assert the received `remoteFrame` reports the expected `address`, `command`, `bits == 56`, and `sync == 4` for a first frame / `14` for a repeat. **This is the check that catches a wrong pulse train before a motor ever hears it.**
+- [ ] **Step 1: Make the firmware self-report the frame it is about to send**
 
-- [ ] **Step 2: Compare against the C++ transmitter**
+Before each transmission, log over serial: the 7 encoded frame bytes in hex, the
+merged pulse count, the packed symbol count, the first three pulse durations, and
+the total frame duration in µs. This is the substitute for a receiver — it exposes
+the entire pipeline output as data.
 
-Capture the C++ firmware transmitting the same command and diff the `pulses[]` arrays against the Rust output. They should agree within the receiver's timing tolerance.
+- [ ] **Step 2: Check the log against known-good values**
 
-- [ ] **Step 3: Drive a real motor**
+These come from the golden captures and the host tests, and are known before any
+hardware runs:
 
-Only after steps 1-2 pass. Use a shade the user has designated for testing.
+| Property | Expected (56-bit first frame) |
+|---|---|
+| Encoded frame | 7 bytes |
+| First pulse | ~10,920 µs HIGH (wake-up) |
+| Second pulse | ~7,357 µs LOW |
+| Merged pulse count | 120 |
+| Packed symbols | 60 |
+| Hardware syncs | 2 (a repeat frame emits 7) |
+
+A real wall-remote capture measured its wake-up pulse at 10,229 µs, so the
+transmitted value being close to `WAKEUP_HIGH` is the right order of magnitude.
+**If the byte count, pulse count or symbol count disagrees, stop — the bug is
+upstream of the antenna and no amount of transmitting will diagnose it.**
+
+- [ ] **Step 3: Decode the firmware's own bytes on the host**
+
+Feed the logged hex bytes into `decode56` in a host test and assert they yield the
+intended command, address and rolling code. This closes the loop without a radio:
+if the bytes decode correctly and the pulse train derives from them by tested code,
+the frame is correct by construction.
+
+- [ ] **Step 4: Transmit at the motor**
+
+Target the office roller shade (address `1032469`).
+
+**Send `Up`, not `Down`.** The shade is currently at its fully-closed hard limit,
+so `Down` would produce no visible movement — indistinguishable from a failed
+transmission, which is the one outcome that teaches us nothing. `Up` from a closed
+shade is unambiguous. It also starts from a physical limit, meaning the motor's
+true position is known rather than dead-reckoned.
+
+**Start the rolling code safely ahead of the last value the motor accepted** — it
+accepted 56, and the C++ spare had reached 57, so begin at 60 or above. A code
+behind the motor's stored value is rejected as a replay and looks exactly like a
+broken transmitter, which would send debugging in the wrong direction entirely.
+
+Failure here is cheap and recoverable: a malformed frame is ignored by the motor
+and costs one rolling code, and the motor has already demonstrated it re-syncs
+after a large gap. Do not retry more than a few times without re-reading the log —
+repeated blind retries are what erode the rolling-code window.
 
 - [ ] **Step 4: Write the checklist and commit**
 
