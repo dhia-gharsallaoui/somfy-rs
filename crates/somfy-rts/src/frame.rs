@@ -87,7 +87,7 @@ pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
 ///
 /// Bytes 7-9 are the extended payload from `encode80BitFrame`
 /// (Somfy.cpp:263-331) and are transmitted **un-obfuscated** ("the last 3 bytes
-/// are not encoded even on 80-bits", Somfy.cpp:130). See [`encode80_tail`] for
+/// are not encoded even on 80-bits", Somfy.cpp:130). See `encode80_tail` for
 /// the exact per-command byte map.
 ///
 /// Two checksums, both computed after the tail is filled:
@@ -105,6 +105,21 @@ pub fn decode56(bytes: &[u8; 7]) -> Result<Frame, FrameError> {
 /// reference re-encodes the tail per repeat, so a transmitter MUST call this
 /// once per frame it sends with the matching index — see `encode80BitFrame`
 /// (Somfy.cpp:263-331).
+///
+/// # Limitations
+///
+/// - `Toggle`'s tail bytes 7-9 are reference-exact (Somfy.cpp:299-301), but
+///   the reference's `Toggle` case also sets `frame[0] = 164` and
+///   `frame[1] |= 0xF0` (Somfy.cpp:297-298), which this crate deliberately
+///   does NOT reproduce: forcing the command nibble to `0xF` would collide
+///   with `RtwProto = 0xF` in this crate's [`Command`] enum, so an encoded
+///   `Toggle` frame would decode back as `RtwProto` and break round-tripping.
+///   `Toggle` is also unreachable from `somfy-domain`. Callers must not rely
+///   on an encoded `Toggle` frame being wire-identical to the reference.
+/// - `SunFlag`, `Flag`, `Sensor` and `RtwProto` have no defined 80-bit tail in
+///   the reference (`default: break`, Somfy.cpp:328-329): bytes 7-9 are left
+///   zeroed for these commands. Callers must not transmit them as 80-bit
+///   frames.
 pub fn encode80(f: &Frame, repeat: u8) -> [u8; 10] {
     let mut b = [0u8; 10];
     b[0] = f.key;
@@ -224,11 +239,33 @@ fn encode80_tail(b: &mut [u8; 10], cmd: Command, repeat: u8) {
             b[9] = 0x80;
         }
         // My and the multi-button family share one tail (Somfy.cpp:316-326).
-        _ => {
+        Command::Prog
+        | Command::UpDown
+        | Command::MyDown
+        | Command::MyUp
+        | Command::MyUpDown
+        | Command::My => {
             b[7] = encode80_byte7(196, repeat);
             b[8] = 0x00;
             b[9] = 0x10;
         }
+        // Toggle's tail bytes match Somfy.cpp:299-301. The reference's Toggle
+        // case additionally does `frame[0] = 164; frame[1] |= 0xF0`
+        // (Somfy.cpp:297-298), which we deliberately do NOT reproduce — see
+        // the "Limitations" section on `encode80`'s doc comment for why.
+        Command::Toggle => {
+            b[7] = encode80_byte7(196, repeat);
+            b[8] = 0x00;
+            b[9] = 0x10;
+        }
+        // SunFlag/Flag/Sensor/RtwProto fall into the reference's
+        // `default: break` (Somfy.cpp:328-329): the C++ defines no 80-bit
+        // tail for these commands at all, not even a checksum. Leave bytes
+        // 7-9 at their zeroed default — the trailing `calc80Checksum` OR
+        // below is a no-op on all-zero input, so this is the faithful
+        // analogue of "break". Callers must not transmit these as 80-bit
+        // frames; there is no reference wire format to match.
+        Command::SunFlag | Command::Flag | Command::Sensor | Command::RtwProto => {}
     }
     b[9] |= calc80_checksum(b[7], b[8], b[9]);
 }
@@ -262,8 +299,4 @@ fn deobfuscate(b: &mut [u8]) {
     for i in (1..7).rev() {
         b[i] ^= b[i - 1];
     }
-}
-
-pub(crate) fn deobfuscate_slice(b: &mut [u8; 10]) {
-    deobfuscate(b)
 }

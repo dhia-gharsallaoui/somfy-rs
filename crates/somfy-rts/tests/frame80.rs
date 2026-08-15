@@ -12,13 +12,26 @@ fn frame(command: Command) -> Frame {
     }
 }
 
+/// Test-only reversal of the forward-XOR obfuscation over bytes 1-6 (mirrors
+/// `obfuscate`, Somfy.cpp:433-435), so tests can assert on raw wire bytes.
+/// Bytes 7-9 are never obfuscated in the first place (Somfy.cpp:130) — this
+/// only matters for bytes 0-6 — but it's applied to the whole buffer to
+/// mirror production code exactly. Kept local to this test file rather than
+/// exposed from the crate: the public API must not grow for test
+/// convenience.
+fn deobfuscate_for_test(b: &mut [u8; 10]) {
+    for i in (1..7).rev() {
+        b[i] ^= b[i - 1];
+    }
+}
+
 /// `encode80Byte7(196, repeat)` = `196 + 4*repeat`, cycling by -15 whenever
 /// the sum would exceed 255 (Somfy.cpp:259-262).
 #[test]
 fn byte7_progresses_by_four_per_repeat_and_wraps_at_15() {
     let b7 = |r: u8| {
         let mut b = encode80(&frame(Command::Up), r);
-        somfy_rts::deobfuscate_for_test(&mut b);
+        deobfuscate_for_test(&mut b);
         b[7]
     };
     assert_eq!(b7(0), 196);
@@ -35,8 +48,8 @@ fn favorite_and_stop_flip_byte7_on_later_repeats() {
     for cmd in [Command::Favorite, Command::Stop] {
         let mut first = encode80(&frame(cmd), 0);
         let mut later = encode80(&frame(cmd), 1);
-        somfy_rts::deobfuscate_for_test(&mut first);
-        somfy_rts::deobfuscate_for_test(&mut later);
+        deobfuscate_for_test(&mut first);
+        deobfuscate_for_test(&mut later);
         assert_eq!(first[7], 196, "{cmd:?} first frame");
         assert_eq!(later[7], 132, "{cmd:?} repeat frame");
     }
@@ -52,7 +65,7 @@ fn base_command_tails_match_cpp() {
     ];
     for (cmd, b8, b9_hi) in cases {
         let mut b = encode80(&frame(cmd), 0);
-        somfy_rts::deobfuscate_for_test(&mut b);
+        deobfuscate_for_test(&mut b);
         assert_eq!(b[8], b8, "{cmd:?} byte 8");
         assert_eq!(b[9] & 0xF0, b9_hi, "{cmd:?} byte 9 high nibble");
     }

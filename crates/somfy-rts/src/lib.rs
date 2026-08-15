@@ -60,10 +60,3 @@ pub use frame::{decode56, decode80, encode56, encode80, Frame, FrameError};
 pub use pulse::{render_pulses, FrameKind, Pulse, TIMINGS};
 pub use rolling::RollingCode;
 pub use rx::{RxDecoder, RxFrame};
-
-/// Test-only: expose de-obfuscation so integration tests can assert on the
-/// raw wire bytes (the C++ tail map is defined pre-obfuscation).
-#[doc(hidden)]
-pub fn deobfuscate_for_test(b: &mut [u8; 10]) {
-    frame::deobfuscate_slice(b)
-}
