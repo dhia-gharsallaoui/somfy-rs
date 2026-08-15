@@ -1,0 +1,22 @@
+[unstable]
+build-std = ["core"]
+
+[env]
+ESP_LOG = "info"
+
+# esp-hal's `rt` feature (on by default) copies a per-chip `linkall.x` into
+# OUT_DIR and adds it to the linker search path, but building against a
+# single crate cache still needs each target told to actually load it — the
+# entry point and `_stack_start_cpu0`/`_stack_end_cpu0` symbols esp-hal
+# expects come from that script.
+[target.xtensa-esp32s3-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
+
+[target.xtensa-esp32-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
+
+[target.xtensa-esp32s2-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x"]

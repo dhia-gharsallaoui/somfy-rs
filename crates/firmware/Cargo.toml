@@ -1,0 +1,42 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "somfy-rs ESP32 firmware"
+
+[[bin]]
+name = "firmware"
+path = "src/main.rs"
+# No test harness for this no_std binary: cargo's default auto-generated
+# unittest target links against `std`/`libtest` unconditionally, which does
+# not exist for this bare-metal target (build-std = ["core"] only, below).
+# Host-side unit tests belong in a separate lib target, built for the host
+# triple rather than the chip target, once this crate has logic worth
+# testing that way.
+test = false
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["unstable"] }
+esp-println = { version = "0.13", features = ["log"] }
+heapless = "0.8"
+embedded-hal = "1.0"
+somfy-rts = { path = "../somfy-rts" }
+somfy-rmt = { path = "../somfy-rmt" }
+
+# No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
+# don't declare `#![no_std]`), so no feature selection lets them compile for
+# this bare-metal target under build-std = ["core"]. Add host-side test
+# tooling only once there is a lib target compiled for the host triple.
+
+[features]
+default = []
+chip-esp32 = ["esp-hal/esp32", "esp-println/esp32"]
+chip-s2 = ["esp-hal/esp32s2", "esp-println/esp32s2"]
+chip-s3 = ["esp-hal/esp32s3", "esp-println/esp32s3"]
+chip-c3 = ["esp-hal/esp32c3", "esp-println/esp32c3"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

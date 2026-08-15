@@ -139,6 +139,14 @@ Two things still hold here:
 | `kind`/`tiltMode` reuse the numeric discriminants deployed devices already emit, rather than a string union | `somfy-api/src/entities.rs::ShadeDto` | the reference firmware's numeric `kind`/`tiltMode` wire fields (same discriminants recorded in the `somfy-domain` table above) | Verified by `somfy-api/tests/entities.rs::shade_dto_serializes_to_stable_json` and `somfy-api/tests/ts_export.rs::entities_use_camelcase_and_heapless_overrides` (asserts `kind`/`tiltMode` stay `number`, not a string union) |
 | `direction` reuses the same sign convention on the wire (-1 up, 0 idle, +1 down) | `somfy-api/src/entities.rs::ShadeDto`, `somfy-api/src/events.rs::ShadeStateEvent` | the reference firmware's direction sign convention on the wire (same convention recorded for `somfy_domain::Direction` above) | Verified by `somfy-api/tests/entities.rs::shade_dto_snapshots_live_state` / `shade_dto_serializes_to_stable_json` |
 
+## firmware
+
+| Item | Where it lives now | Derived from | Verified |
+|---|---|---|---|
+| ESP32-S3 CC1101 pin map (SCK=12, MOSI=11, MISO=13, CSN=10, GDO0=3, GDO2=4) | `crates/firmware/src/chip.rs::pins` (chip-s3 module) | — (not derived; read directly off a running board) | Hardware-verified against a real working ESP32-S3 device on 2026-08-15 (see "Hardware-verified values") |
+| ESP32, ESP32-S2 and ESP32-C3 CC1101 pin maps | `crates/firmware/src/chip.rs::pins` (chip-esp32, chip-s2, chip-c3 modules) | the reference firmware's per-chip default pin assignments, one board-configuration table per chip | Not verified on hardware. Only the ESP32-S3 map above has been checked against a real device; treat these three as unverified placeholders until someone confirms them on the corresponding board |
+| RMT source clock fixed at 80 MHz with a matching divider of 80 (giving 1 µs ticks) | `crates/firmware/src/chip.rs::RMT_CLOCK_MHZ`, `RMT_CLK_DIVIDER` | the reference firmware's RMT clock configuration, required because the ESP32 and ESP32-S2 RMT peripherals only accept an 80 MHz source clock | Not independently hardware-verified for this crate; carried over as a constraint of the RMT peripheral itself, consistent with the tick model already exercised by `somfy-rmt`'s test suite |
+
 ---
 
 ## Inline exceptions
@@ -164,5 +172,6 @@ Values confirmed against real hardware, which outrank any derivation:
 | Value | Evidence | Date |
 |---|---|---|
 | 56-bit first frame emits 2 hardware syncs; repeat emits 7 | Captured wall-remote frames reported `hwsync` 4 and 14 half-pulses respectively | 2026-08-15 |
+| ESP32-S3 CC1101 pin map (SCK=12, MOSI=11, MISO=13, CSN=10, GDO0_TX=3, GDO2_RX=4) | Read directly off a running production ESP32-S3 board's wiring | 2026-08-15 |
 | Wake-up pulse ≈ 10.9 ms HIGH | First pulse of a real capture measured 10229 µs | 2026-08-15 |
 | Backup file format and record layout | Parsed a real v25 device backup with zero field misalignment | 2026-08-15 |

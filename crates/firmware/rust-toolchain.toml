@@ -1,0 +1,4 @@
+# espup's `esp` channel carries the Xtensa targets (ESP32/S2/S3) and the
+# RISC-V ones (C3). The repo root stays on stable for the host crates.
+[toolchain]
+channel = "esp"

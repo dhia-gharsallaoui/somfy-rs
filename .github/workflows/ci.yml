@@ -39,3 +39,38 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
         run: cargo doc --workspace --no-deps
+
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature: chip-esp32
+            target: xtensa-esp32-none-elf
+          - feature: chip-s2
+            target: xtensa-esp32s2-none-elf
+          - feature: chip-s3
+            target: xtensa-esp32s3-none-elf
+          - feature: chip-c3
+            target: riscv32imc-unknown-none-elf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32,esp32s2,esp32s3
+          ldproxy: false
+      - name: clippy (${{ matrix.feature }})
+        working-directory: crates/firmware
+        # No --all-targets here (unlike the host job above): this crate is a
+        # no_std/no_main binary-only target, and --all-targets forces cargo to
+        # also build an implicit unittest harness for the [[bin]] regardless
+        # of `test = false` in Cargo.toml. That harness links std/libtest,
+        # which no bare-metal target here ever provides, so --all-targets
+        # fails unconditionally for this crate — confirmed independent of
+        # feature/dependency choices. Plain clippy already covers the bin.
+        run: cargo clippy --features ${{ matrix.feature }} --target ${{ matrix.target }} -- -D warnings
+      - name: build (${{ matrix.feature }})
+        working-directory: crates/firmware
+        run: cargo build --features ${{ matrix.feature }} --target ${{ matrix.target }} --release
