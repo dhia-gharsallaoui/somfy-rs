@@ -14,7 +14,20 @@ model (shade/group/room registries, travel-time position dead-reckoning, command
 orchestration, overheard-remote tracking), and the Plan 3 contract layer —
 `somfy-api` (serde REST/WS DTOs with `ts-rs` TypeScript generation) and
 `somfy-migrate` (C++ backup-file parser) — are implemented and green on the host.
-**Next: Plan 4** — firmware radio (`esp-hal` RMT TX/RX on ESP targets).
+**Plan 4a (firmware transmit) is complete and proven on hardware.**
+**Next: Plan 4b** — RMT receive, the Embassy radio/state tasks, and persisted
+rolling codes.
+
+**On-air validation landed 2026-08-16.** somfy-rs firmware running on an
+ESP32-S3 drove a real Somfy roller shade in both directions, confirmed by the
+owner. Every transmission was independently decoded by a second, unrelated
+radio, which reported the correct address, command, rolling code, `bits == 56`,
+`valid == true`, and the sync counts the protocol requires — `sync == 4` on
+first frames and `sync == 14` on repeats, matching the wall-remote captures.
+The verification deliberately lives in a separate receiver rather than in the
+firmware: a transmitter that reports on its own output cannot detect the
+failures that matter, because a wrongly built pulse train and the account it
+gives of itself are wrong in the same way.
 
 Golden-capture validation **landed 2026-08-15**: the `somfy-rts` RX path is
 pinned against pulses captured from a physical Somfy wall remote, and all three
@@ -37,7 +50,8 @@ Plans (per [`docs/specs/`](docs/specs/)):
 | 1 | Protocol engine (`somfy-rts`) — **complete** |
 | 2 | Domain model: shades/groups/rooms + position/tilt engine — **complete** |
 | 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **complete** |
-| 4 | Firmware radio: `esp-hal` RMT TX/RX, ESP targets — **next** |
+| 4a | Firmware transmit: CC1101 driver + `esp-hal` RMT TX — **complete, hardware-proven** |
+| 4b | Firmware receive: RMT RX, Embassy tasks, persisted rolling codes — **next** |
 | 5 | Network: WiFi, MQTT, Home Assistant discovery |
 | 6 | Persistence + OTA (A/B partitions, rollback) |
 | 7 | Web UI (Preact) served from flash |
@@ -98,9 +112,15 @@ policy-free:
 | [`somfy-domain`](crates/somfy-domain) | yes | Domain model: shade/group/room registries + position dead-reckoning. Travel-time position/tilt estimator, command orchestration (commands in → planned radio TX + state-delta events out), and overheard-remote tracking. Clock-free — callers inject `now_ms`. |
 | [`somfy-api`](crates/somfy-api) | yes¹ | Shared REST/WebSocket contract: serde DTOs mirroring the domain entities (camelCase wire, whole-percent `u8` positions, C++ numeric discriminants). The `ts` feature generates TypeScript types into `ui/src/api/generated/` so UI/firmware drift is a compile error. |
 | [`somfy-migrate`](crates/somfy-migrate) | yes | C++ ESPSomfy-RTS backup-file parser: reads an exported `.backup` into `MigrationData` (shades, rooms, groups) so an existing setup migrates without re-pairing. Applies the rolling-code `+1` (last-sent → next-to-send) contract; allocation-free. |
+| [`somfy-rmt`](crates/somfy-rmt) | yes | Packs Somfy pulse trains into ESP32 RMT symbols: renders, merges adjacent same-level halves, packs two pulses per 32-bit symbol and terminates the buffer. Pure data, so the packing that hardware depends on is host-testable. |
+| [`somfy-cc1101`](crates/somfy-cc1101) | yes | CC1101 radio driver for on-off-keyed asynchronous-serial transmission at 433.42 MHz. Speaks only `embedded-hal` SPI. Every register byte is assembled from named bit-fields carrying the datasheet arithmetic that produced it, re-checked by compile-time assertion. |
+| [`firmware`](crates/firmware) | yes² | The ESP binary: board wiring, per-chip pin maps, and the RMT transmit path. Deliberately thin — it holds only what genuinely needs `esp-hal`, because this crate cannot be compiled for the host at all, so anything testable lives in a crate beside it. |
 
 ¹ `somfy-api` is `no_std` by default; the `std`/`ts` features are host-only for
 TypeScript generation.
+
+² `firmware` is excluded from the root workspace: it builds only for ESP
+targets, one chip per build (`chip-esp32`/`chip-s2`/`chip-s3`/`chip-c3`).
 
 The remaining `firmware` crate and the `ui/` app arrive in later plans.
 
