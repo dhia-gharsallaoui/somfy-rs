@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "somfy-rs ESP32 firmware"
+# Spelled out rather than inherited: this crate is excluded from the root
+# workspace (it builds only for ESP targets), so `*.workspace = true` is
+# unavailable here. Keep in step with [workspace.package] in the root manifest.
+repository = "https://github.com/dhiagharsallaoui/somfy-rs"
 
 [[bin]]
 name = "firmware"

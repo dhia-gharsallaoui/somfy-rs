@@ -22,6 +22,14 @@ compile_error!(
 // `pub mod pins` definitions into the same scope, which surfaces as a
 // confusing "duplicate definition" error far from its real cause. Fail with
 // a message that names the actual problem instead.
+//
+// In practice neither `compile_error!` above or below is what a
+// mis-invoked build actually hits: esp-println's build script rejects a
+// zero-feature build, and esp-metadata-generated emits ~24 duplicate-macro
+// errors for a two-feature build, both before this crate is compiled. These
+// stay as a backstop — they cost nothing, they name the problem in one line
+// instead of twenty-four, and they keep working if the upstream checks ever
+// move or are relaxed.
 #[cfg(any(
     all(feature = "chip-esp32", feature = "chip-s2"),
     all(feature = "chip-esp32", feature = "chip-s3"),
@@ -41,6 +49,17 @@ pub const RMT_CLOCK_MHZ: u32 = 80;
 
 /// Divider giving 1 µs ticks from `RMT_CLOCK_MHZ`.
 pub const RMT_CLK_DIVIDER: u8 = 80;
+
+// The two constants above are only correct relative to each other, and
+// `somfy-rmt` converts every pulse duration to ticks assuming the pair
+// resolves to `somfy_rmt::TICK_US`. A change to one without the other would
+// not fail to build or to link — it would silently scale every duration in
+// every frame, so a shade would simply stop responding with no error anywhere
+// to explain why. Tie them together so that edit cannot compile.
+const _: () = assert!(
+    RMT_CLK_DIVIDER as u32 == RMT_CLOCK_MHZ * somfy_rmt::TICK_US,
+    "RMT_CLK_DIVIDER must divide RMT_CLOCK_MHZ down to somfy_rmt::TICK_US"
+);
 
 // Pin map verified against a real working ESP32-S3 device on 2026-08-15.
 #[cfg(feature = "chip-s3")]
