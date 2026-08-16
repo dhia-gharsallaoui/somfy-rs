@@ -132,8 +132,8 @@ policy-free:
 | [`somfy-mqtt`](crates/somfy-mqtt) | yes | MQTT topic construction, configuration validation and Home Assistant discovery payloads. The discovery prefix and the state root are separate types that hold their text privately, so concatenating them — the fault that made discovery unusable on the C++ build — does not compile. Bad configuration is refused with a typed error naming the field, never repaired. No user text reaches a topic segment: identifiers are built from literals and stable ids, so a rename cannot move a discovery topic. Payload and publisher are derived from one topic table so they cannot drift apart. Network-free. |
 | [`somfy-store`](crates/somfy-store) | yes | Rolling-code persistence seam: the `RollingCodeStore` trait, wear-levelling slot arithmetic, and a `transmit()` helper that makes persist-before-transmit **unforgeable** — the queue accepts only a ticket minted after a successful commit, so no call site can transmit a code that has not reached flash. |
 | [`somfy-tasks`](crates/somfy-tasks) | yes | The radio and state task bodies, written where a host compiler can reach them. Owns the transmit channel, whose producer end is deliberately unreachable from outside so the ordering guarantee above holds end to end. |
-| [`somfy-mqtt`](crates/somfy-mqtt) | yes | MQTT topic construction and config validation for Home Assistant discovery. `discovery_prefix` and `state_root` expose no accessor at all, so concatenating them — the bug that makes the C++ MQTT integration unusable — does not compile. |
-| [`firmware`](crates/firmware) | yes² | The ESP binary: board wiring, per-chip pin maps, and the RMT transmit path. Deliberately thin — it holds only what genuinely needs `esp-hal`, because this crate cannot be compiled for the host at all, so anything testable lives in a crate beside it. |
+| [`somfy-config`](crates/somfy-config) | yes | The device's persisted configuration — Wi-Fi credentials so far — as pure data: the validation rules and the bytes one flash slot holds. Refuses rather than repairs, because a truncated SSID names a different network and a padded passphrase is the wrong passphrase; both present as a device that will not connect with nothing saying why. **A Plan 5 stopgap that Plan 6 replaces**, and **not** secrets-at-rest: the passphrase is stored in the clear and anyone holding the board can read it. |
+| [`firmware`](crates/firmware) | yes² | The ESP binary: board wiring, per-chip pin maps, the RMT transmit and receive paths, the two flash regions, and Wi-Fi. Deliberately thin — it holds only what genuinely needs `esp-hal`, because this crate cannot be compiled for the host at all, so anything testable lives in a crate beside it. It is also the **only** crate with a heap, and that heap exists for `esp-radio`; the ten crates above it are allocation-free, which CI checks by building every one of them for a target that has no allocator. |
 
 ¹ `somfy-api` is `no_std` by default; the `std`/`ts` features are host-only for
 TypeScript generation.
@@ -141,7 +141,7 @@ TypeScript generation.
 ² `firmware` is excluded from the root workspace: it builds only for ESP
 targets, one chip per build (`chip-esp32`/`chip-s2`/`chip-s3`/`chip-c3`).
 
-The remaining `firmware` crate and the `ui/` app arrive in later plans.
+The `ui/` app arrives in a later plan.
 
 ## Build & test
 

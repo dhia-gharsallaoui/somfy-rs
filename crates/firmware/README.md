@@ -5,20 +5,28 @@ the parts of the controller that can only exist against real hardware.
 
 | Binary | What it does | Puts RF on the air |
 |---|---|---|
-| `firmware` | The controller: radio task, state task, flash-backed rolling-code store | only when commanded — and nothing commands it yet |
+| `firmware` | The controller: radio task, state task, the two flash regions, and — when credentials are provisioned — Wi-Fi and the TCP/IP stack | only when commanded — and nothing commands it yet |
 | `tx-check` | Brings up the CC1101 and transmits one Somfy frame plus repeats, at a synthetic address | **yes** |
 | `store-check` | Reads the rolling-code region, commits the next code, reads it back | no — flash only |
+| `config-check` | Reads the Wi-Fi config region, writes a **placeholder** credential, reads it back | no — flash only, and no network |
 
 They are separate binaries so that proving the rolling-code store survives a
 power cycle never involves keying a transmitter, and so that flashing the
-controller cannot put a frame on the band by itself. Plan 4 ships no command
-source and no config store, so `firmware` boots with an empty shade registry
-and transmits nothing at all; it receives, decodes and logs.
-`docs/hardware-checklist.md` has the procedure for each.
+controller cannot put a frame on the band by itself. There is still no command
+source — Plan 5 Task 3's MQTT client is the first — and the persisted
+configuration carries Wi-Fi credentials and nothing else, so `firmware` boots
+with an empty shade registry and transmits nothing at all; it receives, decodes
+and logs. `docs/hardware-checklist.md` has the procedure for each.
 
-The rolling-code store needs a `rollcode` partition, which is why this crate
-carries its own `partitions.csv` and an `espflash.toml` pointing espflash at
-it. Run `espflash` from this directory so it finds them; a device flashed with
+**The network is optional and cannot take the radio down.** A board with no
+credentials provisioned — which is what a freshly flashed one is — boots
+cleanly, says so, and runs the radio; so does one whose credentials are wrong,
+retrying with bounded backoff. `src/net.rs` documents the four structural
+reasons that holds.
+
+The rolling-code store needs a `rollcode` partition and the config store needs
+a `wificfg` one, which is why this crate carries its own `partitions.csv` and
+an `espflash.toml` pointing espflash at it. Run `espflash` from this directory so it finds them; a device flashed with
 espflash's default table reports `PartitionMissing` and stops rather than
 running without durable storage.
 
@@ -93,8 +101,8 @@ cargo build --features chip-s2    --target xtensa-esp32s2-none-elf
 cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
 ```
 
-Each of those builds all three binaries. Add `--bin store-check` or
-`--bin tx-check` to build only one harness.
+Each of those builds all four binaries. Add `--bin store-check`,
+`--bin config-check` or `--bin tx-check` to build only one harness.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip
 feature enabled is expected to fail — see `src/chip.rs`'s `compile_error!`
@@ -110,8 +118,10 @@ message instead of the one in `chip.rs`.
 
 The `esp` toolchain does not ship a prebuilt `core` for these bare-metal
 targets, so `crates/firmware/.cargo/config.toml` sets
-`[unstable] build-std = ["core"]` to compile `core` from source for each
-build. This requires the `esp` toolchain's nightly-derived compiler
+`[unstable] build-std = ["core", "alloc"]` to compile them from source for
+each build. `alloc` is there for `esp-radio`, which needs a heap; `src/heap.rs`
+carries the size, the two measurements that bracket it, and the argument that
+nothing on the frame path can be starved by it. This requires the `esp` toolchain's nightly-derived compiler
 components (which `espup install` provides) — it will not work on a plain
 `stable` toolchain.
 

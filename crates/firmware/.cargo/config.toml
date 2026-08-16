@@ -1,5 +1,17 @@
+# `alloc` is here for `esp-radio` and for nothing else.
+#
+# Every crate in this workspace is allocation-free, and the six that carry the
+# protocol, the domain and the store still are — CI proves it by building each
+# of them for `thumbv7em-none-eabihf`, a target with no allocator at all. What
+# needs a heap is the Wi-Fi driver: `esp-radio` is `extern crate alloc`, its
+# `StationConfig` holds an `alloc::string::String`, and `esp-rtos` allocates the
+# driver's task stacks. Without `alloc` in this list the build stops at
+# `error[E0463]: can't find crate for 'alloc'`.
+#
+# `crates/firmware/src/net.rs` documents where the heap lives, how big it is and
+# why; `docs/provenance.md` records the measurement behind the size.
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc"]
 
 [env]
 ESP_LOG = "info"

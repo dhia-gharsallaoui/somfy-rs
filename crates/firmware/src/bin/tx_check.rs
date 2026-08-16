@@ -26,6 +26,12 @@
 
 #[path = "../chip.rs"]
 mod chip;
+// `esp_rtos::start` allocates its main-task bookkeeping, so even this binary —
+// which has no network and no radio driver beyond the CC1101 — needs a heap
+// present before the scheduler starts. See `heap` for what the heap is for and
+// why the controller's is far larger than this one.
+#[path = "../heap.rs"]
+mod heap;
 // Only the transmit half of `radio`, pulled in directly rather than through
 // `radio/mod.rs`: this binary never receives, and a module tree it does not use
 // would arrive here as a screenful of dead-code warnings.
@@ -118,6 +124,10 @@ async fn entry(_spawner: Spawner) {
 
 async fn bring_up() -> Result<(), BringUpError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    // Before `esp_rtos::start`, which is the only thing in this binary that
+    // allocates at all.
+    heap::install_scheduler_only();
 
     let timers = TimerGroup::new(peripherals.TIMG0);
     let software = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);

@@ -1,0 +1,17 @@
+[package]
+name = "somfy-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std persisted device configuration for somfy-rs — a Plan 5 stopgap that Plan 6 replaces"
+
+[dependencies]
+heapless = "0.8"
+# The record's validity marker, and the same crate and variant `somfy-store`
+# uses for the same reason: telling a torn write from a good one is the whole
+# job, and hand-rolling the polynomial, reflection and init/xorout of "CRC-32"
+# is the classic way to be subtly and invisibly wrong. A known-answer test
+# pins the variant here too, because picking the wrong one out of the
+# catalogue is a mistake the dependency cannot prevent.
+crc = "3"

@@ -5,7 +5,7 @@ Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
 
-Three independent procedures, because they need different equipment and carry
+Five independent procedures, because they need different equipment and carry
 different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
@@ -14,6 +14,9 @@ different risk:
   this board stays silent.
 - **[Rolling-code store](#rolling-code-store)** — needs nothing but the board,
   and touches only flash.
+- **[Wi-Fi provisioning](#wi-fi-provisioning)** — needs the board and the
+  network's passphrase; touches only flash and puts nothing on the 433 MHz
+  band.
 - **[Controller](#controller)** — the real firmware: receives, tracks, and
   transmits nothing on its own.
 
@@ -24,7 +27,8 @@ transmitter:
 |---|---|---|
 | `tx-check` | **yes**, at a synthetic address | proving the transmit path |
 | `store-check` | no — flash only | proving the rolling-code store |
-| `firmware` | no, until commanded — and Plan 4 ships no command source | the controller itself |
+| `config-check` | no — flash only | proving the Wi-Fi config region |
+| `firmware` | no, until commanded — and there is still no command source | the controller itself |
 
 ## Transmit path
 
@@ -424,13 +428,137 @@ there is — treat it as one. Redundancy belongs with the Plan 6 rewrite.
 
 ---
 
+## Wi-Fi provisioning
+
+Putting a network's credentials on a board. **This procedure touches flash and
+the 2.4 GHz radio only** — nothing goes out on 433 MHz, and the controller's
+Somfy behaviour is unchanged by it either way.
+
+### The passphrase never enters this repository
+
+There is no constant to edit, no environment variable, and no build-time
+credential anywhere in the firmware. The device reads its credentials from the
+`wificfg` flash region and from nowhere else, and the region is written by a
+host-side tool that takes both values on **standard input** — so they exist
+only in the operator's terminal, in the file it writes, and in the board's
+flash. Not in git, not in a shell history, not in `ps` output, not in a build
+cache.
+
+### These credentials are not protected
+
+Flash encryption is not enabled. **Anyone who can hold the board can read the
+passphrase off it** with `espflash read-flash`, and the same is true of the
+file the tool writes. That is stated rather than mitigated: an obfuscation
+scheme would need its key in the same flash and would protect nothing. The only
+real fix is ESP32 flash encryption with the key in eFuse, which is a
+device-provisioning decision, not a firmware one.
+
+Delete the intermediate file once the board has it.
+
+### 1. Write the region image
+
+```bash
+cargo run -p somfy-config --example provision -- wificfg.bin
+# SSID: <typed>
+# passphrase (empty for an open network): <typed>
+```
+
+It validates before writing — an SSID over 32 bytes, a passphrase under 8
+characters, an embedded NUL — so a typo is refused here rather than three
+flashes later as a board that silently will not associate.
+
+### 2. Put it on the board
+
+Step 0 above — **identify the board** — applies here too, every time.
+
+```bash
+cd crates/firmware
+espflash erase-parts --port /dev/ttyUSB0 --partition-table partitions.csv wificfg
+espflash write-bin   --port /dev/ttyUSB0 0x202000 wificfg.bin
+rm wificfg.bin
+```
+
+The erase is **not optional when re-provisioning**. The tool writes sequence
+number 0, so an existing record with a higher sequence number stays newest and
+the new credentials are simply ignored — a board that looks provisioned and
+joins the old network.
+
+### 3. Confirm it landed
+
+```bash
+espflash monitor --port /dev/ttyUSB0 --non-interactive   # reset the board
+```
+
+```
+config: partition 'wificfg' at 0x00202000, 32 slots of 256 bytes
+config: survey slots=32 valid=1 blank=31 damaged=0 newest_seq=Some(0)
+wifi: joining '<your ssid>'
+wifi: associated on channel 6 (-52 dBm)
+net: address 10.0.0.57/24 gateway Some(10.0.0.1)
+```
+
+`wifi: associated` without a following `net: address` means the station joined
+and DHCP did not answer — a different fault from a wrong passphrase, and the
+reason the two are separate lines.
+
+A wrong passphrase looks like this, and keeps looking like it:
+
+```
+wifi: association failed — Disconnected(... reason: NoAccessPointFound ...)
+wifi: retrying in 1000 ms
+```
+
+with the delay doubling to a 60 s ceiling. **The delay sequence is the check**:
+1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000. A delay that never grows
+is a busy retry; one that grows past 60 s means a rebooted router will not be
+rejoined without a power cycle.
+
+Two further things to expect, both deliberate:
+
+- **The log goes quiet once the delay stops changing.** Failures 1–7 are
+  logged, 8 and 9 are not, 10 is. A log line is written with interrupts
+  disabled, and the receiver has about 5 ms to re-arm between a frame and its
+  repeat, so an absent access point must not be allowed to spend that budget
+  twice a second forever.
+- **An access point that associates and *then* drops you does not reset the
+  backoff.** The firmware prints `the link lasted N ms, under the 10000 ms it
+  takes to count as working` and keeps escalating. Captive portals, MAC policy
+  checks and networks with no DHCP server all look like success followed
+  immediately by failure, and resetting on association alone would pin the
+  retry at one second forever.
+
+### The region, and exercising the write path
+
+`config-check` mounts the region, surveys it, writes a **placeholder**
+credential (`SSID_NOT_PROVISIONED`) and reads it back. It is the only hardware
+evidence that the write path works, because the controller itself only ever
+reads.
+
+```bash
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/config-check
+```
+
+**It overwrites a provisioned credential**, exactly as `store-check` advances a
+rolling code. Re-provision afterwards.
+
+| Quantity | Value |
+|---|---|
+| Partition | `wificfg`, data/undefined, 0x202000, 8 KB |
+| Record | 256 bytes: magic `RTSW`, version, flags, lengths, seq, SSID(32), PSK(64), CRC-32 |
+| Slots | 32, in 2 erase sectors of 16 |
+| Rolling codes | untouched — `rollcode` keeps its 0x200000 offset in the new table |
+
+---
+
 ## Controller
 
-The real firmware: the radio task, the state task, and the flash store wired
-together. **It keys the transmitter only when commanded, and Plan 4 ships no
-command source**, so flashing it produces a controller that listens and tracks
-and puts nothing on the air. That is deliberate — no boot of this image can
-move a shade — and it is also why the two harnesses above still exist.
+The real firmware: the radio task, the state task, the two flash stores and —
+when credentials are present — Wi-Fi and the TCP/IP stack, wired together.
+**It keys the transmitter only when commanded, and there is still no command
+source** (Plan 5 Task 3's MQTT client is the first), so flashing it produces a
+controller that listens and tracks and puts nothing on the 433 MHz band. That
+is deliberate — no boot of this image can move a shade — and it is also why the
+harnesses above still exist.
 
 Step 0 above — **identify the board** — applies here too, every time.
 
@@ -442,14 +570,20 @@ espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmwa
 espflash monitor --port /dev/ttyUSB0 --non-interactive
 ```
 
-A healthy boot prints four things, in this order:
+A healthy boot on a board with **no Wi-Fi credentials** — which is what a
+freshly flashed one is — prints this, and nothing about it is an error:
 
 ```
-stack: <n> bytes available, 8192 required
+stack: 193980 bytes available, 8192 required
+config: partition 'wificfg' at 0x00202000, 32 slots of 256 bytes
+config: survey slots=32 valid=0 blank=32 damaged=0 newest_seq=None
 store: partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
 store: survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
 controller: 0 shades provisioned — receiving and tracking only, nothing will
  transmit until a config store and a command source exist
+network: no credentials provisioned — running radio-only. This board still
+ receives and decodes; see docs/hardware-checklist.md to provision one.
+heap: controller started — 0 of 57344 bytes used, peak 0
 controller: running
 ```
 
@@ -458,15 +592,55 @@ Each line is there because nothing else can establish it:
 - **stack** — `RmtTx::transmit_frame` needs roughly 6.5 KB, and Embassy tasks
   have no stacks of their own, so that comes off the main stack. esp-hal's
   linker script gives the main stack whatever DRAM is left after the statics,
-  which moves every time a static is added; the check refuses to start rather
-  than let a future Plan's buffers turn into a corrupted pulse train.
+  which moves every time a static is added — and the Wi-Fi heap is a static, so
+  this figure dropped from 304,652 to 193,980 the moment Wi-Fi arrived. The
+  check refuses to start rather than let a future Plan's buffers turn into a
+  corrupted pulse train.
+- **config survey** — same distinction as the store's: a region that has never
+  held credentials versus one whose credentials are gone.
 - **store survey** — "this device has never stored a code" versus "this
   device's codes are gone". `damaged` above zero on a board nobody power-cut
   deserves a look.
 - **0 shades provisioned** — a silent empty controller and a broken one look
   identical from the serial line.
-- **controller: running** — both tasks spawned. Anything else names its own
-  failure (`StartError`), including which pin disagreed with `chip::pins`.
+- **network: no credentials** — the ordinary state of a new board, said out
+  loud so it is not mistaken for a failure. The radio is unaffected.
+- **heap** — `peak 0` with no network is the check that the heap belongs to
+  `esp-radio` alone: nothing else in the firmware allocates a byte. With Wi-Fi
+  running the peak was **46,660 of 57,344**, and it is printed again whenever
+  the network comes up so the margin can be watched rather than assumed.
+- **controller: running** — both radio tasks spawned. Anything else names its
+  own failure (`StartError`), including which pin disagreed with `chip::pins`.
+
+### Proving the network cannot take the radio down
+
+Spec R9 says the network is a degradable service. Three checks, in increasing
+strength:
+
+1. **No credentials at all.** The boot above. The network is never attempted;
+   `controller: running` still appears.
+2. **Credentials that cannot associate.** Provision `SSID_NOT_PROVISIONED` with
+   `config-check`, then watch the backoff run 1 s → 60 s for several minutes.
+   The controller must keep running throughout — no panic, no reset, no hang.
+3. **A frame received while Wi-Fi is retrying.** The one that actually settles
+   it. Fire the reference transmitter (see [Receive path](#receive-path)) while
+   the board is in state 2 and confirm `state: heard … from 0x…` still appears.
+   **Ten trials, not one** — the link decodes a minority of frames, so a single
+   silent trial proves nothing.
+
+Checks 1 and 2 were run on the spare ESP32-S3 on 2026-08-16/17. **Check 3 has
+not been run** — it needs a transmitter on the owner's network.
+
+A fourth thing worth knowing rather than checking: **the controller reboots on
+a panic; the bring-up harnesses halt.** Wi-Fi brings in panics this firmware
+neither writes nor can catch (`esp-radio` panics on a status code it does not
+recognise; a failed allocation reaches `handle_alloc_error`), and a halted
+board is a dead radio until somebody power-cycles it. So `firmware` prints the
+message, waits 100 ms for the serial line to drain, and resets — expect
+`PANIC: …` followed by `rst:0x3 (RTC_SW_SYS_RST)`. A deterministic panic
+therefore shows up as a reboot loop with a readable message, which is the
+intended trade. `tx-check`, `store-check` and `config-check` still freeze,
+because there a person is watching and the frozen state is worth more.
 
 After that the only output is what the radio hears:
 

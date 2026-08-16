@@ -489,6 +489,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "somfy-config"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "somfy-domain"
 version = "0.1.0"
 dependencies = [

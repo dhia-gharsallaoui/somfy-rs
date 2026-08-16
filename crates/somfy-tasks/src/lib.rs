@@ -38,13 +38,21 @@
 //! field, a getter handing back the underlying channel sender.
 //! [`TransmitQueueHandle`] is where that door is kept shut, and its docs carry
 //! the argument.
+//!
+//! ## What else is here
+//!
+//! [`Backoff`] — the retry schedule the Wi-Fi task waits on. Not a loop, but
+//! the same argument applies: it is pure arithmetic with three easy mistakes
+//! in it, and a task body in `crates/firmware` is one no test can reach.
 
 #![cfg_attr(not(test), no_std)]
 
+mod backoff;
 mod queue;
 mod radio;
 mod state;
 
+pub use backoff::Backoff;
 pub use queue::{
     QueueFull, TransmitChannel, TransmitQueueHandle, TransmitRequests, TRANSMIT_QUEUE_DEPTH,
 };

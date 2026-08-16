@@ -92,7 +92,10 @@ impl<SPI: SpiDevice> Transmitter for Air<'_, SPI> {
     }
 
     async fn send_frame(&mut self, bytes: &[u8], kind: FrameKind) -> Result<(), AirError> {
-        self.tx.transmit_frame(bytes, kind).await.map_err(AirError::Tx)
+        self.tx
+            .transmit_frame(bytes, kind)
+            .await
+            .map_err(AirError::Tx)
     }
 
     /// Park the transmitter and go back to listening.

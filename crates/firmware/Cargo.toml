@@ -29,6 +29,15 @@ name = "store-check"
 path = "src/bin/store_check.rs"
 test = false
 
+# Config-region bring-up harness: mounts `wificfg`, surveys it, writes a
+# placeholder credential and reads it back. No radio, no network, and no way
+# to make it store a real credential — the host-side `provision` example does
+# that. `test = false` for the same reason as above.
+[[bin]]
+name = "config-check"
+path = "src/bin/config_check.rs"
+test = false
+
 # Transmit bring-up harness: the only image here that keys the radio by itself,
 # and it does so at a synthetic address. Separate from `firmware` so that
 # flashing the controller can never put a frame on the band on its own.
@@ -67,6 +76,10 @@ somfy-domain = { path = "../somfy-domain" }
 # wrappers, and the implementations of the traits those bodies are written
 # against.
 somfy-tasks = { path = "../somfy-tasks" }
+# The persisted Wi-Fi credentials: validation and the record's bytes, host-
+# tested. This crate keeps only the flash I/O, exactly as it does for
+# `somfy-store`.
+somfy-config = { path = "../somfy-config" }
 # Embassy, by way of `esp-rtos`. NOT `esp-hal-embassy`: that crate's
 # `executors` feature turns on `esp-hal/__esp_hal_embassy`, a feature esp-hal
 # dropped in 1.0.0-rc.1, so no published version of it resolves against the
@@ -79,11 +92,47 @@ embassy-time = "0.5"
 # `select3` for the state task's three inputs, and `yield_now` for handing the
 # executor to the radio task the moment a transmission is queued.
 embassy-futures = "0.1"
-esp-rtos = { version = "0.3", features = ["embassy"] }
+#
+# `esp-radio` here is not optional decoration: it is the feature that makes
+# `esp-rtos` register itself as the preemptive scheduler the Wi-Fi driver
+# creates its tasks on, and `esp-alloc` is what makes those task stacks come
+# out of the heap this crate installs rather than a second one. Without them
+# `esp_radio::wifi::new` has nowhere to put the driver's threads.
+esp-rtos = { version = "0.3", features = ["embassy", "esp-alloc", "esp-radio"] }
 # Must match `somfy-tasks` and `esp-hal`: the channel types cross both
 # boundaries, so a second copy would be a type mismatch at the seam between
 # the tasks rather than a duplicate-dependency warning.
 embassy-sync = "0.8"
+# Wi-Fi. `esp-radio`, not `esp-wifi`: `esp-wifi 0.15` will not resolve against
+# our `esp-hal 1.1.2` at all, while `esp-radio` continues the same version line
+# after the rename and lives in the esp-hal repo. See CLAUDE.md's evaluation
+# table. `default-features = false` drops nothing we want — the default is
+# `esp-alloc`, which is re-enabled below alongside `wifi`.
+esp-radio = { version = "0.18", default-features = false, features = [
+    "esp-alloc",
+    "wifi",
+] }
+# The heap, and it exists for `esp-radio` alone. `internal-heap-stats` is what
+# turns "the heap is big enough" from an assertion into a measurement: it keeps
+# a high-water mark, which `heap::report` prints. It costs a few
+# instructions per allocation, and nothing on the radio path allocates.
+esp-alloc = { version = "0.10", features = ["internal-heap-stats"] }
+# The TCP/IP stack. `dhcpv4` for the address, `proto-ipv4` for the traffic;
+# no IPv6, and no DNS yet — Task 3's broker address is the first thing that
+# might want it, and an unused resolver is a static buffer for nothing.
+# `embassy-net`'s `StackResources` has to outlive the stack that borrows it,
+# which means a `'static` it is handed exactly once. `StaticCell` is the
+# no_std idiom for that and it is by embassy's own author; the alternative is
+# a `static mut` plus an `unsafe` block asserting single use, which is the
+# same guarantee with the check removed. 3 KB of code, MIT/Apache-2.0, and
+# nothing else in the workspace needs it.
+static_cell = "2"
+embassy-net = { version = "0.9.1", features = [
+    "dhcpv4",
+    "medium-ethernet",
+    "proto-ipv4",
+    "tcp",
+] }
 
 # No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
 # don't declare `#![no_std]`), so no feature selection lets them compile for
@@ -98,6 +147,8 @@ chip-esp32 = [
     "esp-bootloader-esp-idf/esp32",
     "esp-storage/esp32",
     "esp-rtos/esp32",
+    "esp-radio/esp32",
+    "esp-alloc/esp32",
 ]
 chip-s2 = [
     "esp-hal/esp32s2",
@@ -105,6 +156,8 @@ chip-s2 = [
     "esp-bootloader-esp-idf/esp32s2",
     "esp-storage/esp32s2",
     "esp-rtos/esp32s2",
+    "esp-radio/esp32s2",
+    "esp-alloc/esp32s2",
 ]
 chip-s3 = [
     "esp-hal/esp32s3",
@@ -112,6 +165,8 @@ chip-s3 = [
     "esp-bootloader-esp-idf/esp32s3",
     "esp-storage/esp32s3",
     "esp-rtos/esp32s3",
+    "esp-radio/esp32s3",
+    "esp-alloc/esp32s3",
 ]
 chip-c3 = [
     "esp-hal/esp32c3",
@@ -119,6 +174,8 @@ chip-c3 = [
     "esp-bootloader-esp-idf/esp32c3",
     "esp-storage/esp32c3",
     "esp-rtos/esp32c3",
+    "esp-radio/esp32c3",
+    "esp-alloc/esp32c3",
 ]
 
 # `esp-storage`'s build script **refuses** to build for the ESP32 below
@@ -136,3 +193,17 @@ opt-level = "s"
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# `esp-radio` states in its own documentation that it "is necessary to build
+# with optimization level 2 or 3 since otherwise, it might not even be able to
+# connect". That is a timing constraint on the Rust glue around the closed
+# Wi-Fi blob, not a preference — and the failure it describes is a radio that
+# associates unreliably, which would be blamed on the network long before it
+# was blamed on a profile. Both profiles are pinned rather than just the dev
+# one, because `opt-level = "s"` is a size-first setting and the requirement is
+# stated in terms of 2 or 3.
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.release.package.esp-radio]
+opt-level = 3

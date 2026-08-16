@@ -120,6 +120,39 @@ separation is the reason the tasks are split, and it is easy to lose here.
 
 Report the heap figure and the measured stack headroom.
 
+### Task 2 outcome — three things that constrain Task 3
+
+**Done, on hardware.** Full evidence in `docs/provenance.md`; the three facts
+that change what Task 3 can assume:
+
+1. **The heap is 56 KB, and the ESP32-S2 is why it is not larger.** Its usable
+   `dram_seg` is 184 KB and `esp-radio`'s statics take most of it — a 96 KB
+   heap does not link for it at all. 56 KB leaves the ESP32-S2 16,324 bytes of
+   main stack, just under twice what the firmware refuses to start without. The measured
+   high-water mark is **46,660 bytes**, so the margin is 10,684 (23%), and it
+   was measured with association *failing* — the dynamic RX/TX buffers a
+   working link fills are not in it. **Task 3 must read the mark again under
+   real MQTT traffic**; it is printed every time the network comes up. If the
+   working set turns out not to fit the ESP32-S2, the honest outcome is to say
+   so rather than to under-size every chip.
+2. **Static DRAM is now a scarce resource, and `minimq`'s caller-owned rx/tx
+   slices come out of it.** `minimq` advertises its rx size as MQTT5
+   `MaximumPacketSize`, so that buffer is a real choice, not a default to
+   accept: on the ESP32-S2 a 4 KB rx buffer takes the main stack from 16,324 to
+   about 12,200. Still above the 8,192 the boot check requires, but the check
+   is now the thing standing between a generous buffer and a board that will
+   not start.
+3. **The state root is on the wire before the broker is.** `wifi: joining` and
+   `net: address` are separate log lines because a station can be associated
+   with no DHCP lease, which looks identical from the Wi-Fi side and is the
+   state in which nothing works. Task 3's first failure mode will be a broker
+   connect against a stack that has no address yet — `Stack::wait_config_up`
+   is the guard.
+
+Also worth carrying: **`Config::dhcpv4` is what runs, and DNS is not compiled
+in.** Task 3's broker must be reachable by IP, or `embassy-net`'s `dns` feature
+has to be enabled and a resolver socket budgeted out of `SOCKETS`.
+
 ## Task 3 — MQTT client, lifecycle and retention
 
 **Crate:** `crates/firmware` for the transport; keep anything testable in

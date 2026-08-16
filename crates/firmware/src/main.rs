@@ -1,4 +1,4 @@
-//! The controller: two Embassy tasks, four static channels, and the hardware
+//! The controller: the Embassy tasks, four static channels, and the hardware
 //! they own.
 //!
 //! Boot brings up the flash-backed rolling-code store, the CC1101, and both RMT
@@ -7,13 +7,26 @@
 //! file is wiring, and it is deliberately the only place where an `esp-hal`
 //! peripheral and a task body meet.
 //!
+//! ## The network is optional, and the wiring is what makes it so
+//!
+//! Wi-Fi is brought up **after** the radio and state tasks are spawned, by
+//! [`start_network`], which returns nothing. There is no path on which a
+//! missing network, a wrong passphrase or an unreadable configuration region
+//! stops the controller — not because that path is avoided, but because
+//! [`start_network`] gives its caller nothing to propagate. A board with no
+//! credentials provisioned at all is the ordinary state of a freshly flashed
+//! device, and it receives and decodes exactly as it always did. See
+//! [`net`]'s module docs for the other three things that keep the two halves
+//! apart.
+//!
 //! ## This image transmits nothing on its own
 //!
-//! The state task transmits only what it is commanded to, and Plan 4 ships no
-//! command source — the command channel has no producer until Plan 5's API
-//! layer arrives. Nor does it ship a config store, so the shade registry starts
-//! and stays empty. Flashing this therefore produces a controller that listens,
-//! decodes, logs what it hears, and keys the transmitter never.
+//! The state task transmits only what it is commanded to, and there is still no
+//! command source — the command channel has no producer until Plan 5's MQTT
+//! client arrives. The configuration this crate does persist carries Wi-Fi
+//! credentials and nothing else, so the shade registry starts and stays empty.
+//! Flashing this therefore produces a controller that listens, decodes, logs
+//! what it hears, and keys the transmitter never.
 //!
 //! That is intended, and it is also a safety property worth being explicit
 //! about: no boot of this image can move a shade. `tx-check` is the binary that
@@ -31,12 +44,23 @@
 #![no_std]
 #![no_main]
 
+// For `esp-radio` and for nothing this firmware writes. Its `StationConfig`
+// holds an `alloc::string::String`, so the one allocation on our side of the
+// boundary is the passphrase being handed to the driver — see `net::start`.
+// `crates/firmware/.cargo/config.toml` explains why `alloc` is in `build-std`
+// at all, and `heap` explains what the heap is for.
+extern crate alloc;
+
 mod chip;
+mod config;
+mod heap;
+mod net;
 mod radio;
 mod store;
 mod tasks;
 
 use embassy_executor::{SpawnError, Spawner};
+use embassy_futures::yield_now;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{
     delay::Delay,
@@ -56,9 +80,11 @@ use somfy_tasks::{
     CommandChannel, DeltaChannel, FrameChannel, RadioLoop, StateMachine, TransmitChannel, TxProfile,
 };
 
+use config::ConfigStore;
 use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
+use somfy_config::WifiCredentials;
 use store::{FlashStore, StoreError};
 use tasks::Mutex;
 
@@ -90,6 +116,10 @@ const SPI_HZ: u32 = 4_000_000;
 /// pulse train.
 const REQUIRED_STACK_BYTES: usize = 8 * 1024;
 
+/// How long the panic handler waits for the serial line to drain before it
+/// resets the board. See the handler for why this is not optional.
+const PANIC_DRAIN_MS: u32 = 100;
+
 /// Transmissions from the state task to the radio task.
 ///
 /// The producer end is only ever reachable as a `somfy_store::TransmitQueue`,
@@ -109,13 +139,48 @@ static COMMANDS: CommandChannel<Mutex> = CommandChannel::new();
 /// same reason; publishing with none discards immediately.
 static DELTAS: DeltaChannel<Mutex> = DeltaChannel::new();
 
+/// Report the panic, then **reboot** — which is the degradable answer, and it
+/// is the network that made it necessary.
+///
+/// Halting was right while this image was radio and flash only: every panic
+/// reachable then was this project's own code failing deterministically, a
+/// board frozen with its message on the serial line is the best thing to hand
+/// a person debugging it, and rebooting into the same panic would only scroll
+/// it away.
+///
+/// Wi-Fi changes that, because it adds panics this firmware neither writes nor
+/// can catch. `esp-radio` panics on a Wi-Fi status code it does not recognise,
+/// and its event-channel subscriber slots are `expect`ed rather than handled;
+/// an allocation that fails anywhere reaches `handle_alloc_error`, which
+/// panics too. None of those is reachable through [`net::start`]'s `Result`,
+/// so with a halting handler a transient failure in a *degradable* service
+/// would take the radio off the air until somebody physically power-cycled the
+/// board. That is precisely the outcome spec R9 exists to forbid, and no
+/// amount of care in this crate can close it, because the panic is not in this
+/// crate.
+///
+/// So: print first — the message still reaches an attached monitor — then
+/// reset. A board that reboots receives again seconds later. A board that
+/// halts never does. Where the panic is deterministic at boot the cost is a
+/// reboot loop, which is noisy, visible on the serial line, and still strictly
+/// better than a dead radio.
+///
+/// **The bring-up harnesses deliberately keep the halting handler.** They are
+/// run with a person watching the serial line, they contain no network, and
+/// there the frozen state is worth more than the recovery.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     esp_println::println!("PANIC: {}", info);
-    // Nothing left to do on a bare-metal panic: halt here rather than spin
-    // on real work, so an empty loop is the correct body, not a mistake.
-    #[allow(clippy::empty_loop)]
-    loop {}
+    // **Not optional, and measured.** `esp_println` spins until the UART has
+    // room for each byte, not until the line has left the shift register, so
+    // resetting immediately truncates the message — observed on an ESP32-S3,
+    // where a deliberate panic produced a clean reboot with no `PANIC:` line
+    // anywhere on the serial output. A panic you cannot read is most of the
+    // cost of a panic. 100 ms is roughly three times what a long message needs
+    // at 115200 baud, and it doubles as a floor on how fast a deterministic
+    // panic can cycle the board.
+    Delay::new().delay_millis(PANIC_DRAIN_MS);
+    esp_hal::system::software_reset()
 }
 
 /// Anything that can stop the controller starting, reported rather than
@@ -147,19 +212,63 @@ enum StartError {
     Spawn(SpawnError),
 }
 
-#[esp_rtos::main]
-async fn entry(spawner: Spawner) {
-    match start(spawner) {
-        Ok(()) => esp_println::println!("controller: running"),
-        Err(error) => esp_println::println!("controller: failed to start: {:?}", error),
-    }
-    // Returning is correct: the executor outlives this function and keeps
-    // polling the two tasks that were spawned. A failure leaves nothing
-    // spawned and the message above is the whole report.
+/// What [`start`] leaves for the network, once the radio is genuinely running.
+///
+/// It exists only so that a `yield_now` can sit between the two — see [`entry`]
+/// — which is a real ordering requirement and not a stylistic one.
+struct Pending {
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    credentials: Option<WifiCredentials>,
 }
 
-fn start(spawner: Spawner) -> Result<(), StartError> {
+#[esp_rtos::main]
+async fn entry(spawner: Spawner) {
+    let pending = match start(spawner) {
+        Ok(pending) => pending,
+        Err(error) => {
+            // A failure leaves nothing spawned and this message is the whole
+            // report. No network is attempted, because there is no radio for
+            // it to be independent of.
+            esp_println::println!("controller: failed to start: {:?}", error);
+            return;
+        }
+    };
+
+    // **The one await that makes "the radio is already receiving" true.**
+    //
+    // `#[esp_rtos::main]` makes this function an Embassy task like any other,
+    // and `Spawner::spawn` only enqueues — a spawned task is not polled until
+    // whatever is running yields. So without this line every spawn below would
+    // be a promise rather than a fact, and the whole of Wi-Fi bring-up
+    // (`esp_radio::wifi::new` powers the PHY, initialises the blob and creates
+    // the driver's threads) would run before the radio task's *first* poll.
+    // The RMT receive channel is armed inside `RadioLoop::step`, so the
+    // controller would be deaf for all of it — with `air.listen()` already
+    // having put the CC1101 into receive, which is exactly the combination
+    // that looks like working hardware and hears nothing.
+    //
+    // One yield is enough: the radio and state tasks were enqueued before this
+    // task re-enqueued itself, so both are polled — and the receiver armed —
+    // before control returns here.
+    yield_now().await;
+
+    start_network(spawner, pending.wifi, pending.credentials);
+    heap::report("controller started");
+    esp_println::println!("controller: running");
+    // Returning is correct: the executor outlives this function and keeps
+    // polling the tasks that were spawned.
+}
+
+fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    // Before anything else can allocate. `esp-rtos` is built with `alloc`
+    // support so that the Wi-Fi driver's task stacks have somewhere to come
+    // from, and that is true on a board with no credentials as much as on one
+    // with them. See `heap::RADIO_HEAP_BYTES` for the size and where it came
+    // from — it is a static, so it comes out of the same DRAM as the stack
+    // `check_stack_headroom` measures below.
+    heap::install_for_radio();
 
     // The scheduler behind the executor needs a timer and a software interrupt.
     //
@@ -177,12 +286,19 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
     let pins = crate::cc1101_pins!(peripherals);
     check_pin_map(&pins)?;
 
+    // One flash peripheral, two regions, read one after the other. The config
+    // store is mounted through a reborrow and dropped before the rolling-code
+    // store takes the singleton for good — the configuration is read once at
+    // boot and never again, so nothing needs to hold it open, and the store
+    // that *is* held open is the one a running controller writes to.
+    let mut flash = peripherals.FLASH;
+    let credentials = report_config(FlashStorage::new(flash.reborrow()));
+
     // Mounted here rather than inside the state task: `mount` wants roughly
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
-    let mut store = FlashStore::mount(FlashStorage::new(peripherals.FLASH))
-        .map_err(StartError::Store)?;
+    let mut store = FlashStore::mount(FlashStorage::new(flash)).map_err(StartError::Store)?;
     report_store(&mut store)?;
 
     let bus = Spi::new(
@@ -203,8 +319,8 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
     // SPI transaction. The no-delay constructor panics when it meets one, which
     // would abort inside `init` on the very first radio call and read exactly
     // like a dead or miswired radio.
-    let device = ExclusiveDevice::new(bus, chip_select, Delay::new())
-        .map_err(|_| StartError::ChipSelect)?;
+    let device =
+        ExclusiveDevice::new(bus, chip_select, Delay::new()).map_err(|_| StartError::ChipSelect)?;
 
     let mut cc1101 = Cc1101::new(device);
     cc1101.init().map_err(StartError::Radio)?;
@@ -232,9 +348,10 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
     let mut air = Air::new(cc1101, RmtTx::new(transmit));
     air.listen().map_err(StartError::Air)?;
 
-    // An empty registry: Plan 4 ships no config store, so no shade is
-    // provisioned and nothing can be commanded. Said out loud because a silent
-    // empty controller and a broken one look identical from the serial line.
+    // An empty registry: the configuration this crate persists carries Wi-Fi
+    // credentials and nothing else, so no shade is provisioned and nothing can
+    // be commanded. Said out loud because a silent empty controller and a
+    // broken one look identical from the serial line.
     let machine = StateMachine::new(TxProfile::default());
     esp_println::println!(
         "controller: 0 shades provisioned — receiving and tracking only, \
@@ -267,7 +384,95 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
     spawner.spawn(radio);
     spawner.spawn(state);
 
-    Ok(())
+    // The network is brought up by the caller, **after** it has yielded to the
+    // tasks just spawned. That ordering is the degradability requirement
+    // expressed as control flow, and it is why this returns the pieces instead
+    // of finishing the job: see [`entry`] for what the yield buys, and `net`'s
+    // module docs for the other three things that keep the two halves apart.
+    Ok(Pending {
+        wifi: peripherals.WIFI,
+        credentials,
+    })
+}
+
+/// Read the persisted configuration and say what was found.
+///
+/// Returns `None` — meaning "run without a network" — for every outcome that
+/// is not a usable credential, and prints which one it was. That is a
+/// deliberate difference from [`FlashStore`], which refuses to run at all on a
+/// region it cannot read: losing a rolling code costs a re-pairing procedure
+/// at every shade, while losing this costs a Wi-Fi connection and one
+/// re-provisioning step. `config`'s module docs carry the argument.
+///
+/// **A board with nothing provisioned is the ordinary case**, not an error
+/// path. It is what a freshly flashed device looks like, and it is also the
+/// cleanest demonstration that the network is optional: such a board still
+/// receives and decodes.
+fn report_config(flash: FlashStorage<'_>) -> Option<WifiCredentials> {
+    let mut store = match ConfigStore::mount(flash) {
+        Ok(store) => store,
+        Err(error) => {
+            esp_println::println!("config: region unavailable ({:?})", error);
+            return None;
+        }
+    };
+
+    let (base, slots, slot_len) = store.geometry();
+    esp_println::println!(
+        "config: partition '{}' at {:#010X}, {} slots of {} bytes",
+        config::PARTITION_LABEL,
+        base,
+        slots,
+        slot_len,
+    );
+
+    let (record, survey) = match store.load() {
+        Ok(found) => found,
+        Err(error) => {
+            esp_println::println!("config: unreadable ({:?})", error);
+            return None;
+        }
+    };
+    esp_println::println!(
+        "config: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
+        survey.slots,
+        survey.valid,
+        survey.blank,
+        survey.damaged,
+        survey.newest_seq,
+    );
+
+    // `Debug` on the credentials redacts the passphrase, and only the SSID is
+    // printed here in any case. The SSID is broadcast by the access point
+    // several times a second; the passphrase never leaves flash except into
+    // the driver.
+    record.and_then(|record| record.wifi)
+}
+
+/// Start the network if there is one to start, and never fail.
+///
+/// No `Result`, on purpose. A caller cannot propagate what it is not given, so
+/// the "network failure stops the controller" path is not something to avoid
+/// writing — it is not expressible from here.
+fn start_network(
+    spawner: Spawner,
+    wifi: esp_hal::peripherals::WIFI<'static>,
+    credentials: Option<WifiCredentials>,
+) {
+    let Some(credentials) = credentials else {
+        esp_println::println!(
+            "network: no credentials provisioned — running radio-only. \
+             This board still receives and decodes; see docs/hardware-checklist.md \
+             to provision one."
+        );
+        return;
+    };
+    if let Err(error) = net::start(spawner, wifi, &credentials) {
+        esp_println::println!(
+            "network: failed to start ({:?}) — running radio-only, which is unaffected",
+            error,
+        );
+    }
 }
 
 /// Print what the rolling-code region holds before anything writes to it.

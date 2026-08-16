@@ -16,8 +16,19 @@
 # which is the minimum the ring needs to guarantee that erasing one sector can
 # never take the newest record with it.
 #
+# `wificfg` is the second region with the same shape and the same reasons: the
+# Plan 5 configuration store looks it up by label, and it is two 4 KB erase
+# sectors for the same guarantee — erasing one sector can never take the newest
+# record with it. It is a separate partition rather than more slots in
+# `rollcode` because the two have different write rates and very different
+# consequences on loss, and one erase must never touch both.
+#
+# Note `rollcode` keeps its offset. A board reflashed with this table keeps its
+# rolling codes; only the new region beyond it is added.
+#
 # Name,     Type, SubType,   Offset,   Size,     Flags
 nvs,        data, nvs,       0x9000,   0x6000,
 phy_init,   data, phy,       0xf000,   0x1000,
 factory,    app,  factory,   0x10000,  0x1F0000,
 rollcode,   data, undefined, 0x200000, 0x2000,
+wificfg,    data, undefined, 0x202000, 0x2000,
