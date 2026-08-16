@@ -39,17 +39,48 @@ of this port.
 | `somfy-rts` (protocol) | [`somfy`](https://crates.io/crates/somfy) 0.1.0 | **Own.** Frame construction only, transmit-oriented; no pulse rendering, no receive decode. 0 stars/forks, no releases, no visible licence file. Ours does 56/80-bit encode **and** decode, rolling codes, pulse rendering, dual-stream RX and repeat dedupe, and is pinned against real wall-remote captures. |
 | `somfy-cc1101` (radio driver) | [`cc1101`](https://crates.io/crates/cc1101) 0.1.3, [`cc1101-embassy`](https://crates.io/crates/cc1101-embassy) 0.1.0 | **Own — but this was never consciously evaluated, which was a process failure.** The high-level `cc1101` API is packet-oriented (sync words, address filtering, packet length); this project runs the chip in asynchronous-serial OOK where every one of those is switched off, so we would be using its `lowlevel` raw-register module and writing the same bytes by hand anyway. Revisit if that crate grows async-serial support. |
 
-## Source comments must not name the reference implementation
+## Consult the C++ reference EARLY — it is a record of solved problems
 
-See [`docs/provenance.md`](docs/provenance.md). Deriving from the C++ reference
-is **required** — never invent protocol behaviour. Citing it *in source
-comments* is what is forbidden; the citation belongs in `provenance.md`.
-`crates/somfy-migrate/**` is the one documented exception, because that crate's
-subject matter *is* the C++ backup format.
+The reference implementation runs on this same hardware, in this same room,
+talking to these same motors. Every value in it and every structural choice it
+made has already survived contact with reality. **Check it before deriving
+anything from first principles, not after.**
 
-Do not read the reference to hunt for implementation ideas without a reason —
-agents have exhausted their context window in it. Do read it, or ask for the
-relevant extract, when a value would otherwise be invented.
+Read it for three things, in this order of value:
+
+1. **Architecture.** *How* did it solve the problem, not just with what number.
+   It receives with a GPIO change-interrupt and an IRAM handler, **not** with
+   the RMT peripheral — which sidesteps the "wait for the band to go quiet"
+   requirement that RMT reception imposes and that cost us a long detour. A
+   structural choice like that is worth more than any constant.
+2. **What it delegates.** It does not hand-roll its radio configuration; it
+   takes an external library's defaults (`SmartRC-CC1101-Driver-Lib`). Where the
+   reference reached for a library, that is a strong signal we should too — see
+   the reuse rule above.
+3. **Values.** Registers, timings, thresholds. Verify them, then record them in
+   [`docs/provenance.md`](docs/provenance.md) as reference-derived.
+
+**This cost real time, concretely.** A full session went into deriving CC1101
+AGC settings from the datasheet and sweeping them on hardware, while a
+field-proven configuration sat one file away in the library the reference
+depends on. Worse, that config contradicted the theory being swept — it caps
+gain *harder* while raising the magnitude target and widening the OOK decision
+boundary. No amount of first-principles derivation was going to land there.
+
+### The restriction is narrow, and it is not "do not read it"
+
+Only **source comments** must avoid naming the reference. Reading it is
+required: `docs/provenance.md` rule 1 says "never invent protocol behaviour —
+read the reference, verify the value, then record it here, not in a source
+comment." `crates/somfy-migrate/**` is the one documented exception to the
+comment rule, because that crate's subject matter *is* the C++ backup format.
+
+The one real hazard is context: agents have exhausted their window wandering a
+large C++ codebase. **So the orchestrator extracts the relevant excerpt and
+hands it to the implementer** — a named file and line range, or the decoded
+values — rather than telling an agent either "go read it all" or "do not look".
+Telling an implementer not to look, when the answer is in there, is the failure
+this rule exists to prevent.
 
 ## Verification
 
