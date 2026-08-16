@@ -55,6 +55,8 @@ mod rx;
 pub use command::Command;
 pub use dedupe::RxDeduper;
 pub use frame::{decode56, decode80, encode56, encode80, Frame, FrameError};
-pub use pulse::{merge_pulses, render_pulses, FrameKind, Pulse, TIMINGS};
+pub use pulse::{
+    merge_pulses, render_pulses, FrameKind, Pulse, MEASURED_MAX_INTRA_FRAME_SEGMENT_US, TIMINGS,
+};
 pub use rolling::RollingCode;
 pub use rx::{RxDecoder, RxFrame};

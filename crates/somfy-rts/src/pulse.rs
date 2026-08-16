@@ -46,6 +46,35 @@ pub mod TIMINGS {
     pub const INTER_FRAME_GAP: u32 = 27_434;
 }
 
+/// Longest segment of *either* level measured **inside** a real transmission,
+/// in µs.
+///
+/// A receiver that has to decide where one transmission ends needs to know the
+/// longest interval that can pass without an edge inside one, and [`TIMINGS`]
+/// cannot answer that: it describes the pulse train this crate emits, while a
+/// receiver hears whatever a physical remote emits. The two differ here by more
+/// than a factor of two — a real remote's post-wake-up silence measures
+/// ~17.7 ms where [`TIMINGS::WAKEUP_LOW`] is 7357 µs — so a bound taken from
+/// the transmit constants would be wrong against the very hardware it exists to
+/// receive.
+///
+/// **Both levels, deliberately.** The longest segment in the captures happens
+/// to be a LOW, and it is tempting to call this a maximum silence. But the
+/// hardware rule a receiver is sized against is level-agnostic — a reception
+/// ends when no *edge* arrives for long enough, so a sufficiently long HIGH ends
+/// one exactly as a long LOW does. A LOW-only bound would leave the wake-up
+/// pulse outside anything checking it. (Measured, the wake-up HIGH is ~10.2 ms,
+/// well inside; the point is that nothing would notice if it were not.)
+///
+/// This is a **measurement**, not a derivation: the value is the largest segment
+/// in any committed wall-remote capture, and `tests/measured.rs` re-derives it
+/// from those files on every run, so it cannot drift away from its evidence.
+/// Those captures are all *first* frames whose recording stops when the frame
+/// completes, so the figure bounds the intra-frame case only — no committed
+/// capture contains a real remote's inter-frame silence, and nothing here
+/// establishes what that is.
+pub const MEASURED_MAX_INTRA_FRAME_SEGMENT_US: u32 = 17_738;
+
 /// Render an encoded frame to OOK pulses. The frame size selects the protocol:
 /// 7 bytes = 56-bit, 10 bytes = 80-bit.
 ///

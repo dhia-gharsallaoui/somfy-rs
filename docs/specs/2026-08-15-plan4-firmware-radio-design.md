@@ -169,14 +169,52 @@ recorded risk, not for generality.
 
 The RMT RX idle threshold must sit **above the longest in-frame LOW** and **below
 the inter-frame gap**, so that each repeat frame lands as its own completed
-transaction rather than being concatenated or truncated:
+transaction rather than being concatenated or truncated.
+
+This section originally stated that bound as
 
 ```
-WAKEUP_LOW (7,357 µs)  <  idle_threshold  <  INTER_FRAME_GAP (27,434 µs)
+WAKEUP_LOW (7,357 µs)  <  idle_threshold  <  INTER_FRAME_GAP (27,434 µs)   [WRONG]
 ```
 
-Chosen: **12,000 µs**. The field is a `u16` of ticks, so at 1 µs resolution the
-ceiling is 65,535 µs — the chosen value is comfortably representable.
+and chose **12,000 µs**. Both were **corrected during implementation** and are
+recorded here so the reasoning is not repeated.
+
+**The longest in-frame LOW is not `WAKEUP_LOW`.** That constant describes the
+pulse train *this project transmits*; a receiver hears whatever a physical
+remote transmits, and every committed wall-remote capture shows a post-wake-up
+gap near **17.7 ms** — `up_56bit_1.pulses` 17738, `down_56bit_1.pulses` 17722,
+`my_56bit_1.pulses` 17711. A 12,000 µs threshold sits below that and would end
+the reception one pulse into every real first frame. The real window is
+
+```
+17,738 µs (measured, somfy_rts::MEASURED_MAX_INTRA_FRAME_SEGMENT_US)
+    <  idle_threshold  <  27,434 µs (INTER_FRAME_GAP)
+```
+
+Chosen: **22,000 µs** (`somfy_rmt::IDLE_THRESHOLD_US`), roughly mid-band, with
+~4.3 ms of margin below and ~5.4 ms above. Both margins are asserted at compile
+time against the measured constant, and `somfy-rmt/tests/idle_threshold.rs`
+replays the captures through a host model of the hardware's split rule — pinning
+both that 22,000 leaves each capture whole and that 12,000 would have cut it.
+
+Note the two bounds are not equally trustworthy. The floor is measured from real
+hardware. The ceiling is *our* transmitter's gap: no committed fixture contains a
+real remote's repeat frame, so nothing establishes what a remote's inter-frame
+gap actually is. Capturing one belongs to on-air bring-up.
+
+Note the floor constant is **level-agnostic** — the longest segment of either
+level, not the longest silence. The peripheral ends a reception when no *edge*
+arrives for long enough, so a sufficiently long HIGH ends one exactly as a long
+LOW does. The maximum is a LOW today (the longest HIGH is the ~10.2 ms wake-up
+pulse), but a LOW-only bound would leave the wake-up pulse outside the guard.
+
+**The field is also not always 16 bits.** It is 16 on the ESP32 and ESP32-S2 but
+**15 on the ESP32-S3 and ESP32-C3**, so the ceiling is 32,767 µs at 1 µs
+resolution, not 65,535. Any value in the window above is comfortably
+representable either way, and the firmware asserts the bound against `esp-hal`'s
+own per-chip `MAX_RX_IDLE_THRESHOLD` on all four builds rather than against a
+figure written down here.
 
 ## 7. Tasks and the persist-before-TX invariant
 

@@ -2,7 +2,8 @@
 //! them.
 //!
 //! It lives beside the fixtures it parses and is pulled into
-//! `crates/somfy-rmt/tests/replay.rs` with `#[path]`. That cross-crate include
+//! `crates/somfy-rmt/tests/replay.rs` and `crates/somfy-rmt/tests/idle_threshold.rs`
+//! with `#[path]`. That cross-crate include
 //! is deliberate: a second copy of these reconstruction rules could drift from
 //! this one, and a loader that quietly disagrees with the one that produced the
 //! pinned expectations is worse than having no second test at all. The
