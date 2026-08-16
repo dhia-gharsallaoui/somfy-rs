@@ -5,13 +5,24 @@ Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
 
-Two independent procedures, because they need different equipment and carry
+Three independent procedures, because they need different equipment and carry
 different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
   the air.
 - **[Rolling-code store](#rolling-code-store)** — needs nothing but the board,
   and touches only flash.
+- **[Controller](#controller)** — the real firmware: receives, tracks, and
+  transmits nothing on its own.
+
+Which binary is which matters here, because they differ in whether they key a
+transmitter:
+
+| Binary | Keys the radio | What it is for |
+|---|---|---|
+| `tx-check` | **yes**, at a synthetic address | proving the transmit path |
+| `store-check` | no — flash only | proving the rolling-code store |
+| `firmware` | no, until commanded — and Plan 4 ships no command source | the controller itself |
 
 ## Transmit path
 
@@ -49,8 +60,11 @@ Check it against the board you intend to flash. Do this every time, not once.
 source ~/export-esp.sh                      # required before any ESP build
 cd crates/firmware
 cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
-espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmware
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/tx-check
 ```
+
+`tx-check`, not `firmware`: the transmit harness is a binary of its own, and
+the controller in `firmware` deliberately keys nothing by itself.
 
 Run espflash from `crates/firmware`, not from the repo root. `espflash.toml`
 there points it at this crate's `partitions.csv`, which is the only table
@@ -309,3 +323,74 @@ there is — treat it as one. Redundancy belongs with the Plan 6 rewrite.
 | Slots | 32, in 2 erase sectors of 16 |
 | Erases | one sector per full lap — 32 commits |
 | Endurance | 100k cycles x 32 commits per cycle = **3.2M commits** |
+
+---
+
+## Controller
+
+The real firmware: the radio task, the state task, and the flash store wired
+together. **It keys the transmitter only when commanded, and Plan 4 ships no
+command source**, so flashing it produces a controller that listens and tracks
+and puts nothing on the air. That is deliberate — no boot of this image can
+move a shade — and it is also why the two harnesses above still exist.
+
+Step 0 above — **identify the board** — applies here too, every time.
+
+```bash
+source ~/export-esp.sh
+cd crates/firmware
+cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmware
+espflash monitor --port /dev/ttyUSB0 --non-interactive
+```
+
+A healthy boot prints four things, in this order:
+
+```
+stack: <n> bytes available, 8192 required
+store: partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
+store: survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
+controller: 0 shades provisioned — receiving and tracking only, nothing will
+ transmit until a config store and a command source exist
+controller: running
+```
+
+Each line is there because nothing else can establish it:
+
+- **stack** — `RmtTx::transmit_frame` needs roughly 6.5 KB, and Embassy tasks
+  have no stacks of their own, so that comes off the main stack. esp-hal's
+  linker script gives the main stack whatever DRAM is left after the statics,
+  which moves every time a static is added; the check refuses to start rather
+  than let a future Plan's buffers turn into a corrupted pulse train.
+- **store survey** — "this device has never stored a code" versus "this
+  device's codes are gone". `damaged` above zero on a board nobody power-cut
+  deserves a look.
+- **0 shades provisioned** — a silent empty controller and a broken one look
+  identical from the serial line.
+- **controller: running** — both tasks spawned. Anything else names its own
+  failure (`StartError`), including which pin disagreed with `chip::pins`.
+
+After that the only output is what the radio hears:
+
+```
+state: heard Up from 0x0FC0D5 (code 4213)
+```
+
+one line per frame, so a single button press on a wall remote produces one line
+for its first frame and one for each repeat. The state task prints it, not the
+radio task, on purpose: a repeat frame follows the previous one by about 5 ms
+after the receiver has finished with it, and a serial line at 115200 baud would
+eat most of that window before the receiver could be re-armed.
+
+Frames from addresses the controller does not know are printed and then
+dropped by the domain, which is what makes this readable at all with an empty
+registry.
+
+### What this procedure does not establish
+
+Everything about reception on the air. The RF link between the two boards
+decoded ~4–12% of frames during transmit bring-up, and a receiver validated
+against a marginal link is exactly how this project already produced one
+confident wrong diagnosis. Fixing the link and validating reception — decoded
+address, command, `bits`, and the sync counts — belongs to on-air bring-up, not
+here.

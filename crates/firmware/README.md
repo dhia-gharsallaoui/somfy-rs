@@ -5,12 +5,16 @@ the parts of the controller that can only exist against real hardware.
 
 | Binary | What it does | Puts RF on the air |
 |---|---|---|
-| `firmware` | Brings up the CC1101 and transmits one Somfy frame plus repeats, at a synthetic address | **yes** |
+| `firmware` | The controller: radio task, state task, flash-backed rolling-code store | only when commanded — and nothing commands it yet |
+| `tx-check` | Brings up the CC1101 and transmits one Somfy frame plus repeats, at a synthetic address | **yes** |
 | `store-check` | Reads the rolling-code region, commits the next code, reads it back | no — flash only |
 
 They are separate binaries so that proving the rolling-code store survives a
-power cycle never involves keying a transmitter. `docs/hardware-checklist.md`
-has the procedure for each.
+power cycle never involves keying a transmitter, and so that flashing the
+controller cannot put a frame on the band by itself. Plan 4 ships no command
+source and no config store, so `firmware` boots with an empty shade registry
+and transmits nothing at all; it receives, decodes and logs.
+`docs/hardware-checklist.md` has the procedure for each.
 
 The rolling-code store needs a `rollcode` partition, which is why this crate
 carries its own `partitions.csv` and an `espflash.toml` pointing espflash at
@@ -89,8 +93,8 @@ cargo build --features chip-s2    --target xtensa-esp32s2-none-elf
 cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
 ```
 
-Each of those builds both binaries. Add `--bin store-check` to build only the
-flash harness.
+Each of those builds all three binaries. Add `--bin store-check` or
+`--bin tx-check` to build only one harness.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip
 feature enabled is expected to fail — see `src/chip.rs`'s `compile_error!`
@@ -118,5 +122,8 @@ crate — it does not declare `#![no_std]` and uses `std` macros unconditionally
 — so it cannot be built for any of these bare-metal targets under
 `build-std = ["core"]`, regardless of which features are selected. Host-side
 unit tests for driver logic belong in a separate lib target built for the
-host triple, once this crate has logic worth testing that way; there is
-nothing to test yet in this skeleton.
+host triple. In practice almost nothing has needed to be: the task bodies live
+in `somfy-tasks`, the symbol pipeline in `somfy-rmt`, the CC1101 register set
+in `somfy-cc1101` and the store's arithmetic in `somfy-store`, all of which the
+host test suite covers. What is left here is the code that can only be checked
+on a chip.

@@ -29,6 +29,15 @@ name = "store-check"
 path = "src/bin/store_check.rs"
 test = false
 
+# Transmit bring-up harness: the only image here that keys the radio by itself,
+# and it does so at a synthetic address. Separate from `firmware` so that
+# flashing the controller can never put a frame on the band on its own.
+# `test = false` for the same reason as above.
+[[bin]]
+name = "tx-check"
+path = "src/bin/tx_check.rs"
+test = false
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["unstable"] }
 esp-println = { version = "0.13", features = ["log"] }
@@ -52,6 +61,29 @@ somfy-rts = { path = "../somfy-rts" }
 somfy-rmt = { path = "../somfy-rmt" }
 somfy-cc1101 = { path = "../somfy-cc1101" }
 somfy-store = { path = "../somfy-store" }
+somfy-domain = { path = "../somfy-domain" }
+# The two task bodies and the channels between them. Everything in there is
+# host-tested; what is left in this crate is an executor, two `#[task]`
+# wrappers, and the implementations of the traits those bodies are written
+# against.
+somfy-tasks = { path = "../somfy-tasks" }
+# Embassy, by way of `esp-rtos`. NOT `esp-hal-embassy`: that crate's
+# `executors` feature turns on `esp-hal/__esp_hal_embassy`, a feature esp-hal
+# dropped in 1.0.0-rc.1, so no published version of it resolves against the
+# esp-hal this crate uses. `esp-rtos` is its replacement and supplies both the
+# time driver and the thread-mode executor. The executor and time crates are
+# pinned to the majors it depends on, because a second semver-incompatible
+# copy of `embassy-time` in one image is two unrelated clocks, not a warning.
+embassy-executor = "0.10"
+embassy-time = "0.5"
+# `select3` for the state task's three inputs, and `yield_now` for handing the
+# executor to the radio task the moment a transmission is queued.
+embassy-futures = "0.1"
+esp-rtos = { version = "0.3", features = ["embassy"] }
+# Must match `somfy-tasks` and `esp-hal`: the channel types cross both
+# boundaries, so a second copy would be a type mismatch at the seam between
+# the tasks rather than a duplicate-dependency warning.
+embassy-sync = "0.8"
 
 # No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
 # don't declare `#![no_std]`), so no feature selection lets them compile for
@@ -65,25 +97,40 @@ chip-esp32 = [
     "esp-println/esp32",
     "esp-bootloader-esp-idf/esp32",
     "esp-storage/esp32",
+    "esp-rtos/esp32",
 ]
 chip-s2 = [
     "esp-hal/esp32s2",
     "esp-println/esp32s2",
     "esp-bootloader-esp-idf/esp32s2",
     "esp-storage/esp32s2",
+    "esp-rtos/esp32s2",
 ]
 chip-s3 = [
     "esp-hal/esp32s3",
     "esp-println/esp32s3",
     "esp-bootloader-esp-idf/esp32s3",
     "esp-storage/esp32s3",
+    "esp-rtos/esp32s3",
 ]
 chip-c3 = [
     "esp-hal/esp32c3",
     "esp-println/esp32c3",
     "esp-bootloader-esp-idf/esp32c3",
     "esp-storage/esp32c3",
+    "esp-rtos/esp32c3",
 ]
+
+# `esp-storage`'s build script **refuses** to build for the ESP32 below
+# optimization level 2, 3 or s: its flash routines run from RAM with the cache
+# disabled and are timing-sensitive, so an unoptimized build is not slow, it is
+# wrong. The default dev profile is level 0, which means `cargo clippy` — which
+# uses this profile, and which CI runs per chip before the release build —
+# fails at `esp-storage` for `chip-esp32` alone, with a message about
+# optimization that reads like a warning and is a hard error. Setting it here
+# is what keeps the four-chip lint matrix able to run at all.
+[profile.dev]
+opt-level = "s"
 
 [profile.release]
 opt-level = "s"

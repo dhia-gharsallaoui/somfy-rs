@@ -1,0 +1,23 @@
+[package]
+name = "somfy-tasks"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std radio and state task bodies, and the transmit channel whose producer end is unreachable, for somfy-rs"
+
+[dependencies]
+heapless = "0.8"
+somfy-rts = { path = "../somfy-rts" }
+somfy-rmt = { path = "../somfy-rmt" }
+somfy-store = { path = "../somfy-store" }
+somfy-domain = { path = "../somfy-domain" }
+# The bounded channels §7 calls for. Kept in step with the major `esp-hal`
+# itself depends on: the firmware hands *this* crate's channel types to its
+# tasks, and two semver-incompatible copies of `Channel` in one image would
+# not be a version warning, it would be a type mismatch at the seam between
+# the two tasks.
+embassy-sync = "0.8"
+# `select` for the radio loop's one real decision: a pulse arrived, or a
+# transmission is due.
+embassy-futures = "0.1"

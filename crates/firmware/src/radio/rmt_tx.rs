@@ -6,12 +6,12 @@
 //! `somfy_rmt::build_symbols`, which is pure data and covered by host tests.
 //! What is left here is the part that can only exist against real hardware
 //! types: mapping a packed symbol onto `esp_hal::rmt::PulseCode`, and driving
-//! one blocking TX transaction per frame.
+//! one asynchronous TX transaction per frame.
 
 use esp_hal::{
     gpio::Level,
     rmt::{Channel, Error as RmtError, PulseCode, Tx, TxChannelConfig},
-    Blocking,
+    Async,
 };
 use heapless::Vec;
 use somfy_rmt::{build_symbols, PackError, RmtSymbol, MAX_SYMBOLS};
@@ -77,9 +77,6 @@ pub enum TxError {
     /// The RMT peripheral refused the buffer or reported a failed
     /// transmission.
     Rmt(RmtError),
-    /// The channel is missing. Only reachable if a previous transmit was
-    /// interrupted between taking the channel and giving it back.
-    ChannelUnavailable,
 }
 
 impl From<PackError> for TxError {
@@ -127,35 +124,50 @@ pub fn to_pulse_code(symbol: RmtSymbol) -> Option<PulseCode> {
 /// timing, not the radio — and the caller must also wait [`TX_SETTLE_US`] after
 /// that strobe before the first call here.
 ///
-/// ## Known limitation: no transmit timeout
+/// ## Why the channel is `Async`
 ///
-/// [`RmtTx::transmit_frame`] blocks in esp-hal's `TxTransaction::wait`, which
-/// busy-loops with no deadline. A channel that never raised its end or error
-/// interrupt would hang the caller — as bad an outcome as a panic.
+/// Not a preference. `esp_hal::rmt::Rmt` carries its driver mode on the whole
+/// peripheral, not per channel: `Rmt::into_async` converts every channel
+/// creator at once and there is no way back for one of them. The receive side
+/// *must* be asynchronous — a blocking receive busy-polls with no deadline, and
+/// on a radio that may hear nothing for hours that would pin the executor
+/// through every silence — so the transmit side is asynchronous too, and both
+/// channels come from the same `Rmt<Async>`.
 ///
-/// This is not fixable at this esp-hal version and is deliberately not
-/// papered over. `TxTransaction` *owns* the channel and hands it back only
-/// from `wait`; `poll` returns a bare `bool`, and there is no abort that
-/// returns the channel. So a poll-with-deadline loop that gave up would have
-/// to drop the transaction, taking the channel with it and leaving the
-/// transmitter permanently dead — trading a recoverable hang for an
-/// unrecoverable one. Revisit if esp-hal grows a channel-returning abort.
+/// Two consequences worth stating, because this replaces the blocking path the
+/// 2026-08-15 on-air bring-up used:
+///
+/// - **A frame's timing is unaffected.** A whole frame fits in reserved RMT
+///   RAM (the assertion above pins that), so once started the peripheral clocks
+///   every symbol from its own memory. Nothing the CPU does — another task
+///   running, an interrupt, a flash erase — can stretch a pulse *inside* a
+///   frame.
+/// - **The gap between frames can stretch.** Awaiting hands the executor to
+///   other tasks between the frames of a burst, so a long operation elsewhere
+///   delays the next frame. For a 56-bit frame that means a longer silence
+///   before a repeat, which is harmless; an 80-bit burst, whose repeats carry
+///   no gap of their own, would be more sensitive — and no 80-bit hardware
+///   exists to check that against.
+///
+/// It also removes the blocking path's one real hazard: `TxTransaction::wait`
+/// busy-looped with no deadline, so a channel that never raised its end or
+/// error interrupt hung the caller outright. The future simply stays pending,
+/// which costs this task and no other.
 pub struct RmtTx<'ch> {
-    /// `Option` because esp-hal's blocking transmit consumes the channel by
-    /// value and hands it back on completion. See [`RmtTx::transmit_frame`].
-    channel: Option<Channel<'ch, Blocking, Tx>>,
+    /// Not an `Option` like the blocking transmitter this replaces: the
+    /// asynchronous `transmit` borrows the channel rather than consuming it, so
+    /// there is no window in which the channel can be lost.
+    channel: Channel<'ch, Async, Tx>,
 }
 
 impl<'ch> RmtTx<'ch> {
     /// Takes ownership of a channel that has already been configured with
     /// [`tx_channel_config`] and connected to the CC1101's data pin.
-    pub fn new(channel: Channel<'ch, Blocking, Tx>) -> Self {
-        Self {
-            channel: Some(channel),
-        }
+    pub fn new(channel: Channel<'ch, Async, Tx>) -> Self {
+        Self { channel }
     }
 
-    /// Transmit one encoded frame and block until the peripheral is done.
+    /// Transmit one encoded frame and return once the peripheral is done.
     ///
     /// Repeats are separate calls, not one long buffer. The two frame widths
     /// differ in why: a 56-bit frame carries its inter-frame gap at the end of
@@ -163,12 +175,24 @@ impl<'ch> RmtTx<'ch> {
     /// re-encodes part of its payload for each repeat, so each repeat is a
     /// different frame rather than the same one sent again.
     ///
-    /// Needs roughly **6.5 KB of stack** — most of it inside `build_symbols`,
-    /// which renders and merges into two fixed 320-pulse buffers. That is
-    /// comfortable on the main stack but is more than a default async task
-    /// gets, so whichever task ends up owning the radio has to be sized for it
-    /// deliberately.
-    pub fn transmit_frame(&mut self, bytes: &[u8], kind: FrameKind) -> Result<(), TxError> {
+    /// ## What this costs in memory, and where
+    ///
+    /// Roughly **6.5 KB of stack**, nearly all of it inside `build_symbols`,
+    /// which renders and merges into two fixed 320-pulse buffers. Those are
+    /// locals of a synchronous call that returns before the await below, so
+    /// they live on the **executor's stack** and never enter this future.
+    ///
+    /// Embassy tasks have no stacks of their own — they are state machines
+    /// polled on the stack of whatever runs the executor — so "size the radio
+    /// task's stack" means sizing the *main* stack, which is what
+    /// `main::check_stack_headroom` does at boot.
+    ///
+    /// What *is* in the future is what is live across the await: the 96-symbol
+    /// buffer and the 96-entry `PulseCode` array below, about 1.2 KB. Those go
+    /// into the task's statically-allocated future, sized exactly by
+    /// `embassy-executor`, so being wrong about them is a link error rather
+    /// than corruption.
+    pub async fn transmit_frame(&mut self, bytes: &[u8], kind: FrameKind) -> Result<(), TxError> {
         let mut symbols: Vec<RmtSymbol, MAX_SYMBOLS> = Vec::new();
         build_symbols(bytes, kind, &mut symbols)?;
 
@@ -177,36 +201,9 @@ impl<'ch> RmtTx<'ch> {
             *code = to_pulse_code(*symbol).ok_or(TxError::LengthOutOfRange)?;
         }
 
-        let channel = self.channel.take().ok_or(TxError::ChannelUnavailable)?;
-        let (channel, result) = send(channel, &codes[..symbols.len()]);
-        // One restore, unconditional, and nothing between it and the `take`
-        // above can return early — `send` returns the channel in its type, so
-        // there is no path on which it is dropped. A failed transmit that ate
-        // the channel would leave the controller permanently unable to send.
-        self.channel = Some(channel);
-        result
-    }
-}
-
-/// Run one transmit transaction, returning the channel whatever happens.
-///
-/// esp-hal's `transmit` and `wait` both consume the channel and both hand it
-/// back in their error arms. Returning it alongside the outcome — rather than
-/// assigning it in each arm — makes losing it a type error instead of a
-/// reviewing exercise. Note that neither call can use `?`: their error type is
-/// a tuple carrying the channel, so the compiler rejects any attempt to
-/// propagate without unpacking it.
-fn send<'ch>(
-    channel: Channel<'ch, Blocking, Tx>,
-    codes: &[PulseCode],
-) -> (Channel<'ch, Blocking, Tx>, Result<(), TxError>) {
-    let transaction = match channel.transmit(codes) {
-        Ok(transaction) => transaction,
-        Err((error, channel)) => return (channel, Err(TxError::Rmt(error))),
-    };
-
-    match transaction.wait() {
-        Ok(channel) => (channel, Ok(())),
-        Err((error, channel)) => (channel, Err(TxError::Rmt(error))),
+        self.channel
+            .transmit(&codes[..symbols.len()])
+            .await
+            .map_err(TxError::Rmt)
     }
 }

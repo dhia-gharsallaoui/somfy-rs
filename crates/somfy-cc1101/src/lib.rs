@@ -9,7 +9,8 @@
 //! framing, symbol timing or rolling codes lives here — that is `somfy-rts`
 //! (frames and pulse trains) and `somfy-rmt` (packing those pulses for the
 //! ESP32 RMT peripheral). This crate's entire job is to put the radio in the
-//! state where driving that one pin transmits.
+//! state where driving that one pin transmits, and where the other pin carries
+//! what the radio hears.
 //!
 //! The driver speaks to nothing but [`embedded_hal::spi::SpiDevice`], so it
 //! builds for `no_std` targets and is fully testable on the host. That is why
@@ -46,7 +47,7 @@ use embedded_hal::spi::{Operation, SpiDevice};
 
 use config::{
     CONFIG, HEADER_BURST, HEADER_READ, KNOWN_VERSIONS, PARTNUM_CC1101, PATABLE_OOK, REG_PARTNUM,
-    REG_PATABLE, REG_VERSION, RESET_SETTLE_NS, STROBE_SIDLE, STROBE_SRES, STROBE_STX,
+    REG_PATABLE, REG_VERSION, RESET_SETTLE_NS, STROBE_SIDLE, STROBE_SRES, STROBE_SRX, STROBE_STX,
 };
 
 /// Everything that can go wrong talking to the radio.
@@ -103,6 +104,22 @@ impl<SPI: SpiDevice> Cc1101<SPI> {
     /// because `MCSM0.FS_AUTOCAL` was configured to make it.
     pub fn set_tx(&mut self) -> Result<(), Cc1101Error> {
         self.strobe(STROBE_STX)
+    }
+
+    /// Enables the receiver. From IDLE this also calibrates the synthesiser,
+    /// for the same `MCSM0.FS_AUTOCAL` reason as [`Cc1101::set_tx`].
+    ///
+    /// In asynchronous serial mode the chip drives demodulated data onto GDO2
+    /// only while it is receiving, so a receiver that never strobes this reads
+    /// a pin that is simply idle — indistinguishable from a quiet band, and
+    /// therefore from a working receiver that has heard nothing.
+    ///
+    /// Reception continues until something strobes the chip out of RX. That is
+    /// a property of asynchronous serial mode, where the packet handler is
+    /// bypassed entirely: there is no packet to end, so `MCSM1.RXOFF_MODE` —
+    /// which this driver leaves at its reset default — has nothing to act on.
+    pub fn set_rx(&mut self) -> Result<(), Cc1101Error> {
+        self.strobe(STROBE_SRX)
     }
 
     /// Returns the chip to IDLE, switching off the synthesiser and whichever of
@@ -321,15 +338,21 @@ mod tests {
         }
     }
 
+    /// The three mode strobes, pinned as literals. A transposed pair here would
+    /// put the radio in the opposite mode to the one asked for — a transmitter
+    /// that hears and a receiver that radiates — and nothing in a build would
+    /// say so.
     #[test]
-    fn set_tx_strobes_stx_and_set_idle_strobes_sidle() {
+    fn the_mode_strobes_are_srx_stx_and_sidle() {
         let mut expectations = Vec::new();
+        expectations.extend(txn(SpiTransaction::write_vec(vec![0x34])));
         expectations.extend(txn(SpiTransaction::write_vec(vec![0x35])));
         expectations.extend(txn(SpiTransaction::write_vec(vec![0x36])));
 
         let mut spi = SpiMock::new(&expectations);
         let mut radio = Cc1101::new(&mut spi);
 
+        assert_eq!(radio.set_rx(), Ok(()));
         assert_eq!(radio.set_tx(), Ok(()));
         assert_eq!(radio.set_idle(), Ok(()));
         spi.done();
@@ -354,6 +377,7 @@ mod tests {
         assert_eq!(radio.read_version(), Err(Cc1101Error::Spi));
         assert_eq!(radio.init(), Err(Cc1101Error::Spi));
         assert_eq!(radio.set_tx(), Err(Cc1101Error::Spi));
+        assert_eq!(radio.set_rx(), Err(Cc1101Error::Spi));
         assert_eq!(radio.set_idle(), Err(Cc1101Error::Spi));
     }
 }

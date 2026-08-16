@@ -242,6 +242,75 @@ wear-levelled counter region — rolling codes only, no other configuration. Pla
 replaces the backing implementation; the seam and the ordering guarantee stay
 put.
 
+Both halves of that argument are now real. `somfy-store` makes a ticket
+unforgeable; `somfy-tasks`' queue module is where "the producer end is not
+exposed" stops being an obligation on implementations and becomes a fact: the
+`embassy_sync::Channel` is private to that crate, the only handle it hands out
+is usable solely through `TransmitQueue`, and `crates/firmware` — where the
+tasks are wired together — is on the other side of a crate boundary from the
+private field.
+
+### 7.2 Corrected during implementation
+
+Five statements this document or the plan implied that turned out to be false
+against the toolchain and the hardware, recorded here so the reasoning is not
+repeated.
+
+- **`esp-hal-embassy` cannot be used.** Its `executors` feature (on by default)
+  enables `esp-hal/__esp_hal_embassy`, a feature esp-hal **removed in
+  1.0.0-rc.1**, so no published version of it resolves against esp-hal 1.1.
+  `esp-rtos` is the replacement and supplies both the time driver and the
+  thread-mode executor. `embassy-executor` moves to 0.10 with it.
+
+- **Embassy tasks have no stacks.** Plan 4a's finding that `transmit_frame`
+  needs ~6.5 KB and that "a default Embassy task is smaller" conflated two
+  things. A task is a state machine polled on the executor's stack; what it
+  gets statically is space for its *future*, and only what is live across an
+  await goes there. The 6.5 KB is in `build_symbols`'s two 320-pulse buffers,
+  which are locals of a synchronous call and therefore on the **main** stack.
+  The arena that made the "default task size" claim true was removed in
+  `embassy-executor` 0.9; 0.10 sizes each task's future exactly, so being wrong
+  about a future is a link error. The main stack is whatever DRAM esp-hal's
+  linker script has left over — measured at **304,652 bytes** on the ESP32-S3
+  on 2026-08-16 — and `main::check_stack_headroom` reports it at boot and
+  refuses to start below 8 KB.
+
+- **The RMT driver mode is per *peripheral*, not per channel.** `Rmt::into_async`
+  converts every channel creator at once and there is no way back for one of
+  them, so §6.1's requirement that the receiver be asynchronous forces the
+  transmitter to be asynchronous too. Plan 4a's blocking `RmtTx` was converted.
+  A frame's *internal* timing is unaffected — a whole frame fits in reserved RMT
+  RAM and is clocked from there — but the gap *between* the frames of a burst
+  can now stretch if another task runs. **This change has not been re-verified
+  on air.**
+
+- **Not every RMT channel can receive, and the numbers differ per chip.** The
+  ESP32 and ESP32-S2 allow either direction on any channel; the ESP32-S3 splits
+  them 0-3 transmit / 4-7 receive and the ESP32-C3 splits them 0-1 / 2-3. With
+  `memsize = 2` a channel also owns its neighbour's memory block. `chip.rs`'s
+  `rmt_channels!` carries both facts per chip.
+
+- **Nothing put the CC1101 into receive.** `somfy-cc1101` had `set_tx` and
+  `set_idle` only, so the receive path as delivered could not have heard
+  anything: in asynchronous serial mode the chip drives GDO2 only while it is
+  receiving, and an unstrobed radio is indistinguishable from a quiet band.
+  `set_rx` (`SRX`, 0x34) was added, with the register set already correct for it
+  (`IOCFG2 = 0x0D`, `MCSM0` autocalibrating on IDLE→RX).
+
+Two further consequences worth stating rather than discovering:
+
+- **`encode80` takes a repeat index** and re-encodes the frame tail per repeat,
+  so a burst must encode once per frame rather than once per burst. A 56-bit
+  frame encodes identically every time, which is why 4a never met this.
+- **A failed commit still moves the position estimate.** The domain updates a
+  shade's motion model when it handles the command; the frames it plans are
+  dispatched afterwards. A store failure therefore transmits nothing while the
+  estimate believes the shade is moving. Not fixable without either
+  pre-flighting the store (which cannot promise the commit) or telling the
+  domain about transmission outcomes, which crosses the Plan 2 boundary. The
+  recovery is the same one that covers a motor that simply did not hear: the
+  next overheard frame or command re-anchors the estimate.
+
 ## 8. Testing
 
 The project's culture is that logic is host-tested and hardware is a smoke

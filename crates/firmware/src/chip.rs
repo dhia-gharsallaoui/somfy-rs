@@ -9,10 +9,8 @@
 //! this is the one place in the crate where a mismatch would only show up as a
 //! misleading log line. `check_pin_map` in `main.rs` compares them at boot.
 //!
-//! Note there is no blanket `allow(dead_code)` here: the pin constants are all
-//! read by that check now, so an unused item in this file is once again worth
-//! hearing about. Only `GDO2_RX` carries an allow, and only until a receive
-//! path claims it.
+//! Note there is no blanket `allow(dead_code)` here: every pin constant is read
+//! by that check, so an unused item in this file is worth hearing about.
 
 use esp_hal::gpio::AnyPin;
 
@@ -81,9 +79,7 @@ pub mod pins {
     /// (JTAG source select); proven in production but the first suspect
     /// for any boot anomaly.
     pub const GDO0_TX: u8 = 3;
-    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
-    /// is a later task.
-    #[allow(dead_code)]
+    /// CC1101 GDO2 — RX data out, claimed by the receive path.
     pub const GDO2_RX: u8 = 4;
 }
 
@@ -98,9 +94,7 @@ pub mod pins {
     pub const MISO: u8 = 19;
     pub const CSN: u8 = 5;
     pub const GDO0_TX: u8 = 13;
-    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
-    /// is a later task.
-    #[allow(dead_code)]
+    /// CC1101 GDO2 — RX data out, claimed by the receive path.
     pub const GDO2_RX: u8 = 12;
 }
 
@@ -112,9 +106,7 @@ pub mod pins {
     pub const MISO: u8 = 37;
     pub const CSN: u8 = 34;
     pub const GDO0_TX: u8 = 15;
-    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
-    /// is a later task.
-    #[allow(dead_code)]
+    /// CC1101 GDO2 — RX data out, claimed by the receive path.
     pub const GDO2_RX: u8 = 14;
 }
 
@@ -126,17 +118,11 @@ pub mod pins {
     pub const MISO: u8 = 17;
     pub const CSN: u8 = 14;
     pub const GDO0_TX: u8 = 13;
-    /// CC1101 GDO2 — RX data out. Nothing claims it yet; the receive path
-    /// is a later task.
-    #[allow(dead_code)]
+    /// CC1101 GDO2 — RX data out, claimed by the receive path.
     pub const GDO2_RX: u8 = 12;
 }
 
 /// The CC1101's pins, type-erased so one signature serves every chip.
-///
-/// GDO2 (the receive-data pin) is deliberately absent: nothing drives or reads
-/// it yet, and claiming a pin the firmware does not use would suggest a
-/// receive path exists.
 pub struct Cc1101Pins<'d> {
     pub sck: AnyPin<'d>,
     pub mosi: AnyPin<'d>,
@@ -144,6 +130,8 @@ pub struct Cc1101Pins<'d> {
     pub csn: AnyPin<'d>,
     /// CC1101 GDO0 — transmit data in.
     pub gdo0_tx: AnyPin<'d>,
+    /// CC1101 GDO2 — receive data out.
+    pub gdo2_rx: AnyPin<'d>,
 }
 
 /// Claims the CC1101's pins from an owned `Peripherals`.
@@ -163,6 +151,7 @@ macro_rules! cc1101_pins {
             miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
             csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO10),
             gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO3),
+            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO4),
         }
     };
 }
@@ -178,6 +167,7 @@ macro_rules! cc1101_pins {
             miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO19),
             csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO5),
             gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
+            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO12),
         }
     };
 }
@@ -193,6 +183,7 @@ macro_rules! cc1101_pins {
             miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO37),
             csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO34),
             gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO15),
+            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO14),
         }
     };
 }
@@ -208,6 +199,69 @@ macro_rules! cc1101_pins {
             miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO17),
             csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO14),
             gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
+            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO12),
         }
+    };
+}
+
+/// Claims the two RMT channel creators the radio needs: transmit first,
+/// receive second.
+///
+/// A macro for the same reason [`cc1101_pins!`] is one — the creators are
+/// distinct types in named fields of `Rmt`, and moving two of them out by name
+/// leaves the rest of the struct usable — but the numbers also differ per chip
+/// in two ways that are easy to get wrong:
+///
+/// - **Not every channel can receive.** The ESP32 and ESP32-S2 let any channel
+///   do either direction; the ESP32-S3 splits them (0-3 transmit, 4-7 receive)
+///   and the ESP32-C3 splits them differently again (0-1 transmit, 2-3
+///   receive). Asking channel 1 to receive on an S3 is not a runtime error, it
+///   is a missing trait implementation.
+/// - **Each channel is configured for two memory blocks**, so it occupies its
+///   neighbour's as well. That is why the receive channel is never the one
+///   immediately after the transmit channel on the chips that share a block
+///   pool: channel 0 with `memsize = 2` already owns block 1.
+///
+/// ESP32-S3: channels 0-3 transmit, 4-7 receive, with separate memory
+/// banks per direction.
+#[cfg(feature = "chip-s3")]
+#[macro_export]
+macro_rules! rmt_channels {
+    ($rmt:ident) => {
+        ($rmt.channel0, $rmt.channel4)
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+///
+/// ESP32: every channel does either direction out of one shared block
+/// pool, so receive starts at 2 — channel 0 already owns block 1.
+#[cfg(feature = "chip-esp32")]
+#[macro_export]
+macro_rules! rmt_channels {
+    ($rmt:ident) => {
+        ($rmt.channel0, $rmt.channel2)
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+///
+/// ESP32-S2: four channels, either direction, one shared block pool.
+#[cfg(feature = "chip-s2")]
+#[macro_export]
+macro_rules! rmt_channels {
+    ($rmt:ident) => {
+        ($rmt.channel0, $rmt.channel2)
+    };
+}
+
+/// See the `chip-s3` definition above for why this is a macro.
+///
+/// ESP32-C3: channels 0-1 transmit, 2-3 receive.
+#[cfg(feature = "chip-c3")]
+#[macro_export]
+macro_rules! rmt_channels {
+    ($rmt:ident) => {
+        ($rmt.channel0, $rmt.channel2)
     };
 }

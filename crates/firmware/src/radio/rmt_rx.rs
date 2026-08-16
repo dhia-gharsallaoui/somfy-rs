@@ -15,20 +15,13 @@
 //! that stops it reading a previous burst was wrong, which nothing in a
 //! four-chip build could have told anyone.
 //!
-//! ## Nothing constructs this yet
+//! ## What owns this
 //!
-//! The radio task that owns this — and the executor that makes awaiting mean
-//! anything — is the next task, so nothing here is reachable from `main`. The
-//! items that are its entry points therefore carry `allow(dead_code)`, and
-//! every one of them should lose it the moment that task lands.
-//!
-//! They are marked one at a time rather than by a blanket attribute on the
-//! module, following the convention `chip::pins::GDO2_RX` already sets: a
-//! module-wide allow would also silence anything added here *later*, which is
-//! how a field that is written and never read gets to look fine. The receive
-//! path arrives in pieces, and each unclaimed piece is worth naming.
-//!
-//! The code is still compiled, linted and const-asserted on all four chips.
+//! The radio task, and nothing else. It is constructed once in `main` from the
+//! `Rmt<Async>` receive channel and handed straight to `somfy_tasks::RadioLoop`
+//! as its `PulseSource`. Deliberately no radio handle of its own: strobing the
+//! CC1101 between receive and transmit belongs to [`super::air::Air`], which is
+//! what keeps the half-duplex mode in one place.
 
 use esp_hal::{
     rmt::{Channel, Error as RmtError, PulseCode, Rx, RxChannelConfig, MAX_RX_IDLE_THRESHOLD},
@@ -137,7 +130,6 @@ const _: () = assert!(
 /// hardware behaviour to filter a phenomenon nobody here has recorded, while
 /// the decoder already rejects out-of-family durations. Revisit during on-air
 /// bring-up, with a measurement rather than an inference.
-#[allow(dead_code)] // claimed by the radio task
 pub fn rx_channel_config() -> RxChannelConfig {
     RxChannelConfig::default()
         .with_clk_divider(crate::chip::RMT_CLK_DIVIDER)
@@ -156,7 +148,6 @@ pub fn rx_channel_config() -> RxChannelConfig {
 /// The inverse of [`super::rmt_tx::to_pulse_code`], and a delegation for the
 /// same reason: `PulseCode` is a packed `u32` whose bit layout esp-hal already
 /// owns, and a second copy of it here would be a divergence waiting to happen.
-#[allow(dead_code)] // claimed by the radio task
 pub fn from_pulse_code(code: PulseCode) -> RmtSymbol {
     RmtSymbol {
         level1: code.level1().into(),
@@ -201,7 +192,6 @@ pub fn from_pulse_code(code: PulseCode) -> RmtSymbol {
 /// it lands in the silence that ended the previous burst, which by construction
 /// is at least `somfy_rmt::IDLE_THRESHOLD_US` long. **Whether that is short
 /// enough in practice is a question only on-air testing can answer.**
-#[allow(dead_code)] // claimed by the radio task
 pub struct RmtPulseSource<'ch> {
     /// Not an `Option` like the transmit side's channel: `Channel<Async, Rx>`
     /// receives through `&mut self` and is never consumed, so there is no
@@ -224,7 +214,6 @@ pub struct RmtPulseSource<'ch> {
     cursor: BurstCursor,
 }
 
-#[allow(dead_code)] // claimed by the radio task
 impl<'ch> RmtPulseSource<'ch> {
     /// Takes ownership of a channel that has already been configured with
     /// [`rx_channel_config`] and connected to the CC1101's data-out pin.

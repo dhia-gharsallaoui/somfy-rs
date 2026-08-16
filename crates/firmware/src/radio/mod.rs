@@ -7,5 +7,6 @@
 //! (esp-hal's build script rejects a host target), so anything placed here is
 //! anything that can only be checked on a chip. Keep it small.
 
+pub mod air;
 pub mod rmt_rx;
 pub mod rmt_tx;

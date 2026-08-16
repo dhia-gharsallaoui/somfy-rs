@@ -37,6 +37,9 @@ pub(crate) const HEADER_BURST: u8 = 0x40;
 /// Reset the chip.
 pub(crate) const STROBE_SRES: u8 = 0x30;
 
+/// Enable RX.
+pub(crate) const STROBE_SRX: u8 = 0x34;
+
 /// Enable TX.
 pub(crate) const STROBE_STX: u8 = 0x35;
 
