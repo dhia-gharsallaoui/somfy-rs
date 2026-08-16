@@ -10,6 +10,8 @@ different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
   the air.
+- **[Receive path](#receive-path)** — needs a second radio to transmit at you;
+  this board stays silent.
 - **[Rolling-code store](#rolling-code-store)** — needs nothing but the board,
   and touches only flash.
 - **[Controller](#controller)** — the real firmware: receives, tracks, and
@@ -206,6 +208,102 @@ marginal as uninformative until the link is fixed.
 Note also that a poor link to the *reference receiver* says nothing about the
 link to the *motor*: throughout the above, the motor responded first try in
 both directions while the reference decoded ~1 frame in 10.
+
+---
+
+## Receive path
+
+Proving the firmware decodes a real frame off the air. **This board transmits
+nothing** — the frames come from a second device.
+
+### Get a transmitter you can trigger on demand
+
+The single biggest improvement to this procedure. An ESPSomfy-RTS device will
+transmit a real Somfy frame over HTTP:
+
+```bash
+curl -s "http://<reference>:8081/shadeCommand?shadeId=1&command=Up"
+curl -s "http://<reference>:8081/shadeCommand?shadeId=1&command=Down"
+```
+
+**Verify the shade position actually changed** — that is the proof a frame was
+really transmitted, and it is the only reliable one:
+
+```bash
+curl -s "http://<reference>:8081/shade?shadeId=1" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["position"],d["target"])'
+```
+
+0 = fully open, 100 = fully closed. Alternate Up/Down so the shade is not driven
+against a limit, and allow ~10 s of travel between commands. `command=My` is
+**not** a reliable trigger: with no my-position set it appears to be a no-op.
+
+This removes a human from the loop, which matters more than convenience — it is
+what makes ten trials feasible, and single trials are how this project has twice
+reached a confident wrong conclusion.
+
+### Expected output
+
+Frames surface on the internal frame channel, which the state task consumes. With
+an empty registry the state task prints nothing, so during bring-up substitute a
+probe task that drains the channel and prints. A good run:
+
+```
+rx[1]: address=0x0FC115 command=Up   rolling_code=177
+rx[2]: address=0x0FC115 command=Down rolling_code=178
+rx[3]: address=0x0FC115 command=Up   rolling_code=179
+rx[4]: address=0x0FC115 command=Down rolling_code=180
+```
+
+Check the command matches what you fired and the rolling code advances. An
+address alone is not enough — a decoder can produce a plausible address from
+noise.
+
+### Diagnosing "nothing was received"
+
+Work outward from the radio. Each step rules out one layer, and each of these
+was a live hypothesis at some point:
+
+1. **Is the radio in receive?** Read `MARCSTATE` (0x35): `0x0D` is RX, `0x01` is
+   IDLE. The driver must strobe `SRX` — in asynchronous serial mode GDO2 is only
+   driven while receiving, so an unstrobed radio is indistinguishable from a
+   quiet band.
+2. **Is the pad carrying anything?** Sample the GDO2 GPIO directly in a tight
+   loop, bypassing RMT. This separates "no signal" from "signal the RMT or
+   decoder mishandles", and they need opposite fixes.
+3. **What does the band look like idle?** With a correct AGC the line should rest
+   **low** with near-zero edges. Hundreds of edges per second is the AGC slicing
+   its own noise floor, and it makes RMT reception impossible: a reception only
+   ends after `IDLE_THRESHOLD_US` of quiet, so constant noise fills the buffer
+   and esp-hal discards the whole transaction.
+4. **Does a real frame arrive whole?** Fire a transmission and look for a burst
+   with a `longest_high` near **10,000 µs** — the wake-up pulse. Wake-up present
+   but body missing means the frame is arriving and being sliced away.
+
+### Judge captures by decode, not by edge count
+
+The trap that cost the most here. **Idle edge count does not predict whether a
+frame survives.** An AGC configuration was once chosen because it produced the
+quietest idle band, and that setting is precisely the one that loses the frame
+body under any attenuation. Another candidate reaches near-zero edges by pinning
+the line *high*, which is just as undecodable.
+
+Two rules follow:
+
+- A capture counts only if it produces a **checksum-valid frame**. Everything
+  else is a proxy.
+- Also confirm the line **rests low** when idle, not merely that it is quiet.
+
+And note that a whole 56-bit frame is about **89 merged edges**, not ~180 — the
+larger figure counts half-symbols. The committed golden captures are the
+reference: `up_56bit_1.pulses` is 89 pulses, `down_56bit_1.pulses` is 97.
+
+### Creating discriminating conditions
+
+Unattenuated, at short range, every sane configuration decodes everything and
+nothing tells settings apart. To compare them, walk the signal out of the
+101.6 kHz channel filter by writing `FSCTRL0.FREQOFF` — a calibrated stand-in
+for distance. Test-time only; it must never reach `init`.
 
 ---
 
