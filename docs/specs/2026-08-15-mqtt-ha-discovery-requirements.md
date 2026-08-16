@@ -115,6 +115,22 @@ nobody reads. Specifically reject: empty `discovery_prefix`, empty
 The C++ failure mode is precisely that every bad combination was accepted and
 looked like it had worked.
 
+**Also reject overlapping namespaces** — `discovery_prefix` and `state_root`
+that are equal, or where one is a prefix of the other. *(Added 2026-08-16, found
+during Plan 5 Task 1; the original requirement missed it.)*
+
+Each value can be individually valid and the pair still broken. The route is not
+hypothetical: an operator fixing the empty-prefix failure above by setting
+`discovery_prefix = homeassistant`, while leaving `state_root = homeassistant`
+alone, puts `availability_topic` at `homeassistant/status` — Home Assistant's
+own birth/will topic. HA's birth message then marks the device **available while
+it is offline**, which is worse than having no availability at all, because it
+is confidently wrong.
+
+That is exactly the collision R4 exists to prevent, reached by a path neither R3
+nor R4 named. Validating each field in isolation is not sufficient; the pair
+must be validated as a pair.
+
 ### R4 — Payload topics (MUST)
 
 - `~` set to the shade's state base under `state_root`, absolute, no leading `/`.
