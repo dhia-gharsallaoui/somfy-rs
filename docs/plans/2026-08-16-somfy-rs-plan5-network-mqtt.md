@@ -18,7 +18,7 @@ front, on the real dependency graph, not from crate descriptions.**
 |---|---|---|
 | WiFi | **`esp-radio` 0.18.0** | Resolves cleanly against our `esp-hal 1.1.2` — verified by adding it and inspecting `cargo tree -i esp-hal`, which stayed at 1.1.2. Same repo as esp-hal, so it tracks the HAL. `cargo add` skips `1.0.0-beta.0` as a pre-release; do not chase the beta without a reason. `esp-wifi 0.15.1` is the older line. |
 | Network stack | **`embassy-net` 0.9.1** | The standard stack for Embassy, which we already run via `esp-rtos 0.3`. |
-| MQTT | **evaluate `rust-mqtt` 0.5.1 vs `minimq` 0.13.0 in Task 3** | Both `no_std`, both maintained, both MIT/Apache-2.0 and so compatible with our GPL-3.0-only. `rust-mqtt` targets embassy directly; `minimq` (quartiq) is well-regarded and transport-agnostic. Pick on evidence — see Task 3. |
+| MQTT | **`minimq` 0.13.0** (runner-up `rust-mqtt` 0.5.1) | Chosen from a survey of all 230 `mqtt`-keyword crates, not a shortlist — see `CLAUDE.md`. Decider is allocation strategy: `minimq` is alloc-free with **zero `unsafe`** in its source, while `rust-mqtt`'s alloc-free path is a bump allocator that never frees, reclaimable only via `pub unsafe fn reset()` whose safety obligation lands on us. Counted both directly: 0 vs 34. Broker is the HA Mosquitto add-on, so `minimq` being MQTT-v5-only is fine. |
 | HA discovery payloads | **own** | These are our data model rendered as JSON; there is nothing to reuse. The *topic and payload rules* come from the spec. |
 
 **Do not hand-roll an MQTT client.** The spec's hard parts are topic
