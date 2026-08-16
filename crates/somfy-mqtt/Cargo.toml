@@ -1,0 +1,23 @@
+[package]
+name = "somfy-mqtt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std MQTT topic construction, config validation and Home Assistant discovery payloads for somfy-rs"
+
+[dependencies]
+heapless = "0.8"
+somfy-domain = { path = "../somfy-domain" }
+
+[dev-dependencies]
+# The property test's acceptance criterion is stated as a regular expression.
+# Using the literal expression rather than a hand-rolled equivalent removes the
+# question of whether the checker itself is right — a wrong hand-rolled checker
+# passes everything and the property test proves nothing.
+regex = "1"
+proptest = "1"
+# The round-trip test reads topics back out of *rendered* payload bytes rather
+# than out of the struct that produced them. A real parser is what makes that a
+# check on the output and not a restatement of the input.
+serde_json = "1"
