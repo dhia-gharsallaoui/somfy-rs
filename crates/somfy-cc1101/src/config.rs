@@ -6,9 +6,10 @@
 //! is the **value** this driver writes to it.
 //!
 //! Every value below is either built from named bit-field constants whose
-//! arithmetic is shown beside them, or — in the one case where the datasheet
-//! offers no formula — explicitly flagged as a table lookup. There are no
-//! unexplained bytes here by design.
+//! arithmetic is shown beside them, or — where the datasheet offers no formula
+//! — explicitly flagged as a table lookup, a vendor recommendation, or a value
+//! measured on this project's own hardware. There are no unexplained bytes here
+//! by design.
 
 /// Crystal frequency, in hertz.
 ///
@@ -118,6 +119,9 @@ pub(crate) const REG_MDMCFG3: u8 = 0x11;
 pub(crate) const REG_MDMCFG2: u8 = 0x12;
 pub(crate) const REG_DEVIATN: u8 = 0x15;
 pub(crate) const REG_MCSM0: u8 = 0x18;
+pub(crate) const REG_AGCCTRL2: u8 = 0x1B;
+pub(crate) const REG_AGCCTRL1: u8 = 0x1C;
+pub(crate) const REG_AGCCTRL0: u8 = 0x1D;
 pub(crate) const REG_FREND0: u8 = 0x22;
 pub(crate) const REG_PATABLE: u8 = 0x3E;
 
@@ -261,8 +265,22 @@ const MOD_FORMAT_ASK_OOK: u8 = 3;
 /// There is no sync word to match. A Somfy frame's preamble is a run of
 /// hardware-sync pulses that the packet engine never sees, because in
 /// asynchronous serial mode the framing rides on the data pin instead.
-/// Requiring received energy above the carrier-sense threshold keeps the
-/// receiver from presenting noise as data while the band is quiet.
+///
+/// **The carrier-sense half of this setting does nothing here, and an earlier
+/// version of this comment claimed otherwise.** It said that requiring energy
+/// above the carrier-sense threshold kept the receiver from presenting noise as
+/// data in a quiet band. It does not: sync-word qualification is a packet-engine
+/// feature, and the datasheet is explicit that asynchronous serial mode disables
+/// the packet handling hardware and that "no data decision is done on-chip" —
+/// the raw demodulated level goes to the pin either way. Hardware agreed
+/// emphatically: with this setting in place and the AGC unconfigured, GDO2
+/// carried roughly 750 noise edges per second in a silent band. What actually
+/// quiets the receiver is the AGC, further down.
+///
+/// The value is left at 4 regardless. It is part of a register byte that is
+/// hardware-proven on the transmit path, settings 0 and 4 are identical in
+/// every respect this mode can observe, and changing a proven byte to no effect
+/// is not worth the risk. Only the false claim about it is removed.
 const SYNC_MODE_NONE_CARRIER_SENSE: u8 = 4;
 
 /// `[7]` DEM_DCFILT_OFF = 0, `[6:4]` MOD_FORMAT, `[3]` MANCHESTER_EN = 0,
@@ -358,6 +376,219 @@ const PO_TIMEOUT_RESET_DEFAULT: u8 = 1;
 pub(crate) const MCSM0: u8 = (FS_AUTOCAL_IDLE_TO_RX_TX << 4) | (PO_TIMEOUT_RESET_DEFAULT << 2);
 
 // ---------------------------------------------------------------------------
+// AGCCTRL2 / AGCCTRL1 / AGCCTRL0 — receiver gain control
+// ---------------------------------------------------------------------------
+//
+// These three registers are the receive-side gain loop, and until they were
+// added nothing here configured them at all. That is invisible while the radio
+// only ever transmits — the AGC has no transmit-side role — and fatal the
+// moment it has to listen.
+//
+// Left at their reset values the gain is free to wind all the way up, so a
+// quiet 433 MHz band gets amplified until the demodulator is slicing its own
+// noise floor, and GDO2 carries a continuous stream of demodulated noise.
+// Measured on this hardware with nothing transmitting: **roughly 750 edges per
+// second**, with the line high about 70% of the time. Anything downstream that
+// waits for a gap in the data to decide a transmission has ended never gets
+// one, so a real frame arriving inside that noise is discarded along with it.
+//
+// **The datasheet derives none of this, and says so.** It states that the
+// settings its own design tool produces for FSK/MSK "are not optimum" under
+// ASK/OOK and hands the question to a separate vendor application note (DN022,
+// "CC110x/CC111x OOK/ASK Register Settings"), which answers with measured
+// recommendations rather than formulas:
+//
+// ```text
+// AGCCTRL2 = 0x03 to 0x07
+// AGCCTRL1 = 0x00
+// AGCCTRL0 = 0x91 or 0x92
+// ```
+//
+// That recommendation is the starting point below, not the answer, for a
+// reason worth stating plainly: **two of those three values are already what a
+// reset leaves behind.** AGCCTRL2 resets to 0x03 and AGCCTRL0 to 0x91, so
+// writing the note's advice verbatim would change one bit of one register — and
+// the 750 edges per second measured above is precisely the behaviour of
+// 0x03/0x91. The note optimises packet error rate against a signal generator
+// driving a real signal; it never asks what the receiver does in an empty band.
+//
+// So each field below is one of three things, and each says which it is: a
+// value the note recommends, a value chosen on measurement taken on this
+// hardware, or a reset value knowingly kept. There is no arithmetic to show,
+// because the datasheet publishes none for the AGC. See `docs/provenance.md`.
+//
+// **None of the three changes what the radio transmits.** Every field is a
+// receive-path quantity — LNA and DVGA gain, the amplitude the channel filter
+// is driven to, the OOK slicing boundary. There is exactly one path by which
+// they could reach the transmitter and it is worth naming, because it is closed
+// by a detail elsewhere rather than by anything here: `AGCCTRL1`'s carrier-sense
+// thresholds feed Clear Channel Assessment, and `MCSM1.CCA_MODE` — which this
+// driver leaves at its reset value 3, i.e. armed — makes an `STX` strobe
+// *issued from the RX state* conditional on the channel being clear. The
+// firmware never does that; it strobes `SIDLE` and then `STX`, and from IDLE
+// the datasheet's strobe table makes `STX` unconditional. The coupling is
+// therefore latent, not live — and it points the safe way in any case, since
+// [`MAX_DVGA_GAIN`] raises the carrier-sense threshold, which makes CCA report
+// "clear" more readily, never less.
+
+/// `AGCCTRL2.MAX_DVGA_GAIN` = 2: the two highest DVGA gain settings are barred.
+///
+/// **This is the field that does the work, it is outside the range the vendor
+/// note recommends, and it is here on measurement rather than on any
+/// derivation.** The note's `AGCCTRL2` span of 0x03–0x07 varies only
+/// [`MAGN_TARGET`] and leaves this field at 0, "all gain settings can be used".
+///
+/// Each setting removes another of the digital variable-gain amplifier's top
+/// steps, which raises the weakest signal the receiver will respond to. Swept
+/// on this hardware in a quiet band, counting edges on GDO2 over a two-second
+/// window with nothing transmitting, holding `MAX_LNA_GAIN` at 0 and
+/// `MAGN_TARGET` at 3:
+///
+/// ```text
+/// MAX_DVGA_GAIN = 0  ->  1461, 1598, 1572 edges   (the reset behaviour)
+/// MAX_DVGA_GAIN = 1  ->    58,  104,   78 edges
+/// MAX_DVGA_GAIN = 2  ->     0,    2,    0 edges
+/// MAX_DVGA_GAIN = 3  ->     0,    0,    0 edges
+/// ```
+///
+/// 2 is chosen as the *smallest* value that silences the band, because every
+/// step costs sensitivity and there is nothing to be gained by spending more of
+/// it than the measurement demands. 1 is not enough: around 40 edges per second
+/// is a mean gap near 25 ms, which is the same order as the gap a receiver
+/// downstream waits for, so it would work or not work depending on the hour.
+///
+/// The price is quantifiable, from a datasheet table rather than a formula —
+/// see [`CS_THRESHOLD_DBM_TENTHS`]. It is about 12 dB of sensitivity. That is
+/// real, and it is the one number in this file worth arguing about: a remote
+/// pressed in the same room arrives tens of dB above the new floor, but range
+/// is range, and no reception at any distance has been confirmed on air yet.
+const MAX_DVGA_GAIN: u8 = 2;
+
+/// `AGCCTRL2.MAX_LNA_GAIN` = 0: the low-noise amplifier keeps its full range.
+///
+/// Its reset value, kept deliberately. The datasheet offers this field as the
+/// *first* knob to reach for when raising the detection threshold — ahead of
+/// [`MAX_DVGA_GAIN`] — but for a stated reason that is not this one: doing it
+/// in that order "will reduce power consumption in the receiver front end".
+///
+/// Optimising for sensitivity instead points the other way. The LNA sets the
+/// receiver's noise figure, so gain taken out of it is lost before the signal
+/// is ever amplified, while the DVGA sits after the channel filter where the
+/// noise figure is already fixed. The measurement agrees: limiting this field
+/// alone squelched far less per dB spent than limiting the DVGA did — 152 to
+/// 330 edges per second still at setting 3, and 8 to 16 at setting 7, against
+/// silence from `MAX_DVGA_GAIN` = 2.
+const MAX_LNA_GAIN: u8 = 0;
+
+/// `AGCCTRL2.MAGN_TARGET` = 3: the AGC drives the channel filter output to a
+/// 33 dB amplitude.
+///
+/// A **table lookup**, and simultaneously the reset value and the bottom of the
+/// vendor note's recommended `AGCCTRL2` range — the note's 0x03 through 0x07
+/// *is* this field taking the values 3 through 7. The datasheet's table maps
+/// the eight settings to 24, 27, 30, 33, 36, 38, 40 and 42 dB, in steps that
+/// are not uniform and are therefore not computable; see [`MAGN_TARGET_DB`].
+///
+/// Raising it also raises the detection threshold, and measurably helps here
+/// (setting 7 alone cut the noise to roughly 45 edges per second without
+/// touching any gain limit). It is left at 3 anyway, because the datasheet
+/// describes the field as "a compromise between blocker tolerance/selectivity
+/// and sensitivity" and warns that increasing it "reduces the headroom for
+/// blockers, and therefore close-in selectivity". Spending the threshold on
+/// [`MAX_DVGA_GAIN`] instead buys the same silence without narrowing that
+/// headroom, and keeps this field on both the reset value and the recommended
+/// one.
+const MAGN_TARGET: u8 = 3;
+
+/// `[7:6]` MAX_DVGA_GAIN, `[5:3]` MAX_LNA_GAIN, `[2:0]` MAGN_TARGET.
+pub(crate) const AGCCTRL2: u8 = (MAX_DVGA_GAIN << 6) | (MAX_LNA_GAIN << 3) | MAGN_TARGET;
+
+/// `AGCCTRL1.AGC_LNA_PRIORITY` = 0: LNA2 is turned down to its minimum before
+/// the LNA is touched.
+///
+/// **A vendor recommendation with no derivation offered**, and the only bit in
+/// which the note's `AGCCTRL1 = 0x00` differs from the reset value 0x40. The
+/// datasheet presents the two strategies as alternatives and gives no rule for
+/// choosing; the note picks this one for ASK/OOK, so this driver does too.
+///
+/// It made no measurable difference to the noise on this hardware — the sweep
+/// that produced the numbers in [`MAX_DVGA_GAIN`] ran with this field at 0
+/// throughout, and the reset-value baseline it is compared against had it at 1
+/// with everything else identical. It is followed because it is the vendor's
+/// answer for this modulation, not because anything here demonstrates it.
+const AGC_LNA_PRIORITY_LNA2_FIRST: u8 = 0;
+
+/// `AGCCTRL1.CARRIER_SENSE_REL_THR` = 0: relative carrier sense disabled — the
+/// reset value, kept.
+///
+/// It asserts carrier sense on a sudden jump in RSSI rather than on an absolute
+/// level, which is aimed at bands with a time-varying noise floor. Nothing in
+/// this driver consumes carrier sense: the packet handler that would use it as
+/// a sync-word qualifier is bypassed by asynchronous serial mode, and the one
+/// remaining consumer is the CCA gate on an `STX` issued from RX, which the
+/// firmware never issues. Kept at zero so it stays that way.
+const CARRIER_SENSE_REL_THR_DISABLED: u8 = 0;
+
+/// `AGCCTRL1.CARRIER_SENSE_ABS_THR` = 0: carrier sense asserts at the
+/// [`MAGN_TARGET`] amplitude — the reset value, kept.
+///
+/// A signed 4-bit offset in 1 dB steps relative to [`MAGN_TARGET`], and zero
+/// means no offset. Same reasoning as the relative threshold above: it is
+/// written to a known value rather than tuned, because nothing reads it.
+const CARRIER_SENSE_ABS_THR_AT_MAGN_TARGET: u8 = 0;
+
+/// `[7]` not used, `[6]` AGC_LNA_PRIORITY, `[5:4]` CARRIER_SENSE_REL_THR,
+/// `[3:0]` CARRIER_SENSE_ABS_THR.
+pub(crate) const AGCCTRL1: u8 = (AGC_LNA_PRIORITY_LNA2_FIRST << 6)
+    | (CARRIER_SENSE_REL_THR_DISABLED << 4)
+    | CARRIER_SENSE_ABS_THR_AT_MAGN_TARGET;
+
+/// `AGCCTRL0.HYST_LEVEL` = 2: medium hysteresis on the AGC's own gain-change
+/// decision — the reset value, and the vendor note's, kept.
+const HYST_LEVEL_MEDIUM: u8 = 2;
+
+/// `AGCCTRL0.WAIT_TIME` = 1: 16 channel-filter samples after a gain change
+/// before the AGC starts accumulating again — the reset value, and the vendor
+/// note's, kept.
+const WAIT_TIME_16_SAMPLES: u8 = 1;
+
+/// `AGCCTRL0.AGC_FREEZE` = 0: normal operation, gain adjusted whenever needed.
+///
+/// The reset value, and the only setting that makes sense here. The three
+/// alternatives freeze the gain — one of them on sync-word detection, which in
+/// asynchronous serial mode never happens because the packet handler is
+/// bypassed, and the other two under manual control this driver does not
+/// exercise.
+const AGC_FREEZE_NORMAL: u8 = 0;
+
+/// `AGCCTRL0.FILTER_LENGTH` = 1: an 8 dB OOK decision boundary.
+///
+/// This field is overloaded by modulation: for FSK and MSK it is an averaging
+/// length in channel-filter samples, and for ASK/OOK it is the decision
+/// boundary — how far below the peak the demodulator puts the line between a
+/// keyed carrier and no carrier. The datasheet tabulates 4, 8, 12 and 16 dB for
+/// the four settings, which is uniform enough to check; see
+/// [`OOK_DECISION_BOUNDARY_DB`].
+///
+/// The vendor note offers `AGCCTRL0` as "0x91 or 0x92", which is exactly this
+/// field being 1 (8 dB) or 2 (12 dB), and it is a genuine choice rather than a
+/// formality. **Measured on this hardware, the note's other option is not
+/// merely worse, it fails differently and just as completely:** at 12 dB, and
+/// again at the 16 dB setting past the end of the note's range, GDO2 stopped
+/// producing edges but sat *high* 99–100% of the time — a receiver stuck
+/// reporting a carrier that is not there, which is no more decodable than one
+/// stuck reporting noise, and would have looked like success to an edge count
+/// alone. 8 dB is the setting that leaves the line resting low.
+const FILTER_LENGTH_OOK_8DB: u8 = 1;
+
+/// `[7:6]` HYST_LEVEL, `[5:4]` WAIT_TIME, `[3:2]` AGC_FREEZE,
+/// `[1:0]` FILTER_LENGTH.
+pub(crate) const AGCCTRL0: u8 = (HYST_LEVEL_MEDIUM << 6)
+    | (WAIT_TIME_16_SAMPLES << 4)
+    | (AGC_FREEZE_NORMAL << 2)
+    | FILTER_LENGTH_OOK_8DB;
+
+// ---------------------------------------------------------------------------
 // FREND0 / PATABLE — output power
 // ---------------------------------------------------------------------------
 
@@ -436,6 +667,9 @@ pub(crate) const CONFIG: &[(u8, u8)] = &[
     (REG_MDMCFG2, MDMCFG2),
     (REG_DEVIATN, DEVIATN),
     (REG_MCSM0, MCSM0),
+    (REG_AGCCTRL2, AGCCTRL2),
+    (REG_AGCCTRL1, AGCCTRL1),
+    (REG_AGCCTRL0, AGCCTRL0),
     (REG_FREND0, FREND0),
 ];
 
@@ -496,6 +730,67 @@ pub const ACHIEVED_RATE_MBAUD: u32 =
 
 /// One chip per Somfy half-symbol, in millibaud: 1 562 500, i.e. 1562.5 baud.
 const TARGET_RATE_MBAUD: u32 = 1_000_000_000 / SOMFY_HALF_SYMBOL_US;
+
+/// The OOK/ASK decision boundary actually selected, in decibels.
+///
+/// The AGC fields have no datasheet formulas — this is the one exception, and
+/// only because the published table happens to be uniform: settings 0 through 3
+/// map to 4, 8, 12 and 16 dB, which is `4 * (setting + 1)`. Reproducing it
+/// arithmetically is what lets a mistyped [`FILTER_LENGTH_OOK_8DB`] fail the
+/// build instead of quietly moving the slicing threshold.
+pub const OOK_DECISION_BOUNDARY_DB: u8 = 4 * (FILTER_LENGTH_OOK_8DB + 1);
+
+/// Target amplitude out of the channel filter, in decibels.
+///
+/// **A table lookup with no formula behind it** — the datasheet's eight
+/// settings step 24, 27, 30, 33, 36, 38, 40, 42 dB, which is 3 dB per step and
+/// then 2 dB, so it cannot be computed. It is written out as the table it is.
+pub const MAGN_TARGET_DB: u8 = [24, 27, 30, 33, 36, 38, 40, 42][MAGN_TARGET as usize];
+
+/// The carrier-sense threshold the chosen gain limits imply, in **tenths of a
+/// dBm**, so the half-decibel steps survive integer arithmetic.
+///
+/// **Also a table lookup, and an indicative one** — this is the closest the
+/// datasheet comes to putting a number on what [`MAX_DVGA_GAIN`] costs. Its
+/// table of typical RSSI at the carrier-sense threshold, along the
+/// `MAX_LNA_GAIN` = 0 row, reads −97.5, −91.5, −85.5 and −79.5 dBm for the four
+/// `MAX_DVGA_GAIN` settings: a uniform 6 dB per step, which is what is
+/// reproduced here.
+///
+/// Three caveats, none of them small. That table is quoted for 868 MHz at
+/// 2.4 kBaud, and this radio runs at 433 MHz at 1562 baud — the datasheet says
+/// outright that "for other data rates, the user must generate similar tables".
+/// It is the *carrier-sense* threshold, not the OOK slicing threshold, and the
+/// two are only related through the same four gain fields. And it is quoted as
+/// typical, not guaranteed. So the absolute figure is indicative; what it is
+/// used for here is the **difference** — the 12.0 dB of sensitivity that
+/// capping the DVGA gain spends — and that is the number the assertion pins.
+pub const CS_THRESHOLD_DBM_TENTHS: i32 = -975 + 60 * MAX_DVGA_GAIN as i32;
+
+const _: () = {
+    // The AGC bytes, so a mis-shifted field cannot slip through. 0x83 is
+    // deliberately outside the vendor note's recommended 0x03..=0x07 range;
+    // 0x00 and 0x91 are its recommendations exactly.
+    assert!(AGCCTRL2 == 0x83 && AGCCTRL1 == 0x00 && AGCCTRL0 == 0x91);
+
+    // An 8 dB OOK decision boundary, the lower of the two the note offers and
+    // the one measured to leave the line resting low rather than stuck high.
+    assert!(OOK_DECISION_BOUNDARY_DB == 8);
+
+    // 33 dB: the reset value and the bottom of the note's range.
+    assert!(MAGN_TARGET_DB == 33);
+
+    // The carrier-sense row this reads along is only the quoted one while the
+    // LNA keeps its full gain. If that ever changes, the figure below stops
+    // meaning anything and this assertion is the warning.
+    assert!(MAX_LNA_GAIN == 0);
+
+    // −85.5 dBm indicative, and 12.0 dB above what an unlimited DVGA reaches.
+    // That difference is the sensitivity this fix spends to stop the receiver
+    // slicing its own noise floor.
+    assert!(CS_THRESHOLD_DBM_TENTHS == -855);
+    assert!(CS_THRESHOLD_DBM_TENTHS - (-975) == 120);
+};
 
 const _: () = {
     // 433.42 MHz requested; 47.6 Hz low, which is 0.11 ppm.

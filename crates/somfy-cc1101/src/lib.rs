@@ -34,10 +34,15 @@
 //! ## Register values
 //!
 //! Every byte [`Cc1101::init`] writes is assembled from named bit-field
-//! constants in [`config`], each carrying the arithmetic that produced it. Two
-//! values are *not* derived and say so where they are defined: the PA table
-//! entry (a datasheet lookup, no formula exists) and the post-reset settle
-//! delay (a margin choice; the datasheet publishes no figure).
+//! constants in [`config`], each carrying the arithmetic that produced it —
+//! where arithmetic exists. Several values have none, and each says so where it
+//! is defined: the PA table entry (a datasheet lookup, no formula published),
+//! the post-reset settle delay (a margin choice; the datasheet publishes no
+//! figure), and the three AGC registers (the datasheet publishes no AGC
+//! formulas at all and defers ASK/OOK gain settings to a vendor application
+//! note, whose recommendations are measured rather than derived — and which
+//! this driver then has to depart from on its own measurements, for reasons
+//! recorded beside [`config::AGCCTRL2`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -225,6 +230,9 @@ mod tests {
         &[0x12, 0x34],       // MDMCFG2  — ASK/OOK, sync mode 4
         &[0x15, 0x47],       // DEVIATN  — 47.61 kHz
         &[0x18, 0x14],       // MCSM0    — autocalibrate on IDLE -> TX/RX
+        &[0x1B, 0x83],       // AGCCTRL2 — DVGA gain capped so RX stops slicing noise
+        &[0x1C, 0x00],       // AGCCTRL1 — LNA2 turned down first; carrier sense inert
+        &[0x1D, 0x91],       // AGCCTRL0 — 8 dB OOK decision boundary
         &[0x22, 0x11],       // FREND0   — PA_POWER = 1 (OOK needs two levels)
         &[0x7E, 0x00, 0xC0], // PATABLE burst — off level, then +10 dBm
     ];
