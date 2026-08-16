@@ -230,9 +230,9 @@ mod tests {
         &[0x12, 0x34],       // MDMCFG2  — ASK/OOK, sync mode 4
         &[0x15, 0x47],       // DEVIATN  — 47.61 kHz
         &[0x18, 0x14],       // MCSM0    — autocalibrate on IDLE -> TX/RX
-        &[0x1B, 0x83],       // AGCCTRL2 — DVGA gain capped so RX stops slicing noise
+        &[0x1B, 0xC7],       // AGCCTRL2 — DVGA gain capped, AGC target 42 dB
         &[0x1C, 0x00],       // AGCCTRL1 — LNA2 turned down first; carrier sense inert
-        &[0x1D, 0x91],       // AGCCTRL0 — 8 dB OOK decision boundary
+        &[0x1D, 0xB2],       // AGCCTRL0 — slowest AGC wait, 12 dB OOK decision boundary
         &[0x22, 0x11],       // FREND0   — PA_POWER = 1 (OOK needs two levels)
         &[0x7E, 0x00, 0xC0], // PATABLE burst — off level, then +10 dBm
     ];
