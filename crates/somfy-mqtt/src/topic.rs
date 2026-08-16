@@ -14,9 +14,11 @@
 //! - [`DiscoveryPrefix`] and [`StateRoot`] hold their text in a private field
 //!   and expose **no** way to read it — no `as_str`, no `Display`, no `Deref`,
 //!   no `AsRef<str>`, no public field. Not even to the rest of this crate.
-//! - The only readers of those fields are [`DiscoveryPrefix::topic`] and
-//!   [`StateRoot::topic`], each of which reads its own root and seeds a
-//!   [`TopicBuf`] with it.
+//! - Exactly three functions read those fields, all of them here.
+//!   [`DiscoveryPrefix::topic`] and [`StateRoot::topic`] each read *their own*
+//!   root and seed a [`TopicBuf`] with it. [`namespaces_overlap`] reads both —
+//!   and returns a `bool`, so it can compare them but cannot build anything
+//!   from them.
 //! - [`TopicBuf`] can be seeded exactly once, at construction, and afterwards
 //!   accepts only single segments. It has no method that takes a root.
 //!
@@ -275,6 +277,9 @@ impl TopicBuf {
     /// Append a numeric segment, such as a shade id.
     pub(crate) fn number(mut self, value: u8) -> TopicBuf {
         push(&mut self.0, "/");
+        // `Display for u8` writes its digits in one `write_str`, so this is
+        // all-or-nothing like every other push here — never a half-written
+        // number.
         write!(&mut self.0, "{value}").expect("topic capacity proven at compile time");
         self
     }

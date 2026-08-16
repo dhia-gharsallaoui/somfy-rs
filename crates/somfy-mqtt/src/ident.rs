@@ -15,6 +15,7 @@
 use crate::entity::Component;
 use crate::error::{ConfigError, Field};
 use crate::validate::check_token;
+use core::fmt::Write as _;
 use heapless::String;
 use somfy_domain::ShadeId;
 
@@ -35,9 +36,34 @@ pub const MAX_NAME_PART_LEN: usize = 48;
 /// digits of [`ShadeId`].
 pub const MAX_OBJECT_ID_LEN: usize = MAX_NAME_PART_LEN + 1 + 3;
 
-/// Bytes a unique id may occupy: a device id, a component name, up to three
-/// digits of [`ShadeId`], and two separators.
-pub const MAX_UNIQUE_ID_LEN: usize = MAX_DEVICE_ID_LEN + 1 + Component::MAX_LEN + 1 + 3;
+/// Bytes a unique id may occupy.
+///
+/// A device id, a component name, up to three digits of [`ShadeId`], and two
+/// separators — with headroom, deliberately, rather than sized exactly to the
+/// components that exist today. [`Component::MAX_LEN`] is a fold over
+/// [`Component::ALL`], and nothing forces `ALL` to list every variant: the
+/// exhaustive `match` in [`Component::as_str`] forces a new variant to be named
+/// there, but a variant left out of `ALL` leaves `MAX_LEN` stale. Sizing this
+/// exactly would turn that omission into a truncated `unique_id` — and a
+/// truncated `unique_id` is not a visible fault, it is two entities silently
+/// sharing an identity.
+///
+/// The headroom absorbs any Home Assistant component name up to
+/// [`MAX_COMPONENT_HEADROOM`] bytes, which covers every name in HA's set; the
+/// assertion below pins that, and [`push_u8`] panics rather than truncating if
+/// it is ever exceeded anyway.
+pub const MAX_UNIQUE_ID_LEN: usize = 64;
+
+/// Bytes of component name [`MAX_UNIQUE_ID_LEN`] leaves room for.
+///
+/// The longest name in Home Assistant's own component set is
+/// `alarm_control_panel` at 19 bytes; this is comfortably beyond it.
+pub const MAX_COMPONENT_HEADROOM: usize = MAX_UNIQUE_ID_LEN - MAX_DEVICE_ID_LEN - 1 - 1 - 3;
+
+const _: () = assert!(
+    Component::MAX_LEN <= MAX_COMPONENT_HEADROOM,
+    "a component name outgrew the unique-id budget",
+);
 
 /// Substituted for a name that sanitises to nothing — a name written entirely
 /// in a non-Latin script, or one that is empty.
@@ -138,10 +164,12 @@ impl ObjectId {
             &part
         };
         // Capacity is MAX_NAME_PART_LEN + 1 + 3 and `part` is at most
-        // MAX_NAME_PART_LEN, so neither push can fail.
-        let _ = out.push_str(part);
-        let _ = out.push('_');
-        let _ = write_u8(&mut out, id.0);
+        // MAX_NAME_PART_LEN, so neither push can fail. They are still checked:
+        // a dropped push here is a silent change of address, which is the whole
+        // class of fault this crate exists to remove.
+        push_str(&mut out, part);
+        push_str(&mut out, "_");
+        push_u8(&mut out, id.0);
         ObjectId(out)
     }
 
@@ -168,11 +196,11 @@ impl UniqueId {
     /// outright.
     pub fn for_shade(device: &DeviceId, component: Component, id: ShadeId) -> UniqueId {
         let mut out: String<MAX_UNIQUE_ID_LEN> = String::new();
-        let _ = out.push_str(device.as_str());
-        let _ = out.push('_');
-        let _ = out.push_str(component.as_str());
-        let _ = out.push('_');
-        let _ = write_u8(&mut out, id.0);
+        push_str(&mut out, device.as_str());
+        push_str(&mut out, "_");
+        push_str(&mut out, component.as_str());
+        push_str(&mut out, "_");
+        push_u8(&mut out, id.0);
         UniqueId(out)
     }
 
@@ -192,25 +220,40 @@ impl UniqueId {
 /// addresses for the same shade depending on how the name was typed.
 ///
 /// The result may be empty; callers must substitute something.
+///
+/// "Separator" means `_` or `-` however it arose — substituted for a character
+/// outside the class, or typed by the user. Treating the two differently would
+/// make `_lounge` and `  lounge` produce different shapes for no reason a user
+/// could predict, and a leading `_` is carried into the entity id Home
+/// Assistant derives.
 fn sanitise(name: &str) -> String<MAX_NAME_PART_LEN> {
+    fn is_separator(ch: char) -> bool {
+        ch == '_' || ch == '-'
+    }
+
     let mut out: String<MAX_NAME_PART_LEN> = String::new();
     let mut pending_separator = false;
     for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            if pending_separator && !out.is_empty() && out.push('_').is_err() {
-                break;
-            }
-            pending_separator = false;
-            if out.push(ch.to_ascii_lowercase()).is_err() {
-                break;
-            }
-        } else {
+        if !ch.is_ascii_alphanumeric() && !is_separator(ch) {
             pending_separator = true;
+            continue;
+        }
+        // Nothing opens with a separator, typed or substituted, so the first
+        // character is always alphanumeric.
+        if out.is_empty() && is_separator(ch) {
+            continue;
+        }
+        if pending_separator && !out.is_empty() && out.push('_').is_err() {
+            break;
+        }
+        pending_separator = false;
+        if out.push(ch.to_ascii_lowercase()).is_err() {
+            break;
         }
     }
-    // Truncation can strand a separator at the end; a kept character never can,
-    // because a separator is only ever written immediately before one.
-    while out.ends_with('_') {
+    // Truncation can strand a substituted separator at the end, and the user can
+    // type one there. Neither belongs in a topic segment.
+    while out.ends_with('_') || out.ends_with('-') {
         out.pop();
     }
     out
@@ -224,16 +267,21 @@ fn store<const N: usize>(value: &str) -> String<N> {
     out
 }
 
-/// Write a `u8` as decimal without pulling in `core::fmt`'s machinery for what
-/// is at most three digits.
-fn write_u8<const N: usize>(out: &mut String<N>, value: u8) -> Result<(), ()> {
-    if value >= 100 {
-        out.push((b'0' + value / 100) as char)?;
-    }
-    if value >= 10 {
-        out.push((b'0' + (value / 10) % 10) as char)?;
-    }
-    out.push((b'0' + value % 10) as char)
+/// Append text, or panic. See [`push_u8`] for why silence is not an option.
+fn push_str<const N: usize>(out: &mut String<N>, text: &str) {
+    out.push_str(text)
+        .expect("identifier capacity proven at compile time");
+}
+
+/// Append a `u8` as decimal, or panic.
+///
+/// The capacity assertions below prove every caller has room, so this cannot
+/// fail. It panics rather than dropping the digits because the alternative is
+/// silent: an identifier missing its shade number still looks like an
+/// identifier, and two shades sharing one is a configuration Home Assistant
+/// rejects outright.
+fn push_u8<const N: usize>(out: &mut String<N>, value: u8) {
+    write!(out, "{value}").expect("identifier capacity proven at compile time");
 }
 
 #[cfg(test)]
@@ -266,11 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn write_u8_covers_every_width() {
-        for value in [0u8, 7, 10, 99, 100, 255] {
-            let mut out: String<8> = String::new();
-            write_u8(&mut out, value).unwrap();
-            assert_eq!(out.as_str(), value.to_string());
-        }
+    fn sanitise_drops_separators_at_both_edges() {
+        // Typed and substituted separators are treated alike at the edges.
+        assert_eq!(sanitise("_lounge").as_str(), "lounge");
+        assert_eq!(sanitise("-lounge").as_str(), "lounge");
+        assert_eq!(sanitise("_-_lounge_-_").as_str(), "lounge");
+        assert_eq!(sanitise("lounge_").as_str(), "lounge");
+        assert_eq!(sanitise("lounge-").as_str(), "lounge");
+        assert_eq!(sanitise("_").as_str(), "");
+        assert_eq!(sanitise("-").as_str(), "");
+        // Interior separators are left alone: they are part of the name.
+        assert_eq!(sanitise("a_b-c").as_str(), "a_b-c");
     }
 }
