@@ -8,15 +8,30 @@ full design specification lives in [`docs/specs/`](docs/specs/).
 
 ## Status
 
-**Plans 1–3 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
+**Plans 1–4 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
 codes, TX pulse rendering, RX decoding, repeat-frame dedupe), the `somfy-domain`
 model (shade/group/room registries, travel-time position dead-reckoning, command
 orchestration, overheard-remote tracking), and the Plan 3 contract layer —
 `somfy-api` (serde REST/WS DTOs with `ts-rs` TypeScript generation) and
 `somfy-migrate` (C++ backup-file parser) — are implemented and green on the host.
-**Plan 4a (firmware transmit) is complete and proven on hardware.**
-**Next: Plan 4b** — RMT receive, the Embassy radio/state tasks, and persisted
-rolling codes.
+**Plan 4 is complete and proven on hardware, in both directions.**
+**Next: Plan 5** — WiFi, MQTT and Home Assistant discovery.
+
+Receive was proven on 2026-08-16: with a second device transmitting real Somfy
+frames, the firmware decoded **4 of 4**, each carrying the correct address and
+the command actually sent, with rolling codes advancing in step:
+
+```
+rx[1]: address=0x0FC115 command=Up   rolling_code=177
+rx[2]: address=0x0FC115 command=Down rolling_code=178
+rx[3]: address=0x0FC115 command=Up   rolling_code=179
+rx[4]: address=0x0FC115 command=Down rolling_code=180
+```
+
+The whole receive chain is exercised there: CC1101 → GDO2 → RMT capture →
+`RmtPulseSource` → `RxDecoder` → radio task → frame channel. The RMT peripheral
+proved sufficient, so the `GpioPulseSource` interrupt-timestamping fallback that
+§6.1 holds in reserve has not been needed.
 
 **On-air validation landed 2026-08-16.** somfy-rs firmware running on an
 ESP32-S3 drove a real Somfy roller shade in both directions, confirmed by the
@@ -51,7 +66,7 @@ Plans (per [`docs/specs/`](docs/specs/)):
 | 2 | Domain model: shades/groups/rooms + position/tilt engine — **complete** |
 | 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **complete** |
 | 4a | Firmware transmit: CC1101 driver + `esp-hal` RMT TX — **complete, hardware-proven** |
-| 4b | Firmware receive: RMT RX, Embassy tasks, persisted rolling codes — **next** |
+| 4b | Firmware receive: RMT RX, Embassy tasks, persisted rolling codes — **complete, hardware-proven** |
 | 5 | Network: WiFi, MQTT, Home Assistant discovery |
 | 6 | Persistence + OTA (A/B partitions, rollback) |
 | 7 | Web UI (Preact) served from flash |
