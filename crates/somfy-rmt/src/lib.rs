@@ -1,24 +1,35 @@
 //! # somfy-rmt
 //!
-//! Packs Somfy OOK pulse trains into ESP32 RMT symbols.
+//! The RMT peripheral's half of the Somfy radio, as pure data.
 //!
-//! The RMT peripheral stores **two** (level, duration) pairs per 32-bit symbol,
-//! each duration a 15-bit tick count. This crate performs that packing as pure
-//! data so it is testable on the host: `somfy-rts` must stay free of hardware
-//! types, and the `firmware` crate cannot be compiled for the host at all.
+//! Neither neighbour can hold this code: `somfy-rts` must stay free of hardware
+//! concepts, and the `firmware` crate cannot be compiled for the host at all.
+//! So the shapes the RMT peripheral imposes live here, where a host compiler
+//! and a host test suite can still reach them, and the firmware is left with
+//! only the calls that need a chip.
 //!
-//! [`build_symbols`] is the entry point and owns the whole transmit pipeline —
-//! render an encoded frame to pulses, merge them edge-to-edge, pack two per
-//! symbol, and terminate the buffer. That leaves the firmware nothing to do but
-//! map each [`RmtSymbol`] onto `esp_hal::rmt::PulseCode`, which keeps the part
-//! that can only be checked on a chip down to a delegation.
+//! **Transmit.** The peripheral stores **two** (level, duration) pairs per
+//! 32-bit symbol, each duration a 15-bit tick count. [`build_symbols`] owns
+//! that whole pipeline — render an encoded frame to pulses, merge them
+//! edge-to-edge, pack two per symbol, and terminate the buffer — leaving the
+//! firmware to map each [`RmtSymbol`] onto `esp_hal::rmt::PulseCode`.
+//!
+//! **Receive.** [`PulseSource`] is the seam the receive path is written
+//! against: a stream of merged edge-to-edge [`somfy_rts::Pulse`]s, which is
+//! both what the peripheral hands back and what `somfy_rts::RxDecoder` already
+//! consumes. [`ReplayPulseSource`] implements it over a slice, so a captured
+//! transmission can be replayed into receive code on the host.
 //!
 //! Ticks are 1 µs (80 MHz RMT source clock with `clk_divider = 80`).
 
 #![cfg_attr(not(test), no_std)]
 
+mod source;
+
 use heapless::Vec;
 use somfy_rts::{merge_pulses, render_pulses, FrameKind, Pulse};
+
+pub use source::{PulseSource, ReplayPulseSource};
 
 /// Tick period in microseconds. 80 MHz / 80 = 1 MHz.
 pub const TICK_US: u32 = 1;
