@@ -120,21 +120,63 @@ be the flash I/O and nothing else.
 
 Implements Task 1's trait over `esp-hal`'s RMT RX.
 
-**Idle threshold: 12,000 µs**, from §6.2. It must sit above the longest in-frame
-LOW and below the inter-frame gap so each repeat lands as its own completed
-transaction rather than being concatenated or truncated:
+**The channel must be an `Async` RMT channel, and `PulseSource::next_pulse` is
+`async`.** This is not a style choice. esp-hal 1.1.2's `RxTransaction::wait` is
+a busy-poll with no deadline and no yield (`rmt.rs:1879`). For TX that spin is
+bounded by a ~100 ms frame; for RX it is bounded by *nothing* — a shade may go
+untouched for hours. A blocking receive would pin the executor through every
+silence, starving the state task and every queued transmit, which defeats §7's
+entire reason for splitting the tasks. Worse, it presents as "the state task
+stopped ticking", not as an RX bug. Use
+`Channel<'_, Async, Rx>::receive(&mut data).await` (`rmt.rs:2104`).
+
+**Idle threshold — derive it from measured captures, NOT from `TIMINGS`.**
+
+§6.2 of the design spec, and an earlier draft of this plan, both stated:
 
 ```
-WAKEUP_LOW (7,357 µs)  <  idle_threshold  <  INTER_FRAME_GAP (27,434 µs)
+WAKEUP_LOW (7,357 µs)  <  idle_threshold  <  INTER_FRAME_GAP (27,434 µs)   [WRONG]
 ```
 
-Add a **compile-time assertion** for that inequality against the `TIMINGS`
-constants, in the same spirit as 4a's `RMT_CLK_DIVIDER`/`TICK_US` and
-`MAX_TICKS`/`PulseCode::MAX_LEN` guards. A threshold that silently drifts
-outside the window would fragment or merge frames with nothing to explain why.
+and chose 12,000 µs. **That inequality is false against real hardware.** The
+longest in-frame LOW is not `WAKEUP_LOW`. Every committed wall-remote capture
+shows a post-wake-up gap of roughly **17.7 ms**, because a real remote's gap is
+not the transmit-side constant:
+
+| Capture | Wake-up HIGH | Following LOW |
+|---|---|---|
+| `up_56bit_1.pulses` | 10229 | **17738** |
+| `down_56bit_1.pulses` | 10247 | **17722** |
+| `my_56bit_1.pulses` | 10216 | **17711** |
+
+A 12,000 µs threshold sits *below* that, so it would cut a real first frame in
+two at the wake-up gap on every reception. (Probably harmless in practice — the
+fragment before the split is only the wake-up pulse, and the decoder re-acquires
+on the hardware syncs that follow — but a threshold chosen against a bound the
+hardware does not respect is chosen for the wrong reason, and the compile-time
+assertion would have been asserting a property the fixtures already violate.)
+
+The real window is therefore:
+
+```
+~17,740 µs (measured longest intra-frame LOW)  <  idle_threshold  <  27,434 µs
+```
+
+Pick a value with margin on both sides — around 22,000 µs sits mid-band — and
+**derive the lower bound from the captures**, ideally by exposing a measured
+constant from `somfy-rts` so the compile-time assertion has something real to
+assert against. Keep the assertion (same spirit as 4a's
+`RMT_CLK_DIVIDER`/`TICK_US` and `MAX_TICKS`/`PulseCode::MAX_LEN` guards): a
+threshold that drifts outside the window fragments or merges frames with
+nothing anywhere to explain why. Just make it assert the true bound.
 
 The field is a `u16` of ticks; at 1 µs resolution the ceiling is 65,535 µs, so
-12,000 is comfortably representable — assert that too if it is not implied.
+any value in this window is comfortably representable — assert that too if it
+is not implied.
+
+Re-measure the upper bound too if you can: 27,434 µs is *our* transmitter's
+inter-frame gap, and no committed fixture contains a real remote's repeat frame
+to confirm what its gap actually is.
 
 `GpioPulseSource` (the interrupt-timestamping fallback for the recorded RMT-RX
 risk) is **out of scope unless Task 6 shows RMT RX cannot do the job.** Do not
@@ -169,8 +211,25 @@ Order matters and is not arbitrary — listening is strictly safer than
 transmitting, so it comes first:
 
 1. **Listen.** Our board receives; a wall remote or the reference device
-   transmits. Assert decoded address, command, `bits`, and the sync counts
-   (**4** on first frames, **14** on repeats — measured, not assumed).
+   transmits. Assert decoded address, command, `bits`, and the sync counts:
+   **4** on first frames, **14** on repeats.
+
+   Be precise about how well-established each of those is, because they are not
+   equally well-established. All three committed captures are *first* frames
+   reporting `hwsync == 4`, so 4 is re-verifiable from this repository at any
+   time. The 14 was measured during the 2026-08-15 wall-remote session and is
+   recorded in `docs/provenance.md`, but **no committed fixture preserves a
+   repeat frame**, so it cannot be re-checked from the repo — and the value
+   also happens to equal what `render_pulses` derives, which makes an
+   independent measurement easy to mistake for a derivation.
+
+   4a's bring-up adds one-sided support: the reference receiver decoded
+   `sync=14` on repeats from *our* transmitter. That confirms our encoder emits
+   14; it is not a fresh confirmation that a real Somfy remote does.
+
+   **So capture a real repeat frame during this step and commit it as a
+   fixture.** It closes the gap permanently and costs nothing while the
+   equipment is already set up.
 2. **Transmit**, verified by the reference receiver as in 4a. Read the rolling
    code live immediately beforehand — see
    [`docs/hardware-checklist.md`](../hardware-checklist.md); a stale value is
