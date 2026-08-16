@@ -10,8 +10,8 @@
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
     Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, ShadeTopic, StateRoot,
-    MAX_DEVICE_ID_LEN, MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NAME_PART_LEN, MAX_NODE_ID_LEN,
-    MAX_OBJECT_ID_LEN, MAX_STATE_ROOT_LEN, MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
+    MAX_DEVICE_ID_LEN, MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN,
+    MAX_STATE_ROOT_LEN, MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
 };
 
 /// The widest shade id, and therefore the most digits.
@@ -30,8 +30,9 @@ fn maximal_config() -> MqttConfig {
 #[test]
 fn the_widest_topics_fit_with_room_to_spare() {
     let cfg = maximal_config();
-    // A name long enough to fill the object id's name part completely.
-    let object = ObjectId::for_shade(&"o".repeat(MAX_NAME_PART_LEN * 2), WIDEST_SHADE);
+    // The widest object id is the widest shade id: nothing else varies.
+    let object = ObjectId::for_shade(WIDEST_SHADE);
+    assert_eq!(object.as_str(), "shade_255");
     assert_eq!(object.as_str().len(), MAX_OBJECT_ID_LEN);
 
     let mut widest = 0;
@@ -51,7 +52,7 @@ fn the_widest_topics_fit_with_room_to_spare() {
     // assertion runs. The number is the thing worth watching: if a change moves
     // it, the capacity budget deserves a fresh look rather than a silent slide.
     assert_eq!(
-        widest, 171,
+        widest, 128,
         "widest topic moved; re-check the budget against TOPIC_CAPACITY = {TOPIC_CAPACITY}",
     );
     assert!(widest < TOPIC_CAPACITY);
@@ -170,10 +171,10 @@ fn identifiers_keep_every_part_at_the_widest_inputs() {
         "two components share a unique_id: {ids:?}"
     );
 
-    for name in ["", &"z".repeat(1000), "日本語", "Salon / Porte-fenêtre"] {
-        let object = ObjectId::for_shade(name, WIDEST_SHADE);
+    for id in [0u8, 9, 10, 99, 100, 255] {
+        let object = ObjectId::for_shade(ShadeId(id));
         assert!(
-            object.as_str().ends_with("_255"),
+            object.as_str().ends_with(&id.to_string()),
             "{object:?} lost the shade id"
         );
         assert!(object.as_str().len() <= MAX_OBJECT_ID_LEN);

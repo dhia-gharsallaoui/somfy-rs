@@ -53,7 +53,7 @@ fn table() -> [Row; 8] {
             // namespaces are independent, so the discovery topic must start at
             // the prefix and the state must stay under the root.
             outcome: Outcome::Accepted {
-                discovery: "homeassistant/cover/somfyrs/lounge_1/config",
+                discovery: "homeassistant/cover/somfyrs/shade_1/config",
                 base: "mydevice/shades/1",
                 availability: "mydevice/status",
             },
@@ -103,7 +103,7 @@ fn table() -> [Row; 8] {
             state_root: "somfyrs",
             discovery_prefix: "homeassistant",
             outcome: Outcome::Accepted {
-                discovery: "homeassistant/cover/somfyrs/lounge_1/config",
+                discovery: "homeassistant/cover/somfyrs/shade_1/config",
                 base: "somfyrs/shades/1",
                 availability: "somfyrs/status",
             },
@@ -113,7 +113,7 @@ fn table() -> [Row; 8] {
             state_root: "home/blinds",
             discovery_prefix: "homeassistant",
             outcome: Outcome::Accepted {
-                discovery: "homeassistant/cover/somfyrs/lounge_1/config",
+                discovery: "homeassistant/cover/somfyrs/shade_1/config",
                 base: "home/blinds/shades/1",
                 availability: "home/blinds/status",
             },
@@ -123,7 +123,7 @@ fn table() -> [Row; 8] {
             state_root: "somfyrs",
             discovery_prefix: "ha/discovery",
             outcome: Outcome::Accepted {
-                discovery: "ha/discovery/cover/somfyrs/lounge_1/config",
+                discovery: "ha/discovery/cover/somfyrs/shade_1/config",
                 base: "somfyrs/shades/1",
                 availability: "somfyrs/status",
             },
@@ -155,7 +155,7 @@ fn topic_construction_table() {
                 availability,
             } => {
                 let cfg = built.unwrap_or_else(|e| panic!("{}: refused with {e:?}", row.what));
-                let object = ObjectId::for_shade("Lounge", ShadeId(1));
+                let object = ObjectId::for_shade(ShadeId(1));
                 assert_eq!(
                     cfg.discovery_topic(Component::Cover, &object).as_str(),
                     discovery,
@@ -183,7 +183,7 @@ fn no_accepted_row_ever_emits_an_empty_segment() {
         let Ok(cfg) = config(row.state_root, row.discovery_prefix) else {
             continue;
         };
-        let object = ObjectId::for_shade("Lounge", ShadeId(1));
+        let object = ObjectId::for_shade(ShadeId(1));
         let mut topics = alloc_topics(&cfg, &object);
         topics.push(cfg.availability_topic().as_str().to_owned());
         for topic in topics {
@@ -229,13 +229,13 @@ fn alloc_topics(cfg: &MqttConfig, object: &ObjectId) -> Vec<String> {
 #[test]
 fn component_is_the_segment_immediately_after_the_prefix() {
     let cfg = config("somfyrs", "ha/discovery").unwrap();
-    let object = ObjectId::for_shade("Lounge", ShadeId(1));
+    let object = ObjectId::for_shade(ShadeId(1));
     let topic = cfg.discovery_topic(Component::Cover, &object);
     let segments: Vec<&str> = topic.as_str().split('/').collect();
 
     assert_eq!(
         segments,
-        ["ha", "discovery", "cover", "somfyrs", "lounge_1", "config"]
+        ["ha", "discovery", "cover", "somfyrs", "shade_1", "config"]
     );
     // The prefix is two segments here, so "immediately after" is positional,
     // not a fixed index: the component follows the whole prefix.
@@ -248,19 +248,74 @@ fn component_is_the_segment_immediately_after_the_prefix() {
     assert_eq!(*segments.last().unwrap(), "config");
 }
 
-/// A shade name is not a topic. It is sanitised to `[a-zA-Z0-9_-]` before it
-/// can reach a segment, so no name can inject structure into the topic.
+/// A shade name is not a topic, and cannot become one: it is not an input to
+/// any topic this crate builds. `ObjectId::for_shade` takes a [`ShadeId`] and
+/// nothing else, so `Salon / Porte-fenêtre` has no path to a segment at all —
+/// a stronger guarantee than sanitising the name would give, and one the
+/// signature enforces rather than a function body.
+///
+/// It also means the discovery topic does not move when a shade is renamed,
+/// which is what stops every rename leaving an orphaned retained config behind.
 #[test]
 fn a_shade_name_cannot_produce_topic_segments() {
     let cfg = config("somfyrs", "homeassistant").unwrap();
-    let object = ObjectId::for_shade("Salon / Porte-fenêtre", ShadeId(7));
-    let topic = cfg.discovery_topic(Component::Cover, &object);
+    let topic = cfg.discovery_topic(Component::Cover, &ObjectId::for_shade(ShadeId(7)));
 
-    assert_eq!(
-        topic.as_str(),
-        "homeassistant/cover/somfyrs/salon_porte-fen_tre_7/config"
-    );
+    assert_eq!(topic.as_str(), "homeassistant/cover/somfyrs/shade_7/config");
     assert_eq!(topic.as_str().split('/').count(), 5);
+
+    // The name still reaches Home Assistant, in the payload where it belongs.
+    let mut payload: heapless::String<{ somfy_mqtt::PAYLOAD_CAPACITY }> = heapless::String::new();
+    cfg.cover_discovery(ShadeId(7), "Salon / Porte-fenêtre", false)
+        .render(&mut payload)
+        .unwrap();
+    assert!(
+        payload.contains(r#""name":"Salon / Porte-fenêtre""#),
+        "{payload}"
+    );
+}
+
+/// The discovery topic is invariant under the name. This is the rename
+/// stability the id-derived object id buys, asserted directly.
+///
+/// It goes through `cover_discovery`, which is the only public path with a name
+/// in scope at all. Building an `ObjectId` here and comparing it against itself
+/// would pass whatever `cover_discovery` did with the name — which is precisely
+/// the thing under test.
+#[test]
+fn renaming_a_shade_does_not_move_its_discovery_topic() {
+    let cfg = config("somfyrs", "homeassistant").unwrap();
+    let shade = ShadeId(4);
+    let expected = cfg
+        .discovery_topic(Component::Cover, &ObjectId::for_shade(shade))
+        .as_str()
+        .to_owned();
+
+    let mut first_unique_id: Option<String> = None;
+    for name in [
+        "Lounge",
+        "Sitting room",
+        "Salon / Porte-fenêtre",
+        "",
+        "日本語",
+    ] {
+        let discovery = cfg.cover_discovery(shade, name, false);
+
+        // The address the config is published to does not follow the name...
+        let topic = cfg.discovery_topic(Component::Cover, &discovery.object_id);
+        assert_eq!(
+            topic.as_str(),
+            expected,
+            "renaming to {name:?} moved the discovery topic"
+        );
+        assert_eq!(discovery.object_id.as_str(), "shade_4");
+
+        // ...and neither does the identity Home Assistant remembers.
+        match &first_unique_id {
+            None => first_unique_id = Some(discovery.unique_id.as_str().to_owned()),
+            Some(id) => assert_eq!(discovery.unique_id.as_str(), id),
+        }
+    }
 }
 
 /// Every component this crate can emit is a literal from Home Assistant's own
@@ -269,7 +324,7 @@ fn a_shade_name_cannot_produce_topic_segments() {
 #[test]
 fn component_segments_are_literals() {
     let cfg = config("somfyrs", "homeassistant").unwrap();
-    let object = ObjectId::for_shade("Lounge", ShadeId(1));
+    let object = ObjectId::for_shade(ShadeId(1));
     for (component, expected) in [
         (Component::Cover, "cover"),
         (Component::Sensor, "sensor"),

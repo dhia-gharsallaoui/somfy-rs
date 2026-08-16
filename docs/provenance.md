@@ -231,6 +231,29 @@ would reproduce the bug this crate exists to remove.
 | Availability at `{state_root}/status`, publishing `online`/`offline` | `somfy-mqtt/src/config.rs::STATUS_SEGMENT`, `MqttConfig::availability_topic` | The reference firmware's `espsomfyrts/status :: online`, with one deliberate departure: it must live under the **state root**, never under the discovery prefix. `{discovery_prefix}/status` is Home Assistant's own birth and will topic, so availability published there is overwritten by HA's birth message and reports the device available while it is offline | Pinned by `somfy-mqtt/tests/topics.rs::availability_is_under_the_state_root_not_the_discovery_prefix` and, from the payload side, by `somfy-mqtt/tests/round_trip.rs::the_check_actually_catches_availability_under_the_discovery_prefix`. The same collision is also reachable when the two roots are set to the same string — both individually valid — so `MqttConfig::new` refuses overlapping namespaces; pinned by `somfy-mqtt/tests/config_rejection.rs::overlapping_namespaces_are_rejected`. **This rule is not in the requirements spec**; it was found while implementing R4 and is reported as a spec gap |
 | Discovery topic `{discovery_prefix}/{component}/{node_id}/{object_id}/config`, with the component **immediately** after the prefix | `somfy-mqtt/src/config.rs::MqttConfig::discovery_topic` | **Not the reference.** Home Assistant's MQTT discovery contract, which the reference does not implement correctly in any configuration | Verified empirically on 2026-08-15 by publishing both orderings to a live broker and observing which one Home Assistant acted on: `homeassistant/<device>/cover/1/config` was ignored, `homeassistant/cover/<device>/1/config` created an entity that read live position. Recorded in the requirements spec above; pinned by `somfy-mqtt/tests/topics.rs::component_is_the_segment_immediately_after_the_prefix` |
 | `position_open: 0` / `position_closed: 100` in the cover discovery payload | `somfy-mqtt/src/entity.rs::CoverDiscovery::render` | **Not the reference.** Home Assistant's cover defaults are the other way round (100 open, 0 closed), while this project's `Pos` runs 0 fully open to 100 fully closed — see the `somfy-domain` table above. Stating both ends explicitly is what stops every shade reporting itself inverted | Not yet confirmed against a live Home Assistant. **This is the one value in this crate whose correctness a host test cannot establish**, and it is on the Plan 5 Task 5 integration checklist |
+| `object_id` = `shade_{id}`, built from the shade's stable slot index and never from its name | `somfy-mqtt/src/ident.rs::ObjectId::for_shade` | **Not the reference, and a deliberate reading of R2.** R2 says `node_id` and `object_id` "MUST be sanitised to `[a-zA-Z0-9_-]`", which reads as though a shade's name flows into the object id. Building it from the id satisfies the character class more strongly — there is no user text to sanitise — and avoids a lifecycle cost R5 does not name: an object id that follows the name moves the discovery topic on every rename, stranding the old retained config as an orphan unless it is separately cleared. The requirements themselves note `object_id` "does not influence the entity_id", so the stable form costs nothing a user can see; the name still reaches Home Assistant through the payload's `name` field, which is where the display name comes from | Pinned by `somfy-mqtt/tests/topics.rs::renaming_a_shade_does_not_move_its_discovery_topic` and `a_shade_name_cannot_produce_topic_segments`, and as a property by `somfy-mqtt/tests/topic_props.rs::topics_are_invariant_under_the_shade_name` over hostile names (Unicode, slashes, wildcards, control characters, 400 bytes). Uniqueness across all 256 shade ids is exhaustively checked in `somfy-mqtt/src/ident.rs`'s own test module |
+
+### Deliberate deviation from R8 (tilt)
+
+**R8 requires tilt-capable shades to expose `tilt_command_topic` / `tilt_status_topic`. somfy-rs implements the mechanism but will publish them for no shade until the domain's tilt port lands.**
+
+`somfy-domain` states in its own docs that `TiltMode` is config-carriage only: it
+is stored and round-tripped for backup and migration, but no command drives a
+tilt axis, and `Shade::tilt_pos` always reports `Pos::ZERO`
+(`somfy-domain/src/shade.rs`, `somfy-domain/src/types.rs::ShadeConfig::tilt_mode`,
+which additionally warns that the API layer "MUST NOT surface tilt as functional
+until that port lands, or it will advertise moves the domain does not make").
+
+Publishing tilt discovery for a shade whose stored `TiltMode` is non-`None`
+would give Home Assistant a tilt control that reports 0 forever and moves
+nothing. That is the failure acceptance criterion 5 of the requirements spec
+calls out — "Appearing is not working" — and it is worse than an absent control,
+because a control that does nothing reads as a device fault rather than an
+unimplemented feature.
+
+| Item | Where it lives now | Derived from | Verified |
+|---|---|---|---|
+| Tilt topics are carried only when the caller asks for them, via an explicit `has_tilt` argument rather than a read of the stored `TiltMode` | `somfy-mqtt/src/entity.rs::ShadeTopic::for_shade`, `somfy-mqtt/src/config.rs::MqttConfig::cover_discovery` | **Not derived. A deliberate deviation from spec R8**, resolving it against `somfy-domain`'s own contract, which wins because it describes what the firmware can actually do today | Omission is pinned by `somfy-mqtt/tests/topics.rs::tilt_topics_are_omitted_for_non_tilt_shades` and `somfy-mqtt/tests/round_trip.rs::non_tilt_shades_carry_no_tilt_keys`. **Revisit when the domain's tilt port lands** — when `Shade::tilt_pos` reports a real position and a command drives the tilt axis, the caller starts passing `true` and R8 is satisfied with no change to this crate |
 
 ## firmware
 

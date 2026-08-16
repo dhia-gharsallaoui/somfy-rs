@@ -20,7 +20,9 @@
 
 use crate::entity::{Component, CoverDiscovery, ShadeTopic};
 use crate::error::{ConfigError, Field};
-use crate::ident::{DeviceId, NodeId, ObjectId, UniqueId, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN};
+use crate::ident::{
+    DeviceId, NodeId, ObjectId, UniqueId, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS,
+};
 use crate::topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,
     MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
@@ -35,9 +37,6 @@ const SHADES_SEGMENT: &str = "shades";
 
 /// The availability topic's segment under the state root.
 const STATUS_SEGMENT: &str = "status";
-
-/// Digits in the widest [`ShadeId`], which is a `u8`.
-const MAX_SHADE_ID_DIGITS: usize = 3;
 
 /// A validated MQTT configuration: two independent namespaces and two
 /// identifiers.
@@ -201,7 +200,7 @@ impl MqttConfig {
         CoverDiscovery {
             base: self.shade_base(shade),
             availability: self.availability_topic(),
-            object_id: ObjectId::for_shade(name, shade),
+            object_id: ObjectId::for_shade(shade),
             unique_id: UniqueId::for_shade(&self.device_id, Component::Cover, shade),
             name,
             has_tilt,

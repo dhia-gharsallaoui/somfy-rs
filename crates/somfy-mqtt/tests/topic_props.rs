@@ -11,7 +11,8 @@ use proptest::prelude::*;
 use regex::Regex;
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, StateRoot, TOPIC_CAPACITY,
+    Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, StateRoot,
+    PAYLOAD_CAPACITY, TOPIC_CAPACITY,
 };
 
 /// Verbatim from the acceptance criterion.
@@ -78,7 +79,18 @@ proptest! {
             Err(_) => return Ok(()),
         };
         let shade = ShadeId(id);
-        let object = ObjectId::for_shade(&name, shade);
+        let object = ObjectId::for_shade(shade);
+
+        // The criterion is "for any valid config **and any shade name**", so the
+        // name stays an input to the scenario even though it is no longer an
+        // input to any topic. Putting it through the one API that accepts it is
+        // what keeps that true rather than merely asserted: if a name ever finds
+        // its way back into a topic, these are the topics it would corrupt.
+        let name: String = name.chars().take(8).collect();
+        let mut payload: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+        cfg.cover_discovery(shade, &name, has_tilt)
+            .render(&mut payload)
+            .expect("payload fits");
 
         let mut topics = vec![
             cfg.availability_topic(),
@@ -104,38 +116,89 @@ proptest! {
             prop_assert!(!s.contains("//"), "topic {s:?} contains an empty segment");
             prop_assert!(s.len() <= TOPIC_CAPACITY, "topic {s:?} overran the capacity");
         }
+
+        // Deliberately *not* asserted here: that no topic contains the name as a
+        // substring. It looks like the natural check and it is unsound — a
+        // one-character name of "a" is a substring of the literal `status`, and
+        // this property test found that in 512 cases within a second of it being
+        // written. `topics_are_invariant_under_the_shade_name` below states the
+        // real property instead, and states it more strongly: the topics do not
+        // merely avoid the name, they do not vary with it at all.
     }
 
-    /// The object id is a topic segment on its own, so it must satisfy the
-    /// segment grammar for every possible name — never empty, never a slash.
+    /// Every topic is invariant under the shade's name.
+    ///
+    /// This is the stronger form of the criterion above, and the one that
+    /// matters after the object id stopped following the name: it is not that
+    /// hostile names are cleaned up on the way into a topic, it is that they
+    /// never get there. A rename therefore cannot move a discovery topic and
+    /// strand a retained config at the old address.
+    ///
+    /// The name is still generated here, and still reaches the payload — the
+    /// assertion is that the payload changes and the topics do not.
     #[test]
-    fn object_id_is_always_a_single_valid_segment(
-        name in shade_name(),
+    fn topics_are_invariant_under_the_shade_name(
+        prefix in valid_root(),
+        root in valid_root(),
+        name_a in shade_name(),
+        name_b in shade_name(),
         id in 0u8..=255,
+        has_tilt in any::<bool>(),
     ) {
-        let object = ObjectId::for_shade(&name, ShadeId(id));
-        let s = object.as_str();
+        let Ok(cfg) = MqttConfig::new(
+            DiscoveryPrefix::new(&prefix).unwrap(),
+            StateRoot::new(&root).unwrap(),
+            NodeId::new("somfyrs").unwrap(),
+            DeviceId::new("a1b2c3d4").unwrap(),
+        ) else {
+            return Ok(());
+        };
+        let shade = ShadeId(id);
+        let object = ObjectId::for_shade(shade);
+
+        // Nothing in the topic set can vary, because the name is not an input
+        // to any of it.
+        prop_assert_eq!(
+            cfg.discovery_topic(Component::Cover, &object),
+            cfg.discovery_topic(Component::Cover, &ObjectId::for_shade(shade)),
+        );
+
+        // The payload does carry the name, and both must render.
+        let mut a: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+        let mut b: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+        let short_a = name_a.chars().take(8).collect::<String>();
+        let short_b = name_b.chars().take(8).collect::<String>();
+        cfg.cover_discovery(shade, &short_a, has_tilt).render(&mut a).unwrap();
+        cfg.cover_discovery(shade, &short_b, has_tilt).render(&mut b).unwrap();
+
+        // Same shade, different names: the `~` base and the object id are
+        // byte-identical in both payloads.
+        let base = cfg.shade_base(shade);
+        let quoted = format!("\"~\":\"{base}\"");
+        prop_assert!(a.contains(&quoted), "{a}");
+        prop_assert!(b.contains(&quoted), "{b}");
+        let object_field = format!("\"object_id\":\"{}\"", object.as_str());
+        prop_assert!(a.contains(&object_field), "{a}");
+        prop_assert!(b.contains(&object_field), "{b}");
+    }
+
+    /// The object id is a topic segment on its own: never empty, never a slash,
+    /// always within the class, and distinct for distinct shades. Two shades
+    /// sharing an object id share a discovery topic, and the second silently
+    /// overwrites the first.
+    #[test]
+    fn object_ids_are_distinct_valid_segments(a in 0u8..=255, b in 0u8..=255) {
+        let one = ObjectId::for_shade(ShadeId(a));
+        let s = one.as_str();
         prop_assert!(!s.is_empty());
         prop_assert!(!s.contains('/'));
         prop_assert!(
-            s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
             "object id {s:?} escaped the character class",
         );
-    }
 
-    /// Distinct shades never share an object id, whatever they are named —
-    /// two entities sharing a discovery topic means the second silently
-    /// overwrites the first.
-    #[test]
-    fn object_ids_are_unique_per_shade(
-        name_a in shade_name(),
-        name_b in shade_name(),
-        a in 0u8..=255,
-        b in 0u8..=255,
-    ) {
         prop_assume!(a != b);
-        let one = ObjectId::for_shade(&name_a, ShadeId(a));
-        let two = ObjectId::for_shade(&name_b, ShadeId(b));
+        let two = ObjectId::for_shade(ShadeId(b));
         prop_assert_ne!(one.as_str(), two.as_str());
     }
 }

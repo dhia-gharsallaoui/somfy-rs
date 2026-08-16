@@ -29,9 +29,12 @@
 //!    the builder that turns a root into a topic can be seeded exactly once.
 //!    Concatenating them is not a mistake to avoid; it is a program that cannot
 //!    be written. See [`DiscoveryPrefix`] for the compile-fail proofs.
-//! 2. **No topic has an empty segment.** Every segment comes from a firmware
-//!    literal, a validated identifier, or a sanitised name, and none of those
-//!    can be empty.
+//! 2. **No topic has an empty segment, and no user text reaches one.** Every
+//!    segment is a firmware literal, an operator identifier validated to
+//!    `[a-zA-Z0-9_-]`, or a value built from a literal and a shade id. A shade
+//!    named `Salon / Porte-fenêtre` cannot produce a topic segment because its
+//!    name is not an input to any topic — it reaches Home Assistant through the
+//!    payload's `name` field, which is where the display name comes from.
 //! 3. **Bad configuration is refused, never repaired.** [`ConfigError`] names
 //!    the [`Field`] that was wrong. There is no variant meaning "accepted with
 //!    adjustments", because a silently adjusted address is indistinguishable
@@ -78,13 +81,13 @@
 //!     DeviceId::new("a1b2c3d4")?,
 //! )?;
 //! let shade = ShadeId(1);
-//! let object = ObjectId::for_shade("Salon / Porte-fenêtre", shade);
+//! let object = ObjectId::for_shade(shade);
 //!
 //! // Discovery lives under the prefix; state lives under the root; the two
 //! // never meet except through the payload's `~`.
 //! assert_eq!(
 //!     config.discovery_topic(Component::Cover, &object).as_str(),
-//!     "homeassistant/cover/somfyrs/salon_porte-fen_tre_1/config",
+//!     "homeassistant/cover/somfyrs/shade_1/config",
 //! );
 //! assert_eq!(config.shade_base(shade).as_str(), "somfyrs/shades/1");
 //! assert_eq!(
@@ -111,10 +114,11 @@
 //! - Topics whose [`TopicRole`] is [`TopicRole::Subscribed`] must never be
 //!   published retained. A retained command replays on every reconnect, which
 //!   is a shade that closes itself each time the broker restarts.
-//! - Renaming a shade changes its [`ObjectId`] and therefore its discovery
-//!   topic. The retained config at the old topic must be cleared with a
-//!   zero-length retained publish, exactly as deleting a shade must. The entity
-//!   itself survives, because [`UniqueId`] is not derived from the name.
+//! - Deleting a shade means clearing the retained config at its discovery
+//!   topic with a zero-length retained publish, or the entity outlives the
+//!   shade with no way to remove it but by hand. Renaming one does *not*:
+//!   neither [`ObjectId`] nor [`UniqueId`] follows the name, so a rename is a
+//!   payload change and the topic stays where it was.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -131,8 +135,8 @@ pub use entity::{
 };
 pub use error::{ConfigError, Field};
 pub use ident::{
-    DeviceId, NodeId, ObjectId, UniqueId, MAX_DEVICE_ID_LEN, MAX_NAME_PART_LEN, MAX_NODE_ID_LEN,
-    MAX_OBJECT_ID_LEN, MAX_UNIQUE_ID_LEN,
+    DeviceId, NodeId, ObjectId, UniqueId, MAX_COMPONENT_HEADROOM, MAX_DEVICE_ID_LEN,
+    MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
 };
 pub use topic::{
     DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN, MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,

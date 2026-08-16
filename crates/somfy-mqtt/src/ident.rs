@@ -1,16 +1,32 @@
-//! The identifiers that become topic segments, and the sanitiser that stands
-//! between a human-chosen name and a topic.
+//! The identifiers that become topic segments.
 //!
-//! Two different disciplines apply here, and the difference is deliberate:
+//! Two disciplines apply, and the difference is deliberate:
 //!
 //! - **Configuration is validated.** [`NodeId`] and [`DeviceId`] come from an
 //!   operator who is choosing an MQTT identifier, so a value outside
 //!   `[a-zA-Z0-9_-]` is a mistake to report, not one to paper over.
-//! - **A shade name is sanitised.** A shade is called `Salon / Porte-fenêtre`
-//!   because that is what the room is called. Refusing it would be refusing the
-//!   user's own language, so it is transformed on the way into a topic — and
-//!   the name itself survives untouched in the discovery payload's `name`
-//!   field, which is where Home Assistant reads it from anyway.
+//! - **Derived identifiers are built, not transformed.** [`ObjectId`] and
+//!   [`UniqueId`] are assembled from a literal and a [`ShadeId`], so they
+//!   satisfy the character class by construction. Nothing a user types reaches
+//!   a topic segment at all.
+//!
+//! ## Why a shade's name is not in its object id
+//!
+//! An earlier shape sanitised the name into the object id, on the reading that
+//! R2's "`node_id` and `object_id` MUST be sanitised" implies the name flows in.
+//! It does satisfy that requirement, but it buys a legible topic at the price of
+//! a lifecycle bug: renaming a shade moves its discovery topic, so the retained
+//! config at the old address has to be cleared or it becomes an orphan. That is
+//! the mess the requirements complain about — an estate accumulating retained
+//! entities that can only be deleted by hand.
+//!
+//! The requirements themselves note that `object_id` "does not influence the
+//! entity_id", so a stable, id-derived value costs nothing a user can see. The
+//! human-readable name still reaches Home Assistant, through the discovery
+//! payload's `name` field, which is where the display name actually comes from.
+//! Building the id from the shade's stable slot index instead makes a rename a
+//! payload change and nothing more, and it satisfies R2's character class more
+//! strongly than sanitising would: there is no user text to sanitise.
 
 use crate::entity::Component;
 use crate::error::{ConfigError, Field};
@@ -25,16 +41,24 @@ pub const MAX_NODE_ID_LEN: usize = 32;
 /// Bytes a `device_id` may occupy.
 pub const MAX_DEVICE_ID_LEN: usize = 32;
 
-/// Bytes of sanitised shade name an object id may carry, before the id suffix.
-///
-/// Truncating here is safe in a way truncating configuration is not: the object
-/// id is a label this crate derives, not an address the operator typed, and the
-/// id suffix keeps it unique however short the name part gets.
-pub const MAX_NAME_PART_LEN: usize = 48;
+/// Digits in the widest [`ShadeId`], which is a `u8`.
+pub const MAX_SHADE_ID_DIGITS: usize = 3;
 
-/// Bytes an object id may occupy: a name part, a separator, and up to three
-/// digits of [`ShadeId`].
-pub const MAX_OBJECT_ID_LEN: usize = MAX_NAME_PART_LEN + 1 + 3;
+/// What every shade's object id starts with.
+///
+/// A literal rather than a bare number so a topic read off a broker says what
+/// it addresses. [`Component`] already separates a shade's cover from its
+/// sensors, since it is a different segment of the discovery topic.
+const OBJECT_ID_PREFIX: &str = "shade_";
+
+/// Bytes an object id may occupy: the prefix and up to three digits of
+/// [`ShadeId`].
+///
+/// Exact rather than padded, and safe to be exact because both terms are fixed
+/// at compile time — change the prefix and this constant moves with it. That is
+/// the difference from [`MAX_UNIQUE_ID_LEN`], whose bound depends on a
+/// hand-maintained array and therefore carries headroom.
+pub const MAX_OBJECT_ID_LEN: usize = OBJECT_ID_PREFIX.len() + MAX_SHADE_ID_DIGITS;
 
 /// Bytes a unique id may occupy.
 ///
@@ -64,10 +88,6 @@ const _: () = assert!(
     Component::MAX_LEN <= MAX_COMPONENT_HEADROOM,
     "a component name outgrew the unique-id budget",
 );
-
-/// Substituted for a name that sanitises to nothing — a name written entirely
-/// in a non-Latin script, or one that is empty.
-const EMPTY_NAME_FALLBACK: &str = "shade";
 
 /// The optional device segment of a discovery topic.
 ///
@@ -125,50 +145,32 @@ impl DeviceId {
 
 /// The last segment before `config` in a discovery topic.
 ///
-/// Derived from the shade's name so the topic is legible to whoever is watching
-/// the broker, with the shade id appended so it is unique and non-empty
-/// whatever the name is.
-///
-/// **Consequence worth knowing:** renaming a shade changes its object id, and
-/// therefore its discovery topic. The retained config at the old topic must be
-/// cleared with a zero-length retained publish, exactly as deleting a shade
-/// does. The entity itself survives the rename, because `unique_id` is built
-/// from the device and shade ids and not from the name.
+/// Built from the shade's stable slot index, never from its name, so the
+/// discovery topic does not move when a shade is renamed. See the module docs
+/// for why that trade is worth making: an object id that follows the name turns
+/// every rename into a retained config that has to be cleared or become an
+/// orphan, and buys nothing a user can see, because `object_id` does not
+/// influence the entity id Home Assistant creates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectId(String<MAX_OBJECT_ID_LEN>);
 
 impl ObjectId {
-    /// Derive an object id from a shade's name and id.
+    /// Derive an object id from a shade's id.
     ///
-    /// Infallible by construction: any name at all produces a valid single
-    /// segment.
+    /// Infallible, unique per shade, never empty, and always a single segment
+    /// in `[a-zA-Z0-9_-]` — all four by construction rather than by check,
+    /// because the only inputs are a literal and an integer.
     ///
     /// ```
     /// use somfy_domain::ShadeId;
     /// use somfy_mqtt::ObjectId;
     ///
-    /// assert_eq!(ObjectId::for_shade("Lounge", ShadeId(1)).as_str(), "lounge_1");
-    /// assert_eq!(
-    ///     ObjectId::for_shade("Salon / Porte-fenêtre", ShadeId(7)).as_str(),
-    ///     "salon_porte-fen_tre_7",
-    /// );
-    /// // A name with nothing usable in it still yields a valid segment.
-    /// assert_eq!(ObjectId::for_shade("日本語", ShadeId(2)).as_str(), "shade_2");
+    /// assert_eq!(ObjectId::for_shade(ShadeId(1)).as_str(), "shade_1");
+    /// assert_eq!(ObjectId::for_shade(ShadeId(255)).as_str(), "shade_255");
     /// ```
-    pub fn for_shade(name: &str, id: ShadeId) -> ObjectId {
+    pub fn for_shade(id: ShadeId) -> ObjectId {
         let mut out: String<MAX_OBJECT_ID_LEN> = String::new();
-        let part = sanitise(name);
-        let part = if part.is_empty() {
-            EMPTY_NAME_FALLBACK
-        } else {
-            &part
-        };
-        // Capacity is MAX_NAME_PART_LEN + 1 + 3 and `part` is at most
-        // MAX_NAME_PART_LEN, so neither push can fail. They are still checked:
-        // a dropped push here is a silent change of address, which is the whole
-        // class of fault this crate exists to remove.
-        push_str(&mut out, part);
-        push_str(&mut out, "_");
+        push_str(&mut out, OBJECT_ID_PREFIX);
         push_u8(&mut out, id.0);
         ObjectId(out)
     }
@@ -210,55 +212,6 @@ impl UniqueId {
     }
 }
 
-/// Reduce an arbitrary name to the topic character class.
-///
-/// Characters in `[a-zA-Z0-9_-]` are kept, lowercased. Every run of anything
-/// else — spaces, slashes, accented letters, emoji, control characters —
-/// collapses to a single `_`, and leading and trailing separators are dropped.
-/// Lowercasing is normalisation, not sanitisation: MQTT topics are
-/// case-sensitive, so `Lounge` and `lounge` would otherwise be two different
-/// addresses for the same shade depending on how the name was typed.
-///
-/// The result may be empty; callers must substitute something.
-///
-/// "Separator" means `_` or `-` however it arose — substituted for a character
-/// outside the class, or typed by the user. Treating the two differently would
-/// make `_lounge` and `  lounge` produce different shapes for no reason a user
-/// could predict, and a leading `_` is carried into the entity id Home
-/// Assistant derives.
-fn sanitise(name: &str) -> String<MAX_NAME_PART_LEN> {
-    fn is_separator(ch: char) -> bool {
-        ch == '_' || ch == '-'
-    }
-
-    let mut out: String<MAX_NAME_PART_LEN> = String::new();
-    let mut pending_separator = false;
-    for ch in name.chars() {
-        if !ch.is_ascii_alphanumeric() && !is_separator(ch) {
-            pending_separator = true;
-            continue;
-        }
-        // Nothing opens with a separator, typed or substituted, so the first
-        // character is always alphanumeric.
-        if out.is_empty() && is_separator(ch) {
-            continue;
-        }
-        if pending_separator && !out.is_empty() && out.push('_').is_err() {
-            break;
-        }
-        pending_separator = false;
-        if out.push(ch.to_ascii_lowercase()).is_err() {
-            break;
-        }
-    }
-    // Truncation can strand a substituted separator at the end, and the user can
-    // type one there. Neither belongs in a topic segment.
-    while out.ends_with('_') || out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
 /// Store an already-validated token. The length was checked by the validator,
 /// so the push cannot fail.
 fn store<const N: usize>(value: &str) -> String<N> {
@@ -288,42 +241,26 @@ fn push_u8<const N: usize>(out: &mut String<N>, value: u8) {
 mod tests {
     use super::*;
 
+    /// Every shade id yields a distinct, single, non-empty segment. Distinctness
+    /// is the property that matters: two shades sharing an object id share a
+    /// discovery topic, and the second silently overwrites the first.
     #[test]
-    fn sanitise_collapses_runs_and_trims_edges() {
-        assert_eq!(sanitise("Lounge").as_str(), "lounge");
-        assert_eq!(sanitise("  Lounge  ").as_str(), "lounge");
-        assert_eq!(
-            sanitise("Salon / Porte-fenêtre").as_str(),
-            "salon_porte-fen_tre"
-        );
-        assert_eq!(sanitise("///").as_str(), "");
-        assert_eq!(sanitise("").as_str(), "");
-        assert_eq!(sanitise("日本語").as_str(), "");
-        assert_eq!(sanitise("a\u{0}b").as_str(), "a_b");
-    }
-
-    #[test]
-    fn sanitise_truncates_without_stranding_a_separator() {
-        let long = "é".repeat(200);
-        assert_eq!(sanitise(&long).as_str(), "");
-
-        let alternating = "a-".repeat(200);
-        let out = sanitise(&alternating);
-        assert!(out.len() <= MAX_NAME_PART_LEN);
-        assert!(!out.ends_with('_'));
-    }
-
-    #[test]
-    fn sanitise_drops_separators_at_both_edges() {
-        // Typed and substituted separators are treated alike at the edges.
-        assert_eq!(sanitise("_lounge").as_str(), "lounge");
-        assert_eq!(sanitise("-lounge").as_str(), "lounge");
-        assert_eq!(sanitise("_-_lounge_-_").as_str(), "lounge");
-        assert_eq!(sanitise("lounge_").as_str(), "lounge");
-        assert_eq!(sanitise("lounge-").as_str(), "lounge");
-        assert_eq!(sanitise("_").as_str(), "");
-        assert_eq!(sanitise("-").as_str(), "");
-        // Interior separators are left alone: they are part of the name.
-        assert_eq!(sanitise("a_b-c").as_str(), "a_b-c");
+    fn object_ids_are_distinct_valid_segments_for_every_shade_id() {
+        let mut seen: Vec<heapless::String<MAX_OBJECT_ID_LEN>> = Vec::new();
+        for id in 0u8..=255 {
+            let object = ObjectId::for_shade(ShadeId(id));
+            let text = object.as_str();
+            assert!(!text.is_empty());
+            assert!(
+                text.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{text} escaped the character class",
+            );
+            assert_eq!(text, format!("shade_{id}"));
+            assert!(text.len() <= MAX_OBJECT_ID_LEN);
+            assert!(!seen.iter().any(|s| s.as_str() == text), "{text} repeated");
+            seen.push(object.0.clone());
+        }
+        assert_eq!(seen.len(), 256);
     }
 }
