@@ -31,10 +31,11 @@
 //!
 //! Of the two ends it does hand out:
 //!
-//! - [`TransmitChannel::requests`] returns a consumer, which cannot send.
 //! - [`TransmitChannel::queue`] returns a [`TransmitQueueHandle`], whose
 //!   `sender` field is private, which has no inherent methods at all, and which
 //!   is reachable only through the [`TransmitQueue`] trait.
+//! - [`TransmitChannel::requests`] returns a [`TransmitRequests`], which can
+//!   only receive.
 //!
 //! `TransmitQueueHandle` therefore has exactly one operation — `enqueue`, which
 //! demands a ticket — and this crate exports nothing else that can reach the
@@ -44,6 +45,25 @@
 //! The enforcement is a **crate** boundary rather than a module one, which
 //! matters: `crates/firmware` is where the tasks are wired together, and
 //! nothing it can write reaches a private field over here.
+//!
+//! ## Why the *consumer* end is a newtype too
+//!
+//! Shutting the producer door is not enough on its own, and this was found in
+//! review rather than by design. `TransmitRequest` has public fields, and
+//! `embassy_sync::channel::Channel` is a public type any crate may construct.
+//! So while a bare `Receiver` was all [`crate::RadioLoop::new`] asked for, a
+//! caller could build a **second, private channel**, push a request into it
+//! with no ticket and no commit, and hand its receiver to the radio task — a
+//! three-line bypass using nothing but public API and no private field at all.
+//! The producer end of *this* channel being shut is irrelevant if the radio
+//! will accept any channel.
+//!
+//! [`TransmitRequests`] closes that: it has a private field and no public
+//! constructor, so the only way to obtain one is [`TransmitChannel::requests`],
+//! and `RadioLoop` accepts nothing else. Feeding the radio therefore requires a
+//! `TransmitChannel`, whose only producer requires a ticket, which only
+//! [`somfy_store::transmit`] mints and only after a successful commit. The
+//! chain closes.
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
@@ -104,14 +124,61 @@ impl<M: RawMutex, const N: usize> TransmitChannel<M, N> {
     }
 
     /// The consumer end, for the radio task.
-    pub fn requests(&self) -> Receiver<'_, M, TransmitRequest, N> {
-        self.inner.receiver()
+    ///
+    /// Nothing stops this being called twice, and two radio loops sharing one
+    /// channel would race for requests. It is not made take-once because the
+    /// hardware already settles it: a second [`crate::RadioLoop`] would need a
+    /// second `PulseSource` and a second transmitter, and there is one radio.
+    /// What this type does enforce is the part the hardware cannot — that the
+    /// radio is fed by a channel whose producer demanded a ticket.
+    pub fn requests(&self) -> TransmitRequests<'_, M, N> {
+        TransmitRequests {
+            receiver: self.inner.receiver(),
+        }
     }
 }
 
 impl<M: RawMutex, const N: usize> Default for TransmitChannel<M, N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The consumer end of a [`TransmitChannel`] — and the only thing
+/// [`crate::RadioLoop`] will take.
+///
+/// Its field is private and it has no public constructor, so
+/// [`TransmitChannel::requests`] is the only source of one. That is what stops
+/// a caller building a private channel of its own, pushing an uncommitted
+/// request into it, and handing the radio task the receiver: the radio can only
+/// be fed by a channel whose producer end demanded a ticket.
+///
+/// Deliberately neither `Copy` nor `Clone`, unlike the `embassy_sync::Receiver`
+/// it wraps — one radio, one consumer.
+///
+/// The wrapped receiver is not reachable:
+///
+/// ```compile_fail,E0616
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// use somfy_tasks::TransmitChannel;
+///
+/// let channel: TransmitChannel<NoopRawMutex, 2> = TransmitChannel::new();
+/// let requests = channel.requests();
+/// let receiver = requests.receiver;
+/// ```
+pub struct TransmitRequests<'ch, M: RawMutex, const N: usize = TRANSMIT_QUEUE_DEPTH> {
+    receiver: Receiver<'ch, M, TransmitRequest, N>,
+}
+
+impl<M: RawMutex, const N: usize> TransmitRequests<'_, M, N> {
+    /// Wait for the next authorised transmission.
+    pub async fn receive(&self) -> TransmitRequest {
+        self.receiver.receive().await
+    }
+
+    /// Take a request if one is waiting, without waiting for one.
+    pub fn try_receive(&self) -> Option<TransmitRequest> {
+        self.receiver.try_receive().ok()
     }
 }
 

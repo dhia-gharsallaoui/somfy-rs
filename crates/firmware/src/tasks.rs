@@ -86,6 +86,19 @@ pub type Radio = RadioLoop<
 pub type Deltas =
     ImmediatePublisher<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
 
+/// One in this many repeats of an anomaly is logged, after the first.
+///
+/// See [`radio`] for why a log line on the receive path is expensive. The first
+/// occurrence is always reported — it is the one that tells you the receiver is
+/// alive and hearing something — and after that the rate is bounded, so a storm
+/// costs a line every so often rather than a line each.
+const ANOMALY_LOG_INTERVAL: u32 = 64;
+
+/// Whether this occurrence of an anomaly is one to say out loud.
+fn worth_reporting(count: u32) -> bool {
+    count == 1 || count.is_multiple_of(ANOMALY_LOG_INTERVAL)
+}
+
 /// Sole owner of the CC1101 and both RMT channels.
 ///
 /// ## What it does and does not print
@@ -100,24 +113,43 @@ pub type Deltas =
 /// frame instead, by which time this loop is already awaiting the next
 /// reception.
 ///
-/// Anomalies are logged, because they are rare by construction and because a
-/// receiver that silently discards is indistinguishable from a quiet band. A
-/// completed transmission is logged too: the radio is out of receive for the
-/// whole burst anyway, so there is no window left to protect.
+/// The two receive-side anomalies sit at exactly the same point in that cycle
+/// and cost exactly as much, so they are **counted** and reported at a bounded
+/// rate rather than printed each time. Neither is as rare as it looks: a
+/// marginal signal produces an undecodable burst for every repeat of every
+/// press, and a dropped frame happens precisely when the state task is already
+/// behind — so printing one per occurrence would slow the radio task most in
+/// the two situations where it can least afford it.
+///
+/// Transmit-side events are printed as they happen: the radio is out of receive
+/// for the whole burst anyway, so there is no window left to protect.
 #[task]
 pub async fn radio(mut radio: Radio) -> ! {
+    let mut undecodable = 0u32;
+    let mut dropped = 0u32;
     loop {
         match radio.step().await {
             // Published, deliberately silent. See above.
             RadioEvent::Received(_) => {}
             RadioEvent::Undecodable { bit_length } => {
-                esp_println::println!("radio: undecodable {}-bit burst", bit_length);
+                undecodable = undecodable.saturating_add(1);
+                if worth_reporting(undecodable) {
+                    esp_println::println!(
+                        "radio: undecodable {}-bit burst ({} so far)",
+                        bit_length,
+                        undecodable,
+                    );
+                }
             }
             RadioEvent::ReceiveQueueFull(frame) => {
-                esp_println::println!(
-                    "radio: dropped a frame for {:#08X} — state task is behind",
-                    frame.address,
-                );
+                dropped = dropped.saturating_add(1);
+                if worth_reporting(dropped) {
+                    esp_println::println!(
+                        "radio: dropped a frame for {:#08X} — state task is behind ({} so far)",
+                        frame.address,
+                        dropped,
+                    );
+                }
             }
             RadioEvent::SourceFinished => {
                 // Not a shutdown: transmission carries on. Worth one line
@@ -173,11 +205,21 @@ pub async fn state(
 ) -> ! {
     let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
     loop {
-        let mut emitted: Vec<StateDelta, DELTA_CAPACITY> = Vec::new();
+        // `select3` polls its arms in order and returns on the first that is
+        // ready, so a permanently-ready earlier arm would starve a later one.
+        // The order is chosen for that: a command is the thing a person is
+        // waiting on, a frame is an observation, and the tick is what plans
+        // arrival stops. It is safe because none of the three can be
+        // continuously ready — the two channels are drained faster than any
+        // radio can fill them, and the ticker fires at `TICK_MS`.
         let event = select3(commands.receive(), frames.receive(), ticker.next()).await;
         // Sampled after the wait, not before it: the wait is the part that
         // takes time, and the domain dead-reckons from this number.
         let now_ms = Instant::now().as_millis();
+        // Declared after the await, not before it, so this 32-slot buffer is
+        // not live across the wait and therefore not carried in the task's
+        // statically-allocated future.
+        let mut emitted: Vec<StateDelta, DELTA_CAPACITY> = Vec::new();
 
         let dispatched = match event {
             Either3::First(command) => {

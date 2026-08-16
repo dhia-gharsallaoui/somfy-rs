@@ -333,10 +333,29 @@ impl StateMachine {
             match transmit(store, queue, plan) {
                 Ok(_) => outcome.sent += 1,
                 Err(error) => {
-                    // Kept, not returned: the next planned frame belongs to a
-                    // different shade and has its own store record.
+                    // A full queue stops the whole dispatch; a store failure
+                    // does not. The asymmetry is the point.
+                    //
+                    // A store failure is about **one address** — the next
+                    // planned frame belongs to a different shade with its own
+                    // record, and must still go out.
+                    //
+                    // A full queue is about **the radio**, and the next frame
+                    // would be refused too — but only after paying for its own
+                    // commit first. A full group is 64 planned frames against a
+                    // queue four deep, so carrying on would mean 60 more ring
+                    // scans, 60 more flash writes and around four sector
+                    // erases, each burning a rolling code for a frame nobody
+                    // will ever send, and each holding this core with
+                    // interrupts disabled while the receiver hears nothing.
+                    // That is exactly the deaf window this module's docs argue
+                    // must only ever sit next to a burst.
+                    let backlogged = matches!(error, TransmitError::Queue(_));
                     if outcome.first_error.is_none() {
                         outcome.first_error = Some(error);
+                    }
+                    if backlogged {
+                        break;
                     }
                 }
             }

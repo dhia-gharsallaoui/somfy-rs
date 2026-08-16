@@ -64,7 +64,7 @@ fn a_failed_commit_puts_nothing_in_the_channel() {
     let result = transmit(&mut store, &mut queue, plan());
 
     assert!(matches!(result, Err(TransmitError::Store(_))));
-    assert!(channel.requests().try_receive().is_err());
+    assert!(channel.requests().try_receive().is_none());
     assert_eq!(store.code(ADDRESS), Some(42));
 }
 
@@ -88,7 +88,7 @@ fn a_full_channel_refuses_and_leaves_the_code_advanced() {
     let requests = channel.requests();
     assert_eq!(requests.try_receive().unwrap().frame.rolling_code, 1);
     assert_eq!(requests.try_receive().unwrap().frame.rolling_code, 2);
-    assert!(requests.try_receive().is_err());
+    assert!(requests.try_receive().is_none());
 }
 
 /// Draining makes room again: the queue is a backlog, not a fuse.
@@ -147,7 +147,7 @@ fn an_unprovisioned_address_never_reaches_the_radio() {
         result,
         Err(TransmitError::NoStoredCode { address: ADDRESS })
     );
-    assert!(channel.requests().try_receive().is_err());
+    assert!(channel.requests().try_receive().is_none());
     // And an explicit seed is what makes it transmittable — visibly, in the
     // caller, never inside the store.
     store.commit(ADDRESS, RollingCode(1)).expect("seed");

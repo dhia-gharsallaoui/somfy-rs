@@ -242,13 +242,27 @@ wear-levelled counter region — rolling codes only, no other configuration. Pla
 replaces the backing implementation; the seam and the ordering guarantee stay
 put.
 
-Both halves of that argument are now real. `somfy-store` makes a ticket
-unforgeable; `somfy-tasks`' queue module is where "the producer end is not
-exposed" stops being an obligation on implementations and becomes a fact: the
-`embassy_sync::Channel` is private to that crate, the only handle it hands out
-is usable solely through `TransmitQueue`, and `crates/firmware` — where the
-tasks are wired together — is on the other side of a crate boundary from the
-private field.
+Both halves of that argument are now real, and closing the second half took
+**two** private types rather than the one the sentence implies.
+
+`somfy-store` makes a ticket unforgeable. `somfy-tasks` shuts the producer
+door: the `embassy_sync::Channel` is private to that crate, no method lends out
+a reference to it — a `&Channel` *is* a producer handle, since `send` lives on
+the channel — and the only handle it hands out is usable solely through
+`TransmitQueue`. `crates/firmware`, where the tasks are wired together, is on
+the other side of a crate boundary from the private field.
+
+That is still not enough on its own, which review found and the design did not.
+`TransmitRequest` has public fields and `embassy_sync::Channel` is a public
+type anyone may construct, so as long as the radio task accepted a bare
+`Receiver`, a caller could build a **second, private channel**, push an
+uncommitted request into it, and hand the radio that receiver — a three-line
+bypass using nothing but public API and touching no private field at all.
+Shutting one channel's producer door is worth nothing if the radio will accept
+any channel. So the consumer end is a private newtype too
+(`somfy_tasks::TransmitRequests`), mintable only by `TransmitChannel`, and
+`RadioLoop` accepts nothing else. The chain is: radio ← only a
+`TransmitChannel` ← only a ticket ← only a successful commit.
 
 ### 7.2 Corrected during implementation
 
@@ -302,6 +316,14 @@ Two further consequences worth stating rather than discovering:
 - **`encode80` takes a repeat index** and re-encodes the frame tail per repeat,
   so a burst must encode once per frame rather than once per burst. A 56-bit
   frame encodes identically every time, which is why 4a never met this.
+- **A full radio queue must stop a dispatch; a store failure must not.** A
+  full group plans `TX_CAPACITY` = 64 frames against a queue four deep, so a
+  dispatch that carried on past the first refusal would pay for ~60 more
+  commits — each a ring scan, a flash write and one erase in sixteen — burning
+  a rolling code for a frame nobody will send and holding the core with
+  interrupts disabled while the receiver hears nothing. That is precisely the
+  deaf window §7's placement argument exists to avoid. A store failure is the
+  opposite case: it is about one address, and the next shade must still move.
 - **A failed commit still moves the position estimate.** The domain updates a
   shade's motion model when it handles the command; the frames it plans are
   dispatched afterwards. A store failure therefore transmits nothing while the

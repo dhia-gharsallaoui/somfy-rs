@@ -503,3 +503,75 @@ fn a_failed_commit_still_moves_the_estimate() {
         "the estimate moved anyway — this is the divergence"
     );
 }
+
+/// A full radio queue stops the dispatch; a store failure does not.
+///
+/// The asymmetry is the whole point, and it is a flash-wear and deaf-window
+/// property rather than a cosmetic one. A full group plans 64 frames against a
+/// queue four deep, so carrying on past the first refusal would mean ~60 more
+/// commits — each a ring scan, a flash write and one erase in sixteen — every
+/// one of them burning a rolling code for a frame nobody will send, and every
+/// one of them holding the core with interrupts disabled while the receiver
+/// hears nothing.
+#[test]
+fn a_full_queue_stops_the_dispatch_instead_of_committing_the_rest() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 5), (B, 9)]);
+    let mut queue = MockQueue::new(&log);
+    queue.full = true;
+    let (mut state, _a, _b, group) = two_shades();
+
+    let dispatch = state
+        .command_group(
+            &mut store,
+            &mut queue,
+            group,
+            ShadeCommand::Down,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(dispatch.planned, 2);
+    assert_eq!(dispatch.sent, 0);
+    assert!(matches!(
+        dispatch.first_error,
+        Some(TransmitError::Queue(_))
+    ));
+    // The second shade's record was never even read, let alone written.
+    assert_eq!(store.code(A), Some(6), "the first shade's code advanced");
+    assert_eq!(store.code(B), Some(9), "the second shade's did not");
+    assert!(
+        !log.borrow()
+            .iter()
+            .any(|event| matches!(event, Event::Load { address } if *address == B)),
+        "the dispatch must stop, not carry on paying for refusals"
+    );
+}
+
+/// A store failure, by contrast, is about one address and must not stop the
+/// dispatch — already covered above, restated here as the other half of the
+/// same rule so the pair cannot drift apart.
+#[test]
+fn a_store_failure_does_not_stop_the_dispatch() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 5), (B, 9)]);
+    store.commit_fails_for = Some(A);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, _a, _b, group) = two_shades();
+
+    let dispatch = state
+        .command_group(
+            &mut store,
+            &mut queue,
+            group,
+            ShadeCommand::Down,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(dispatch.sent, 1);
+    assert_eq!(queue.sent.len(), 1);
+    assert_eq!(queue.sent[0].frame.address, B);
+}

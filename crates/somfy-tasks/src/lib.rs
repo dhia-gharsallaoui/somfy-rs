@@ -45,7 +45,9 @@ mod queue;
 mod radio;
 mod state;
 
-pub use queue::{QueueFull, TransmitChannel, TransmitQueueHandle, TRANSMIT_QUEUE_DEPTH};
+pub use queue::{
+    QueueFull, TransmitChannel, TransmitQueueHandle, TransmitRequests, TRANSMIT_QUEUE_DEPTH,
+};
 pub use radio::{FrameChannel, RadioEvent, RadioLoop, Transmitter, FRAME_QUEUE_DEPTH};
 pub use state::{
     CommandChannel, ControlCommand, DeltaChannel, Dispatch, StateMachine, TxProfile,

@@ -232,17 +232,6 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
     let mut air = Air::new(cc1101, RmtTx::new(transmit));
     air.listen().map_err(StartError::Air)?;
 
-    // `#[task]` hands back a token or a `SpawnError`; `Spawner::spawn` itself is
-    // infallible once it has one, so the fallible half is the token.
-    let radio = tasks::radio(RadioLoop::new(
-        RmtPulseSource::new(receive),
-        air,
-        TRANSMIT.requests(),
-        FRAMES.sender(),
-    ))
-    .map_err(StartError::Spawn)?;
-    spawner.spawn(radio);
-
     // An empty registry: Plan 4 ships no config store, so no shade is
     // provisioned and nothing can be commanded. Said out loud because a silent
     // empty controller and a broken one look identical from the serial line.
@@ -252,6 +241,19 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
          nothing will transmit until a config store and a command source exist"
     );
 
+    // Both tokens first, then both spawns. `#[task]` hands back a token or a
+    // `SpawnError` and `Spawner::spawn` is infallible once it has one, so
+    // spawning as each token is obtained would leave a half-started
+    // controller on a failure — a live radio task with nothing draining
+    // `FRAMES`, which fills and then reports a dropped frame for every
+    // reception, forever. Taking both first makes that unrepresentable.
+    let radio = tasks::radio(RadioLoop::new(
+        RmtPulseSource::new(receive),
+        air,
+        TRANSMIT.requests(),
+        FRAMES.sender(),
+    ))
+    .map_err(StartError::Spawn)?;
     let state = tasks::state(
         machine,
         store,
@@ -261,6 +263,8 @@ fn start(spawner: Spawner) -> Result<(), StartError> {
         DELTAS.immediate_publisher(),
     )
     .map_err(StartError::Spawn)?;
+
+    spawner.spawn(radio);
     spawner.spawn(state);
 
     Ok(())

@@ -18,8 +18,11 @@ use somfy_rmt::ReplayPulseSource;
 use somfy_rts::{
     encode56, encode80, merge_pulses, render_pulses, Command, Frame, FrameKind, Pulse,
 };
-use somfy_store::{FrameBits, TransmitRequest};
-use somfy_tasks::{FrameChannel, RadioEvent, RadioLoop, Transmitter};
+use somfy_store::{transmit, FrameBits, TransmitPlan};
+use somfy_tasks::{FrameChannel, RadioEvent, RadioLoop, TransmitChannel, Transmitter};
+
+mod support;
+use support::MockStore;
 
 // The captures live in `somfy-rts`, next to the decoder they were taken to
 // pin. Read-only here, as everywhere.
@@ -46,9 +49,11 @@ struct MockTransmitter<'a> {
     log: &'a RefCell<Vec<Keyed>>,
     fail_key_on: bool,
     /// Frame index (0 = first frame) at which `send_frame` starts failing.
-    fail_frame_at: Option<u8>,
+    fail_frame_at: Option<u16>,
     fail_key_off: bool,
-    frames: u8,
+    /// Wider than the `u8` the loop reports, so that this double cannot be the
+    /// thing that overflows in the 256-frame test.
+    frames: u16,
 }
 
 impl<'a> MockTransmitter<'a> {
@@ -97,23 +102,44 @@ impl Transmitter for MockTransmitter<'_> {
     }
 }
 
-fn request(bits: FrameBits, repeats: u8) -> TransmitRequest {
-    TransmitRequest {
-        frame: Frame {
-            key: 0xA7,
-            command: Command::Up,
-            rolling_code: 7,
+/// The rolling code every queued request below carries.
+const CODE: u16 = 7;
+
+type Requests = TransmitChannel<NoopRawMutex, 4>;
+
+/// Put one authorised transmission in the radio's queue.
+///
+/// Through `somfy_store::transmit` and a mock store, because that is the only
+/// way there is: `RadioLoop` takes a `TransmitRequests`, which only a
+/// `TransmitChannel` can mint, whose producer end demands a ticket, which only
+/// a successful commit produces. A test that could shortcut that would be
+/// testing a radio the firmware cannot build.
+fn queue(channel: &Requests, command: Command, bits: FrameBits, repeats: u8) {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(ADDRESS, CODE)]);
+    let mut sender = channel.queue();
+    transmit(
+        &mut store,
+        &mut sender,
+        TransmitPlan {
             address: ADDRESS,
+            command,
+            bits,
+            repeats,
         },
-        bits,
-        repeats,
-    }
+    )
+    .expect("commit and enqueue");
 }
 
-/// The transmit channel's producer end is unreachable from outside
-/// `somfy-tasks` without a committed ticket, which is the point — so a test
-/// that only wants the *radio* half uses a plain channel it owns.
-type Requests = embassy_sync::channel::Channel<NoopRawMutex, TransmitRequest, 4>;
+/// One `Up` burst of `repeats` repeats, 56-bit.
+fn queue_up(channel: &Requests, repeats: u8) {
+    queue(channel, Command::Up, FrameBits::Bits56, repeats);
+}
+
+/// The frame `queue` produces, for tests that need to encode it themselves.
+fn queued_frame(command: Command) -> Frame {
+    somfy_rts::RollingCode(CODE).next_frame(command, ADDRESS)
+}
 
 #[test]
 fn a_real_capture_replays_into_a_decoded_frame() {
@@ -124,7 +150,7 @@ fn a_real_capture_replays_into_a_decoded_frame() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&pulses),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -155,7 +181,7 @@ fn a_spent_source_reports_finished_once_its_frame_is_out() {
         let mut radio = RadioLoop::new(
             ReplayPulseSource::new(&pulses),
             MockTransmitter::new(&log),
-            requests.receiver(),
+            requests.requests(),
             frames.sender(),
         );
 
@@ -190,7 +216,7 @@ fn a_full_frame_channel_drops_the_frame_and_reports_it() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&pulses),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -209,7 +235,7 @@ fn a_corrupted_burst_is_reported_and_the_loop_survives_it() {
     // bit flipped in the encoded bytes before they were rendered. The decoder
     // still collects 56 bits — it is the checksum that refuses it, which is the
     // case a receiver actually meets on a marginal signal.
-    let mut bytes = encode56(&request(FrameBits::Bits56, 0).frame).unwrap();
+    let mut bytes = encode56(&queued_frame(Command::Up)).unwrap();
     bytes[6] ^= 0x01;
     let mut rendered: heapless::Vec<Pulse, 320> = heapless::Vec::new();
     render_pulses(&bytes, FrameKind::First, &mut rendered);
@@ -222,7 +248,7 @@ fn a_corrupted_burst_is_reported_and_the_loop_survives_it() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&pulses),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -240,13 +266,13 @@ fn a_corrupted_burst_is_reported_and_the_loop_survives_it() {
 #[test]
 fn a_burst_is_keyed_on_once_around_all_its_frames() {
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 2)).unwrap();
+    queue_up(&requests, 2);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -255,13 +281,11 @@ fn a_burst_is_keyed_on_once_around_all_its_frames() {
     assert_eq!(
         event,
         RadioEvent::Transmitted {
-            rolling_code: 7,
+            rolling_code: CODE,
             frames: 3
         }
     );
-    let bytes = encode56(&request(FrameBits::Bits56, 2).frame)
-        .unwrap()
-        .to_vec();
+    let bytes = encode56(&queued_frame(Command::Up)).unwrap().to_vec();
     assert_eq!(
         log.into_inner(),
         vec![
@@ -289,23 +313,14 @@ fn a_burst_is_keyed_on_once_around_all_its_frames() {
 #[test]
 fn an_80_bit_burst_re_encodes_every_repeat() {
     let requests: Requests = Requests::new();
-    let request = TransmitRequest {
-        frame: Frame {
-            key: 0xA3,
-            command: Command::Favorite,
-            rolling_code: 3,
-            address: ADDRESS,
-        },
-        bits: FrameBits::Bits80,
-        repeats: 2,
-    };
-    requests.try_send(request).unwrap();
+    queue(&requests, Command::Favorite, FrameBits::Bits80, 2);
+    let frame = queued_frame(Command::Favorite);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -323,7 +338,7 @@ fn an_80_bit_burst_re_encodes_every_repeat() {
     for (index, bytes) in sent.iter().enumerate() {
         assert_eq!(
             bytes.as_slice(),
-            &encode80(&request.frame, index as u8)[..],
+            &encode80(&frame, index as u8)[..],
             "repeat {index} must carry its own encoding"
         );
     }
@@ -336,7 +351,7 @@ fn an_80_bit_burst_re_encodes_every_repeat() {
 #[test]
 fn a_failed_frame_still_parks_the_radio() {
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 2)).unwrap();
+    queue_up(&requests, 2);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut transmitter = MockTransmitter::new(&log);
@@ -344,7 +359,7 @@ fn a_failed_frame_still_parks_the_radio() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         transmitter,
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -368,7 +383,7 @@ fn a_failed_frame_still_parks_the_radio() {
 #[test]
 fn a_send_failure_outranks_a_parking_failure() {
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 0)).unwrap();
+    queue_up(&requests, 0);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut transmitter = MockTransmitter::new(&log);
@@ -377,7 +392,7 @@ fn a_send_failure_outranks_a_parking_failure() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         transmitter,
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -395,7 +410,7 @@ fn a_send_failure_outranks_a_parking_failure() {
 #[test]
 fn a_radio_that_will_not_key_returns_to_receiving() {
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 2)).unwrap();
+    queue_up(&requests, 2);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut transmitter = MockTransmitter::new(&log);
@@ -403,7 +418,7 @@ fn a_radio_that_will_not_key_returns_to_receiving() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         transmitter,
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -426,20 +441,20 @@ fn a_radio_that_will_not_key_returns_to_receiving() {
 fn a_pending_transmission_pre_empts_a_waiting_pulse() {
     let pulses = capture::load_fixture(FIXTURES, "up_56bit_1.pulses");
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 0)).unwrap();
+    queue_up(&requests, 0);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&pulses),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
     assert_eq!(
         block_on(radio.step()),
         RadioEvent::Transmitted {
-            rolling_code: 7,
+            rolling_code: CODE,
             frames: 1
         }
     );
@@ -460,17 +475,17 @@ fn a_finished_source_still_transmits() {
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
     assert!(matches!(block_on(radio.step()), RadioEvent::SourceFinished));
 
-    requests.try_send(request(FrameBits::Bits56, 1)).unwrap();
+    queue_up(&requests, 1);
     assert_eq!(
         block_on(radio.step()),
         RadioEvent::Transmitted {
-            rolling_code: 7,
+            rolling_code: CODE,
             frames: 2
         }
     );
@@ -480,14 +495,14 @@ fn a_finished_source_still_transmits() {
 #[test]
 fn consecutive_requests_are_keyed_separately() {
     let requests: Requests = Requests::new();
-    requests.try_send(request(FrameBits::Bits56, 0)).unwrap();
-    requests.try_send(request(FrameBits::Bits56, 0)).unwrap();
+    queue_up(&requests, 0);
+    queue_up(&requests, 0);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -507,25 +522,16 @@ fn consecutive_requests_are_keyed_separately() {
 #[test]
 fn an_unencodable_request_never_keys_the_radio() {
     let requests: Requests = Requests::new();
-    requests
-        .try_send(TransmitRequest {
-            frame: Frame {
-                key: 0xA0,
-                command: Command::Favorite,
-                rolling_code: 1,
-                address: ADDRESS,
-            },
-            // Favorite is an extended command; a 56-bit frame cannot carry it.
-            bits: FrameBits::Bits56,
-            repeats: 2,
-        })
-        .unwrap();
+    // Favorite is an extended command; a 56-bit frame cannot carry it. The
+    // store and the queue are perfectly happy with it — the refusal is the
+    // encoder's, at the radio, which is the case this pins.
+    queue(&requests, Command::Favorite, FrameBits::Bits56, 2);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
     let mut radio = RadioLoop::new(
         ReplayPulseSource::new(&[]),
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -571,7 +577,7 @@ fn a_capture_split_across_two_sources_still_decodes() {
             at: 0,
         },
         MockTransmitter::new(&log),
-        requests.receiver(),
+        requests.requests(),
         frames.sender(),
     );
 
@@ -579,4 +585,38 @@ fn a_capture_split_across_two_sources_still_decodes() {
         RadioEvent::Received(frame) => assert_eq!(frame.command, Command::Up),
         other => panic!("expected a frame across the seam, got {other:?}"),
     }
+}
+
+/// `repeats` is a `u8`, so the widest burst representable is 256 frames — one
+/// more than the count fits. It must saturate rather than wrap: an overflow
+/// panics in a debug build, inside the radio task, which is the outcome this
+/// loop reports errors rather than unwrapping in order to avoid.
+#[test]
+fn the_widest_representable_burst_saturates_rather_than_overflowing() {
+    let requests: Requests = Requests::new();
+    queue_up(&requests, u8::MAX);
+    let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
+    let log = RefCell::new(Vec::new());
+    let mut radio = RadioLoop::new(
+        ReplayPulseSource::new(&[]),
+        MockTransmitter::new(&log),
+        requests.requests(),
+        frames.sender(),
+    );
+
+    assert_eq!(
+        block_on(radio.step()),
+        RadioEvent::Transmitted {
+            rolling_code: CODE,
+            frames: u8::MAX,
+        }
+    );
+    // 256 frames really did go out; only the count saturated.
+    assert_eq!(
+        log.into_inner()
+            .iter()
+            .filter(|entry| matches!(entry, Keyed::Frame { .. }))
+            .count(),
+        256
+    );
 }

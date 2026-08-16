@@ -15,11 +15,12 @@
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use embassy_sync::channel::{Channel, Receiver, Sender};
-use heapless::Vec;
-use somfy_rmt::{PulseSource, FRAME56_BYTES, FRAME80_BYTES};
+use embassy_sync::channel::{Channel, Sender};
+use somfy_rmt::PulseSource;
 use somfy_rts::{decode56, decode80, encode56, encode80, Frame, FrameError, FrameKind, RxDecoder};
 use somfy_store::{FrameBits, TransmitRequest};
+
+use crate::queue::TransmitRequests;
 
 /// Decoded frames the state task may have waiting.
 ///
@@ -65,6 +66,13 @@ pub trait Transmitter {
     /// nothing until that finishes, so returning early costs the leading edge
     /// of the wake-up pulse — a frame that goes out shortened with nothing
     /// anywhere reporting it.
+    ///
+    /// **Synchronous, so that wait is a spin.** Making it `async` would let the
+    /// implementation sleep instead, and would also let another task run
+    /// between the strobe and the first symbol — which is a settle window, not
+    /// idle time, and one whose length the implementation chose. A spin of a
+    /// millisecond or so, twice per burst, is the price of not having to reason
+    /// about that.
     fn key_on(&mut self) -> Result<(), Self::Error>;
 
     /// Clock one encoded frame out, and return once it is fully sent.
@@ -119,13 +127,84 @@ pub enum RadioEvent<E> {
 ///
 /// Owns the pulse source, the transmitter, and both ends it needs of the two
 /// channels. Construct it in the task, then call [`RadioLoop::step`] forever.
+///
+/// ## It cannot be fed by a channel nobody committed to
+///
+/// The requests end is a [`TransmitRequests`], not a bare `embassy_sync`
+/// receiver, and that is load-bearing rather than tidiness. `TransmitRequest`
+/// has public fields and `Channel` is a public type anyone may construct, so
+/// accepting any receiver would let a caller build a private channel of its
+/// own, push a request into it with no ticket and no commit, and hand the radio
+/// task the far end — a bypass needing no private field at all. Shutting one
+/// channel's producer door is worth nothing if the radio will take any channel.
+///
+/// So it does not compile:
+///
+/// ```compile_fail,E0308
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// use embassy_sync::channel::Channel;
+/// use somfy_rmt::ReplayPulseSource;
+/// use somfy_rts::FrameKind;
+/// use somfy_store::TransmitRequest;
+/// use somfy_tasks::{FrameChannel, RadioLoop, Transmitter};
+///
+/// struct Dead;
+/// impl Transmitter for Dead {
+///     type Error = ();
+///     fn key_on(&mut self) -> Result<(), ()> { Ok(()) }
+///     async fn send_frame(&mut self, _bytes: &[u8], _kind: FrameKind) -> Result<(), ()> { Ok(()) }
+///     fn key_off(&mut self) -> Result<(), ()> { Ok(()) }
+/// }
+///
+/// // A channel of one's own, with no ticket anywhere near it.
+/// let mine: Channel<NoopRawMutex, TransmitRequest, 4> = Channel::new();
+/// let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
+/// let _ = RadioLoop::new(
+///     ReplayPulseSource::new(&[]),
+///     Dead,
+///     mine.receiver(),
+///     frames.sender(),
+/// );
+/// ```
+///
+/// The same construction through a [`crate::TransmitChannel`] does, because
+/// getting a request into *that* one requires a ticket:
+///
+/// ```
+/// use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+/// use somfy_rmt::ReplayPulseSource;
+/// use somfy_rts::FrameKind;
+/// use somfy_tasks::{FrameChannel, RadioLoop, TransmitChannel, Transmitter};
+///
+/// struct Dead;
+/// impl Transmitter for Dead {
+///     type Error = ();
+///     fn key_on(&mut self) -> Result<(), ()> { Ok(()) }
+///     async fn send_frame(&mut self, _bytes: &[u8], _kind: FrameKind) -> Result<(), ()> { Ok(()) }
+///     fn key_off(&mut self) -> Result<(), ()> { Ok(()) }
+/// }
+///
+/// let requests: TransmitChannel<NoopRawMutex, 4> = TransmitChannel::new();
+/// let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
+/// let _ = RadioLoop::new(
+///     ReplayPulseSource::new(&[]),
+///     Dead,
+///     requests.requests(),
+///     frames.sender(),
+/// );
+/// ```
 pub struct RadioLoop<'ch, S, T, M, const TXN: usize, const RXN: usize>
 where
     M: RawMutex,
 {
     source: S,
     transmitter: T,
-    requests: Receiver<'ch, M, TransmitRequest, TXN>,
+    /// A [`TransmitRequests`], not a bare `embassy_sync` receiver: the radio
+    /// must only be feedable from a [`crate::TransmitChannel`], whose producer
+    /// end demands a committed ticket. Accepting any receiver would let a
+    /// caller build a private channel, push an uncommitted request into it, and
+    /// hand it over — a bypass needing no private field at all.
+    requests: TransmitRequests<'ch, M, TXN>,
     frames: Sender<'ch, M, Frame, RXN>,
     /// One decoder for the life of the task, deliberately never reset between
     /// bursts: every burst opens with the hardware-sync preamble, whose 2560 µs
@@ -149,7 +228,7 @@ where
     pub fn new(
         source: S,
         transmitter: T,
-        requests: Receiver<'ch, M, TransmitRequest, TXN>,
+        requests: TransmitRequests<'ch, M, TXN>,
         frames: Sender<'ch, M, Frame, RXN>,
     ) -> Self {
         Self {
@@ -295,9 +374,9 @@ async fn transmit<T: Transmitter>(
     transmitter: &mut T,
     request: &TransmitRequest,
 ) -> RadioEvent<T::Error> {
-    // Encoded before anything is keyed: a request that cannot be encoded should
+    // Checked before anything is keyed: a request that cannot be encoded should
     // not put a carrier on the air at all.
-    if let Err(error) = encode(request, 0) {
+    if let Err(error) = encodable(request) {
         return RadioEvent::Unencodable(error);
     }
 
@@ -314,29 +393,47 @@ async fn transmit<T: Transmitter>(
     let mut sent = 0u8;
     let mut failure = None;
     for repeat in 0..=request.repeats {
-        // Re-encoded per repeat, not encoded once and resent. An 80-bit frame
-        // re-encodes its tail for each repeat index (`somfy_rts::encode80`), so
-        // reusing the first frame's bytes would put the wrong tail on every
-        // repeat. A 56-bit frame encodes identically every time, so one code
-        // path covers both and the width cannot be got wrong here.
-        let bytes = match encode(request, repeat) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Unreachable: repeat 0 encoded above, and neither width's
-                // encoder can start failing at a later repeat index. Reported
-                // rather than unwrapped, because a panic in the radio task
-                // takes the whole controller off the air.
-                let _ = transmitter.key_off();
-                return RadioEvent::Unencodable(error);
-            }
-        };
         let kind = if repeat == 0 {
             FrameKind::First
         } else {
             FrameKind::Repeat
         };
-        match transmitter.send_frame(&bytes, kind).await {
-            Ok(()) => sent += 1,
+        // Encoded per repeat, not once for the burst. An 80-bit frame
+        // re-encodes its tail for each repeat index (`somfy_rts::encode80`), so
+        // reusing the first frame's bytes would put the wrong tail on every
+        // repeat. A 56-bit frame encodes identically every time, so one code
+        // path covers both and the width cannot be got wrong here.
+        //
+        // The encoders return fixed-size arrays, borrowed straight into
+        // `send_frame` — no intermediate buffer, so there is no capacity to
+        // size wrongly and no truncation to discard. The rolling code inside
+        // `request.frame` goes out as given and is never re-derived: it is the
+        // value the store already committed, and re-deriving it is exactly how
+        // the persisted code and the transmitted code drift apart.
+        let outcome = match request.bits {
+            FrameBits::Bits56 => match encode56(&request.frame) {
+                Ok(bytes) => transmitter.send_frame(&bytes, kind).await,
+                Err(error) => {
+                    // Unreachable: `encodable` above already encoded this
+                    // frame. Reported rather than unwrapped anyway, because a
+                    // panic in the radio task takes the controller off the air.
+                    let _ = transmitter.key_off();
+                    return RadioEvent::Unencodable(error);
+                }
+            },
+            FrameBits::Bits80 => {
+                transmitter
+                    .send_frame(&encode80(&request.frame, repeat), kind)
+                    .await
+            }
+        };
+        match outcome {
+            // Saturating, not wrapping: `repeats` is a `u8`, so `0..=255` is
+            // 256 frames and the 256th increment would overflow — a panic in
+            // debug and a `frames: 0` report in release, for a burst that
+            // actually went out. A count that stops at 255 is wrong by one and
+            // harmless; the other two are not.
+            Ok(()) => sent = sent.saturating_add(1),
             Err(error) => {
                 failure = Some(error);
                 break;
@@ -355,32 +452,15 @@ async fn transmit<T: Transmitter>(
     }
 }
 
-/// Encode one frame of a burst at `repeat` (0 = first frame).
+/// Can this request be put in a frame at all?
 ///
-/// The rolling code inside `request.frame` is transmitted as given and never
-/// re-derived: it is the value the store already committed, and re-deriving it
-/// is exactly how the persisted code and the transmitted code drift apart.
-fn encode(request: &TransmitRequest, repeat: u8) -> Result<Vec<u8, FRAME80_BYTES>, FrameError> {
-    let mut bytes: Vec<u8, FRAME80_BYTES> = Vec::new();
+/// Only 56-bit frames can refuse: `somfy_rts::encode56` rejects the extended
+/// commands, while `encode80` is infallible. Asked before the radio is keyed so
+/// that a request nobody can encode never becomes a carrier with nothing behind
+/// it.
+fn encodable(request: &TransmitRequest) -> Result<(), FrameError> {
     match request.bits {
-        FrameBits::Bits56 => {
-            let encoded = encode56(&request.frame)?;
-            // Infallible: the buffer's capacity is the wider frame's length.
-            let _ = bytes.extend_from_slice(&encoded);
-        }
-        FrameBits::Bits80 => {
-            let encoded = encode80(&request.frame, repeat);
-            let _ = bytes.extend_from_slice(&encoded);
-        }
+        FrameBits::Bits56 => encode56(&request.frame).map(|_| ()),
+        FrameBits::Bits80 => Ok(()),
     }
-    Ok(bytes)
 }
-
-// The encode buffer above is sized to the wider frame, so neither width can
-// overflow it. Asserted rather than assumed: `extend_from_slice`'s failure is
-// discarded there, and a buffer one byte short would silently hand the
-// transmitter a truncated frame.
-const _: () = assert!(
-    FRAME56_BYTES <= FRAME80_BYTES,
-    "the encode buffer must hold either frame width"
-);

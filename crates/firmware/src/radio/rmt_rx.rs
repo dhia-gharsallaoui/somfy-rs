@@ -23,6 +23,7 @@
 //! CC1101 between receive and transmit belongs to [`super::air::Air`], which is
 //! what keeps the half-duplex mode in one place.
 
+use embassy_time::{Duration, Timer};
 use esp_hal::{
     rmt::{Channel, Error as RmtError, PulseCode, Rx, RxChannelConfig, MAX_RX_IDLE_THRESHOLD},
     Async,
@@ -33,6 +34,24 @@ use somfy_rmt::{
     MAX_SYMBOLS,
 };
 use somfy_rts::Pulse;
+
+/// How long to wait before re-arming after a reception that delivered no
+/// pulses at all.
+///
+/// A reception normally ends because the air went quiet for
+/// `somfy_rmt::IDLE_THRESHOLD_US`, and delivers whatever preceded that silence.
+/// Two things resolve *without* the receiver ever pending, though: a completed
+/// reception carrying zero symbols, and a failure that is already latched when
+/// the future is first polled. Retrying either immediately is right — a dropped
+/// burst is not the end of the stream — but retrying it with no pause at all
+/// turns a persistent one into a loop that resolves instantly forever and pins
+/// the executor, which is the exact failure this type is `Async` to avoid,
+/// reached from the other direction.
+///
+/// One millisecond is 1/22nd of the idle threshold, so it cannot cost a burst
+/// that was going to arrive, and it caps an otherwise unbounded spin at a
+/// thousand attempts a second.
+const EMPTY_RECEPTION_BACKOFF_MS: u64 = 1;
 
 /// RMT memory blocks reserved for the receive channel.
 ///
@@ -287,11 +306,20 @@ impl PulseSource for RmtPulseSource<'_> {
     /// configuration unreachable; this is what happens if some future call site
     /// configures the channel itself and gets it wrong.
     ///
-    /// `esp_hal::rmt::Error` is `#[non_exhaustive]`, so that "only
-    /// `InvalidDataLength` resolves without pending" is a property of today's
-    /// esp-hal that nothing in this repository pins. A future variant that
-    /// behaved the same way would reintroduce the spin. Re-check this arm when
-    /// bumping esp-hal.
+    /// `esp_hal::rmt::Error` is `#[non_exhaustive]`, so treating
+    /// `InvalidDataLength` as the only *permanent* failure is a property of
+    /// today's esp-hal that nothing in this repository pins. Re-check this arm
+    /// when bumping esp-hal.
+    ///
+    /// ## Every other unproductive reception backs off
+    ///
+    /// Reporting exhaustion is reserved for a configuration that can never
+    /// work; anything else is retried, because a dropped burst is not the end
+    /// of the stream. But a reception that delivers nothing and resolves
+    /// without pending — a completed transaction carrying zero symbols, or a
+    /// failure already latched when the future is first polled — would
+    /// otherwise be retried at whatever rate the executor can manage. See
+    /// [`EMPTY_RECEPTION_BACKOFF_MS`].
     async fn next_pulse(&mut self) -> Option<Pulse> {
         loop {
             if let Some(pulse) = self.take_pulse() {
@@ -299,6 +327,12 @@ impl PulseSource for RmtPulseSource<'_> {
             }
             if let Err(RmtError::InvalidDataLength) = self.receive_burst().await {
                 return None;
+            }
+            // `receive_burst` empties `burst` before it awaits and only refills
+            // it from a reception that succeeded, so this covers both the
+            // zero-symbol case and every failure that is not permanent.
+            if self.burst.is_empty() {
+                Timer::after(Duration::from_millis(EMPTY_RECEPTION_BACKOFF_MS)).await;
             }
         }
     }
