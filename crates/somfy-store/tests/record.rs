@@ -157,6 +157,38 @@ fn every_single_bit_that_fails_to_program_is_caught() {
     }
 }
 
+/// Two tables holding the same addresses are the same table, whatever is in
+/// the unused entries behind them. The flash store's durability check compares
+/// a decoded record against the one it wrote, so an equality that could depend
+/// on unreachable bytes would make that check depend on them too.
+#[test]
+fn table_equality_ignores_everything_past_the_live_entries() {
+    let mut first = CodeTable::new();
+    first.set(0x00_C0DE, RollingCode(1)).expect("fits");
+    first.set(0x00_BEEF, RollingCode(2)).expect("fits");
+
+    // The same two entries, but reached by writing and overwriting a third
+    // address first, so the arrays behind `len` took a different route.
+    let mut second = CodeTable::new();
+    second.set(0x00_C0DE, RollingCode(9)).expect("fits");
+    second.set(0x00_BEEF, RollingCode(9)).expect("fits");
+    second.set(0x00_C0DE, RollingCode(1)).expect("replace");
+    second.set(0x00_BEEF, RollingCode(2)).expect("replace");
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn tables_differing_in_a_live_entry_are_not_equal() {
+    assert_ne!(table(&[(1, 1)]), table(&[(1, 2)]));
+    assert_ne!(table(&[(1, 1)]), table(&[(2, 1)]));
+    assert_ne!(table(&[(1, 1)]), table(&[(1, 1), (2, 2)]));
+    // Order is part of the value, not incidental: it is the order the entries
+    // are written to flash in, and the store's durability check compares a
+    // decoded record against the one it encoded.
+    assert_ne!(table(&[(1, 1), (2, 2)]), table(&[(2, 2), (1, 1)]));
+}
+
 #[test]
 fn a_record_from_another_format_is_rejected_by_its_magic() {
     let mut bytes = record(1, &[]).encode();

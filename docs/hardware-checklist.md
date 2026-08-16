@@ -242,10 +242,17 @@ and one more commit.
 | Survives a reflash | `espflash flash …` again, then monitor | Same — `flash` does not touch data partitions |
 | Wraps the ring safely | ~35 resets | At the 33rd commit `valid` drops from 32 to 17 as a sector is erased, `damaged` stays 0, the code keeps counting |
 | Reports a missing region | Flash with a table lacking `rollcode` | `store check failed: PartitionMissing` — never a silent default |
+| Refuses to reseed over damage | Erase the region, then write a lone torn record into it (below) | `store check failed: Unreadable { damaged: 1, slots: 32 }` — a region that is damaged and holds no record is **not** a fresh one |
+| Seeds a genuinely blank region | `espflash erase-parts … rollcode` | `region is blank — seeding`, then `RollingCode(1)` |
 
-Measured on an ESP32-S3 on 2026-08-16: all four behaved as above, over a run
+Measured on an ESP32-S3 on 2026-08-16: all six behaved as above, over a run
 from `RollingCode(1)` to `RollingCode(43)` spanning a ring wrap, a reflash, and
 a partition-table swap and restore.
+
+The last two are a pair, and the pairing is the point. Refusing costs a person
+one `erase-parts` command; reseeding over lost codes costs a physical
+re-pairing procedure at every shade. So the store refuses on anything it cannot
+positively identify as blank, and only an erased region seeds.
 
 ## 3. Simulating a torn write
 
@@ -272,6 +279,26 @@ store: commit(0x00C0DE, 6) ok                    <- stepped over the wreckage
 correct: the torn record is inert, and the commit that would have overwritten
 it steps past instead — writing into it would only clear more bits and produce
 another unreadable record, wedging the ring for good.
+
+Plant the torn record **alone**, with no complete record anywhere, and the
+store refuses rather than treating the region as fresh:
+
+```
+store: survey slots=32 valid=0 blank=31 damaged=1 newest_seq=None addresses=0
+store check failed: Unreadable { damaged: 1, slots: 32 }
+```
+
+Clear it with `espflash erase-parts … rollcode`, which is the only state the
+store will seed into.
+
+### What this does not catch
+
+The store distinguishes a torn write from a good record; it cannot distinguish
+a torn write from a *completed* record that was destroyed afterwards. Both
+leave damaged slots ahead of a valid one, and there is no second copy to check
+against, so a failing sector makes `load` fall back to an older code with no
+error. `damaged` above zero on a device nobody power-cut is the only signal
+there is — treat it as one. Redundancy belongs with the Plan 6 rewrite.
 
 ## Region layout
 

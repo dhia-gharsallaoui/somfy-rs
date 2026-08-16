@@ -188,6 +188,17 @@ impl SectorRing {
 /// the newest is the one no other record is "ahead" of by less than half the
 /// counter's range.
 ///
+/// # Precondition: one window, not two
+///
+/// That comparison is circular, and it is only well-defined while **every live
+/// sequence number lies inside a span shorter than 2^31**. A ring written only
+/// by [`SlotLayout::next_write`] satisfies that automatically — consecutive
+/// numbers, at most `slot_count` of them alive at once — so the precondition is
+/// really a constraint on the *caller*: never restart the counter from a low
+/// value while high-numbered records may still be readable. `newest_slot` would
+/// then read the restarted record as ancient and hand back a rolling code the
+/// motor has already accepted.
+///
 /// Returns `None` when no slot holds a record. Ties keep the earlier index;
 /// duplicate sequence numbers mean a corrupt region and the caller should treat
 /// the result as arbitrary.

@@ -42,9 +42,56 @@
 //! record cannot pass its checksum that way. And `SectorRing` guarantees the
 //! sector being erased never holds the newest record, so what is destroyed was
 //! already superseded.
+//!
+//! ## What this store does NOT protect against
+//!
+//! The guarantee above is about **torn writes** — a commit interrupted
+//! part-way. It is not a general damage guarantee, and the difference matters.
+//!
+//! If a *completed* record is destroyed some other way — a failing sector, bit
+//! rot, a stray write — the scan sees a damaged slot where a valid one used to
+//! be and falls back to the newest record it can still read, which is an
+//! **older** one. `load` then answers with a code the motor has already
+//! accepted, and nothing here can tell that apart from a run of torn writes:
+//! both leave damaged slots ahead of a valid record, and the store has no
+//! second copy to check against. Only the `damaged` count in [`Survey`] hints
+//! at it, which is why a boot that reports damage on a device that was not
+//! power-cut deserves a look rather than a shrug.
+//!
+//! The fix is redundancy — a second copy of the newest record in the other
+//! sector — which is a change to the record layout and belongs with the Plan 6
+//! rewrite rather than bolted on here. What is *not* acceptable, and is
+//! handled, is the store quietly deciding a damaged region is a blank one; see
+//! [`Scan::newest_or_refuse`].
+//!
+//! ## Two hazards this puts on the rest of the firmware
+//!
+//! Both come from `esp-storage` and neither is visible from the signatures, so
+//! they are recorded here for whoever wires the tasks up.
+//!
+//! - **Every flash operation runs with interrupts disabled on this core.**
+//!   `esp-storage`'s `critical-section` feature is on by default and holds an
+//!   interrupt-disabling lock across the whole ROM call. Reads are short, but a
+//!   4 KB sector erase — one commit in [`somfy_store::SectorRing::slots_per_sector`],
+//!   so one button press in 16 — is tens of milliseconds, and the datasheet
+//!   worst case is a few hundred. RMT reception during that window is simply
+//!   lost. Committing off the radio task does not help; the core is the core.
+//!
+//! - **A commit fails outright while the second core is running.**
+//!   `FlashStorage`'s default multi-core strategy is to refuse the write rather
+//!   than risk it, which is the right default — the alternative parks the other
+//!   core mid-execution, and parking it mid-frame is worse than a failed
+//!   commit, since a failed commit at least stops the transmission cleanly.
+//!   But it means that the day something starts the app core, **every commit
+//!   returns `Flash(OtherCoreRunning)` and nothing can transmit at all**. That
+//!   is a deliberate, loud failure and not a silent one, but it is a decision
+//!   waiting to be made rather than one already made: `multicore_auto_park()`
+//!   is the opt-in, and it belongs to whoever owns the tasks.
 
+// `ReadNorFlash` rather than `ReadStorage`, even for `capacity`: both traits
+// carry a `read`, and importing both makes every call site ambiguous.
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
-use esp_bootloader_esp_idf::partitions;
+use esp_bootloader_esp_idf::partitions::{self, PartitionType};
 use esp_storage::{FlashStorage, FlashStorageError};
 use somfy_rts::RollingCode;
 use somfy_store::{
@@ -128,9 +175,13 @@ pub enum StoreError {
     /// The record read back after a write is not the record written. The bytes
     /// did not reach the array, whatever the write reported.
     NotDurable,
-    /// A slot that decoded during the scan would not decode when read again.
-    /// Two reads of the same cells disagreed, which is failing flash.
+    /// A slot that decoded during the scan read back differently the second
+    /// time. Two reads of the same cells disagreed, which is failing flash.
     Unstable { slot: usize },
+    /// The ring holds no readable record, but it is not blank either — so
+    /// whether it once held rolling codes is unknowable. Reported rather than
+    /// treated as a first boot; see [`Scan::newest_or_refuse`].
+    Unreadable { damaged: usize, slots: usize },
     /// The newest record already names `somfy_store::MAX_CODES` addresses and
     /// this commit is for another one.
     TableFull,
@@ -201,6 +252,46 @@ struct Scan {
     /// `free[i]` — slot `i` is erased, so a record can be written into it
     /// without erasing anything first. Indices past the ring stay false.
     free: [bool; MAX_SLOTS],
+    /// Slots holding a record that passed its checksum.
+    valid: usize,
+    /// Slots never written since the last erase.
+    blank: usize,
+    /// Slots holding something that is neither.
+    damaged: usize,
+}
+
+impl Scan {
+    /// The newest record, refusing when the ring cannot say whether there was
+    /// one.
+    ///
+    /// `Ok(None)` is reserved for a ring that is genuinely **blank** — a first
+    /// boot. No valid record *plus* something damaged is a different fact: the
+    /// region held bytes that are not a record, and there is no way to tell
+    /// whether they were once somebody's rolling code. Treating that as a first
+    /// boot is how a store starts counting from 1 on a controller that had
+    /// three shades paired to it, and every one of them then needs a physical
+    /// re-pairing.
+    ///
+    /// It is also the path a format bump would take: bump `Record`'s version
+    /// and every existing record decodes as damaged, so without this the store
+    /// would erase a perfectly good region and reseed rather than reporting
+    /// that it found records it could not read.
+    ///
+    /// Refusing is recoverable — a person re-seeds, or erases the region with
+    /// `espflash erase-parts rollcode` — and accepting is not. That asymmetry
+    /// is the whole argument, and it is why even the narrow case that *is*
+    /// explainable (a torn first write leaves exactly one damaged slot in an
+    /// otherwise blank region) is refused too rather than special-cased.
+    fn newest_or_refuse(&self) -> Result<Option<(usize, Record)>, StoreError> {
+        match (self.newest, self.damaged) {
+            (Some(newest), _) => Ok(Some(newest)),
+            (None, 0) => Ok(None),
+            (None, damaged) => Err(StoreError::Unreadable {
+                damaged,
+                slots: self.valid + self.blank + damaged,
+            }),
+        }
+    }
 }
 
 /// The flash-backed [`RollingCodeStore`].
@@ -227,18 +318,34 @@ impl<'d> FlashStore<'d> {
     /// store can be handed to a modestly-sized task afterwards; it is only
     /// mounting that is expensive.
     pub fn mount(mut flash: FlashStorage<'d>) -> Result<Self, StoreError> {
+        let capacity = flash.capacity() as u64;
         let (base, len) = {
             let mut buffer = [0u8; PARTITION_TABLE_BYTES];
             let table = partitions::read_partition_table(&mut flash, &mut buffer)
                 .map_err(StoreError::PartitionTable)?;
             let entry = table
                 .iter()
-                .find(|entry| entry.label_as_str() == PARTITION_LABEL)
+                .find(|entry| {
+                    // Label *and* type: a label match alone would happily mount
+                    // an app partition somebody named `rollcode`, and the first
+                    // erase would take the firmware with it.
+                    entry.label_as_str() == PARTITION_LABEL
+                        && matches!(entry.partition_type(), PartitionType::Data(_))
+                })
                 .ok_or(StoreError::PartitionMissing)?;
             (entry.offset(), entry.len())
         };
 
         let geometry = || StoreError::PartitionGeometry { offset: base, len };
+        // The table is data read off the device, so it is checked rather than
+        // trusted — in 64-bit arithmetic, because the point is to catch a
+        // partition that runs off the end of a smaller flash than the one this
+        // table was written for. Without this, `partitions.csv`'s 0x200000 on a
+        // 2 MB board mounts happily and then fails every single operation with
+        // `OutOfBounds`, at the far end of the codebase from the cause.
+        if base as u64 + len as u64 > capacity {
+            return Err(geometry());
+        }
         // Erases address whole sectors of the *flash*, not of the partition, so
         // a partition that does not start on a sector boundary would have every
         // erase spill into its neighbour.
@@ -263,37 +370,36 @@ impl<'d> FlashStore<'d> {
     }
 
     /// Walk every slot and report what is there.
+    ///
+    /// Unlike [`RollingCodeStore::load`] this never refuses: it is the
+    /// diagnostic that explains *why* the store is refusing, so it has to be
+    /// readable in exactly the states the store will not act on.
     pub fn survey(&mut self) -> Result<Survey, StoreError> {
-        let mut survey = Survey {
-            slots: self.ring.layout().slot_count(),
-            ..Survey::default()
-        };
-        let scan = self.scan(|decoded| match decoded {
-            Ok(_) => survey.valid += 1,
-            Err(RecordError::Blank) => survey.blank += 1,
-            Err(_) => survey.damaged += 1,
-        })?;
-        if let Some((_, record)) = scan.newest {
-            survey.newest_seq = Some(record.seq);
-            survey.addresses = record.table.len();
-        }
-        Ok(survey)
+        let scan = self.scan()?;
+        Ok(Survey {
+            slots: scan.valid + scan.blank + scan.damaged,
+            valid: scan.valid,
+            blank: scan.blank,
+            damaged: scan.damaged,
+            newest_seq: scan.newest.map(|(_, record)| record.seq),
+            addresses: scan.newest.map_or(0, |(_, record)| record.table.len()),
+        })
     }
 
-    /// Read every slot, show each decode attempt to `observe`, and report both
-    /// the newest valid record and which slots are erased.
+    /// Read every slot: the newest valid record, which slots are erased, and a
+    /// tally of what each one held.
     ///
     /// The winner is read a second time rather than kept from the first pass:
     /// which slot wins is only known once every sequence number is in hand, and
     /// holding all 64 decoded records to avoid one 256-byte read would cost
-    /// several KB of stack in a task that has better uses for it.
-    fn scan(
-        &mut self,
-        mut observe: impl FnMut(&Result<Record, RecordError>),
-    ) -> Result<Scan, StoreError> {
+    /// several KB of stack in a task that has better uses for it. The second
+    /// read is checked against the first, so cells that answer differently
+    /// twice are reported rather than silently believed.
+    fn scan(&mut self) -> Result<Scan, StoreError> {
         let slot_count = self.ring.layout().slot_count();
         let mut sequences = [None; MAX_SLOTS];
         let mut free = [false; MAX_SLOTS];
+        let (mut valid, mut blank, mut damaged) = (0, 0, 0);
 
         let mut buffer = ScanBuffer([0u8; RECORD_LEN * SCAN_SLOTS]);
         let mut slot = 0;
@@ -306,15 +412,19 @@ impl<'d> FlashStore<'d> {
             for index in 0..batch {
                 let mut record = [0u8; RECORD_LEN];
                 record.copy_from_slice(&bytes[index * RECORD_LEN..][..RECORD_LEN]);
-                let decoded = Record::decode(&record);
-                observe(&decoded);
-                match decoded {
-                    Ok(record) => sequences[slot + index] = Some(record.seq),
+                match Record::decode(&record) {
+                    Ok(record) => {
+                        sequences[slot + index] = Some(record.seq);
+                        valid += 1;
+                    }
                     // Only an erased slot can take a write without an erase
                     // first. A damaged one is emphatically not free: writing
                     // over it would AND into the wreckage.
-                    Err(RecordError::Blank) => free[slot + index] = true,
-                    Err(_) => {}
+                    Err(RecordError::Blank) => {
+                        free[slot + index] = true;
+                        blank += 1;
+                    }
+                    Err(_) => damaged += 1,
                 }
             }
             slot += batch;
@@ -325,11 +435,17 @@ impl<'d> FlashStore<'d> {
         let newest = match newest_slot(&sequences[..slot_count]) {
             None => None,
             Some(slot) => match self.read_slot(slot)? {
-                Ok(record) => Some((slot, record)),
-                Err(_) => return Err(StoreError::Unstable { slot }),
+                Ok(record) if Some(record.seq) == sequences[slot] => Some((slot, record)),
+                _ => return Err(StoreError::Unstable { slot }),
             },
         };
-        Ok(Scan { newest, free })
+        Ok(Scan {
+            newest,
+            free,
+            valid,
+            blank,
+            damaged,
+        })
     }
 
     /// Read one slot and try to decode it.
@@ -379,14 +495,15 @@ impl<'d> FlashStore<'d> {
 impl RollingCodeStore for FlashStore<'_> {
     type Error = StoreError;
 
-    /// `Ok(None)` means the ring holds no record for `address` — either it has
-    /// never been written, or the newest record does not name this address.
-    /// Both are facts to report. A read failure is `Err`, and neither is ever
-    /// answered with a plausible-looking starting value.
+    /// `Ok(None)` means the ring holds no record for `address` — either it is
+    /// blank, or its newest record does not name this address. Both are facts
+    /// to report. A read failure is `Err`, so is a region that holds unreadable
+    /// bytes and no record, and none of them is ever answered with a
+    /// plausible-looking starting value.
     fn load(&mut self, address: u32) -> Result<Option<RollingCode>, Self::Error> {
         Ok(self
-            .scan(|_| {})?
-            .newest
+            .scan()?
+            .newest_or_refuse()?
             .and_then(|(_, record)| record.table.get(address)))
     }
 
@@ -396,8 +513,15 @@ impl RollingCodeStore for FlashStore<'_> {
     /// that is what lets the ring erase an old sector without carrying anything
     /// forward. `somfy_store::Record`'s module docs give the full argument.
     fn commit(&mut self, address: u32, code: RollingCode) -> Result<(), Self::Error> {
-        let scan = self.scan(|_| {})?;
-        let mut record = match scan.newest {
+        let scan = self.scan()?;
+        // Not `scan.newest`: a ring with nothing readable in it and damage in
+        // it is not a blank ring, and starting a fresh seq-0 table there would
+        // discard every other address's code without a word. It would also
+        // restart the sequence counter underneath `newest_slot`, whose circular
+        // comparison then reads any slot that later reads clean as *newer* —
+        // rolling the code backwards.
+        let newest = scan.newest_or_refuse()?;
+        let mut record = match newest {
             Some((_, record)) => record,
             None => Record {
                 seq: 0,
@@ -409,7 +533,7 @@ impl RollingCodeStore for FlashStore<'_> {
         let aim = self
             .ring
             .layout()
-            .next_write(scan.newest.map(|(slot, record)| SlotWrite {
+            .next_write(newest.map(|(slot, record)| SlotWrite {
                 slot,
                 seq: record.seq,
             }));

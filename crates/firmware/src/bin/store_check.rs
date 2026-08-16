@@ -94,10 +94,29 @@ fn check() -> Result<(), StoreError> {
     // never inside the store. See `RollingCodeStore`'s docs: a store that
     // answers with a starting value when it cannot find a record replays codes
     // the motor has already accepted.
+    //
+    // And seeding only when the region is *blank*. This binary exists to catch
+    // a store that lost its codes; a harness that responds to any empty read by
+    // cheerfully starting again at 1 would report success on precisely the
+    // failure it was built to detect. `load` already refuses a region that is
+    // damaged and holds no record, so this only has to cover the remaining
+    // case: damage sitting alongside a readable record for some *other*
+    // address, which is still worth stopping for on a device nobody power-cut.
     let next = match loaded {
         Some(code) => RollingCode(code.0.wrapping_add(1)),
+        None if survey.damaged > 0 => {
+            esp_println::println!(
+                "store: NOT seeding — {} damaged slot(s) present, so an empty read \
+                 may be lost data rather than a fresh region",
+                survey.damaged,
+            );
+            return Err(StoreError::Unreadable {
+                damaged: survey.damaged,
+                slots: survey.slots,
+            });
+        }
         None => {
-            esp_println::println!("store: no record yet — seeding");
+            esp_println::println!("store: region is blank — seeding");
             RollingCode(SEED_CODE)
         }
     };

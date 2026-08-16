@@ -87,10 +87,29 @@ pub enum TableError {
 }
 
 /// Every address's next-to-send rolling code, as one record carries them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Entries past `len` are unreachable and are not part of the value; see the
+/// hand-written [`PartialEq`].
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct CodeTable {
     entries: [(u32, u16); MAX_CODES],
     len: usize,
+}
+
+/// Compares the live entries only.
+///
+/// Not derived, because the derived version would compare all [`MAX_CODES`]
+/// array slots including the ones behind `len`. Those are unreachable through
+/// every method here, so two tables that differ only there are the same table —
+/// but the flash store's write-verify compares a decoded record against the one
+/// it encoded, and an equality that could depend on unreachable bytes would
+/// quietly make **durability** depend on them too. The invariant that keeps the
+/// derived version correct (`new` zero-fills, entries are append-only) is real,
+/// but it lives elsewhere; this makes the property local.
+impl PartialEq for CodeTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries[..self.len] == other.entries[..other.len]
+    }
 }
 
 impl Default for CodeTable {
@@ -191,6 +210,10 @@ pub enum RecordError {
     Count(u16),
     /// An entry carries something that is not a 24-bit RTS address.
     Address(u32),
+    /// Two entries name the same address, so the record does not say what that
+    /// address's code is. Unreachable through [`CodeTable::set`], which
+    /// replaces rather than appends; these bytes came from somewhere else.
+    DuplicateAddress(u32),
 }
 
 impl Record {
@@ -252,6 +275,14 @@ impl Record {
             let at = HEADER_LEN + index * ENTRY_LEN;
             let address = u32::from_le_bytes(word(bytes, at));
             let code = RollingCode(u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]));
+            // A repeated address would make `set` replace rather than append,
+            // so the record would decode to fewer entries than it claims and
+            // re-encode to different bytes — which the flash store's
+            // write-verify would then reject with nothing to explain it. The
+            // record simply does not say what that address's code is; refuse it.
+            if table.get(address).is_some() {
+                return Err(RecordError::DuplicateAddress(address));
+            }
             // `set` is the only way in, so a decoded table obeys exactly the
             // same rules as one built by hand — including rejecting an address
             // too wide to be an RTS remote. `Full` is unreachable: `count` was
@@ -339,6 +370,25 @@ mod tests {
         assert_eq!(
             Record::decode(&bytes),
             Err(RecordError::Address(0xDEAD_BEEF))
+        );
+    }
+
+    #[test]
+    fn a_record_naming_the_same_address_twice_is_rejected() {
+        let mut table = CodeTable::new();
+        table.set(0x00_C0DE, RollingCode(1)).expect("fits");
+        table.set(0x00_BEEF, RollingCode(2)).expect("fits");
+        let mut bytes = Record { seq: 1, table }.encode();
+
+        // Point the second entry at the first entry's address.
+        let (first, second) = (HEADER_LEN, HEADER_LEN + ENTRY_LEN);
+        let address = word(&bytes, first);
+        bytes[second..second + 4].copy_from_slice(&address);
+        re_checksum(&mut bytes);
+
+        assert_eq!(
+            Record::decode(&bytes),
+            Err(RecordError::DuplicateAddress(0x00_C0DE))
         );
     }
 
