@@ -125,11 +125,27 @@ Report the heap figure and the measured stack headroom.
 **Crate:** `crates/firmware` for the transport; keep anything testable in
 `somfy-mqtt`.
 
-**Start by evaluating `rust-mqtt` against `minimq`** on: `no_std` without
-`alloc` if possible, LWT support, retained-publish control, QoS 0/1, and how
-they take a transport (we have `embassy-net`). Record the comparison and the
-decision in `CLAUDE.md`'s evaluation table — the rule requires the finding
-either way.
+**The client is chosen: `minimq` 0.13.0** (runner-up `rust-mqtt` 0.5.1). See the
+survey in `CLAUDE.md` — 230 crates swept, every `no_std` client's source read,
+both finalists proven to build for `xtensa-esp32s3-none-elf` under
+`build-std = ["core"]` with retained publish, retained LWT, zero-length retained
+removal, non-retained QoS 1, subscribe and unsubscribe all exercised.
+
+**Broker confirmed: the Home Assistant Mosquitto add-on**, which ships Mosquitto
+2.x and has spoken MQTT 5.0 since 1.6. This clears the one condition that would
+have eliminated *both* finalists — `minimq` is v5-only and `rust-mqtt`'s `v3`
+feature is an empty stub (`src/v3/mod.rs` is 1 byte, `src/v3/packet/mod.rs` is
+0 bytes, README: "`v3`: Unused"). Still worth confirming from a real CONNACK on
+first connect rather than from version numbers; it is one log line and it
+converts an inference into an observation.
+
+**Reconnection is ours to write.** Neither finalist provides it — `rust-mqtt`
+says so outright ("does not implement opinionated connection management —
+automatic reconnects, keepalive loops, retry policies... intentionally left to
+the user"), and `minimq` is the same shape. So R9's bounded backoff, plus
+re-subscribing and republishing retained state on reconnect, is real work to
+budget rather than glue. `minimq`'s `ConnectEvent::Connected` vs `Reconnected`
+is the hook for "republish discovery only on a fresh broker session".
 
 Then implement R5 and R6, which are where the sharp edges are:
 
