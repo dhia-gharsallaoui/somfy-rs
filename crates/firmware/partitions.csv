@@ -1,0 +1,23 @@
+# somfy-rs partition table.
+#
+# The only reason this file exists is `rollcode`: the rolling-code store looks
+# its region up by label at boot and refuses to run without it, rather than
+# writing to a compiled-in offset that would silently collide with the app once
+# the app grows. See `docs/specs/2026-08-15-config-integrity-requirements.md`.
+#
+# `espflash.toml` next to this file points espflash here, so a plain
+# `espflash flash …` from `crates/firmware` writes this table rather than
+# espflash's built-in default. Flashing with the default table instead is not
+# silently wrong — the firmware reports `PartitionMissing` and stops.
+#
+# Everything else is the stock single-app layout. `factory` is 1.9 MB against a
+# ~250 KB image, so the table fits any 4 MB board and leaves room to grow;
+# `rollcode` sits after it, sector-aligned, at 8 KB — two 4 KB erase sectors,
+# which is the minimum the ring needs to guarantee that erasing one sector can
+# never take the newest record with it.
+#
+# Name,     Type, SubType,   Offset,   Size,     Flags
+nvs,        data, nvs,       0x9000,   0x6000,
+phy_init,   data, phy,       0xf000,   0x1000,
+factory,    app,  factory,   0x10000,  0x1F0000,
+rollcode,   data, undefined, 0x200000, 0x2000,

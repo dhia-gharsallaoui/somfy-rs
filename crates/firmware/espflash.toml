@@ -1,0 +1,10 @@
+# Makes `espflash flash …` run from this directory write `partitions.csv`
+# instead of espflash's built-in default table.
+#
+# Without this the rolling-code partition would have to be passed on every
+# flash as `--partition-table partitions.csv`, and the one time somebody forgot
+# they would flash a device that cannot persist a rolling code. That failure is
+# reported rather than silent — the firmware stops at `PartitionMissing` — but
+# a flag nobody has to remember is better than a good error message.
+[idf_format_args]
+partition_table = "partitions.csv"

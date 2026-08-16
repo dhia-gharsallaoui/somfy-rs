@@ -1,9 +1,21 @@
-# Hardware bring-up checklist — transmit path
+# Hardware bring-up checklist
 
-How to put somfy-rs firmware on a board and prove it is actually transmitting.
+How to put somfy-rs firmware on a board and prove it is actually working.
 Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
+
+Two independent procedures, because they need different equipment and carry
+different risk:
+
+- **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
+  the air.
+- **[Rolling-code store](#rolling-code-store)** — needs nothing but the board,
+  and touches only flash.
+
+## Transmit path
+
+Proving the firmware is actually transmitting.
 
 ## What you need
 
@@ -40,11 +52,26 @@ cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
 espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmware
 ```
 
+Run espflash from `crates/firmware`, not from the repo root. `espflash.toml`
+there points it at this crate's `partitions.csv`, which is the only table
+containing the `rollcode` partition the store needs; espflash only looks for
+that config in the current directory and its parent. Flashing without it is not
+silently wrong — the store reports `PartitionMissing` and stops — but it is an
+avoidable trip.
+
+**`espflash flash` does not erase data partitions**, which is what makes the
+rolling code survive a reflash. Use `espflash erase-parts rollcode` when you
+actually want it gone.
+
 If espflash reports **"ESP-IDF App Descriptor missing"**, the image lacks
 `esp_bootloader_esp_idf::esp_app_desc!()`. Note that nothing in the build
 catches this: the descriptor has no runtime behaviour, so the compiler, clippy
 and the entire four-chip CI matrix stay green on a binary that cannot be put on
 a device at all.
+
+If it reports **"Error while running FlashEnd command"**, drop `--no-stub`.
+The flash stub is the default and works; the ROM loader path was seen to fail
+this way on an ESP32-S3 on 2026-08-16.
 
 ## 2. Watch it boot
 
@@ -165,3 +192,93 @@ marginal as uninformative until the link is fixed.
 Note also that a poor link to the *reference receiver* says nothing about the
 link to the *motor*: throughout the above, the motor responded first try in
 both directions while the reference decoded ~1 frame in 10.
+
+---
+
+## Rolling-code store
+
+Proving a committed rolling code really is durable. **This procedure needs no
+radio and transmits nothing** — `store-check` is a separate binary from
+`firmware` for exactly that reason, so proving persistence never involves
+keying a transmitter.
+
+The claim being tested is the one the whole persist-before-transmit design
+rests on: a code that `commit` accepted survives losing power and survives
+reflashing. Neither can be checked on the host, and neither can be checked by
+the store reporting on its own success.
+
+## 1. Flash the store harness
+
+Step 0 above — **identify the board** — applies here too, every time.
+
+```bash
+source ~/export-esp.sh
+cd crates/firmware
+cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/store-check
+espflash monitor --port /dev/ttyUSB0 --non-interactive
+```
+
+Each boot prints the region, a survey of every slot, the stored code, one
+commit, and the read-back:
+
+```
+store: partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
+store: survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
+store: load(0x00C0DE) = Some(RollingCode(3))
+store: commit(0x00C0DE, 4) ok
+store: load(0x00C0DE) = Some(RollingCode(4))
+store check complete
+```
+
+## 2. The four things worth checking
+
+`espflash monitor` resets the board on connect, so each run is one more boot
+and one more commit.
+
+| Check | How | Expected |
+|---|---|---|
+| Survives a reset | Reconnect the monitor | The code continues; it never restarts from 1 |
+| Survives a reflash | `espflash flash …` again, then monitor | Same — `flash` does not touch data partitions |
+| Wraps the ring safely | ~35 resets | At the 33rd commit `valid` drops from 32 to 17 as a sector is erased, `damaged` stays 0, the code keeps counting |
+| Reports a missing region | Flash with a table lacking `rollcode` | `store check failed: PartitionMissing` — never a silent default |
+
+Measured on an ESP32-S3 on 2026-08-16: all four behaved as above, over a run
+from `RollingCode(1)` to `RollingCode(43)` spanning a ring wrap, a reflash, and
+a partition-table swap and restore.
+
+## 3. Simulating a torn write
+
+The interesting failure is losing power part-way through a commit. You can
+plant one rather than waiting for it, which is worth doing because the recovery
+path is otherwise never exercised: erase the region, write a sector image whose
+first slot holds a complete record and whose second holds only the first 64
+bytes of one, and boot.
+
+```bash
+espflash erase-parts --port /dev/ttyUSB0 --partition-table partitions.csv rollcode
+espflash write-bin --port /dev/ttyUSB0 0x200000 sector-with-a-torn-record.bin
+```
+
+Expected, and observed on 2026-08-16:
+
+```
+store: survey slots=32 valid=1 blank=30 damaged=1 newest_seq=Some(0) addresses=1
+store: load(0x00C0DE) = Some(RollingCode(5))     <- the last durable code, not the torn one
+store: commit(0x00C0DE, 6) ok                    <- stepped over the wreckage
+```
+
+`damaged=1` persists until the ring laps round and erases that sector. That is
+correct: the torn record is inert, and the commit that would have overwritten
+it steps past instead — writing into it would only clear more bits and produce
+another unreadable record, wedging the ring for good.
+
+## Region layout
+
+| Quantity | Value |
+|---|---|
+| Partition | `rollcode`, data/undefined, 0x200000, 8 KB |
+| Record | 256 bytes: header, up to 30 `(address, code)` entries, CRC-32 |
+| Slots | 32, in 2 erase sectors of 16 |
+| Erases | one sector per full lap — 32 commits |
+| Endurance | 100k cycles x 32 commits per cycle = **3.2M commits** |

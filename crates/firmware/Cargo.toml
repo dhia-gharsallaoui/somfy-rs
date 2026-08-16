@@ -20,6 +20,15 @@ path = "src/main.rs"
 # testing that way.
 test = false
 
+# Flash-only bring-up harness for the rolling-code store: no SPI, no RMT,
+# nothing on the air. It is a second binary rather than a branch inside
+# `firmware` precisely so that proving the store survives a power cycle never
+# involves keying a transmitter. `test = false` for the same reason as above.
+[[bin]]
+name = "store-check"
+path = "src/bin/store_check.rs"
+test = false
+
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["unstable"] }
 esp-println = { version = "0.13", features = ["log"] }
@@ -34,9 +43,15 @@ embedded-hal-bus = "0.3"
 # espflash 4.x refuses to flash a binary without one. Without this the firmware
 # compiles and links perfectly and simply cannot be put on a device.
 esp-bootloader-esp-idf = "0.5"
+# Raw access to the on-board SPI NOR flash, as `embedded-storage` traits. The
+# rolling-code store needs word-granular writes and sector erases, which is
+# exactly what these expose and what an ESP-IDF NVS-style API would hide.
+esp-storage = "0.9"
+embedded-storage = "0.3"
 somfy-rts = { path = "../somfy-rts" }
 somfy-rmt = { path = "../somfy-rmt" }
 somfy-cc1101 = { path = "../somfy-cc1101" }
+somfy-store = { path = "../somfy-store" }
 
 # No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
 # don't declare `#![no_std]`), so no feature selection lets them compile for
@@ -45,10 +60,30 @@ somfy-cc1101 = { path = "../somfy-cc1101" }
 
 [features]
 default = []
-chip-esp32 = ["esp-hal/esp32", "esp-println/esp32", "esp-bootloader-esp-idf/esp32"]
-chip-s2 = ["esp-hal/esp32s2", "esp-println/esp32s2", "esp-bootloader-esp-idf/esp32s2"]
-chip-s3 = ["esp-hal/esp32s3", "esp-println/esp32s3", "esp-bootloader-esp-idf/esp32s3"]
-chip-c3 = ["esp-hal/esp32c3", "esp-println/esp32c3", "esp-bootloader-esp-idf/esp32c3"]
+chip-esp32 = [
+    "esp-hal/esp32",
+    "esp-println/esp32",
+    "esp-bootloader-esp-idf/esp32",
+    "esp-storage/esp32",
+]
+chip-s2 = [
+    "esp-hal/esp32s2",
+    "esp-println/esp32s2",
+    "esp-bootloader-esp-idf/esp32s2",
+    "esp-storage/esp32s2",
+]
+chip-s3 = [
+    "esp-hal/esp32s3",
+    "esp-println/esp32s3",
+    "esp-bootloader-esp-idf/esp32s3",
+    "esp-storage/esp32s3",
+]
+chip-c3 = [
+    "esp-hal/esp32c3",
+    "esp-println/esp32c3",
+    "esp-bootloader-esp-idf/esp32c3",
+    "esp-storage/esp32c3",
+]
 
 [profile.release]
 opt-level = "s"

@@ -8,3 +8,11 @@ description = "no_std rolling-code store seam and the persist-before-transmit or
 
 [dependencies]
 somfy-rts = { path = "../somfy-rts" }
+# A record's validity marker. Deliberately not hand-rolled: the polynomial,
+# reflection and init/xorout of "CRC-32" are exactly the details that are easy
+# to get subtly wrong and impossible to notice, and this seam's whole job is
+# telling a torn write from a good one. `crc` is no_std and pulls in only its
+# own parameter catalogue. A known-answer test in `record.rs` still pins the
+# variant, because choosing the wrong one from the catalogue is a mistake this
+# dependency cannot prevent.
+crc = "3"

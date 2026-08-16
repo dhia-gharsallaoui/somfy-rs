@@ -77,6 +77,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,6 +633,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-storage"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cf2b3f00c9f94b27c62a4f5296b19470c3a083c687c8146e554a459f9bee596"
+dependencies = [
+ "document-features",
+ "embedded-storage",
+ "esp-hal",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
+ "esp-rom-sys",
+ "esp-sync",
+]
+
+[[package]]
 name = "esp-sync"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,13 +745,16 @@ version = "0.1.0"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-bus",
+ "embedded-storage",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "esp-storage",
  "heapless 0.8.0",
  "somfy-cc1101",
  "somfy-rmt",
  "somfy-rts",
+ "somfy-store",
 ]
 
 [[package]]
@@ -1196,6 +1229,14 @@ name = "somfy-rts"
 version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
+]
+
+[[package]]
+name = "somfy-store"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "somfy-rts",
 ]
 
 [[package]]

@@ -1,9 +1,22 @@
 # firmware
 
-ESP32-family firmware skeleton for somfy-rs: a `no_std`/`no_main` binary that
-proves the build-and-link path for the Somfy RTS transmitter on real hardware.
-It currently does nothing but initialize the chip and print a startup banner;
-the CC1101 SPI driver and RTS transmit loop land in a later task.
+ESP32-family firmware for somfy-rs: `no_std`/`no_main` binaries that exercise
+the parts of the controller that can only exist against real hardware.
+
+| Binary | What it does | Puts RF on the air |
+|---|---|---|
+| `firmware` | Brings up the CC1101 and transmits one Somfy frame plus repeats, at a synthetic address | **yes** |
+| `store-check` | Reads the rolling-code region, commits the next code, reads it back | no — flash only |
+
+They are separate binaries so that proving the rolling-code store survives a
+power cycle never involves keying a transmitter. `docs/hardware-checklist.md`
+has the procedure for each.
+
+The rolling-code store needs a `rollcode` partition, which is why this crate
+carries its own `partitions.csv` and an `espflash.toml` pointing espflash at
+it. Run `espflash` from this directory so it finds them; a device flashed with
+espflash's default table reports `PartitionMissing` and stops rather than
+running without durable storage.
 
 This crate is its own Cargo workspace (see the root `Cargo.toml`'s
 `exclude = ["crates/firmware"]`), so building or testing the rest of the
@@ -75,6 +88,9 @@ cargo build --features chip-esp32 --target xtensa-esp32-none-elf
 cargo build --features chip-s2    --target xtensa-esp32s2-none-elf
 cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
 ```
+
+Each of those builds both binaries. Add `--bin store-check` to build only the
+flash harness.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip
 feature enabled is expected to fail — see `src/chip.rs`'s `compile_error!`

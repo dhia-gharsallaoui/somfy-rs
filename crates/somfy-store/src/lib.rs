@@ -28,6 +28,19 @@
 //! deliberately outside the crate, where the private field is genuinely out of
 //! reach — pins the runtime sequence.
 //!
+//! ## What else is here, and why it is here rather than in the firmware
+//!
+//! An implementation of [`RollingCodeStore`] over flash needs two things this
+//! crate also provides: a ring of slots that spreads writes over a region with
+//! a large erase unit ([`SlotLayout`], [`SectorRing`], [`newest_slot`]), and a
+//! record format whose validity can be judged after a power cut ([`Record`]).
+//!
+//! Neither has anything to do with a particular chip, and both are the parts
+//! most worth testing — a slot ring that erases the wrong sector, or a decoder
+//! that accepts a half-written record, loses a rolling code and costs the user
+//! a physical re-pairing procedure. So they live here, host-tested, and
+//! `crates/firmware` is left with the flash I/O and nothing else.
+//!
 //! ## Why a crate of its own
 //!
 //! `somfy-domain` states in its own module docs that it "owns no clock, no
@@ -42,11 +55,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod record;
 mod slots;
 mod store;
 mod transmit;
 
-pub use slots::{newest_slot, SlotLayout, SlotWrite};
+pub use record::{CodeTable, Record, RecordError, TableError, MAX_CODES, RECORD_LEN};
+pub use slots::{newest_slot, SectorRing, SlotLayout, SlotWrite};
 pub use store::RollingCodeStore;
 pub use transmit::{
     transmit, FrameBits, TransmitError, TransmitPlan, TransmitQueue, TransmitRequest,
