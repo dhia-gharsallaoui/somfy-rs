@@ -95,6 +95,19 @@ impl Controller {
     /// state looking un-reported, so the delta re-emits on the next call rather
     /// than being permanently suppressed. (Generic over the buffer depth so the
     /// overflow path is unit-testable; callers pass a `DELTA_CAPACITY` buffer.)
+    ///
+    /// **The registry lookup below is what keeps the cache index in bounds, and
+    /// it has to stay first.** [`ShadeId`] is a public tuple struct, so any
+    /// caller can build a `ShadeId(200)` out of nothing, and `last_emitted` is
+    /// a bare `[_; MAX_SHADES]` indexed by the raw byte. It is in range only
+    /// because [`Registry::shade`](crate::Registry::shade) has already answered
+    /// `Some` for this id, and it can only do that for a slot the registry
+    /// holds — whose array cannot be longer than `MAX_SHADES`. Reordering these
+    /// two lines, or reaching the cache on a path that skips the lookup, is an
+    /// out-of-bounds panic on a value a caller made up. Ids the caller chooses
+    /// rather than the registry — see
+    /// [`Registry::add_shade_with_id`](crate::Registry::add_shade_with_id) —
+    /// make that easier to do by accident, which is why it is written down.
     fn emit_if_changed<const N: usize>(&mut self, id: ShadeId, deltas: &mut Vec<StateDelta, N>) {
         let Some(shade) = self.registry.shade(id) else {
             return;

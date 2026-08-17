@@ -36,6 +36,68 @@ fn command_shade_plans_tx_and_emits_delta_on_tick() {
     assert_eq!(deltas2[0].direction, Direction::Down);
 }
 
+/// A shade at a caller-chosen id must reach every part of the controller, and
+/// the delta cache is the part that could quietly not: `last_emitted` is a
+/// plain `[_; MAX_SHADES]` indexed by the raw id, so a sparse id at the very
+/// last slot exercises the one bound that a positional registry used to
+/// guarantee for free. Both ends of the range are driven — slot 31 because it
+/// is the highest an id can name, and slot 0 because it is the one a
+/// positional registry would have handed out instead.
+#[test]
+fn a_shade_at_a_chosen_id_still_plans_and_emits() {
+    use somfy_domain::{ShadeId, MAX_SHADES};
+
+    for slot in [0u8, (MAX_SHADES - 1) as u8] {
+        let mut c = Controller::new();
+        let id = c
+            .registry
+            .add_shade_with_id(ShadeId(slot), ShadeConfig::new("A", 0x101).unwrap())
+            .unwrap();
+        let (mut tx, mut deltas) = bufs();
+        c.command_shade(id, ShadeCommand::Down, 0, &mut tx, &mut deltas)
+            .unwrap();
+        assert_eq!(tx.len(), 1, "slot {slot}");
+
+        let (mut tx2, mut deltas2) = bufs();
+        c.tick(5_000, &mut tx2, &mut deltas2);
+        assert_eq!(deltas2.len(), 1, "slot {slot}");
+        assert_eq!(deltas2[0].id, id);
+        assert_eq!(deltas2[0].pos, Pos::from_percent(50));
+    }
+}
+
+/// The registry's capacity is what bounds a delta buffer, and holes do not
+/// raise it: `DELTA_CAPACITY` is `MAX_SHADES`, and a registry whose ids are
+/// spread out still holds at most `MAX_SHADES` live shades because the slot
+/// array cannot be longer than that. Driven at the actual worst case rather
+/// than argued, since the buffer only screams in debug builds.
+#[test]
+fn a_full_registry_of_chosen_ids_fits_one_delta_buffer() {
+    use somfy_domain::{ShadeId, MAX_SHADES};
+
+    let mut c = Controller::new();
+    // Placed highest-id-first, so every add grows the slot array to its full
+    // length immediately and then fills holes — the opposite of the order a
+    // positional registry produces.
+    for slot in (0..MAX_SHADES as u8).rev() {
+        c.registry
+            .add_shade_with_id(
+                ShadeId(slot),
+                ShadeConfig::new("s", 0x1000 + slot as u32).unwrap(),
+            )
+            .unwrap();
+    }
+    let (mut tx, mut deltas) = bufs();
+    for slot in 0..MAX_SHADES as u8 {
+        c.command_shade(ShadeId(slot), ShadeCommand::Down, 0, &mut tx, &mut deltas)
+            .unwrap();
+        tx.clear();
+    }
+    let (mut tx2, mut deltas2) = bufs();
+    c.tick(5_000, &mut tx2, &mut deltas2);
+    assert_eq!(deltas2.len(), MAX_SHADES);
+}
+
 #[test]
 fn idle_ticks_emit_no_deltas() {
     let (mut c, _) = setup();
