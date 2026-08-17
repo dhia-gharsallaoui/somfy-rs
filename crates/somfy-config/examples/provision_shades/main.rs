@@ -60,7 +60,9 @@
 
 mod import;
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use somfy_config::{ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY};
 use somfy_domain::{ShadeConfig, ShadeKind, TiltMode};
@@ -102,13 +104,27 @@ usage:
 OUT defaults to shades.bin. FILE is a backup exported from the controller being
 replaced; it carries real radio addresses and rolling codes, so treat it as a key.";
 
+/// The extension a backup is exported with, and therefore the one thing the
+/// output must never be named. See [`Args::parse`].
+const BACKUP_EXTENSION: &str = "backup";
+
 /// Where the shades come from and where the image goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
     /// A backup to import, or `None` to ask.
-    backup: Option<String>,
+    backup: Option<PathBuf>,
     /// The flash image to write.
-    out: String,
+    out: PathBuf,
+}
+
+/// What [`Args::parse`] decided: run, or print the usage and stop without it
+/// being an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Parsed {
+    /// Arguments to run with.
+    Run(Args),
+    /// `--help`. Not a failure, so it must not exit like one.
+    Usage,
 }
 
 impl Args {
@@ -116,56 +132,111 @@ impl Args {
     ///
     /// Deliberately tiny and hand-written: two forms, one flag, and a
     /// dependency whose job is to render `--help` is a dependency this does not
-    /// need. Unknown flags are refused rather than treated as filenames —
-    /// a mistyped `--from-backups` that silently became the output path would
-    /// overwrite the file it was meant to read.
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    /// need. `OsString` rather than `String` because both arguments are
+    /// filenames, filenames are not required to be UTF-8, and
+    /// `std::env::args()` *panics* on one that is not — in the only entry point
+    /// this tool has.
+    ///
+    /// ## Two ways to destroy the backup, both refused here
+    ///
+    /// The backup is the only recoverable source of the rolling codes in it,
+    /// and it must be exported fresh to be worth anything — so if the image is
+    /// written over it, the recovery is pairing every shade by hand. Two
+    /// spellings of that reach this function:
+    ///
+    /// - the same path given twice, which is the typo;
+    /// - `--from-backup *.backup` with more than one match, which the shell
+    ///   expands to `--from-backup a.backup b.backup` — so `b.backup` lands in
+    ///   the output slot and is truncated to 2,048 bytes. Path equality does
+    ///   **not** catch this one, which is why the output may not be named like
+    ///   a backup at all.
+    ///
+    /// Unknown options are refused rather than treated as filenames for a third
+    /// version of the same hazard: a mistyped `--from-backups` falling through
+    /// to the output slot would overwrite the file it was meant to read.
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
         const FLAG: &str = "--from-backup";
         const FLAG_EQ: &str = "--from-backup=";
 
-        let mut backup: Option<String> = None;
-        let mut out: Option<String> = None;
+        let mut backup: Option<PathBuf> = None;
+        let mut out: Option<PathBuf> = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
-            if let Some(path) = arg.strip_prefix(FLAG_EQ) {
-                backup = Some(path.to_string());
-            } else if arg == FLAG {
-                backup = Some(
-                    args.next()
-                        .ok_or_else(|| format!("{FLAG} needs the path of a backup file"))?,
-                );
-            } else if arg.starts_with('-') {
-                return Err(format!("{arg:?} is not an option this tool has"));
-            } else if out.replace(arg).is_some() {
-                return Err("only one output file can be written".to_string());
+            // Only the flags have to be text. A path that is not UTF-8 falls
+            // through to the positional arm with its bytes intact.
+            match arg.to_str() {
+                Some("--help" | "-h") => return Ok(Parsed::Usage),
+                Some(text) if text.starts_with(FLAG_EQ) => {
+                    set_once(&mut backup, text[FLAG_EQ.len()..].into(), FLAG)?;
+                }
+                Some(FLAG) => {
+                    let path = args
+                        .next()
+                        .ok_or_else(|| format!("{FLAG} needs the path of a backup file"))?;
+                    set_once(&mut backup, path.into(), FLAG)?;
+                }
+                Some(text) if text.starts_with('-') => {
+                    return Err(format!("{text:?} is not an option this tool has"));
+                }
+                _ => set_once(&mut out, arg.into(), "the output file")?,
             }
         }
 
-        let out = out.unwrap_or_else(|| "shades.bin".to_string());
+        for (path, what) in [(backup.as_ref(), FLAG), (out.as_ref(), "the output file")] {
+            if path.is_some_and(|path| path.as_os_str().is_empty()) {
+                return Err(format!("{what} was given an empty path"));
+            }
+        }
+        let out = out.unwrap_or_else(|| PathBuf::from("shades.bin"));
 
-        // The backup is the only copy of its rolling codes, and it has to be
-        // exported fresh to be worth anything — so overwriting it with the
-        // image built from it would destroy the one file that cannot simply be
-        // regenerated. String equality catches the realistic version of this
-        // (the same path typed twice); two different spellings of one file
-        // would slip through, which is why the tool also never opens the output
-        // until the input has been read in full.
-        if backup.as_deref() == Some(out.as_str()) {
-            return Err(format!(
-                "{out:?} is both the backup to read and the image to write; the image would \
-                 overwrite the backup, and a backup cannot be re-exported after the fact \
-                 without the rolling codes having moved on"
-            ));
+        if let Some(backup) = &backup {
+            if backup == &out {
+                return Err(format!(
+                    "{} is both the backup to read and the image to write; the image would \
+                     overwrite the backup, and a backup cannot be re-exported after the fact \
+                     without the rolling codes having moved on",
+                    out.display(),
+                ));
+            }
+            if out.extension().is_some_and(|ext| ext == BACKUP_EXTENSION) {
+                return Err(format!(
+                    "the image would be written to {}, which is named like a backup. Refusing, \
+                     because `--from-backup *.{BACKUP_EXTENSION}` with more than one match puts \
+                     a real backup in the output slot — and that backup is the only copy of the \
+                     rolling codes it holds",
+                    out.display(),
+                ));
+            }
         }
 
-        Ok(Args { backup, out })
+        Ok(Parsed::Run(Args { backup, out }))
+    }
+}
+
+/// Fill a slot that may only be filled once.
+///
+/// A second output file is refused, so a second `--from-backup` is too: silently
+/// letting the last one win is how a command that names two different backups
+/// imports one of them and says nothing about the other.
+fn set_once(slot: &mut Option<PathBuf>, path: PathBuf, what: &str) -> Result<(), String> {
+    match slot.replace(path) {
+        Some(_) => Err(format!("{what} was given twice")),
+        None => Ok(()),
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse(std::env::args().skip(1))
-        .inspect_err(|error| eprintln!("{error}\n\n{USAGE}"))?;
+    let args = match Args::parse(std::env::args_os().skip(1))
+        .inspect_err(|error| eprintln!("{error}\n\n{USAGE}"))?
+    {
+        Parsed::Run(args) => args,
+        // Asking for the usage is not a failure and must not exit like one.
+        Parsed::Usage => {
+            eprintln!("{USAGE}");
+            return Ok(());
+        }
+    };
 
     let record = match &args.backup {
         Some(path) => from_backup(path)?,
@@ -173,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     std::fs::write(&args.out, record.encode())?;
-    eprintln!("\nwrote {SHADE_RECORD_LEN} bytes to {}", args.out);
+    eprintln!("\nwrote {SHADE_RECORD_LEN} bytes to {}", args.out.display());
     // The import path has already shown the table — it has to, because that is
     // what a confirmation is a confirmation *of*. Printing it twice would make
     // the copy above look like a different table from the one just written.
@@ -191,30 +262,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Nothing is written until this returns, which is what lets the misalignment
 /// case ask before it acts rather than apologise afterwards.
-fn from_backup(path: &str) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
+fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
+    let shown = path.display();
     let bytes = std::fs::read(path)
-        .inspect_err(|error| eprintln!("refusing to write: cannot read {path}: {error}"))?;
+        .inspect_err(|error| eprintln!("refusing to write: cannot read {shown}: {error}"))?;
 
     let imported = import::read_backup(&bytes)
         .inspect_err(|refusal| eprintln!("refusing to write: {refusal}"))?;
 
     eprintln!(
-        "read {} shade{} from {path} (backup format version {}).",
+        "read {} shade{} from {shown} (backup format version {}).",
         imported.shades.len(),
         if imported.shades.len() == 1 { "" } else { "s" },
         imported.version,
     );
-    if imported.groups > 0 || imported.linked_remotes > 0 {
-        eprintln!(
-            "  the backup also holds {} group(s) and {} linked remote(s). This region holds \n\
-             \x20 shades only, so neither is written here; a linked remote's rolling code is \n\
-             \x20 not in the backup file at all.",
-            imported.groups, imported.linked_remotes,
-        );
+    // Everything the backup carried that this region has no room for. Said
+    // plainly rather than left for someone to notice is missing.
+    for (count, what, because) in [
+        (imported.rooms, "room", "this region holds shades only"),
+        (imported.groups, "group", "this region holds shades only"),
+        (
+            imported.linked_remotes,
+            "linked remote",
+            "their rolling codes are not in the backup file at all",
+        ),
+        (
+            imported.favourites,
+            "'my' favourite",
+            "there is no field to provision one into; the motors keep theirs, \
+             and this controller will not know it until you set it again",
+        ),
+    ] {
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            eprintln!("  {count} {what}{plural} not written here — {because}.");
+        }
     }
 
-    // Loud, and one line per shade, because a shade imported as something it is
-    // not is a shade that will be driven wrongly and say nothing about it.
+    let misaligned = imported.misaligned().then_some(imported.skipped_resyncs);
+    let record = ShadeRecord {
+        seq: 0,
+        shades: imported.shades,
+    };
+    eprintln!();
+    describe(&record);
+
+    // After the table, not before it: the whole point is that these are the
+    // last lines under the shade they are about, rather than a block that
+    // scrolls away above thirty entries. A shade imported as something it is
+    // not will be driven wrongly and say nothing about it.
     if !imported.warnings.is_empty() {
         eprintln!(
             "\n{} value(s) could not be carried across as they stand:",
@@ -227,14 +323,6 @@ fn from_backup(path: &str) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
             );
         }
     }
-
-    let misaligned = imported.misaligned().then_some(imported.skipped_resyncs);
-    let record = ShadeRecord {
-        seq: 0,
-        shades: imported.shades,
-    };
-    eprintln!();
-    describe(&record);
 
     if let Some(records) = misaligned {
         confirm_misaligned(records)?;
@@ -442,24 +530,25 @@ fn read_line(prompt: &str) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Args, String> {
-        Args::parse(args.iter().map(|arg| arg.to_string()))
+    fn parse(args: &[&str]) -> Result<Parsed, String> {
+        Args::parse(args.iter().map(OsString::from))
+    }
+
+    fn run(backup: Option<&str>, out: &str) -> Result<Parsed, String> {
+        Ok(Parsed::Run(Args {
+            backup: backup.map(PathBuf::from),
+            out: PathBuf::from(out),
+        }))
     }
 
     #[test]
     fn no_arguments_means_prompts_and_the_default_file() {
-        assert_eq!(
-            parse(&[]),
-            Ok(Args {
-                backup: None,
-                out: "shades.bin".to_string(),
-            }),
-        );
+        assert_eq!(parse(&[]), run(None, "shades.bin"));
     }
 
     #[test]
     fn a_bare_path_is_still_the_output_file() {
-        assert_eq!(parse(&["out.bin"]).expect("valid").out, "out.bin");
+        assert_eq!(parse(&["out.bin"]), run(None, "out.bin"));
     }
 
     #[test]
@@ -470,10 +559,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse(&form),
-                Ok(Args {
-                    backup: Some("device.backup".to_string()),
-                    out: "shades.bin".to_string(),
-                }),
+                run(Some("device.backup"), "shades.bin"),
                 "{form:?}",
             );
         }
@@ -481,10 +567,7 @@ mod tests {
 
     #[test]
     fn the_output_file_can_be_given_on_either_side_of_the_flag() {
-        let expected = Ok(Args {
-            backup: Some("device.backup".to_string()),
-            out: "out.bin".to_string(),
-        });
+        let expected = run(Some("device.backup"), "out.bin");
         assert_eq!(
             parse(&["--from-backup", "device.backup", "out.bin"]),
             expected
@@ -500,6 +583,13 @@ mod tests {
         assert!(parse(&["--from-backup"]).is_err());
     }
 
+    /// Asking for the usage is not a failure and must not exit like one.
+    #[test]
+    fn help_asks_for_the_usage_rather_than_failing() {
+        assert_eq!(parse(&["--help"]), Ok(Parsed::Usage));
+        assert_eq!(parse(&["-h"]), Ok(Parsed::Usage));
+    }
+
     /// The reason unknown options are refused rather than taken as filenames:
     /// a mistyped flag falling through to the output slot would overwrite the
     /// file it was meant to read.
@@ -509,19 +599,56 @@ mod tests {
         assert!(parse(&["-f", "device.backup"]).is_err());
     }
 
+    /// Two of anything is a command whose author meant two different things,
+    /// and picking one silently is how the other goes unmentioned.
     #[test]
-    fn two_output_files_are_refused() {
+    fn giving_either_path_twice_is_refused() {
         assert!(parse(&["one.bin", "two.bin"]).is_err());
+        assert!(parse(&["--from-backup", "a.backup", "--from-backup", "b.backup"]).is_err());
+        assert!(parse(&["--from-backup=a.backup", "--from-backup=b.backup"]).is_err());
+    }
+
+    #[test]
+    fn an_empty_path_is_refused_rather_than_carried_to_the_open() {
+        assert!(parse(&["--from-backup="]).is_err());
+        assert!(parse(&[""]).is_err());
     }
 
     /// The backup is the only copy of the codes in it, so writing the image
-    /// over it is refused rather than done.
+    /// over it is refused rather than done — by name, and by the shape of a
+    /// name, since a glob that matched twice puts a *different* backup in the
+    /// output slot and path equality would wave it through.
     #[test]
-    fn writing_the_image_over_the_backup_is_refused() {
+    fn writing_the_image_over_a_backup_is_refused() {
         assert!(parse(&["--from-backup", "device.backup", "device.backup"]).is_err());
         assert!(parse(&["--from-backup=device.backup", "device.backup"]).is_err());
-        // Different files of the same name are still fine.
-        assert!(parse(&["--from-backup", "device.backup", "shades.bin"]).is_ok());
+        // `--from-backup *.backup`, expanded by the shell to two matches.
+        assert!(parse(&["--from-backup", "a.backup", "b.backup"]).is_err());
+        // A file merely named after one is fine — it is the extension that is
+        // refused, and only while a backup is being read.
+        assert!(parse(&["--from-backup", "a.backup", "backup.bin"]).is_ok());
+        assert!(parse(&["shades.backup"]).is_ok());
+    }
+
+    /// A filename is a bag of bytes on this platform, and `std::env::args`
+    /// panics on one that is not UTF-8. Both slots have to take it.
+    #[test]
+    fn a_path_that_is_not_utf8_is_a_path_like_any_other() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let odd = OsString::from_vec(vec![b'o', 0xFF, b'.', b'b', b'i', b'n']);
+            let parsed = Args::parse([OsString::from("--from-backup=d.backup"), odd.clone()])
+                .expect("a non-UTF-8 filename is still a filename");
+            assert_eq!(
+                parsed,
+                Parsed::Run(Args {
+                    backup: Some(PathBuf::from("d.backup")),
+                    out: PathBuf::from(odd),
+                })
+            );
+        }
     }
 
     /// Both forms have to appear where a person will look for them.

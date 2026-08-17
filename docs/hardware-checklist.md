@@ -650,27 +650,38 @@ the file is the only source this has.
 
 ```bash
 cargo run -p somfy-config --example provision_shades -- --from-backup device.backup shades.bin
-# read 4 shades from device.backup (backup format version 25).
-#   the backup also holds 1 group(s) and 1 linked remote(s). ...
-#
-# 1 value(s) could not be carried across as they stand:
-#   !! ShadeId(1) 'Garage': shade kind 0x05 is not one this firmware models — ...
+# read 5 shades from device.backup (backup format version 25).
+#   1 room not written here — this region holds shades only.
+#   1 group not written here — this region holds shades only.
+#   2 'my' favourites not written here — there is no field to provision one into; ...
 #
 #   ShadeId(0) 'Kitchen' address ... seed rolling code 42
 #   ...
+#
+# 3 value(s) could not be carried across as they stand:
+#   !! ShadeId(1) 'Garage': shade kind 0x05 is not one this firmware models — ...
+#   !! ShadeId(2) 'Terrace': the old controller drove this shade with 80-bit frames — ...
+#
 # wrote 2048 bytes to shades.bin
 ```
 
-The same validation applies, plus three things worth reading rather than
+The same validation applies, plus four things worth reading rather than
 scrolling past:
 
 - **Every shade is imported or none is.** A backup with one bad field is refused
   whole and the message names the shade, because dropping the third shade
   renumbers the fourth and fifth (see *Order is identity*).
-- **Anything that could not be carried across is printed per shade, with `!!`.**
-  A kind this firmware does not model becomes a roller; a shade the old
-  controller drove with 80-bit frames has nowhere to record that and will not
-  respond. Both are stated rather than silently applied.
+- **Whatever the backup held that this region cannot is counted and named** —
+  rooms, groups, linked remotes, and each shade's "my" favourite. A favourite in
+  particular is real behaviour lost: the motor keeps its own, but this
+  controller will not know about it, so its position estimate drifts after a
+  `My` press until you set one here.
+- **Anything that could not be carried across is printed per shade, with `!!`,
+  below the table.** A kind this firmware does not model becomes a roller. A
+  shade the old controller drove with 80-bit frames, or with a radio protocol
+  other than the one this firmware speaks, has nowhere to record that and **will
+  be provisioned and will not respond** — check those two before you conclude
+  the radio is broken.
 - **If the backup's records did not all line up, it stops and asks.** A comma
   inside a shade's name shifts every field after it, which can produce a
   perfectly plausible wrong rolling code. In that case the tool prints the whole
@@ -678,7 +689,10 @@ scrolling past:
 
 The backup carries your real radio addresses and rolling codes. Treat the file
 like a key: it is what a nearby attacker would need to forge commands to your
-motors. Do not commit it or paste it anywhere.
+motors. Do not commit it or paste it anywhere. For the same reason the tool
+**refuses to write the image over a backup** — including `--from-backup
+*.backup` when the glob matches more than one file, which would otherwise put a
+real backup in the output slot.
 
 Rooms, groups and network settings are **not** imported by this step — the
 region holds shades only.

@@ -17,11 +17,24 @@
 //!
 //! ## What is not carried across
 //!
-//! The backup describes a whole installation; this record holds shades. Rooms,
-//! groups and network settings are not written here, and neither are the
-//! rolling codes of remotes linked to a shade — those are not in the exported
-//! file at all. [`Import`] counts what it saw so the tool can say so rather
-//! than let a person discover it later.
+//! The backup describes a whole installation; this record holds shades. **Not
+//! written here:** rooms, groups, network settings, each shade's room
+//! assignment, and the rolling codes of remotes linked to a shade — those last
+//! are not in the exported file at all. Nor are the live positions the old
+//! controller was tracking, which a fresh controller has no business believing
+//! anyway: it re-establishes them by driving a shade to an end stop.
+//!
+//! The one omission with teeth is the **"my" favourite**. `somfy_domain::Shade`
+//! models it (`my_pos: Option<Pos>`) and acts on it — a `My` press with no
+//! favourite set is a *no-op in the domain* while the motor still recalls its
+//! own, so the position estimate silently walks away from the shade — but
+//! `ShadeConfig` has no field to provision one into. [`Import`] therefore
+//! counts the favourites it had to drop, along with the rooms and groups and
+//! linked remotes, so the tool can say so rather than let a person discover it.
+//!
+//! Shade flags (sun and wind sensor bits, `SimMy`) are dropped without a count:
+//! nothing in this firmware models any of them, so there is no behaviour to
+//! lose and nothing a person could act on.
 //!
 //! ## Order is identity, and the backup's own ids are not it
 //!
@@ -33,20 +46,22 @@
 //! second import of a *reordered* backup renames every entity after the change,
 //! exactly as reordering by hand does.
 //!
-//! ## Three rules this owes the reader, and why they are rules
+//! ## Rules this owes the reader, and why they are rules
 //!
 //! - **A kind or tilt mode this firmware does not model becomes a roller (or
 //!   no tilt) and is reported per shade.** Dropping the shade would silently
 //!   shrink the installation; guessing a behaviour would move a garage door
 //!   with a shade's travel times. Substituting and saying so is the only one of
 //!   the three a person can act on.
-//! - **A frame width other than 56 bits is reported, because there is nowhere
-//!   to put it.** This controller transmits at one width for the whole
-//!   installation (`somfy_tasks::TxProfile`), `ShadeConfig` has no field for a
-//!   per-shade width, and so a shade the old controller drove at 80 bits
-//!   imports looking perfectly healthy and will not move. That is the same
-//!   failure as a wrong rolling code — a shade that ignores the controller —
-//!   arriving by a different road, and it is worth exactly as much noise.
+//! - **A frame width or a radio protocol other than the one this controller
+//!   speaks is reported, because there is nowhere to put either.** The width is
+//!   a single setting for the whole installation (`somfy_tasks::TxProfile`) and
+//!   the protocol is not a setting at all — `somfy-rts` encodes one — while
+//!   `ShadeConfig` has a field for neither. So a shade the old controller drove
+//!   some other way imports looking perfectly healthy and will not move. That
+//!   is the same failure as a wrong rolling code — a shade that ignores the
+//!   controller — arriving by a different road, and it is worth exactly as much
+//!   noise.
 //! - **Records that did not align exactly are surfaced, never applied
 //!   silently.** [`Import::misaligned`] means at least one record's fields did
 //!   not land where they were expected — a comma inside a name shifts every
@@ -66,6 +81,24 @@ use somfy_migrate::{
 /// is carried across as data and cannot be driven.
 const TRANSMITTED_BIT_LENGTH: u8 = 56;
 
+/// The radio-protocol discriminant a shade must carry to be one this firmware
+/// can drive.
+///
+/// **Where the value comes from, since an unexplained constant is a fabricated
+/// one.** It is not read off a protocol table: it is the value the backup
+/// reader substitutes when a shade record has no protocol field at all, which
+/// `somfy_migrate::parse_shade_record` documents and applies for the versions
+/// predating it. A file with no protocol field describes shades that were
+/// driven the ordinary way, so the ordinary way is what this discriminant
+/// spells — and `somfy-rts` encodes exactly one protocol, with no field on
+/// `ShadeConfig` to select another. See `docs/provenance.md`.
+///
+/// The claim being made is therefore narrow and checkable: **a shade whose
+/// stored protocol differs from the absent-field default was deliberately set
+/// to something else, and this firmware cannot honour the difference.** What
+/// the other values *are* is not asserted here, because nothing here needs it.
+const TRANSMITTED_PROTOCOL: u8 = 0x00;
+
 /// A value the backup carried that this firmware cannot use as it stands.
 ///
 /// Two of these are substitutions — something else was written in the field.
@@ -83,6 +116,10 @@ pub enum Caveat {
     /// shade is imported exactly as it stands and will be transmitted to at the
     /// controller's width, which is not the one its motor is paired for.
     FrameWidth(u8),
+    /// A radio protocol other than [`TRANSMITTED_PROTOCOL`]. Nothing is
+    /// substituted, for the same reason and with the same consequence: the
+    /// shade is provisioned, appears in Home Assistant, and does not move.
+    Protocol(u8),
 }
 
 impl core::fmt::Display for Caveat {
@@ -103,6 +140,12 @@ impl core::fmt::Display for Caveat {
                 "the old controller drove this shade with {bits}-bit frames and this one sends \
                  {TRANSMITTED_BIT_LENGTH}-bit — there is no per-shade width to import it into, \
                  so the shade will be provisioned and will not respond"
+            ),
+            Caveat::Protocol(raw) => write!(
+                f,
+                "the old controller drove this shade with radio protocol {raw:#04X} and this \
+                 one speaks only {TRANSMITTED_PROTOCOL:#04X} — there is no per-shade protocol \
+                 to import it into, so the shade will be provisioned and will not respond"
             ),
         }
     }
@@ -134,11 +177,20 @@ pub struct Import {
     pub skipped_resyncs: u16,
     /// The backup's format version, for the report.
     pub version: u8,
+    /// Rooms the backup carried. None are written here, and neither is any
+    /// shade's room assignment.
+    pub rooms: usize,
     /// Groups the backup carried. None are written here.
     pub groups: usize,
     /// Linked remotes the backup carried, summed over every shade. None are
     /// written here, and their rolling codes are not in the file to begin with.
     pub linked_remotes: usize,
+    /// Shades whose "my" favourite was set on the old controller and could not
+    /// be provisioned — see this module's docs, which is where the consequence
+    /// is. Counted rather than warned per shade: a favourite is common enough
+    /// that one `!!` line each would bury the two caveats that mean a shade
+    /// will not move at all.
+    pub favourites: usize,
 }
 
 impl Import {
@@ -287,8 +339,16 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
     let mut shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY> = heapless::Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
     let mut linked_remotes = 0usize;
+    let mut favourites = 0usize;
 
-    for (index, migrated) in data.shades.iter().enumerate() {
+    for migrated in data.shades.iter() {
+        // The position in the *imported* table, which is the shade's id and
+        // what a warning names. Nothing is ever skipped — a shade that cannot
+        // be imported refuses the whole table — so it is equally the shade's
+        // position in the backup, which is what a refusal names. Taken from the
+        // table rather than from an `enumerate` so that stays true by
+        // construction rather than by everyone remembering it.
+        let index = shades.len();
         let name = migrated.name.as_str();
         if name.is_empty() {
             return Err(Refusal::Unnamed { index });
@@ -325,9 +385,13 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             TiltMode::None
         });
 
-        // And the one that is not a substitution: a width there is no field for.
+        // And the two that are not substitutions: a width and a protocol there
+        // is no field for. Both mean a shade that is provisioned and inert.
         if migrated.bit_length != TRANSMITTED_BIT_LENGTH {
             note(Caveat::FrameWidth(migrated.bit_length));
+        }
+        if migrated.proto_raw != TRANSMITTED_PROTOCOL {
+            note(Caveat::Protocol(migrated.proto_raw));
         }
 
         config.up_time_ms = migrated.up_time_ms;
@@ -354,6 +418,11 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         shades.push(shade).map_err(|_| Refusal::TooManyShades)?;
 
         linked_remotes += migrated.linked_addresses.len();
+        // The backup's unset favourite is a negative sentinel, so any position
+        // at or above zero is one the old controller was actually holding.
+        if migrated.my_position_centi >= 0 {
+            favourites += 1;
+        }
     }
 
     Ok(Import {
@@ -361,8 +430,10 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         warnings,
         skipped_resyncs: data.skipped_resyncs,
         version: data.version,
+        rooms: data.rooms.len(),
         groups: data.groups.len(),
         linked_remotes,
+        favourites,
     })
 }
 

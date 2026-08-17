@@ -31,10 +31,11 @@ fn migrated(name: &str, address: u32) -> MigratedShade {
         room_id: 1,
         linked_addresses: heapless::Vec::new(),
         flags_raw: 0,
-        // The width this controller sends, so no test warns about it by
-        // accident and the one that does warn says so on its own line.
+        // The width and protocol this controller speaks, so no test warns
+        // about them by accident and the ones that do say so on their own
+        // lines.
         bit_length: TRANSMITTED_BIT_LENGTH,
-        proto_raw: 1,
+        proto_raw: TRANSMITTED_PROTOCOL,
     }
 }
 
@@ -159,19 +160,31 @@ fn an_unmodelled_tilt_mode_becomes_none_and_is_warned_about() {
     );
 }
 
-/// One shade can need both, and the report has to carry both — a warning
-/// that hides another warning is the failure this whole rule is about.
+/// One shade can need every one of them, and the report has to carry every
+/// one — a warning that hides another warning is the failure this whole rule
+/// is about. Asserts the caveats themselves, not how many there are: a count
+/// is equally satisfied by the same warning four times.
 #[test]
-fn a_shade_needing_both_substitutions_is_warned_about_twice() {
+fn a_shade_needing_every_caveat_is_warned_about_for_each() {
     let mut shade = migrated("Gate", 0x00_1001);
     shade.kind_raw = 0x0B;
     shade.tilt_mode_raw = 0xFF;
+    shade.bit_length = 80;
+    shade.proto_raw = 0x09;
 
     let import = import(&data(&[shade])).expect("the shade is imported");
     assert_eq!(
-        import.warnings.len(),
-        2,
-        "both substitutions must be reported"
+        import
+            .warnings
+            .iter()
+            .map(|warning| warning.caveat)
+            .collect::<Vec<_>>(),
+        vec![
+            Caveat::Kind(0x0B),
+            Caveat::TiltMode(0xFF),
+            Caveat::FrameWidth(80),
+            Caveat::Protocol(0x09),
+        ],
     );
 }
 
@@ -201,6 +214,32 @@ fn a_shade_paired_at_another_frame_width_is_warned_about() {
 fn the_width_this_controller_sends_is_not_warned_about() {
     let mut shade = migrated("Kitchen", 0x00_1001);
     shade.bit_length = TRANSMITTED_BIT_LENGTH;
+    assert!(import(&data(&[shade])).expect("valid").warnings.is_empty());
+}
+
+/// And the same for the protocol: `somfy-rts` encodes one, `ShadeConfig` has
+/// no field to select another, so a shade set to a different one is
+/// provisioned and inert.
+#[test]
+fn a_shade_using_another_radio_protocol_is_warned_about() {
+    let mut shade = migrated("Relay", 0x00_1001);
+    shade.proto_raw = 0x08;
+
+    let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
+    assert_eq!(
+        import.warnings,
+        vec![Warning {
+            index: 0,
+            name: "Relay".to_string(),
+            caveat: Caveat::Protocol(0x08),
+        }]
+    );
+}
+
+#[test]
+fn the_protocol_this_controller_speaks_is_not_warned_about() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.proto_raw = TRANSMITTED_PROTOCOL;
     assert!(import(&data(&[shade])).expect("valid").warnings.is_empty());
 }
 
@@ -321,13 +360,34 @@ fn both_too_many_shades_refusals_name_the_same_limit() {
     }
 }
 
+/// Which variant a refusal is, and how many there are.
+///
+/// The pair exists so [`every_refusal_says_something`] cannot silently stop
+/// covering the enum. Adding a variant breaks this `match` (a compile error);
+/// fixing the match without adding a sample fails the coverage assertion. The
+/// `MigrateError` half needs no equivalent — [`Refusal`]'s own `Display`
+/// matches it exhaustively, so a new one breaks there first.
+fn refusal_variant(refusal: &Refusal) -> usize {
+    match refusal {
+        Refusal::Unreadable(_) => 0,
+        Refusal::NoShades => 1,
+        Refusal::TooManyShades => 2,
+        Refusal::Unnamed { .. } => 3,
+        Refusal::Shade { .. } => 4,
+        Refusal::DuplicateAddress { .. } => 5,
+    }
+}
+const REFUSAL_VARIANTS: usize = 6;
+
 /// Every refusal has to read as a sentence a person can act on, not as the
-/// `Debug` spelling of an enum.
+/// `Debug` spelling of an enum — and every refusal has to be in the list.
 #[test]
 fn every_refusal_says_something() {
-    for refusal in [
+    let samples = [
+        Refusal::Unreadable(MigrateError::UnexpectedEof),
         Refusal::Unreadable(MigrateError::BadNumber),
         Refusal::Unreadable(MigrateError::StringTooLong),
+        Refusal::Unreadable(MigrateError::UnsupportedVersion(18)),
         Refusal::Unreadable(MigrateError::BadRecord("too_many_groups")),
         Refusal::NoShades,
         Refusal::TooManyShades,
@@ -343,7 +403,16 @@ fn every_refusal_says_something() {
             name: "Salon".to_string(),
             address: 0x00_1001,
         },
-    ] {
+    ];
+
+    for variant in 0..REFUSAL_VARIANTS {
+        assert!(
+            samples.iter().any(|r| refusal_variant(r) == variant),
+            "refusal variant {variant} has no sample here, so nothing checks what it says"
+        );
+    }
+
+    for refusal in &samples {
         let said = refusal.to_string();
         assert!(said.len() > 20, "{refusal:?} says too little: {said:?}");
         assert!(
@@ -406,6 +475,52 @@ fn groups_are_counted_but_not_written() {
     assert_eq!(import.shades.len(), 1, "a group is not a shade");
 }
 
+/// A favourite is real behaviour in the domain (`Shade::my_pos`) that this
+/// record has no field for, so it has to be counted and said — but counted,
+/// not warned per shade, or the two caveats that mean a shade will not move at
+/// all would be buried under it.
+#[test]
+fn favourites_are_counted_but_not_written() {
+    let mut with = migrated("Kitchen", 0x00_1001);
+    with.my_position_centi = 5_000; // 50.00%
+    let mut without = migrated("Salon", 0x00_1002);
+    without.my_position_centi = -100; // the unset sentinel
+
+    let import = import(&data(&[with, without])).expect("both import");
+    assert_eq!(import.favourites, 1);
+    assert!(
+        import.warnings.is_empty(),
+        "a favourite is a count, not a per-shade warning"
+    );
+}
+
+/// Fully closed is a favourite too — the boundary between "set" and the
+/// negative unset sentinel is zero, and an off-by-one here would drop it.
+#[test]
+fn a_favourite_at_fully_open_is_still_a_favourite() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.my_position_centi = 0;
+    assert_eq!(import(&data(&[shade])).expect("valid").favourites, 1);
+}
+
+#[test]
+fn rooms_are_counted_but_not_written() {
+    use somfy_migrate::MigratedRoom;
+
+    let mut with_room = data(&[migrated("Kitchen", 0x00_1001)]);
+    with_room
+        .rooms
+        .push(MigratedRoom {
+            room_id: 1,
+            name: hstr("Living Room"),
+        })
+        .expect("fits");
+
+    let import = import(&with_room).expect("valid");
+    assert_eq!(import.rooms, 1);
+    assert_eq!(import.shades.len(), 1, "a room is not a shade");
+}
+
 #[test]
 fn the_backups_version_is_carried_into_the_report() {
     let mut old = data(&[migrated("Kitchen", 0x00_1001)]);
@@ -431,7 +546,7 @@ fn shade_fields(name: &str, address: u32, last_code: u16) -> Vec<String> {
         address.to_string(),                      // remoteAddress
         name.to_string(),                         // name
         (TiltMode::Integrated as u8).to_string(), // tiltType
-        "1".to_string(),                          // proto
+        TRANSMITTED_PROTOCOL.to_string(),         // proto
         TRANSMITTED_BIT_LENGTH.to_string(),       // bitLength
         "30000".to_string(),                      // upTime
         "29000".to_string(),                      // downTime
@@ -513,6 +628,37 @@ fn a_stored_last_sent_code_reaches_the_record_as_the_next_one() {
     let bytes = backup(25, &[shade_fields("Kitchen", 0x00_1001, 41)]);
     let import = read_backup(&bytes).expect("a well-formed backup");
     assert_eq!(import.shades[0].initial_code, RollingCode(42));
+
+    // And on to the bytes. A round-trip through `encode`/`decode` alone would
+    // pass even if the two agreed on a wrong offset, so this reads the code
+    // out of the image at the position the record's own docs give it:
+    // entry 0 starts after the 12-byte header, and the code is 4 bytes into an
+    // entry, after the address.
+    let image = somfy_config::ShadeRecord {
+        seq: 0,
+        shades: import.shades,
+    }
+    .encode();
+    assert_eq!(&image[12 + 4..12 + 6], &42u16.to_le_bytes());
+}
+
+/// The one piece of arithmetic in the whole contract, at the only value where
+/// it can be wrong: a controller that sent 65535 has next-to-send 0, and a
+/// seed of 0 has to survive being written and read back like any other.
+#[test]
+fn a_code_that_wrapped_past_the_last_one_arrives_as_zero() {
+    use somfy_config::ShadeRecord;
+
+    let bytes = backup(25, &[shade_fields("Kitchen", 0x00_1001, u16::MAX)]);
+    let import = read_backup(&bytes).expect("a well-formed backup");
+    assert_eq!(import.shades[0].initial_code, RollingCode(0));
+
+    let record = ShadeRecord {
+        seq: 0,
+        shades: import.shades,
+    };
+    let decoded = ShadeRecord::decode(&record.encode()).expect("the table decodes");
+    assert_eq!(decoded.shades[0].initial_code, RollingCode(0));
 }
 
 /// The backup order is the id order, end to end.
@@ -550,6 +696,28 @@ fn a_record_that_did_not_align_arrives_flagged_rather_than_refused() {
     );
     assert_eq!(import.skipped_resyncs, 1);
     assert_eq!(import.shades.len(), 1, "the shade is imported, not dropped");
+}
+
+/// The other side of that boundary, and the one that actually pins the two
+/// capacities together: a backup holding exactly what the table holds must
+/// import whole and encode into one record. `both_too_many_shades_refusals_
+/// name_the_same_limit` cannot catch a divergence, because both messages are
+/// *formatted* from this crate's constant — this can.
+#[test]
+fn a_backup_of_exactly_the_table_capacity_imports_whole() {
+    use somfy_config::ShadeRecord;
+
+    let shades: Vec<Vec<String>> = (0..SHADE_TABLE_CAPACITY)
+        .map(|n| shade_fields("Shade", 0x00_1000 + n as u32, n as u16))
+        .collect();
+    let import = read_backup(&backup(25, &shades)).expect("exactly the capacity fits");
+    assert_eq!(import.shades.len(), SHADE_TABLE_CAPACITY);
+
+    let record = ShadeRecord {
+        seq: 0,
+        shades: import.shades,
+    };
+    assert_eq!(ShadeRecord::decode(&record.encode()), Ok(record));
 }
 
 /// More shades than the table holds is refused whole, and the refusal says
@@ -671,6 +839,31 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
         assert!(config.name.len() <= 32, "shade {index} name does not fit");
         assert!(config.up_time_ms > 0, "shade {index} has no up time");
         assert!(config.down_time_ms > 0, "shade {index} has no down time");
+
+        // The mapping itself, against the only data that can settle it — and
+        // *comparing* rather than printing, so the assertion is a boolean and
+        // the message is an index. The rolling code is why this file is worth
+        // handling carefully at all: one transposed here is a shade that has
+        // to be paired again by hand.
+        let from_parser = &parsed.shades[index];
+        assert!(
+            shade.initial_code == from_parser.next_code,
+            "shade {index} rolling code was not carried across verbatim"
+        );
+        assert!(
+            config.address == from_parser.address,
+            "shade {index} address was not carried across verbatim"
+        );
+        assert!(
+            config.name.as_str() == from_parser.name.as_str(),
+            "shade {index} name was not carried across verbatim"
+        );
+        assert!(
+            config.up_time_ms == from_parser.up_time_ms
+                && config.down_time_ms == from_parser.down_time_ms
+                && config.tilt_time_ms == from_parser.tilt_time_ms,
+            "shade {index} travel times were not carried across verbatim"
+        );
     }
 
     // Whatever was flagged, the handling is the documented one.
@@ -679,18 +872,44 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
         match warning.caveat {
             Caveat::Kind(_) => assert_eq!(config.kind, ShadeKind::Roller),
             Caveat::TiltMode(_) => assert_eq!(config.tilt_mode, TiltMode::None),
-            // Nothing to check in the config: the whole point of this one
-            // is that there is no field it could have gone into.
+            // Nothing to check in the config: the whole point of these two is
+            // that there is no field either could have gone into. What is
+            // checked instead is that they did not fire at all — see below.
             Caveat::FrameWidth(bits) => assert_ne!(bits, TRANSMITTED_BIT_LENGTH),
+            Caveat::Protocol(raw) => assert_ne!(raw, TRANSMITTED_PROTOCOL),
         }
     }
 
+    // [`TRANSMITTED_BIT_LENGTH`] and [`TRANSMITTED_PROTOCOL`] are *derived*
+    // constants — the second from the value the reader substitutes when a
+    // record has no protocol field at all — and this is the only place they
+    // meet real data. A shade on a working installation of the kind this
+    // firmware replaces is drivable by it, so neither caveat should fire. If
+    // one does, either a genuinely mixed installation is being imported (and
+    // those shades really will not move) or the derivation is wrong; both are
+    // worth stopping for. Indices only, as everywhere here.
+    let undrivable: Vec<usize> = import
+        .warnings
+        .iter()
+        .filter(|warning| matches!(warning.caveat, Caveat::FrameWidth(_) | Caveat::Protocol(_)))
+        .map(|warning| warning.index)
+        .collect();
+    assert!(
+        undrivable.is_empty(),
+        "shades {undrivable:?} imported as undrivable — either this installation is mixed, \
+         or TRANSMITTED_BIT_LENGTH / TRANSMITTED_PROTOCOL is derived wrong"
+    );
+
     // And the table is one the device will load: the record's own decode is
-    // the same code the firmware runs.
+    // the same code the firmware runs, and the codes have to survive it.
     let record = ShadeRecord {
         seq: 0,
         shades: import.shades,
     };
     let decoded = ShadeRecord::decode(&record.encode()).expect("the table decodes");
     assert_eq!(decoded.shades.len(), parsed.shades.len());
+    assert!(
+        decoded.shades == record.shades,
+        "the encoded table did not decode back to itself"
+    );
 }
