@@ -37,15 +37,24 @@
 //! [`MqttConfig::state`](crate::MqttConfig::state) — the only retained
 //! per-shade publish — takes the first and cannot be given the second.
 //!
-//! # The symmetry that prevents orphans
+//! # The containment that prevents orphans
 //!
 //! **Two arrays, and both are read by both halves.** [`SHADE_COMPONENTS`] is
 //! the per-shade set and [`DeviceEntity::ALL`] is the per-device one; an
 //! announcement publishes a discovery config for each member of each, and a
 //! retirement clears one. An entity added to either therefore joins both sides
 //! at once, and cannot be announced without also being removable.
+//!
+//! The per-shade half is no longer an equality, and the direction matters. A
+//! shade owns a pairing button only when this controller allocated its address
+//! ([`Pairing`]), so an announcement publishes a **subset** of
+//! [`SHADE_COMPONENTS`] while a retirement still clears all of it. That is the
+//! safe direction and the only one that is safe: clearing a topic nothing was
+//! published to is a zero-length retained publish the broker discards, while
+//! failing to clear one leaves a retained config with no device behind it.
 //! `tests/lifecycle.rs::retirement_clears_every_topic_an_announcement_retains`
-//! is that property, checked against the plans rather than against the arrays.
+//! is that property — checked for **every** [`Pairing`], against the plans
+//! rather than against the arrays.
 //!
 //! The device-level half is the one that could have been a second list somebody
 //! has to remember. It is not: [`MqttConfig::retire`] walks the same
@@ -89,7 +98,72 @@ pub const OFFLINE: &[u8] = b"offline";
 ///   to report (RTS is one-way).
 ///
 /// R7's fuller entity set is device-level, and [`DeviceEntity`] carries it.
+///
+/// **This is the set a shade *can* own, and the set a retirement clears.** What
+/// one shade actually owns is [`Pairing::components`], which is a subset — see
+/// that type for why the two halves are deliberately no longer symmetric.
 pub const SHADE_COMPONENTS: [Component; 2] = [Component::Cover, Component::Button];
+
+/// Whether a shade is offered a pairing button.
+///
+/// # Why this is not the same for every shade
+///
+/// Pairing is a step in **adding** a shade, not a control on one that already
+/// works: it transmits `Prog` at the shade's own address while a person holds
+/// the motor in programming mode, and it teaches that motor *this controller's*
+/// address. For a shade whose address this controller allocated, that is the
+/// action that makes the shade work at all. For a shade whose address came from
+/// an imported table — another controller's virtual remote — it is an action
+/// with no meaning: the motor already answers to that address, and the button
+/// offers to teach it something it knows.
+///
+/// So an estate imported from another controller was showing a pairing button
+/// on every shade, and every one of them was an invitation to do nothing.
+///
+/// # Why a status and not a `bool`
+///
+/// For the reason [`Retention`] is not a `bool`: at a call site `true` says
+/// nothing about which way round it is, and getting it backwards publishes a
+/// button on exactly the shades it is meaningless for.
+///
+/// # Why this is not stored anywhere
+///
+/// It is a function of the shade's address, which never changes once allocated,
+/// so it can be recomputed at any moment and cannot drift. The tempting
+/// alternative — a `paired: bool` the user sets — would be a belief recorded as
+/// a fact: RTS is one-way, so a controller can never learn whether a motor
+/// accepted a `Prog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// This controller allocated the shade's address, so pairing it is an
+    /// action that means something. The button is published.
+    Offered,
+    /// The address came from somewhere else. No button is published.
+    Withheld,
+}
+
+impl Pairing {
+    /// Whether a shade in this state owns an entity of `component`.
+    pub fn offers(self, component: Component) -> bool {
+        match component {
+            Component::Button => matches!(self, Pairing::Offered),
+            // Everything else a shade owns, it owns unconditionally.
+            _ => true,
+        }
+    }
+
+    /// The components a shade in this state owns an entity of.
+    ///
+    /// A filter over [`SHADE_COMPONENTS`] rather than a second list, so a
+    /// component added there still joins the announcement — the property the
+    /// two-arrays rule was protecting, kept while the sets are allowed to
+    /// differ.
+    pub fn components(self) -> impl Iterator<Item = Component> {
+        SHADE_COMPONENTS
+            .into_iter()
+            .filter(move |component| self.offers(*component))
+    }
+}
 
 /// Whether the broker keeps a message after it has delivered it.
 ///
@@ -358,16 +432,22 @@ impl MqttConfig {
     /// The firmware publishes them from its registry and its own counters after
     /// walking this plan; that is the "republish retained state on reconnect"
     /// half of R9.
+    /// `pairing` answers, per shade, whether it owns a pairing button. It is a
+    /// function rather than a flag because the answer differs from shade to
+    /// shade within one announcement, and it is the caller's because the fact
+    /// it is derived from — who allocated the shade's radio address — lives in
+    /// the domain, not here. See [`Pairing`].
     pub fn announce<'a>(
         &'a self,
         shades: &'a [ShadeId],
         has_tilt: bool,
+        pairing: impl Fn(ShadeId) -> Pairing + 'a,
     ) -> impl Iterator<Item = Step<'static>> + 'a {
         core::iter::once(Step::Send(self.online()))
             .chain(
                 shades
                     .iter()
-                    .flat_map(move |shade| self.announce_shade(*shade, has_tilt)),
+                    .flat_map(move |shade| self.announce_shade(*shade, has_tilt, pairing(*shade))),
             )
             .chain(self.announce_device())
     }
@@ -389,14 +469,22 @@ impl MqttConfig {
     }
 
     /// One shade's discovery configs and command subscriptions.
+    ///
+    /// The **subscriptions are not gated** by `pairing`, and that asymmetry is
+    /// deliberate: a shade with no pairing button still has a pairing topic,
+    /// and a broker that already holds something on it — from an earlier
+    /// configuration, or from a person with `mosquitto_pub` — would otherwise
+    /// go unheard. Subscribing costs one packet; the entity is what the user
+    /// sees, and the entity is what is withheld.
     pub fn announce_shade(
         &self,
         shade: ShadeId,
         has_tilt: bool,
+        pairing: Pairing,
     ) -> impl Iterator<Item = Step<'static>> + '_ {
         let object = ObjectId::for_shade(shade);
-        SHADE_COMPONENTS
-            .into_iter()
+        pairing
+            .components()
             .map(move |component| {
                 Step::Send(Publish {
                     topic: self.discovery_topic(component, &object),
@@ -417,7 +505,13 @@ impl MqttConfig {
     /// Everything that removes one shade — its entities and its retained state.
     ///
     /// Every step is a zero-length retained publish. Deliberately takes no
-    /// `has_tilt`: see this module's docs.
+    /// `has_tilt` and no [`Pairing`]: see this module's docs, and note that
+    /// **the retirement is the wider of the two sets on purpose**. Clearing a
+    /// topic that was never published is a zero-length retained publish to a
+    /// topic holding nothing — a no-op the broker discards. Getting the
+    /// condition wrong the other way leaves a retained discovery config with no
+    /// device behind it, forever, clearable only by a person with an MQTT
+    /// client. One direction costs a packet; the other costs an afternoon.
     ///
     /// This is the plan to run when a shade is deleted from the registry. It is
     /// **not** run at shutdown — a device going offline still owns its entities,
@@ -521,9 +615,10 @@ pub fn reconfigure<'a>(
     new: &'a MqttConfig,
     shades: &'a [ShadeId],
     has_tilt: bool,
+    pairing: impl Fn(ShadeId) -> Pairing + 'a,
 ) -> impl Iterator<Item = Step<'static>> + 'a {
     superseded
         .iter()
         .flat_map(move |old| old.retire(shades))
-        .chain(new.announce(shades, has_tilt))
+        .chain(new.announce(shades, has_tilt, pairing))
 }

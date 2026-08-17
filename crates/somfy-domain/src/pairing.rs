@@ -34,7 +34,7 @@
 //! by accident.
 
 use crate::registry::MAX_SHADES;
-use crate::ShadeId;
+use crate::{DomainError, Registry, ShadeConfig, ShadeId};
 
 /// Repeat frames that follow the first frame of a pairing burst.
 ///
@@ -116,6 +116,43 @@ impl RemoteIdentity {
         }
     }
 
+    /// Whether `address` is one this project's allocator produced.
+    ///
+    /// The whole test is [`OWN_SPACE`], and it is exact in one direction: no
+    /// address below `0x80_0000` can have come from [`address_for`], because
+    /// every base carries the bit and nothing added to a base can clear it. So
+    /// a `false` here means "this address came from somewhere else" — an
+    /// imported table, a wall remote — with certainty.
+    ///
+    /// **It is a fact about the scheme, not about this board.** A tighter test
+    /// — `address` inside `self.base ..= self.base + MAX_SHADES + u8::MAX` —
+    /// would additionally say "*this* controller allocated it", and it is
+    /// deliberately not what this is. A board whose table was restored onto
+    /// different hardware, or whose base moved, would then report its own
+    /// allocated addresses as foreign, and the caller that matters — the one
+    /// deciding whether to offer a pairing button — would remove a button that
+    /// works. The direction of the error is what settles it: over-reporting
+    /// ownership offers a pairing action for a motor this controller may not
+    /// have paired, which does nothing until somebody puts that motor into
+    /// programming mode; under-reporting hides the action that is the only way
+    /// to get the motor paired at all.
+    ///
+    /// A named function rather than a mask at each call site, because the mask
+    /// is a claim about this allocator that a reader of the call site cannot
+    /// check.
+    ///
+    /// ```
+    /// use somfy_domain::RemoteIdentity;
+    ///
+    /// // Allocated here: the marker bit is set.
+    /// assert!(RemoteIdentity::is_allocated(RemoteIdentity::SPACE_START));
+    /// // Anything a 20-bit-prefix derivation can produce is not.
+    /// assert!(!RemoteIdentity::is_allocated(0x0F_C0DE));
+    /// ```
+    pub const fn is_allocated(address: u32) -> bool {
+        address & OWN_SPACE != 0
+    }
+
     /// The address shade zero would take in an empty table.
     ///
     /// Exposed for diagnostics — a controller that prints this at boot is one an
@@ -149,4 +186,115 @@ impl RemoteIdentity {
             .map(|probe| first + probe)
             .find(|address| !taken(*address))
     }
+}
+
+/// What [`allocate_if_absent`] did, and therefore what the shade's address is
+/// now.
+///
+/// `#[must_use]` for the same reason the rolling-code store's seeding outcome
+/// is: the interesting case is [`Kept`](Allocated::Kept), which means the
+/// caller asked to create a shade that already exists and got the existing one
+/// back untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Allocated {
+    /// The registry already held a shade at this id. **Nothing was allocated
+    /// and nothing was changed** — not the address, not the name, not the
+    /// travel times. This is the address that shade has always had.
+    Kept(u32),
+    /// The slot was free. A fresh address was allocated and the shade placed at
+    /// it.
+    Fresh(u32),
+}
+
+impl Allocated {
+    /// The shade's address, whichever of the two happened.
+    pub fn address(self) -> u32 {
+        match self {
+            Allocated::Kept(address) | Allocated::Fresh(address) => address,
+        }
+    }
+}
+
+/// Create the shade at `id` if that slot is free, allocating its radio address.
+///
+/// # Why this is not "add a shade, then set its address"
+///
+/// **A motor obeys an address, not a shade.** Pairing teaches one motor one
+/// 24-bit address; nothing in the RTS protocol can tell the motor the address
+/// changed, and nothing can ask it what it learned. So a controller that
+/// reallocates an address a shade already had produces a shade that stops
+/// responding, looks exactly like a dead motor or a dead radio, and is fixed
+/// only by walking to the shade and pairing it again by hand.
+///
+/// That is the same class of loss the rolling-code store's `seed_if_absent`
+/// exists to prevent, and this has the same shape for the same reason: it **reads
+/// first**, and the allocation and the placement are both inside the branch
+/// where the read found the slot empty. Reallocating is not a thing this
+/// declines to do — there is no argument that reaches the other branch, and no
+/// other function in this crate allocates at all.
+///
+/// # What it refuses
+///
+/// - [`DomainError::IdOutOfRange`] if `id` names no slot.
+/// - [`DomainError::NameTooLong`], [`DomainError::InvalidAddress`] — the
+///   ordinary [`ShadeConfig::new`] rules, so a shade created here is a shade
+///   the registry and the persisted record both accept.
+/// - [`DomainError::AddressUnavailable`] if every candidate address is already
+///   in the table. A registry holds at most [`MAX_SHADES`] addresses and
+///   [`RemoteIdentity::address_for`] probes `MAX_SHADES + 1` candidates, so
+///   this cannot be reached through a registry — it is reported rather than
+///   asserted because the alternative is a silent wrong answer.
+///
+/// ```
+/// use somfy_domain::{allocate_if_absent, Allocated, Registry, RemoteIdentity, ShadeId};
+///
+/// let identity = RemoteIdentity::from_mac([0x00, 0x00, 0x00, 0x12, 0x34, 0x56]);
+/// let mut registry = Registry::new();
+///
+/// let first = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen")?;
+/// assert!(matches!(first, Allocated::Fresh(_)));
+/// assert!(RemoteIdentity::is_allocated(first.address()));
+///
+/// // Asked again — with a different name, even — the slot is occupied, so the
+/// // address is handed back unchanged and nothing is written.
+/// let again = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Renamed")?;
+/// assert_eq!(again, Allocated::Kept(first.address()));
+/// assert_eq!(registry.shade(ShadeId(0)).map(|s| s.config.name.as_str()), Some("Kitchen"));
+/// # Ok::<(), somfy_domain::DomainError>(())
+/// ```
+pub fn allocate_if_absent(
+    registry: &mut Registry,
+    identity: &RemoteIdentity,
+    id: ShadeId,
+    name: &str,
+) -> Result<Allocated, DomainError> {
+    if id.0 as usize >= MAX_SHADES {
+        return Err(DomainError::IdOutOfRange);
+    }
+    // Read first. Everything below is inside the branch where this said the
+    // slot is empty, which is what makes "an address never moves" structural
+    // rather than a rule to remember.
+    if let Some(shade) = registry.shade(id) {
+        return Ok(Allocated::Kept(shade.config.address));
+    }
+
+    // `is_linked`, not an address comparison: a shade's linked wall remotes are
+    // as taken as its own address. Allocating one of them would leave the
+    // controller unable to tell its own frames from the remote's — every burst
+    // it sent would come back as an overheard press and move the position
+    // estimate a second time.
+    let address = identity
+        .address_for(id, |candidate| {
+            registry
+                .shades()
+                .any(|(_, shade)| shade.is_linked(candidate))
+        })
+        .ok_or(DomainError::AddressUnavailable)?;
+
+    // Straight through the ordinary constructor, so a shade created here is
+    // one `Registry::add_shade` and `somfy_config::StoredShade` both accept.
+    let config = ShadeConfig::new(name, address)?;
+    registry.add_shade_with_id(id, config)?;
+    Ok(Allocated::Fresh(address))
 }

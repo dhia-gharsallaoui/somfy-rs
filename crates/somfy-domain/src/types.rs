@@ -102,6 +102,78 @@ impl TiltMode {
     }
 }
 
+/// How wide a frame the motor behind a shade was paired as.
+///
+/// A motor learns a remote at one width and answers nothing else, so this is a
+/// property of the *installation*, not a preference: a shade paired as an
+/// 80-bit device is deaf to every 56-bit frame, and a controller that sends the
+/// wrong one produces a shade that imports looking healthy and never moves.
+///
+/// Discriminants are the bit counts themselves, which is also the byte deployed
+/// device backups store, so a migrated width needs no translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameWidth {
+    /// The 7-byte frame nearly every RTS motor in the field uses.
+    Bits56 = 56,
+    /// The 10-byte extended frame.
+    Bits80 = 80,
+}
+
+impl FrameWidth {
+    /// Map a raw bit-length byte from a device backup or a stored record.
+    ///
+    /// `None` for anything that is not one of the two widths the protocol has.
+    /// Reported rather than defaulted, for the same reason
+    /// [`ShadeKind::from_raw`] reports: a shade silently re-widthed is a shade
+    /// that stops responding, and nothing says why.
+    pub fn from_raw(raw: u8) -> Option<FrameWidth> {
+        match raw {
+            56 => Some(FrameWidth::Bits56),
+            80 => Some(FrameWidth::Bits80),
+            _ => None,
+        }
+    }
+}
+
+/// Which radio protocol a shade speaks.
+///
+/// Only [`RadioProtocol::Rts`] is the one this firmware transmits — see
+/// [`ShadeConfig::protocol`] for what carrying the others buys. The
+/// discriminants are the protocol bytes deployed device backups store, so a
+/// migrated value needs no translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RadioProtocol {
+    /// Somfy RTS — what `somfy-rts` encodes and what every motor this project
+    /// has transmitted at is paired as.
+    Rts = 0x00,
+    /// Somfy RTW.
+    Rtw = 0x01,
+    /// Somfy RTV.
+    Rtv = 0x02,
+    /// A general-purpose relay output rather than a motor.
+    GpRelay = 0x08,
+    /// A general-purpose remote input rather than a motor.
+    GpRemote = 0x09,
+}
+
+impl RadioProtocol {
+    /// Map a raw protocol byte from a device backup or a stored record.
+    ///
+    /// `None` for a byte outside the set above.
+    pub fn from_raw(raw: u8) -> Option<RadioProtocol> {
+        match raw {
+            0x00 => Some(RadioProtocol::Rts),
+            0x01 => Some(RadioProtocol::Rtw),
+            0x02 => Some(RadioProtocol::Rtv),
+            0x08 => Some(RadioProtocol::GpRelay),
+            0x09 => Some(RadioProtocol::GpRemote),
+            _ => None,
+        }
+    }
+}
+
 /// Movement direction. Signs match the convention deployed firmware uses
 /// for its position-tracking integer: -1 toward 0 (open), +1 toward 100
 /// (closed), 0 idle.
@@ -152,6 +224,15 @@ pub enum DomainError {
     /// every shade in the house with nobody at any of them. Every other command
     /// here is a movement somebody can watch and undo.
     NotAGroupCommand,
+    /// Every address the allocator could offer is already in the table.
+    ///
+    /// Raised only by
+    /// [`allocate_if_absent`](crate::allocate_if_absent). Unreachable through a
+    /// registry — it holds at most [`MAX_SHADES`](crate::MAX_SHADES) addresses
+    /// and the allocator probes one more candidate than that — and reported
+    /// rather than asserted, because the alternative to an error here is a
+    /// silently wrong address.
+    AddressUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +258,23 @@ pub struct ShadeConfig {
     pub up_time_ms: u32,
     pub down_time_ms: u32,
     pub tilt_time_ms: u32,
+    /// The frame width the motor behind this shade was paired as.
+    ///
+    /// **Carried, not yet honoured on the wire.** The transmit width is still
+    /// per-controller (`somfy_tasks::TxProfile`), so a shade whose width
+    /// differs from the controller's is one the controller cannot drive. That
+    /// is the state this field exists to make *visible*: before it, the width
+    /// was read out of a backup, reported once, and dropped, so the shade
+    /// imported looking healthy and never moved.
+    pub frame_width: FrameWidth,
+    /// The radio protocol this shade speaks.
+    ///
+    /// Carried for the same reason as [`ShadeConfig::frame_width`], and with a
+    /// sharper edge: `somfy-rts` implements [`RadioProtocol::Rts`] and nothing
+    /// else, so a shade set to any other value cannot be driven at all by any
+    /// configuration of this firmware. Storing it is what lets the device say
+    /// so instead of transmitting frames the motor is not listening for.
+    pub protocol: RadioProtocol,
 }
 
 impl ShadeConfig {
@@ -198,6 +296,12 @@ impl ShadeConfig {
             up_time_ms: 10_000,
             down_time_ms: 10_000,
             tilt_time_ms: 7_000,
+            // The width and protocol this firmware transmits. A shade built by
+            // hand is one this controller is about to pair, so it is one this
+            // controller can drive; an imported shade overwrites both from what
+            // the backup recorded.
+            frame_width: FrameWidth::Bits56,
+            protocol: RadioProtocol::Rts,
         })
     }
 }

@@ -22,8 +22,8 @@
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
     reconfigure, Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId,
-    Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic, OFFLINE,
-    ONLINE, SHADE_COMPONENTS,
+    Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic,
+    OFFLINE, ONLINE, SHADE_COMPONENTS,
 };
 
 const NODE: &str = "somfyrs";
@@ -134,7 +134,7 @@ fn the_will_is_offline_retained_at_the_availability_topic() {
 #[test]
 fn online_is_the_first_message_of_an_announcement_and_it_is_retained() {
     let config = default_config();
-    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], false));
+    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], false, |_| Pairing::Offered));
     assert_eq!(
         steps.first(),
         Some(&Flat::Send {
@@ -155,7 +155,7 @@ fn online_is_the_first_message_of_an_announcement_and_it_is_retained() {
 #[test]
 fn every_discovery_config_is_published_retained() {
     let config = default_config();
-    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(7)], false));
+    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(7)], false, |_| Pairing::Offered));
 
     let configs: Vec<&Flat> = steps
         .iter()
@@ -288,8 +288,13 @@ fn the_tilt_topics_are_cleared_even_for_a_shade_that_never_had_tilt() {
 #[test]
 fn retirement_clears_every_topic_an_announcement_retains() {
     let config = default_config();
-    for has_tilt in [false, true] {
-        let announced: Vec<String> = flatten(config.announce(&[ShadeId(5)], has_tilt))
+    for (has_tilt, pairing) in [
+        (false, Pairing::Offered),
+        (false, Pairing::Withheld),
+        (true, Pairing::Offered),
+        (true, Pairing::Withheld),
+    ] {
+        let announced: Vec<String> = flatten(config.announce(&[ShadeId(5)], has_tilt, |_| pairing))
             .into_iter()
             .filter_map(|step| match step {
                 Flat::Send {
@@ -324,7 +329,7 @@ fn retirement_clears_every_topic_an_announcement_retains() {
         for topic in announced.into_iter().chain(state) {
             assert!(
                 cleared.contains(&topic),
-                "{topic} is retained but never cleared (has_tilt={has_tilt})",
+                "{topic} is retained but never cleared (has_tilt={has_tilt}, {pairing:?})",
             );
         }
     }
@@ -340,7 +345,7 @@ fn retirement_clears_every_topic_an_announcement_retains() {
 #[test]
 fn every_device_entity_is_announced_once_retained() {
     let config = default_config();
-    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], false));
+    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], false, |_| Pairing::Offered));
 
     for entity in DeviceEntity::ALL {
         let topic = config
@@ -376,7 +381,7 @@ fn every_device_entity_is_announced_once_retained() {
 fn the_device_entity_count_does_not_follow_the_shade_count() {
     let config = default_config();
     let count = |shades: &[ShadeId]| {
-        flatten(config.announce(shades, false))
+        flatten(config.announce(shades, false, |_| Pairing::Offered))
             .into_iter()
             .filter(|step| {
                 matches!(
@@ -406,7 +411,7 @@ fn the_device_entity_count_does_not_follow_the_shade_count() {
 #[test]
 fn the_device_namespace_carries_no_subscriptions() {
     let config = default_config();
-    let steps = flatten(config.announce(&[ShadeId(1)], true));
+    let steps = flatten(config.announce(&[ShadeId(1)], true, |_| Pairing::Offered));
     let device_base = config.device_base().as_str().to_string();
     for step in &steps {
         if let Flat::Listen { topic, .. } = step {
@@ -562,13 +567,13 @@ fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     for shades in 0u8..=3 {
         let ids: Vec<ShadeId> = (1..=shades).map(ShadeId).collect();
         assert_eq!(
-            operations(config.announce(&ids, false)),
+            operations(config.announce(&ids, false, |_| Pairing::Offered)),
             1 + per_shade * usize::from(shades) + k,
             "the announcement's cost is 1 + {per_shade}N + k; N={shades}",
         );
     }
 
-    let cost = operations(config.announce(&[ShadeId(1)], false));
+    let cost = operations(config.announce(&[ShadeId(1)], false, |_| Pairing::Offered));
     assert!(
         cost > INFLIGHT_SLOTS,
         "an announcement for one shade costs {cost} operations, which no longer \
@@ -579,7 +584,7 @@ fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     // The firmware follows the plan with one reading per device entity, so the
     // burst on a freshly flashed board with a broker and nothing provisioned is
     // `1 + pN + k` plus `k` readings: eleven operations, and no shade in sight.
-    let bare = operations(config.announce(&[], false));
+    let bare = operations(config.announce(&[], false, |_| Pairing::Offered));
     assert_eq!(bare, 1 + k);
     assert!(
         bare + k > INFLIGHT_SLOTS,
@@ -597,10 +602,16 @@ fn walking_a_plan_without_settling_runs_out_of_slots_partway() {
     let current = default_config();
     let mut client = Inflight::new();
 
-    let failed_at = reconfigure(&superseded, &current, &[ShadeId(1), ShadeId(2)], false)
-        .map(|_| client.operation())
-        .find_map(Result::err)
-        .expect("a plan this long cannot be walked unsettled");
+    let failed_at = reconfigure(
+        &superseded,
+        &current,
+        &[ShadeId(1), ShadeId(2)],
+        false,
+        |_| Pairing::Offered,
+    )
+    .map(|_| client.operation())
+    .find_map(Result::err)
+    .expect("a plan this long cannot be walked unsettled");
 
     assert_eq!(
         failed_at,
@@ -623,7 +634,7 @@ fn settling_after_every_operation_completes_a_plan_of_any_length() {
     let shades: Vec<ShadeId> = (1u8..=8).map(ShadeId).collect();
 
     let mut client = Inflight::new();
-    let plan = reconfigure(&superseded, &current, &shades, true);
+    let plan = reconfigure(&superseded, &current, &shades, true, |_| Pairing::Offered);
     let mut length = 0;
     for _ in plan {
         client
@@ -667,7 +678,9 @@ fn retiring_the_device_clears_its_availability_topic() {
 fn changing_the_state_root_clears_the_old_topics_before_publishing_the_new_ones() {
     let old = [config("homeassistant", "oldroot")];
     let new = config("homeassistant", "newroot");
-    let steps = flatten(reconfigure(&old, &new, &[ShadeId(1)], false));
+    let steps = flatten(reconfigure(&old, &new, &[ShadeId(1)], false, |_| {
+        Pairing::Offered
+    }));
 
     let first_new = steps
         .iter()
@@ -699,7 +712,9 @@ fn changing_the_state_root_clears_the_old_topics_before_publishing_the_new_ones(
 fn changing_the_discovery_prefix_clears_the_old_configs_before_publishing_the_new_ones() {
     let old = [config("oldprefix", "somfyrs")];
     let new = config("homeassistant", "somfyrs");
-    let steps = flatten(reconfigure(&old, &new, &[ShadeId(1)], false));
+    let steps = flatten(reconfigure(&old, &new, &[ShadeId(1)], false, |_| {
+        Pairing::Offered
+    }));
 
     let old_config = "oldprefix/cover/somfyrs/shade_1/config".to_string();
     let new_config = "homeassistant/cover/somfyrs/shade_1/config".to_string();
@@ -737,7 +752,9 @@ fn every_superseded_configuration_is_cleared_and_the_new_one_announced_once() {
         config("homeassistant", "secondroot"),
     ];
     let new = default_config();
-    let steps = flatten(reconfigure(&superseded, &new, &[ShadeId(1)], false));
+    let steps = flatten(reconfigure(&superseded, &new, &[ShadeId(1)], false, |_| {
+        Pairing::Offered
+    }));
     let sent = published(&steps);
 
     for root in ["firstroot", "secondroot"] {
@@ -751,7 +768,7 @@ fn every_superseded_configuration_is_cleared_and_the_new_one_announced_once() {
     // The announcement itself happens once. Counted over the *announcement's*
     // topics rather than over all publishes, because a tombstone can legally
     // address the same topic — see the test below.
-    let announced = flatten(new.announce(&[ShadeId(1)], false));
+    let announced = flatten(new.announce(&[ShadeId(1)], false, |_| Pairing::Offered));
     for topic in published(&announced) {
         let announcements = steps
             .iter()
@@ -793,8 +810,11 @@ fn a_tombstone_never_outlives_a_publish_to_the_same_topic() {
         &new,
         &[ShadeId(1)],
         false,
+        |_| Pairing::Offered,
     )));
-    let steps = flatten(reconfigure(&superseded, &new, &[ShadeId(1)], false));
+    let steps = flatten(reconfigure(&superseded, &new, &[ShadeId(1)], false, |_| {
+        Pairing::Offered
+    }));
 
     for topic in &sent {
         let last = steps
@@ -807,7 +827,9 @@ fn a_tombstone_never_outlives_a_publish_to_the_same_topic() {
         // A topic whose *last* word is a tombstone is a topic this device has
         // deliberately removed. That is right for anything only the old
         // configuration owned, and wrong for anything the new one publishes.
-        let announced = published(&flatten(new.announce(&[ShadeId(1)], false)));
+        let announced = published(&flatten(
+            new.announce(&[ShadeId(1)], false, |_| Pairing::Offered),
+        ));
         if announced.contains(topic) {
             assert_ne!(
                 payload,
@@ -841,11 +863,11 @@ fn no_plan_ever_publishes_to_a_command_topic() {
     }
 
     let plans: Vec<Vec<Flat>> = vec![
-        flatten(new.announce(&shades, true)),
-        flatten(new.announce(&shades, false)),
+        flatten(new.announce(&shades, true, |_| Pairing::Offered)),
+        flatten(new.announce(&shades, false, |_| Pairing::Offered)),
         flatten(new.retire(&shades)),
         flatten(new.retire_shade(ShadeId(1))),
-        flatten(reconfigure(&old, &new, &shades, true)),
+        flatten(reconfigure(&old, &new, &shades, true, |_| Pairing::Offered)),
         vec![Flat::Send {
             topic: new.will().topic().as_str().to_string(),
             retained: true,
@@ -871,7 +893,7 @@ fn no_plan_ever_publishes_to_a_command_topic() {
 #[test]
 fn a_subscription_never_asks_for_retained_messages() {
     let config = default_config();
-    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], true));
+    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], true, |_| Pairing::Offered));
     let listens: Vec<&Flat> = steps
         .iter()
         .filter(|step| matches!(step, Flat::Listen { .. }))
@@ -901,7 +923,7 @@ fn a_subscription_never_asks_for_retained_messages() {
 fn the_subscriptions_are_exactly_the_command_topics() {
     let config = default_config();
     for has_tilt in [false, true] {
-        let steps = flatten(config.announce(&[ShadeId(9)], has_tilt));
+        let steps = flatten(config.announce(&[ShadeId(9)], has_tilt, |_| Pairing::Offered));
         let mut listened: Vec<String> = steps
             .iter()
             .filter_map(|step| match step {

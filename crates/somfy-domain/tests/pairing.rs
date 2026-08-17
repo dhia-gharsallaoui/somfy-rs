@@ -8,8 +8,9 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    Controller, DomainError, PlannedTx, Pos, RemoteIdentity, Repeats, Shade, ShadeCommand,
-    ShadeConfig, ShadeId, StateDelta, DELTA_CAPACITY, MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
+    allocate_if_absent, Allocated, Controller, DomainError, PlannedTx, Pos, Registry,
+    RemoteIdentity, Repeats, Shade, ShadeCommand, ShadeConfig, ShadeId, StateDelta, DELTA_CAPACITY,
+    MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
 };
 use somfy_rts::Command;
 
@@ -210,6 +211,194 @@ fn a_full_table_still_yields_an_address() {
         .address_for(ShadeId(0), |a| full.contains(&a))
         .expect("MAX_SHADES taken addresses cannot exhaust MAX_SHADES + 1 candidates");
     assert!(!full.contains(&address));
+}
+
+// ---------------------------------------------------------------------------
+// The ownership predicate
+// ---------------------------------------------------------------------------
+
+/// Everything the allocator can produce reports as allocated, for every shade
+/// id and a spread of MACs — not just for the one board that prompted the
+/// question.
+#[test]
+fn every_address_this_allocator_produces_reports_as_allocated() {
+    for unique in [
+        [0x00, 0x00, 0x00],
+        [0xFF, 0xFF, 0xFF],
+        [0x12, 0x34, 0x56],
+        [0xF0, 0x0D, 0x1E],
+        [0x00, 0x00, 0x01],
+    ] {
+        let identity = RemoteIdentity::from_mac(mac(unique));
+        for id in 0..MAX_SHADES as u8 {
+            let address = identity.address_for(ShadeId(id), free).expect("an address");
+            assert!(
+                RemoteIdentity::is_allocated(address),
+                "{address:#08X} from {unique:?}/{id}",
+            );
+        }
+    }
+}
+
+/// And nothing the *other* scheme can produce does. This is the same
+/// structural separation `no_allocated_address_is_reachable_by_the_oui_derivation`
+/// asserts, read from the predicate's side: an imported table carries addresses
+/// a 20-bit prefix derivation produced, plus at most a `u8` shade offset, and
+/// none of that reaches bit 23.
+#[test]
+fn no_address_the_other_scheme_can_produce_reports_as_allocated() {
+    for unique in [[0x00, 0x00, 0x00], [0xFF, 0xFF, 0xFF], [0x12, 0x34, 0x56]] {
+        let start = oui_derived_start(mac(unique));
+        for id in 0..=u8::MAX as u32 {
+            assert!(
+                !RemoteIdentity::is_allocated(start + id),
+                "{:#08X}",
+                start + id,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allocating once, and never again
+// ---------------------------------------------------------------------------
+
+/// The rule that costs a physical re-pairing when it is broken: a shade's
+/// address does not move, whatever it is asked afterwards.
+#[test]
+fn an_allocated_address_is_never_reallocated() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let first = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen").unwrap();
+    assert!(matches!(first, Allocated::Fresh(_)));
+
+    // Asked again, with a different name, ten times over.
+    for _ in 0..10 {
+        let again = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Something Else");
+        assert_eq!(again, Ok(Allocated::Kept(first.address())));
+    }
+    let shade = registry.shade(ShadeId(0)).expect("still there");
+    assert_eq!(shade.config.address, first.address());
+    assert_eq!(shade.config.name.as_str(), "Kitchen");
+}
+
+/// Adding a shade beside one that already exists does not disturb it, and the
+/// two get different addresses.
+#[test]
+fn a_second_shade_gets_its_own_address_and_leaves_the_first_alone() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let one = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen").unwrap();
+    let two = allocate_if_absent(&mut registry, &identity, ShadeId(1), "Salon").unwrap();
+
+    assert_ne!(one.address(), two.address());
+    assert_eq!(
+        registry.shade(ShadeId(0)).unwrap().config.address,
+        one.address()
+    );
+    assert_eq!(
+        registry.shade(ShadeId(1)).unwrap().config.address,
+        two.address()
+    );
+}
+
+/// An imported table is exactly the case the probe exists for: its addresses
+/// belong to another controller, and allocating over one would be two
+/// controllers transmitting as one remote.
+#[test]
+fn an_allocation_steps_over_an_imported_address() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    // Put a shade at the address the allocator would otherwise hand to id 0 —
+    // an imported row would do this whenever the two spaces happened to meet.
+    let wanted = identity.address_for(ShadeId(0), free).unwrap();
+    registry
+        .add_shade_with_id(ShadeId(7), ShadeConfig::new("Imported", wanted).unwrap())
+        .unwrap();
+
+    let fresh = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen").unwrap();
+    assert_ne!(fresh.address(), wanted);
+    assert_eq!(registry.shade(ShadeId(7)).unwrap().config.address, wanted);
+}
+
+/// A wall remote's address is as taken as a shade's own.
+///
+/// If the allocator handed itself an address a linked remote already uses, the
+/// controller could not tell its own frames from the remote's: every burst it
+/// sent would come back as an overheard press and move the position estimate a
+/// second time. The remote is a physical object in somebody's hall and cannot
+/// be renumbered; the allocation can.
+#[test]
+fn an_allocation_steps_over_a_linked_remotes_address() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let wanted = identity.address_for(ShadeId(0), free).unwrap();
+    registry
+        .add_shade_with_id(ShadeId(7), ShadeConfig::new("Imported", 0x00_1001).unwrap())
+        .unwrap();
+    registry
+        .shade_mut(ShadeId(7))
+        .unwrap()
+        .link_remote(wanted)
+        .unwrap();
+
+    let fresh = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen").unwrap();
+    assert_ne!(
+        fresh.address(),
+        wanted,
+        "the allocator took an address a wall remote already transmits at",
+    );
+}
+
+/// An id no slot answers to is refused, rather than being wrapped or clamped
+/// onto some other shade's slot.
+#[test]
+fn an_id_past_the_registry_is_refused() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+    assert_eq!(
+        allocate_if_absent(&mut registry, &identity, ShadeId(MAX_SHADES as u8), "X"),
+        Err(DomainError::IdOutOfRange),
+    );
+}
+
+/// A freshly allocated shade is one the persisted record and the registry both
+/// accept: the address is in range, is not a sentinel, and carries the marker.
+#[test]
+fn a_fresh_allocation_is_a_shade_everything_downstream_accepts() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+    for id in 0..MAX_SHADES as u8 {
+        let fresh = allocate_if_absent(&mut registry, &identity, ShadeId(id), "S").unwrap();
+        let address = fresh.address();
+        assert!(RemoteIdentity::is_allocated(address));
+        assert!(ShadeConfig::new("S", address).is_ok());
+    }
+    assert_eq!(registry.shades().count(), MAX_SHADES);
+}
+
+/// A name the registry cannot hold is refused **before** anything is placed, so
+/// a failed add does not leave a half-created shade at a burnt address.
+#[test]
+fn a_refused_name_allocates_nothing() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+    let long = "x".repeat(33);
+    assert_eq!(
+        allocate_if_absent(&mut registry, &identity, ShadeId(0), &long),
+        Err(DomainError::NameTooLong),
+    );
+    assert!(registry.shade(ShadeId(0)).is_none());
+    // And the address it would have taken is still free for the next attempt.
+    let fresh = allocate_if_absent(&mut registry, &identity, ShadeId(0), "Kitchen").unwrap();
+    assert_eq!(
+        fresh,
+        Allocated::Fresh(identity.address_for(ShadeId(0), free).unwrap())
+    );
 }
 
 // ---------------------------------------------------------------------------

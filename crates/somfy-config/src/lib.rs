@@ -90,6 +90,7 @@ pub use mqtt::{
 };
 pub use record::{ConfigRecord, RecordError, CONFIG_RECORD_LEN};
 pub use shade::{
-    ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError, StoredShade, TravelField,
-    SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
+    Announced, Layout, LinkedRemote, ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError,
+    StoredShade, TravelField, MAX_LINKED_REMOTES, MAX_LINKS, SHADE_RECORD_LEN,
+    SHADE_TABLE_CAPACITY,
 };

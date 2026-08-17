@@ -9,6 +9,7 @@
 //! binary.
 
 use super::*;
+use somfy_config::Announced;
 use somfy_migrate::MigratedShade;
 use somfy_rts::RollingCode;
 
@@ -116,6 +117,8 @@ fn an_imported_table_survives_the_records_own_decode() {
 
     let record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: import.shades,
     };
     assert_eq!(ShadeRecord::decode(&record.encode()), Ok(record));
@@ -375,6 +378,8 @@ fn refusal_variant(refusal: &Refusal) -> usize {
         Refusal::Unnamed { .. } => 3,
         Refusal::Shade { .. } => 4,
         Refusal::DuplicateAddress { .. } => 5,
+        Refusal::TooManyLinks { .. } => 6,
+        Refusal::Link { .. } => 7,
     }
 }
 const REFUSAL_VARIANTS: usize = 6;
@@ -442,17 +447,124 @@ fn a_refusal_yields_no_shades_at_all() {
     assert_eq!((index, name.as_str()), (1, "Broken"));
 }
 
-// -- what was seen but not written ---------------------------------------
+// -- linked remotes: written, and still not shades ------------------------
 
+/// The wall remotes are now carried across, because they are the only thing
+/// that can correct a position estimate: RTS is one-way, so a shade whose
+/// remotes are unknown drifts every time somebody presses the switch on the
+/// wall, and nothing anywhere says why.
+///
+/// The half this test kept from the one it replaces is the important half: a
+/// linked remote shares a motor, not an identity, and must never become a
+/// shade of its own.
 #[test]
-fn linked_remotes_are_counted_but_not_written() {
+fn linked_remotes_are_written_and_are_still_not_shades() {
     let mut shade = migrated("Kitchen", 0x00_1001);
     shade.linked_addresses = hvec(&[0x00_2001, 0x00_2002]);
 
     let import = import(&data(&[shade])).expect("valid");
-    assert_eq!(import.linked_remotes, 2);
     assert_eq!(import.shades.len(), 1, "a linked remote is not a shade");
+    assert_eq!(
+        import.links.as_slice(),
+        &[
+            LinkedRemote {
+                shade: ShadeId(0),
+                address: 0x00_2001,
+            },
+            LinkedRemote {
+                shade: ShadeId(0),
+                address: 0x00_2002,
+            },
+        ],
+    );
 }
+
+/// And the whole way to the bytes: an imported table with links round-trips
+/// through the record, so the device gets what the tool showed.
+#[test]
+fn imported_links_survive_the_records_round_trip() {
+    use somfy_config::ShadeRecord;
+
+    let mut first = migrated("Kitchen", 0x00_1001);
+    first.linked_addresses = hvec(&[0x00_2001]);
+    let mut second = migrated("Salon", 0x00_1002);
+    second.linked_addresses = hvec(&[0x00_2002, 0x00_2003]);
+
+    let import = import(&data(&[first, second])).expect("valid");
+    let record = ShadeRecord {
+        seq: 0,
+        announced: Announced::NONE,
+        links: import.links,
+        shades: import.shades,
+    };
+    assert_eq!(ShadeRecord::decode(&record.encode()), Ok(record));
+}
+
+/// A remote linked to the shade it is a remote *for* is the shade's own
+/// address arriving twice. The domain refuses it, so the tool does.
+#[test]
+fn a_remote_at_the_shades_own_address_is_refused() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.linked_addresses = hvec(&[0x00_1001]);
+
+    assert_eq!(
+        import(&data(&[shade])),
+        Err(Refusal::Link {
+            index: 0,
+            name: "Kitchen".to_string(),
+            address: 0x00_1001,
+            error: DomainError::DuplicateAddress,
+        }),
+    );
+}
+
+/// A sentinel address is not a remote, and importing one would put a link in
+/// the record that the device then refuses — taking the whole table with it.
+#[test]
+fn a_sentinel_linked_address_is_refused() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.linked_addresses = hvec(&[0x00_2001, 0]);
+
+    assert_eq!(
+        import(&data(&[shade])),
+        Err(Refusal::Link {
+            index: 0,
+            name: "Kitchen".to_string(),
+            address: 0,
+            error: DomainError::InvalidAddress,
+        }),
+    );
+}
+
+/// The record's pool is shared across the whole table, so a big enough
+/// installation runs out. Refused rather than truncated: a dropped link is a
+/// wall remote that silently stops correcting a shade, which is the failure
+/// this whole field exists to end.
+#[test]
+fn more_links_than_the_record_holds_are_refused_rather_than_dropped() {
+    // Seven remotes each is the domain's per-shade limit, so this fills the
+    // shared pool without ever breaking the per-shade one.
+    let mut shades = std::vec::Vec::new();
+    let mut address = 0x00_2000u32;
+    for index in 0..(MAX_LINKS / MAX_LINKED_REMOTES + 1) {
+        let mut shade = migrated("Shade", 0x00_1001 + index as u32);
+        let mut linked: heapless::Vec<u32, 7> = heapless::Vec::new();
+        for _ in 0..MAX_LINKED_REMOTES {
+            linked.push(address).unwrap();
+            address += 1;
+        }
+        shade.linked_addresses = linked;
+        shades.push(shade);
+    }
+
+    let refusal = import(&data(&shades)).expect_err("the pool is not big enough");
+    assert!(
+        matches!(refusal, Refusal::TooManyLinks { held, .. } if held == MAX_LINKS),
+        "{refusal:?}",
+    );
+}
+
+// -- what was seen but not written ---------------------------------------
 
 #[test]
 fn groups_are_counted_but_not_written() {
@@ -632,14 +744,16 @@ fn a_stored_last_sent_code_reaches_the_record_as_the_next_one() {
     // And on to the bytes. A round-trip through `encode`/`decode` alone would
     // pass even if the two agreed on a wrong offset, so this reads the code
     // out of the image at the position the record's own docs give it:
-    // entry 0 starts after the 12-byte header, and the code is 4 bytes into an
+    // entry 0 starts after the 20-byte header, and the code is 4 bytes into an
     // entry, after the address.
     let image = somfy_config::ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: import.shades,
     }
     .encode();
-    assert_eq!(&image[12 + 4..12 + 6], &42u16.to_le_bytes());
+    assert_eq!(&image[20 + 4..20 + 6], &42u16.to_le_bytes());
 }
 
 /// The one piece of arithmetic in the whole contract, at the only value where
@@ -655,6 +769,8 @@ fn a_code_that_wrapped_past_the_last_one_arrives_as_zero() {
 
     let record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: import.shades,
     };
     let decoded = ShadeRecord::decode(&record.encode()).expect("the table decodes");
@@ -715,6 +831,8 @@ fn a_backup_of_exactly_the_table_capacity_imports_whole() {
 
     let record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: import.shades,
     };
     assert_eq!(ShadeRecord::decode(&record.encode()), Ok(record));
@@ -904,6 +1022,8 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
     // the same code the firmware runs, and the codes have to survive it.
     let record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: import.shades,
     };
     let decoded = ShadeRecord::decode(&record.encode()).expect("the table decodes");

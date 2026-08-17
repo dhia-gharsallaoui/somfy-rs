@@ -15,9 +15,9 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, Payload, PublishedTopic,
-    Retention, ShadeTopic, StateRoot, Step, SubscribedTopic, TopicRole, PAYLOAD_CAPACITY,
-    SHADE_COMPONENTS,
+    Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, Pairing, Payload,
+    PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic, TopicRole,
+    PAYLOAD_CAPACITY, SHADE_COMPONENTS,
 };
 
 fn config() -> MqttConfig {
@@ -197,6 +197,121 @@ fn a_name_past_the_limit_is_refused_and_leaves_nothing_behind() {
 // The lifecycle
 // ---------------------------------------------------------------------------
 
+/// **The gate.** A shade whose address this controller did not allocate gets no
+/// pairing button, because pairing it would teach a motor an address it already
+/// answers to. An imported estate was showing one on every shade.
+#[test]
+fn a_shade_this_controller_did_not_allocate_gets_no_pairing_button() {
+    let cfg = config();
+    let shade = ShadeId(3);
+    let button = cfg
+        .discovery_topic(Component::Button, &ObjectId::for_shade(shade))
+        .as_str()
+        .to_owned();
+    let cover = cfg
+        .discovery_topic(Component::Cover, &ObjectId::for_shade(shade))
+        .as_str()
+        .to_owned();
+
+    let published = |pairing| -> Vec<String> {
+        cfg.announce_shade(shade, false, pairing)
+            .filter_map(|step| match step {
+                Step::Send(publish) => Some(publish.topic().as_str().to_owned()),
+                Step::Listen(_) => None,
+            })
+            .collect()
+    };
+
+    let offered = published(Pairing::Offered);
+    assert!(offered.contains(&button));
+    assert!(offered.contains(&cover));
+
+    let withheld = published(Pairing::Withheld);
+    assert!(
+        !withheld.contains(&button),
+        "an imported shade is still offered a pairing button",
+    );
+    assert!(
+        withheld.contains(&cover),
+        "withholding the button must not withhold the shade itself",
+    );
+}
+
+/// Withholding the button does not withhold the subscription.
+///
+/// A broker may already hold something retained on the pairing topic — from an
+/// earlier configuration, or from somebody's `mosquitto_pub` — and a device that
+/// never subscribes never hears it. Subscribing costs one packet; the entity is
+/// what the user sees and the entity is what is withheld.
+#[test]
+fn withholding_the_button_still_subscribes_to_the_pair_topic() {
+    let cfg = config();
+    let shade = ShadeId(3);
+    let expected = cfg.shade_topic(shade, ShadeTopic::Pair).as_str().to_owned();
+
+    for pairing in [Pairing::Offered, Pairing::Withheld] {
+        assert!(
+            cfg.announce_shade(shade, false, pairing)
+                .any(|step| match step {
+                    Step::Listen(listen) => listen.topic().as_str() == expected,
+                    Step::Send(_) => false,
+                }),
+            "{pairing:?}",
+        );
+    }
+}
+
+/// The retirement is unconditional, and that is the safe direction: it clears
+/// the button's topic even for a shade that never had one. A zero-length
+/// retained publish to a topic holding nothing is a no-op; the converse — a
+/// retained config with no device behind it — is only clearable by hand.
+#[test]
+fn the_button_is_retired_for_a_shade_that_never_had_one() {
+    let cfg = config();
+    let shade = ShadeId(3);
+    let button = cfg
+        .discovery_topic(Component::Button, &ObjectId::for_shade(shade))
+        .as_str()
+        .to_owned();
+
+    // Not announced …
+    assert!(!cfg
+        .announce_shade(shade, false, Pairing::Withheld)
+        .any(|step| match step {
+            Step::Send(publish) => publish.topic().as_str() == button,
+            Step::Listen(_) => false,
+        }));
+    // … and cleared anyway.
+    assert!(cfg.retire_shade(shade).any(|step| match step {
+        Step::Send(publish) =>
+            publish.topic().as_str() == button
+                && publish.payload() == Payload::Nothing
+                && publish.retention() == Retention::Retained,
+        Step::Listen(_) => false,
+    }));
+}
+
+/// A shade's component set is a filter over `SHADE_COMPONENTS`, never a second
+/// list — so a component added there still reaches the announcement, which is
+/// the property the "both halves read one array" rule was protecting.
+#[test]
+fn the_offered_set_is_a_subset_of_the_table_both_halves_read() {
+    for pairing in [Pairing::Offered, Pairing::Withheld] {
+        for component in pairing.components() {
+            assert!(
+                SHADE_COMPONENTS.contains(&component),
+                "{component:?} is announced and never retired",
+            );
+        }
+    }
+    // And the only thing the gate removes is the button.
+    let offered: Vec<Component> = Pairing::Offered.components().collect();
+    let withheld: Vec<Component> = Pairing::Withheld.components().collect();
+    assert_eq!(offered.as_slice(), &SHADE_COMPONENTS[..]);
+    assert!(!withheld.contains(&Component::Button));
+    assert!(withheld.contains(&Component::Cover));
+}
+
 /// The button joins both halves at once, because both read `SHADE_COMPONENTS`.
 /// An entity that can be announced and not removed is a retained orphan only an
 /// MQTT client can clear.
@@ -211,20 +326,22 @@ fn the_button_is_announced_and_retired_from_the_same_table() {
         .as_str()
         .to_owned();
 
-    let announced = cfg.announce_shade(shade, false).any(|step| match step {
-        Step::Send(publish) => {
-            publish.topic().as_str() == expected
-                && matches!(
-                    publish.payload(),
-                    Payload::Discovery {
-                        component: Component::Button,
-                        ..
-                    }
-                )
-                && publish.retention() == Retention::Retained
-        }
-        Step::Listen(_) => false,
-    });
+    let announced = cfg
+        .announce_shade(shade, false, Pairing::Offered)
+        .any(|step| match step {
+            Step::Send(publish) => {
+                publish.topic().as_str() == expected
+                    && matches!(
+                        publish.payload(),
+                        Payload::Discovery {
+                            component: Component::Button,
+                            ..
+                        }
+                    )
+                    && publish.retention() == Retention::Retained
+            }
+            Step::Listen(_) => false,
+        });
     assert!(announced, "the button's discovery config is not announced");
 
     let retired = cfg.retire_shade(shade).any(|step| match step {
@@ -248,10 +365,11 @@ fn announcing_a_shade_subscribes_to_its_pair_topic() {
 
     for has_tilt in [false, true] {
         assert!(
-            cfg.announce_shade(shade, has_tilt).any(|step| match step {
-                Step::Listen(listen) => listen.topic().as_str() == expected,
-                Step::Send(_) => false,
-            }),
+            cfg.announce_shade(shade, has_tilt, Pairing::Offered)
+                .any(|step| match step {
+                    Step::Listen(listen) => listen.topic().as_str() == expected,
+                    Step::Send(_) => false,
+                }),
             "has_tilt={has_tilt}",
         );
     }

@@ -130,10 +130,23 @@ pub struct Shade {
     /// Step targets and native Up/Down moves never schedule a stop.
     stop_on_arrival: bool,
     /// Remotes (besides this shade's own address) whose RX frames drive the
-    /// estimate via [`Shade::apply_overheard`]. Bounded at 7 linked remotes,
-    /// matching the fixed-size limit used by real deployed firmware.
-    linked: Vec<u32, 7>,
+    /// estimate via [`Shade::apply_overheard`]. Bounded at
+    /// [`MAX_LINKED_REMOTES`], matching the fixed-size limit used by real
+    /// deployed firmware.
+    linked: Vec<u32, MAX_LINKED_REMOTES>,
 }
+
+/// Remotes one shade may have linked to it.
+///
+/// **These are the only feedback this controller ever gets.** RTS is one-way:
+/// nothing asks a motor where it is, so the position estimate is dead
+/// reckoning from the moment it was last known. A wall remote moving the shade
+/// is therefore not an inconvenience to be tolerated — it is the one event that
+/// can put the estimate back on the truth, and it can only do that if the
+/// remote's address is registered here. A shade with an empty list drifts
+/// silently, and every frame that could have corrected it is decoded, matched
+/// against nothing, and dropped.
+pub const MAX_LINKED_REMOTES: usize = 7;
 
 impl Shade {
     /// Position starts fully open ([`Pos::ZERO`]); no favorite is set.
@@ -266,6 +279,28 @@ impl Shade {
         self.linked
             .push(addr)
             .map_err(|_| DomainError::RegistryFull)
+    }
+
+    /// Forget a linked remote. [`DomainError::NotFound`] if it was not linked.
+    ///
+    /// The shade's **own** address is not a link and cannot be removed this
+    /// way: it is what the controller transmits as, and dropping it would leave
+    /// a shade nothing could command. `is_linked` answers `true` for it, which
+    /// is why the check here is against the list rather than against that.
+    pub fn unlink_remote(&mut self, addr: u32) -> Result<(), crate::DomainError> {
+        let Some(at) = self.linked.iter().position(|held| *held == addr) else {
+            return Err(crate::DomainError::NotFound);
+        };
+        self.linked.swap_remove(at);
+        Ok(())
+    }
+
+    /// The remotes linked to this shade, for whoever has to persist them.
+    ///
+    /// Excludes the shade's own address, which is not a link — it is in
+    /// [`ShadeConfig::address`] and is stored there.
+    pub fn linked(&self) -> &[u32] {
+        &self.linked
     }
 
     /// True if `addr` is this shade's own remote address or a linked remote.

@@ -72,7 +72,9 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use somfy_config::{ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY};
+use somfy_config::{
+    Announced, ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
+};
 use somfy_domain::{RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
 
@@ -290,11 +292,6 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         (imported.rooms, "room", "this region holds shades only"),
         (imported.groups, "group", "this region holds shades only"),
         (
-            imported.linked_remotes,
-            "linked remote",
-            "their rolling codes are not in the backup file at all",
-        ),
-        (
             imported.favourites,
             "'my' favourite",
             "there is no field to provision one into; the motors keep theirs, \
@@ -307,9 +304,19 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         }
     }
 
+    if !imported.links.is_empty() {
+        eprintln!(
+            "  {} linked remote(s) written — a wall remote's presses are the only thing \
+             that can correct a shade's position estimate.",
+            imported.links.len(),
+        );
+    }
+
     let misaligned = imported.misaligned().then_some(imported.skipped_resyncs);
     let record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: imported.links,
         shades: imported.shades,
     };
     eprintln!();
@@ -368,6 +375,8 @@ fn confirm_misaligned(records: u16) -> Result<(), Box<dyn std::error::Error>> {
 fn from_prompts() -> Result<ShadeRecord, Box<dyn std::error::Error>> {
     let mut record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: heapless::Vec::new(),
     };
 
@@ -813,6 +822,8 @@ mod tests {
     fn record_with(addresses: &[u32]) -> ShadeRecord {
         let mut record = ShadeRecord {
             seq: 0,
+            announced: Announced::NONE,
+            links: heapless::Vec::new(),
             shades: heapless::Vec::new(),
         };
         for (index, address) in addresses.iter().enumerate() {

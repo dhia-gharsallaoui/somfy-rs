@@ -4,9 +4,13 @@
 //! `src/shade.rs`; everything here is reachable by a provisioning tool and by
 //! the firmware, which is what makes it the contract.
 
-use somfy_config::{ShadeError, ShadeRecord, ShadeRecordError, StoredShade, TravelField};
-use somfy_config::{SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY};
-use somfy_domain::{DomainError, ShadeConfig, ShadeKind, TiltMode, MAX_SHADES};
+use somfy_config::{
+    Announced, LinkedRemote, ShadeError, ShadeRecord, ShadeRecordError, StoredShade, TravelField,
+};
+use somfy_config::{MAX_LINKED_REMOTES, MAX_LINKS, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY};
+use somfy_domain::{
+    DomainError, FrameWidth, RadioProtocol, ShadeConfig, ShadeId, ShadeKind, TiltMode, MAX_SHADES,
+};
 use somfy_rts::RollingCode;
 
 /// A shade built the way a provisioning tool builds one: through the domain's
@@ -19,6 +23,8 @@ fn shade(name: &str, address: u32, code: u16) -> StoredShade {
 fn record(shades: &[StoredShade]) -> ShadeRecord {
     let mut record = ShadeRecord {
         seq: 0,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: heapless::Vec::new(),
     };
     for entry in shades {
@@ -62,6 +68,8 @@ fn a_full_registry_fits_in_one_record() {
 
     let mut full = ShadeRecord {
         seq: 7,
+        announced: Announced::NONE,
+        links: heapless::Vec::new(),
         shades: heapless::Vec::new(),
     };
     for index in 0..MAX_SHADES {
@@ -210,7 +218,7 @@ fn one_refused_entry_visits_nothing_at_all() {
     // Reach past the constructor the way a foreign writer would: a shade kind
     // this firmware does not model, in the middle entry.
     let mut bytes = written.encode();
-    let entry = 12 + 56; // header, then the second entry
+    let entry = 20 + 56; // header, then the second entry
     bytes[entry + 6] = 0x05; // garage, which `ShadeKind::from_raw` refuses
     let checksum =
         crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&bytes[..SHADE_RECORD_LEN - 4]);
@@ -291,4 +299,370 @@ fn the_sequence_number_round_trips() {
     written.seq = u32::MAX;
     let decoded = ShadeRecord::decode(&written.encode()).expect("decodes");
     assert_eq!(decoded.seq, u32::MAX);
+}
+
+// ---------------------------------------------------------------------------
+// The announced-shade bitmap
+// ---------------------------------------------------------------------------
+
+/// The bitmap is what gives `MqttConfig::retire_shade` a caller, so it has to
+/// survive the round trip exactly — and independently of the table, because the
+/// case it exists for is the one where the two disagree.
+#[test]
+fn the_announced_set_round_trips_and_is_not_derived_from_the_table() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    // Shade 4 was announced and no longer exists: an orphan waiting to be
+    // cleared, and this is the only fact that can name it.
+    written.announced = Announced::NONE.with(ShadeId(0)).with(ShadeId(4));
+
+    let decoded = ShadeRecord::decode(&written.encode()).expect("decodes");
+    assert_eq!(decoded.announced, written.announced);
+    assert!(decoded.announced.contains(ShadeId(4)));
+    assert_eq!(decoded.shades.len(), 1);
+}
+
+/// Every id the registry has, and the ones past it. The bound is the whole
+/// content of the type: a shift by an id past the word is undefined where it is
+/// not a panic.
+#[test]
+fn the_bitmap_holds_every_registry_id_and_ignores_the_ones_past_it() {
+    let mut set = Announced::NONE;
+    for id in 0..SHADE_TABLE_CAPACITY as u8 {
+        set = set.with(ShadeId(id));
+        assert!(set.contains(ShadeId(id)));
+    }
+    assert_eq!(set.ids().count(), SHADE_TABLE_CAPACITY);
+
+    for id in [SHADE_TABLE_CAPACITY as u8, 200, u8::MAX] {
+        assert!(!set.contains(ShadeId(id)));
+        assert_eq!(set.with(ShadeId(id)), set);
+        assert_eq!(set.without(ShadeId(id)), set);
+    }
+}
+
+/// A stored word with bits above the registry's capacity names slots this build
+/// has no shade for and no topic to clear, so they are dropped rather than
+/// carried into a claim it cannot act on.
+#[test]
+fn bits_above_the_registry_are_dropped_on_the_way_in() {
+    let set = Announced::from_bits(u32::MAX);
+    assert_eq!(set.ids().count(), SHADE_TABLE_CAPACITY);
+    for id in 0..SHADE_TABLE_CAPACITY as u8 {
+        assert!(set.contains(ShadeId(id)));
+    }
+}
+
+/// Removing one id leaves the rest alone. A retirement clears one shade, not
+/// the estate.
+#[test]
+fn clearing_one_id_leaves_the_others() {
+    let set = Announced::NONE
+        .with(ShadeId(0))
+        .with(ShadeId(5))
+        .with(ShadeId(31));
+    let after = set.without(ShadeId(5));
+    let ids: std::vec::Vec<ShadeId> = after.ids().collect();
+    assert_eq!(ids, std::vec![ShadeId(0), ShadeId(31)]);
+}
+
+// ---------------------------------------------------------------------------
+// Frame width and radio protocol
+// ---------------------------------------------------------------------------
+
+/// The two fields that used to be parsed, reported and dropped. A shade the old
+/// controller drove another way imported looking healthy and never moved;
+/// carrying them is what lets the device say so instead.
+#[test]
+fn the_frame_width_and_protocol_survive_the_round_trip() {
+    for (width, protocol) in [
+        (FrameWidth::Bits56, RadioProtocol::Rts),
+        (FrameWidth::Bits80, RadioProtocol::Rts),
+        (FrameWidth::Bits56, RadioProtocol::Rtw),
+        (FrameWidth::Bits80, RadioProtocol::GpRemote),
+    ] {
+        let mut entry = shade("Kitchen", 0x00_1001, 1);
+        entry.config.frame_width = width;
+        entry.config.protocol = protocol;
+        let decoded = ShadeRecord::decode(&record(&[entry]).encode()).expect("decodes");
+        assert_eq!(decoded.shades[0].config.frame_width, width);
+        assert_eq!(decoded.shades[0].config.protocol, protocol);
+    }
+}
+
+/// A width that is neither of the protocol's two is reported, not defaulted to
+/// 56 — a motor paired at the other width is deaf to every frame the
+/// substitution would produce.
+#[test]
+fn a_frame_width_that_is_not_a_frame_width_is_reported() {
+    let mut bytes = record(&[shade("Kitchen", 0x00_1001, 1)]).encode();
+    bytes[20 + 21] = 64;
+    let checksum =
+        crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&bytes[..SHADE_RECORD_LEN - 4]);
+    bytes[SHADE_RECORD_LEN - 4..].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(
+        ShadeRecord::decode(&bytes),
+        Err(ShadeRecordError::Width { index: 0, raw: 64 }),
+    );
+}
+
+/// And the same for a protocol byte outside the set.
+#[test]
+fn a_protocol_byte_outside_the_set_is_reported() {
+    let mut bytes = record(&[shade("Kitchen", 0x00_1001, 1)]).encode();
+    bytes[20 + 22] = 0x7F;
+    let checksum =
+        crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&bytes[..SHADE_RECORD_LEN - 4]);
+    bytes[SHADE_RECORD_LEN - 4..].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(
+        ShadeRecord::decode(&bytes),
+        Err(ShadeRecordError::Protocol {
+            index: 0,
+            raw: 0x7F
+        }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Linked remotes
+// ---------------------------------------------------------------------------
+
+/// The pool round-trips, and the links reach the shades they belong to.
+///
+/// RTS is one-way: a wall remote's press is the only event that can put a
+/// position estimate back on the truth, and it can only do that if the
+/// remote's address survives a reboot.
+#[test]
+fn linked_remotes_round_trip_and_name_their_shade() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1), shade("Salon", 0x00_1002, 2)]);
+    for link in [
+        LinkedRemote {
+            shade: ShadeId(0),
+            address: 0x00_2001,
+        },
+        LinkedRemote {
+            shade: ShadeId(1),
+            address: 0x00_2002,
+        },
+        LinkedRemote {
+            shade: ShadeId(1),
+            address: 0x00_2003,
+        },
+    ] {
+        written.links.push(link).expect("fits");
+    }
+
+    let bytes = written.encode();
+    assert_eq!(ShadeRecord::decode(&bytes), Ok(written.clone()));
+
+    let mut visited: std::vec::Vec<LinkedRemote> = std::vec::Vec::new();
+    let header = ShadeRecord::for_each_link(&bytes, |link| visited.push(link)).expect("decodes");
+    assert_eq!(header.links, 3);
+    assert_eq!(visited.as_slice(), written.links.as_slice());
+}
+
+/// The pool is the whole record's, not one shade's, and it is exactly what is
+/// left over after the table. The figure is asserted so it cannot drift from
+/// the layout that produced it.
+#[test]
+fn the_pool_is_what_is_left_of_the_record() {
+    assert_eq!(MAX_LINKS, 58);
+    assert_eq!(MAX_LINKED_REMOTES, 7);
+    // The reason the bound is shared, stated as the arithmetic rather than as
+    // a claim: seven remotes on every one of thirty-two shades is more links
+    // than a 2048-byte slot has room for, whatever else it gives up.
+    assert_eq!(SHADE_TABLE_CAPACITY * MAX_LINKED_REMOTES, 224);
+    assert_eq!(MAX_LINKS, 58);
+}
+
+/// A full pool fits, and a full pool is still a record the device reads.
+#[test]
+fn a_full_pool_round_trips() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    // One shade would break the per-shade bound long before the pool filled,
+    // so the links are spread across a table wide enough to hold them.
+    written.shades.clear();
+    let shades_needed = MAX_LINKS.div_ceil(MAX_LINKED_REMOTES);
+    for index in 0..shades_needed {
+        written
+            .shades
+            .push(shade("S", 0x00_1001 + index as u32, 1))
+            .expect("fits");
+    }
+    let mut address = 0x00_5000u32;
+    'fill: for index in 0..shades_needed {
+        for _ in 0..MAX_LINKED_REMOTES {
+            if written
+                .links
+                .push(LinkedRemote {
+                    shade: ShadeId(index as u8),
+                    address,
+                })
+                .is_err()
+            {
+                break 'fill;
+            }
+            address += 1;
+        }
+    }
+    assert_eq!(written.links.len(), MAX_LINKS);
+    assert_eq!(ShadeRecord::decode(&written.encode()), Ok(written));
+}
+
+/// A link naming a row the record does not have is reported, not skipped:
+/// the remote belongs to *some* shade, and guessing which would attach a wall
+/// remote to the wrong motor's estimate.
+#[test]
+fn a_link_naming_a_missing_shade_is_reported() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    written
+        .links
+        .push(LinkedRemote {
+            shade: ShadeId(4),
+            address: 0x00_2001,
+        })
+        .expect("fits");
+    assert_eq!(
+        ShadeRecord::decode(&written.encode()),
+        Err(ShadeRecordError::LinkShade { index: 0, shade: 4 }),
+    );
+}
+
+/// A shade's own address is not a link to it. The domain refuses it as a
+/// duplicate, so the record does too — otherwise flash could deliver a table
+/// the registry then rejects one shade at a time.
+#[test]
+fn a_link_at_the_shades_own_address_is_reported() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    written
+        .links
+        .push(LinkedRemote {
+            shade: ShadeId(0),
+            address: 0x00_1001,
+        })
+        .expect("fits");
+    assert_eq!(
+        ShadeRecord::decode(&written.encode()),
+        Err(ShadeRecordError::Link {
+            index: 0,
+            error: DomainError::DuplicateAddress,
+        }),
+    );
+}
+
+/// The same remote twice on one shade. Harmless in itself and refused anyway,
+/// because the domain refuses it and the two must not disagree.
+#[test]
+fn the_same_remote_linked_twice_to_one_shade_is_reported() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    for _ in 0..2 {
+        written
+            .links
+            .push(LinkedRemote {
+                shade: ShadeId(0),
+                address: 0x00_2001,
+            })
+            .expect("fits");
+    }
+    assert_eq!(
+        ShadeRecord::decode(&written.encode()),
+        Err(ShadeRecordError::Link {
+            index: 1,
+            error: DomainError::DuplicateAddress,
+        }),
+    );
+}
+
+/// One remote may drive two shades — a wall switch that runs a pair of
+/// blinds — so the same address on two different rows is not a duplicate.
+#[test]
+fn one_remote_may_drive_two_shades() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1), shade("Salon", 0x00_1002, 2)]);
+    for row in [0u8, 1] {
+        written
+            .links
+            .push(LinkedRemote {
+                shade: ShadeId(row),
+                address: 0x00_2001,
+            })
+            .expect("fits");
+    }
+    assert_eq!(ShadeRecord::decode(&written.encode()), Ok(written));
+}
+
+/// An eighth remote on one shade is past the domain's own bound, so the record
+/// refuses it rather than handing the registry a link it will drop.
+#[test]
+fn more_than_seven_remotes_on_one_shade_is_reported() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    for index in 0..=MAX_LINKED_REMOTES {
+        written
+            .links
+            .push(LinkedRemote {
+                shade: ShadeId(0),
+                address: 0x00_2001 + index as u32,
+            })
+            .expect("fits");
+    }
+    assert_eq!(
+        ShadeRecord::decode(&written.encode()),
+        Err(ShadeRecordError::Link {
+            index: MAX_LINKED_REMOTES,
+            error: DomainError::RegistryFull,
+        }),
+    );
+}
+
+/// A sentinel address is not a remote.
+#[test]
+fn a_sentinel_link_address_is_reported() {
+    let mut bytes = record(&[shade("Kitchen", 0x00_1001, 1)]).encode();
+    // One live pool word, and the word itself all zero — which is what a
+    // sentinel address looks like once the row is row 0.
+    bytes[16..18].copy_from_slice(&1u16.to_le_bytes());
+    let checksum =
+        crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&bytes[..SHADE_RECORD_LEN - 4]);
+    bytes[SHADE_RECORD_LEN - 4..].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(
+        ShadeRecord::decode(&bytes),
+        Err(ShadeRecordError::Link {
+            index: 0,
+            error: DomainError::InvalidAddress,
+        }),
+    );
+}
+
+/// A header claiming more links than the pool holds is refused before any word
+/// is read, so a corrupt count cannot walk off the end of the record.
+#[test]
+fn a_link_count_past_the_pool_is_reported() {
+    let mut bytes = record(&[shade("Kitchen", 0x00_1001, 1)]).encode();
+    let claimed = MAX_LINKS as u16 + 1;
+    bytes[16..18].copy_from_slice(&claimed.to_le_bytes());
+    let checksum =
+        crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&bytes[..SHADE_RECORD_LEN - 4]);
+    bytes[SHADE_RECORD_LEN - 4..].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(
+        ShadeRecord::decode(&bytes),
+        Err(ShadeRecordError::LinkCount(claimed)),
+    );
+}
+
+/// All or nothing covers the links too: a table whose entries are all good and
+/// whose pool is not places **no** shades, so a caller cannot end up with a
+/// half-linked installation it then has to undo.
+#[test]
+fn one_bad_link_visits_no_shades_at_all() {
+    let mut written = record(&[shade("Kitchen", 0x00_1001, 1)]);
+    written
+        .links
+        .push(LinkedRemote {
+            shade: ShadeId(9),
+            address: 0x00_2001,
+        })
+        .expect("fits");
+    let bytes = written.encode();
+
+    let mut visited = 0;
+    assert!(ShadeRecord::for_each(&bytes, |_, _| visited += 1).is_err());
+    assert_eq!(visited, 0, "a bad link must not leave shades placed");
 }
