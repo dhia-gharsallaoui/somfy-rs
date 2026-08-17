@@ -89,7 +89,7 @@ per-task criterion because it exercises the seams rather than the parts:
 The import from the C++ backup was a bootstrap, not the destination. A shade
 this controller *paired itself* owns its own virtual remote, which is what
 finally ends the identity collision: today our board transmits as
-`1032469/70/71`, the same virtual remote the C++ controller uses, with two
+the imported addresses — the same virtual remote the C++ controller uses, with two
 independent rolling-code counters.
 
 Three things currently block that test, and they are all in this plan:
@@ -206,3 +206,11 @@ are acceptance criteria, per spec §12.
   remote's address and rolling codes and must be removed or re-captured against
   a throwaway address before this repository goes public. Owner's decision,
   blocks open-sourcing and nothing else.
+
+  **Scope correction, 2026-08-17.** This is larger than the fixtures. Three
+  documents also carried a real shade address in plain text — two of them
+  written during this work — and have been redacted. That fixes the working
+  tree and **not the history**: the addresses remain in earlier commits, so
+  going public needs a history rewrite or a fresh repository, not a patch.
+  Treat "no real address in the repo" as an obligation with a known outstanding
+  breach rather than an invariant currently holding.

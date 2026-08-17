@@ -1230,7 +1230,8 @@ teach nothing.
 
 - [ ] **Step 3: Transmit at the motor**
 
-Target the office roller shade (address `1032469`).
+Target the office roller shade (its address is in the operator's own shade
+table; it is deliberately not written down here).
 
 **Send `Up`, not `Down`.** The shade is currently at its fully-closed hard limit,
 so `Down` would produce no visible movement — indistinguishable from a failed
