@@ -87,6 +87,53 @@ pub enum ApiErrorCode {
     AddressNotAllocated,
 }
 
+impl ApiErrorCode {
+    /// The HTTP status this rejection is reported with.
+    ///
+    /// # Why the mapping lives here rather than in the router
+    ///
+    /// It is a property of the *rejection*, not of the code that happens to be
+    /// answering: "this name is too long" is a malformed field wherever it is
+    /// said, and "the registry is full" is a conflict with collection state
+    /// wherever it is said. Beside the variant it describes, an exhaustive
+    /// match makes a code added below unable to reach a router until somebody
+    /// has decided what it means over HTTP — the compiler asks.
+    /// `ui/mock/plugin.ts` holds the same gate on the mock side, as a total
+    /// `Record<ApiErrorCode, number>`, and the two must agree because the same
+    /// client code runs against both.
+    ///
+    /// # The two choices worth defending
+    ///
+    /// - **[`RegistryFull`](ApiErrorCode::RegistryFull) is 409, not 507.** The
+    ///   device is not out of storage in any sense the client can wait out; it
+    ///   is at its shade limit, and the fix is to remove a shade. 409 says "the
+    ///   state of this collection conflicts with what you asked", which is
+    ///   exactly the situation.
+    /// - **[`AddressNotAllocated`](ApiErrorCode::AddressNotAllocated) is 409,
+    ///   not 400.** The request is perfectly well-formed. What makes it
+    ///   inapplicable is a property of the shade — its address belongs to
+    ///   another controller — so it is a conflict with resource state rather
+    ///   than a malformed body, and a UI that highlighted a form field over it
+    ///   would be pointing at nothing.
+    ///
+    /// [`InvalidAddress`](ApiErrorCode::InvalidAddress) is the one 5xx, and
+    /// deliberately: the client does not choose the address, this device does,
+    /// so an address the domain refuses is this device's fault and there is
+    /// nothing the caller could have sent instead.
+    pub const fn http_status(self) -> u16 {
+        match self {
+            ApiErrorCode::NameEmpty
+            | ApiErrorCode::NameTooLong
+            | ApiErrorCode::InvalidKind
+            | ApiErrorCode::InvalidTiltMode
+            | ApiErrorCode::TravelTimeZero => 400,
+            ApiErrorCode::NotFound => 404,
+            ApiErrorCode::RegistryFull | ApiErrorCode::AddressNotAllocated => 409,
+            ApiErrorCode::InvalidAddress => 500,
+        }
+    }
+}
+
 /// The body of a non-2xx REST response. The HTTP status says how the client
 /// should treat it; [`ApiErrorCode`] says what to tell the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

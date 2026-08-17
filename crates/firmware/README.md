@@ -121,16 +121,50 @@ this directory.
 
 ## Building
 
-From `crates/firmware/`, with `~/export-esp.sh` already sourced:
+The web UI is embedded in the image with `include_bytes!`, so **build it
+first** — `ui/dist/` is a build artefact and is not tracked:
+
+```bash
+cd ui && bun install && bun run build
+```
+
+Without it, `build.rs` stops with "there is no ../../ui/dist/ to embed" rather
+than producing an image whose UI is a 404.
+
+Then from `crates/firmware/`, with `~/export-esp.sh` already sourced:
 
 ```bash
 cargo build --features chip-s3    --target xtensa-esp32s3-none-elf
-cargo build --features chip-esp32 --target xtensa-esp32-none-elf
 cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
+# The ESP32 has no DRAM for the web server — see below.
+cargo build --no-default-features --features chip-esp32,mqtt \
+  --target xtensa-esp32-none-elf
 ```
 
 Each of those builds all four binaries. Add `--bin store-check`,
 `--bin config-check` or `--bin tx-check` to build only one harness.
+
+### Transport features
+
+Three, all on by default: **`mqtt`** (the broker session), **`http`** (the web
+server and `/api/v1/`), and **`ui`** (the embedded single-page app, which
+implies `http`). Turning them off is not primarily a size knob — it is a
+structural test that HTTP and MQTT reach the *same* functions rather than
+reimplementing each other. A build with both off must still compile, and CI
+builds exactly that per chip; `Cargo.toml` carries the argument.
+
+| build | command |
+|---|---|
+| everything (default) | `--features chip-s3` |
+| API with no browser front end | `--no-default-features --features chip-s3,http` |
+| broker only | `--no-default-features --features chip-s3,mqtt` |
+| radio only | `--no-default-features --features chip-s3` |
+
+**`http` and `ui` cannot be built for the ESP32.** With the server in, that chip
+has 54,556 bytes of DRAM for a 66,280-byte stack budget and the image does not
+link; `src/heap.rs` refuses it with a `compile_error!` naming the measurement.
+The ESP32-S3 and ESP32-C3 carry it with 38,760 and 25,448 bytes of Wi-Fi heap to
+spare.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip
 feature enabled is expected to fail — see `src/chip.rs`'s `compile_error!`

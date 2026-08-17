@@ -137,11 +137,36 @@ const RETRY_LOG_INTERVAL: u32 = 10;
 
 /// Socket slots the stack is built with.
 ///
-/// DHCP takes one for as long as it is configured. The other two are for
-/// whatever connects — Task 3's MQTT session is one of them — and a slot is a
-/// few dozen bytes of the `StackResources` static, so the spare one costs
-/// nothing worth economising on.
-const SOCKETS: usize = 3;
+/// **A sum of what is actually in the image, not a round number.** Exceeding it
+/// is not a degraded service: `embassy_net::tcp::TcpSocket::new` panics on a
+/// full socket set, and this firmware's panic handler reboots the board — so a
+/// stack one slot short is a device that reboots the moment the last client
+/// connects, which is the failure mode this arithmetic exists to make
+/// impossible.
+///
+/// It is one of the two places a `#[cfg]` on a transport appears outside that
+/// transport's own module, and it earns it: how many sockets a network needs is
+/// a property of who connects to it, and the alternative — sizing for the
+/// largest configuration always — costs the ESP32 about 1.5 KB of its Wi-Fi
+/// heap for sockets an image without a web server can never open.
+const SOCKETS: usize = DHCP_SOCKETS + BROKER_SOCKETS + SERVER_SOCKETS;
+
+/// DHCP holds one for as long as the address is configured.
+const DHCP_SOCKETS: usize = 1;
+
+/// The broker session's, when there is one. It reconnects on the same slot.
+#[cfg(feature = "mqtt")]
+const BROKER_SOCKETS: usize = 1;
+/// See the `mqtt` definition above.
+#[cfg(not(feature = "mqtt"))]
+const BROKER_SOCKETS: usize = 0;
+
+/// One per web-server connection task, because each accepts on its own socket.
+#[cfg(feature = "http")]
+const SERVER_SOCKETS: usize = crate::api::HTTP_TASKS;
+/// See the `http` definition above.
+#[cfg(not(feature = "http"))]
+const SERVER_SOCKETS: usize = 0;
 
 /// How often the station's signal strength is re-read while the link is up.
 ///

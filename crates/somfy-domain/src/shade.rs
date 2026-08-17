@@ -268,6 +268,44 @@ impl Shade {
     /// values that never identify a real remote, the same guard used by
     /// [`ShadeConfig::new`]), duplicates (including this shade's own
     /// address), and overflow past the 7-remote link limit.
+    /// Replace this shade's configuration, keeping any move it is making
+    /// honest.
+    ///
+    /// # Why a method rather than an assignment to `config`
+    ///
+    /// Because `config` carries the travel times, and [`Shade::tick`] reads
+    /// them **absolutely**: it computes where the shade is from the start
+    /// anchor, the elapsed time and the travel time, rather than integrating
+    /// step by step. So assigning a new travel time mid-move re-interprets the
+    /// travel that has already happened, and the failure is not subtle — a
+    /// shade 10 s into a 30 s close, given a corrected 10 s time, is reported
+    /// as *arrived and fully shut* on the very next tick, and the controller
+    /// plans a stop that halts the motor a third of the way down.
+    ///
+    /// That is not an adversarial case. It is the calibration workflow the
+    /// position-accuracy requirements ask for — time the shade with a
+    /// stopwatch, then save what you measured — performed while the shade is
+    /// still moving, which is exactly when somebody has just timed it.
+    ///
+    /// So the move is re-anchored at where the *old* times say it has reached,
+    /// and the new times apply only to what is left. Nothing can recover what
+    /// the old number should have been, so this is the only reading that can be
+    /// right.
+    ///
+    /// **The address is not taken from `config`.** A motor obeys an address;
+    /// nothing in this protocol can tell it the address moved, and nothing can
+    /// ask it what it learned — so a shade whose address changed is a shade
+    /// that stops responding and is fixed only by walking to it. The incoming
+    /// value is overwritten with the one this shade already has.
+    pub fn reconfigure(&mut self, mut config: ShadeConfig, now_ms: u64) {
+        let (up, down) = (self.config.up_time_ms, self.config.down_time_ms);
+        let (tilt_up, tilt_down) = (self.config.tilt_time_ms, self.config.tilt_time_ms);
+        self.lift.reanchor(now_ms, up, down);
+        self.tilt.reanchor(now_ms, tilt_up, tilt_down);
+        config.address = self.config.address;
+        self.config = config;
+    }
+
     pub fn link_remote(&mut self, addr: u32) -> Result<(), crate::DomainError> {
         use crate::DomainError;
         if addr == 0 || addr >= 0xFF_FFFF {

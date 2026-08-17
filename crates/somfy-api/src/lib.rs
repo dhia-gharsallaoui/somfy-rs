@@ -71,7 +71,7 @@ mod shades;
 pub use commands::CommandDto;
 pub use entities::{
     AddressOrigin, CalibrationSource, GroupDto, RoomDto, ShadeDto, FACTORY_DOWN_TIME_MS,
-    FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS,
+    FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS, SHADE_JSON_MAX_BYTES,
 };
 pub use errors::{ApiErrorCode, ApiErrorDto};
 pub use events::{ShadeStateEvent, WsEvent};

@@ -36,10 +36,21 @@
 
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::String;
+use somfy_api::{CreateShadeDto, PatchShadeDto};
 use somfy_domain::ShadeId;
-use somfy_mqtt::MAX_NAME_LEN;
 
 use crate::tasks::Mutex;
+
+/// Longest shade name this vocabulary carries, in bytes.
+///
+/// Thirty-two, which is `somfy_domain::ShadeConfig::name`'s own capacity and
+/// therefore the most a shade can be called. It used to be `somfy_mqtt`'s
+/// constant of the same value, and **that was a coupling rather than a
+/// coincidence**: an edit is a change to the shade table, not a message to a
+/// broker, so a build with no broker in it had no business needing a constant
+/// from one. Feature-gating the transports is what made the borrowing visible;
+/// see `crates/firmware/Cargo.toml`.
+pub const MAX_NAME_LEN: usize = 32;
 
 /// Edits waiting for the state task.
 ///
@@ -58,27 +69,51 @@ pub const EVENT_QUEUE_DEPTH: usize = 8;
 
 /// A change to the shade table, as asked for.
 ///
-/// **Nothing in this image constructs one yet**, and that is the honest state
-/// of it: the producer is the device's API surface, which is a separate piece
-/// of work. What is here is the consumer — the state task applies every variant
-/// below, persists it and tells the broker — so the API layer has a seam to
-/// send into rather than a registry to reach across.
+/// # One vocabulary, two ways of arriving
+///
+/// Every variant below is applied by exactly one function —
+/// [`crate::tasks::apply_edit`] — and there are two ways to reach it. The HTTP
+/// surface hands one over [`crate::rpc`] and waits for the answer, because
+/// `POST /api/v1/shades` owes the client the id and the address the device just
+/// allocated and no other party can produce them. Anything that does not need
+/// an answer sends one down [`EditChannel`] and carries on.
+///
+/// The difference is the *transport*, and it is a real one: a request/response
+/// protocol has somewhere to put a refusal and a fire-and-forget queue does
+/// not. What must never differ is what the edit *does*, which is why neither
+/// path contains any of it.
 #[allow(
     dead_code,
-    reason = "the producer is the API surface, which is not in this image yet; \
-              every variant is applied by `tasks::apply_edit`"
+    reason = "`Link` and `Unlink` have no producer yet — the wall-remote screen \
+              is a later piece of work — and both are applied by \
+              `tasks::apply_edit` exactly as the other three are"
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShadeEdit {
     /// Add a shade, allocating it an address from this controller's own space.
     ///
-    /// No address here, deliberately: the caller does not choose one. An
-    /// address is allocated once, by `somfy_domain::allocate_if_absent`, and
-    /// never moves — a motor paired at one address obeys that address, and
-    /// nothing in a one-way protocol can tell it otherwise.
+    /// No address in the request, deliberately: the caller does not choose one.
+    /// An address is allocated once, by `somfy_domain::allocate_with`, and never
+    /// moves — a motor paired at one address obeys that address, and nothing in
+    /// a one-way protocol can tell it otherwise. The configuration is built
+    /// *at* the allocated address by [`CreateShadeDto::to_config`], which is
+    /// also where every rule about what a shade may be lives.
     Add {
-        /// What to call it. The only thing a person supplies.
-        name: String<MAX_NAME_LEN>,
+        /// The request, unvalidated. It is validated where the address is
+        /// known, because one of the rules is about the address.
+        request: CreateShadeDto,
+    },
+    /// Change a shade that already exists.
+    ///
+    /// Carries the *patch*, not the resulting configuration, so that the
+    /// absent-means-unchanged rule is resolved against the shade's real current
+    /// state at the moment it is applied rather than against a copy taken when
+    /// the request arrived.
+    Reconfigure {
+        /// Which one.
+        id: ShadeId,
+        /// What to change.
+        patch: PatchShadeDto,
     },
     /// Remove a shade, and everything the broker holds for it.
     Remove {
@@ -125,6 +160,11 @@ pub enum ShadeEvent {
 }
 
 /// What the broker session did, for the state task to persist.
+#[allow(
+    dead_code,
+    reason = "the producer is the broker session, which a build without `mqtt` \
+              does not have; the state task applies both either way"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShadeAck {
     /// The entities are on the broker.
@@ -152,9 +192,11 @@ pub type EditReceiver = Receiver<'static, Mutex, ShadeEdit, EDIT_QUEUE_DEPTH>;
 /// The sending end of the event channel, as the state task holds it.
 pub type EventSender = Sender<'static, Mutex, ShadeEvent, EVENT_QUEUE_DEPTH>;
 /// The receiving end of the event channel, as the broker session holds it.
+#[allow(dead_code, reason = "held by the broker session, which `mqtt` gates")]
 pub type EventReceiver = Receiver<'static, Mutex, ShadeEvent, EVENT_QUEUE_DEPTH>;
 /// The sending end of the acknowledgement channel, as the broker session holds
 /// it.
+#[allow(dead_code, reason = "held by the broker session, which `mqtt` gates")]
 pub type AckSender = Sender<'static, Mutex, ShadeAck, EVENT_QUEUE_DEPTH>;
 /// The receiving end of the acknowledgement channel, as the state task holds
 /// it.

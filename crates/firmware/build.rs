@@ -14,8 +14,51 @@
 //! rules — app partitions on 64 KB boundaries, `data, ota` sized exactly
 //! 0x2000, overlaps, duplicate names, the 0x9000 floor. Everything this file
 //! adds is specific to this project.
+//!
+//! # It also compresses the web UI into the image
+//!
+//! The second half of this script has nothing to do with the table: it takes
+//! the three files `ui/dist/` holds and writes each of them into `OUT_DIR`
+//! twice — once as it stands and once gzipped — so that `src/api/assets.rs` can
+//! `include_bytes!` both and the server can answer `Accept-Encoding` honestly
+//! rather than sending compressed bytes to a client that never asked for them.
+//!
+//! Doing it here rather than committing the compressed files keeps one copy of
+//! the UI in the repository, and doing it here rather than in the UI's own
+//! build keeps the compression level a firmware decision — it is the firmware
+//! that pays for the bytes.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use esp_idf_part::{AppType, DataType, Partition, PartitionTable, SubType, Type};
+
+/// Where the built UI is, relative to this crate.
+///
+/// It is a build artefact — `/ui/dist` is in `.gitignore` — so a fresh checkout
+/// does not have it and this script says so rather than embedding nothing. A
+/// firmware image whose web UI silently became a 404 is exactly the kind of
+/// failure that is found by a person holding a browser, long after the build
+/// that caused it went green.
+const UI_DIST: &str = "../../ui/dist";
+
+/// The files the UI build is pinned to produce.
+///
+/// Hash-free and fixed at three by `ui/vite.config.ts`, which collapses every
+/// chunk into one JS file and one CSS file precisely so that this list can be
+/// written once. A file appearing or disappearing there is a change here too,
+/// and this list is what makes that a build failure rather than an asset that
+/// is quietly not served.
+const UI_FILES: &[&str] = &["index.html", "assets/app.css", "assets/app.js"];
+
+/// gzip level for the embedded copies.
+///
+/// Nine because nothing here is compressed at request time: the cost is paid
+/// once, on a developer's machine, and what it buys is flash and the bytes that
+/// cross a home Wi-Fi link on every page load. `ui/scripts/size.ts` measures the
+/// budget at the same level, so the figure it reports is the figure this
+/// embeds.
+const GZIP_LEVEL: u32 = 9;
 
 /// Where each pinned data region must stay, and what it costs to move it.
 ///
@@ -77,6 +120,90 @@ fn main() {
     check_ota_data(&table);
     check_no_factory(&table);
     check_fits_four_megabytes(&table);
+
+    embed_web_ui();
+}
+
+/// Copy each built UI file into `OUT_DIR`, and write a gzipped copy beside it.
+///
+/// Both, not just the compressed one. A client that does not send
+/// `Accept-Encoding: gzip` — `curl` out of the box, which is what this project
+/// debugs with — must not be handed compressed bytes labelled as HTML, and this
+/// device has no room to inflate them on the way out. Keeping the original is
+/// how the negotiation stays honest, and it is affordable: the three files are
+/// under 80 KB against the megabyte and a third the app slot has spare (the
+/// measurement is in `partitions.csv`).
+fn embed_web_ui() {
+    // Nothing to embed without the feature that serves it, and this is not
+    // merely an optimisation: a build script runs once per *crate*, so without
+    // this check `tx-check` — a bring-up harness with no network in it at all —
+    // would refuse to build until somebody had run `bun run build`. The `ui`
+    // feature is supposed to mean "no UI in this image", and that has to
+    // include not needing one to exist.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
+    if std::env::var_os("CARGO_FEATURE_UI").is_none() {
+        return;
+    }
+
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR"));
+    let dist = Path::new(UI_DIST);
+
+    // The directory as well as the files: a rebuild of the UI replaces them,
+    // and a `dist/` that has just appeared has to re-run this script rather
+    // than leave a previously-failed build cached.
+    println!("cargo:rerun-if-changed={UI_DIST}");
+
+    if !dist.is_dir() {
+        fail_ui(format_args!(
+            "there is no {UI_DIST}/ to embed.\n\
+             The web UI ships inside the firmware image — there is no filesystem on the device \
+             to read it from — so a build without it would produce a controller that answers \
+             404 at its own address.\n\
+             Build it first:  cd ui && bun install && bun run build"
+        ));
+    }
+
+    for name in UI_FILES {
+        let source = dist.join(name);
+        println!("cargo:rerun-if-changed={}", source.display());
+
+        let bytes = std::fs::read(&source).unwrap_or_else(|error| {
+            fail_ui(format_args!(
+                "{UI_DIST}/{name} could not be read ({error}).\n\
+                 `ui/vite.config.ts` pins the build to exactly these three hash-free files so \
+                 that the firmware's route table can be written once. If that config changed, \
+                 UI_FILES in this script has to change with it.\n\
+                 Rebuild it:  cd ui && bun run build"
+            ))
+        });
+
+        // Flattened, because `include_bytes!` wants one path per asset and a
+        // directory tree in OUT_DIR buys nothing: the names are fixed and
+        // distinct already.
+        let stem = name.rsplit('/').next().unwrap_or(name);
+        write_out(&out.join(stem), &bytes);
+        write_out(&out.join(format!("{stem}.gz")), &gzip(&bytes));
+    }
+}
+
+/// gzip one asset at [`GZIP_LEVEL`].
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+    encoder
+        .write_all(bytes)
+        .and_then(|()| encoder.finish())
+        .unwrap_or_else(|error| fail_ui(format_args!("the UI could not be compressed: {error}")))
+}
+
+/// Write one generated file, replacing whatever was there.
+fn write_out(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap_or_else(|error| {
+        fail_ui(format_args!(
+            "{} could not be written ({error})",
+            path.display()
+        ))
+    });
 }
 
 /// Every region that must not move is where it was.
@@ -189,4 +316,9 @@ fn check_fits_four_megabytes(table: &PartitionTable) {
 /// A build-script failure that reads as prose rather than as a stack trace.
 fn fail(message: std::fmt::Arguments<'_>) -> ! {
     panic!("\n\ncrates/firmware/partitions.csv: {message}\n\n");
+}
+
+/// The same, for the half of this script that embeds the web UI.
+fn fail_ui(message: std::fmt::Arguments<'_>) -> ! {
+    panic!("\n\ncrates/firmware: {message}\n\n");
 }

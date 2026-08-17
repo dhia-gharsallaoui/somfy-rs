@@ -72,6 +72,15 @@ test = false
 # Apache-2.0, last release 2025-04-16. A build dependency, so it is compiled for
 # the host and none of it reaches the image.
 esp-idf-part = "0.6"
+# Compresses `ui/dist/` into the image. A build dependency, so none of it is
+# linked into the firmware — the device never inflates anything, it serves the
+# bytes this produced. The reference for "the standard Rust DEFLATE crate":
+# 620,040,372 downloads (137,601,615 recent), MIT OR Apache-2.0, last release
+# 2026-02-03, and it lives under `rust-lang/`. `default-features = false` plus
+# `rust_backend` keeps it off `libz`/`zlib-ng`, so building this crate needs no
+# C toolchain and no system library — which matters because the three chip
+# targets already bring their own.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["unstable"] }
@@ -109,7 +118,7 @@ somfy-config = { path = "../somfy-config" }
 # Topic construction, config validation, HA discovery payloads, and the
 # lifecycle plans this crate's broker session executes. Everything decided
 # there is host-tested there; what is left here is the transport.
-somfy-mqtt = { path = "../somfy-mqtt" }
+somfy-mqtt = { path = "../somfy-mqtt", optional = true }
 # The MQTT client. Chosen from a survey of all 230 `mqtt`-keyword crates with
 # every no_std client's source read — see CLAUDE.md's evaluation table. It is
 # alloc-free with zero `unsafe` in its source, takes caller-owned fixed rx/tx
@@ -118,7 +127,7 @@ somfy-mqtt = { path = "../somfy-mqtt" }
 # false` drops its `defmt` default: this firmware logs through `esp-println`,
 # and a second logging framework would pull `defmt` and its transport into the
 # image for output nothing here reads.
-minimq = { version = "0.13", default-features = false }
+minimq = { version = "0.13", default-features = false, optional = true }
 # Embassy, by way of `esp-rtos`. NOT `esp-hal-embassy`: that crate's
 # `executors` feature turns on `esp-hal/__esp_hal_embassy`, a feature esp-hal
 # dropped in 1.0.0-rc.1, so no published version of it resolves against the
@@ -171,6 +180,39 @@ esp-alloc = { version = "0.10", features = ["internal-heap-stats"] }
 # same guarantee with the check removed. 3 KB of code, MIT/Apache-2.0, and
 # nothing else in the workspace needs it.
 static_cell = "2"
+# The web server and its WebSocket. Chosen over `edge-http`/`edge-ws` — see
+# CLAUDE.md's evaluation table — and both were proved to build for
+# `xtensa-esp32s3-none-elf` and `riscv32imc-unknown-none-elf` under
+# `build-std = ["core"]` before either was adopted. `default-features = false`
+# drops its `alloc` default: nothing on the request path allocates, and the heap
+# this image carries belongs to `esp-radio`.
+#
+# `embassy` supplies the `TcpSocket` listener and the timer; `json` supplies
+# `SocketTx::send_json` and the `Json` extractor over `serde-json-core`; `ws` is
+# the WebSocket. No `defmt` and no `log`: this firmware logs through
+# `esp-println`, and a second framework would pull its transport into the image
+# for output nothing here reads.
+picoserve = { version = "0.19", default-features = false, optional = true, features = [
+    "embassy",
+    "json",
+    "ws",
+] }
+# JSON in and out of fixed slices, with no allocator. Pinned to the same major
+# `picoserve` depends on so there is one copy: two would be two `Serialize`
+# traits, and the DTOs implement one of them.
+#
+# It is the only `no_std` serde JSON codec with real adoption — 4,129,193
+# downloads (486,496 recent), 198 stars, 74 forks, last push 2025-11-18, MIT OR
+# Apache-2.0 — and it is what makes the wire shape the *derive* rather than a
+# hand-written writer, so `ui/src/api/generated/` and what this device sends
+# cannot disagree.
+serde-json-core = { version = "0.6", default-features = false, optional = true }
+# The `Serialize` bound on this crate's own response types. Same version and
+# same `default-features = false` as `somfy-api` pins, so there is one serde.
+serde = { version = "1", default-features = false, optional = true }
+# The DTOs, their validation, and the status each rejection carries. Everything
+# decided there is host-tested there; what is left here is the transport.
+somfy-api = { path = "../somfy-api" }
 embassy-net = { version = "0.9.1", features = [
     "dhcpv4",
     "medium-ethernet",
@@ -184,7 +226,41 @@ embassy-net = { version = "0.9.1", features = [
 # tooling only once there is a lib target compiled for the host triple.
 
 [features]
-default = []
+# The ordinary build is the full one. A chip feature still has to be named on
+# top of these — there is no default chip, and there should not be.
+default = ["mqtt", "ui"]
+
+# The three transports, and **the reason they are features is not size.**
+#
+# Flash is a non-argument here: the ESP32 image is 632,640 bytes of a 2,031,616
+# slot and the whole web UI is 24 KiB gzipped. Two reasons hold.
+#
+# **They are a structural test of the one design rule this firmware has.** HTTP
+# and MQTT must reach the same functions rather than reimplementing each other,
+# and a feature gate proves it on every build: if `somfy-domain`, `somfy-tasks`
+# and this crate's own state task compile with `mqtt` off, `http` off and both
+# off, then no transport logic leaked into the core. A `#[cfg]` that has to
+# appear inside `StateMachine`, `ShadeEdit` or `tasks::apply_edit` is not a line
+# to write — it is the boundary being in the wrong place. Two of those were
+# found by turning these on for the first time, and both were fixed rather than
+# gated: `edits.rs` was borrowing `somfy_mqtt::MAX_NAME_LEN` for a constant that
+# is the domain's, and the state task's request seam was living inside the HTTP
+# module rather than beside the task it belongs to.
+#
+# **And on the ESP32 the web server does not fit.** That is measured, not
+# estimated: with `http` on, the DRAM left for the stack and the heap falls to
+# 57,236 bytes against a stack budget of 66,280 — the image does not link at
+# all, let alone leave the Wi-Fi driver its 47,464-byte working set. `src/heap.rs`
+# carries the arithmetic per chip. `http` is therefore off for that chip and on
+# for the two that have the DRAM.
+mqtt = ["dep:minimq", "dep:somfy-mqtt"]
+http = ["dep:picoserve", "dep:serde", "dep:serde-json-core"]
+# The UI implies the server, because a UI with nothing to serve it is not a
+# configuration anybody wants. The reverse is a real build: `http` without `ui`
+# is the API with no browser front end, which is what an integration or a
+# `curl`-driven test rig needs and what keeps 100 KB of assets out of an image
+# that will never serve them.
+ui = ["http"]
 
 # Three chips, two architectures, one configuration each. There is no feature
 # here that turns a part of the firmware off: every supported chip builds the

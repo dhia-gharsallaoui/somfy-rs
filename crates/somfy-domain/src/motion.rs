@@ -83,6 +83,40 @@ impl Motion {
         self.start_pos = s.pos;
     }
 
+    /// Re-anchor an in-progress move at where it has actually reached, keeping
+    /// the same target.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Motion::tick`] computes position **absolutely** from `start_pos`,
+    /// `move_start_ms` and the travel time — it does not integrate
+    /// incrementally. That is deliberate and it is what makes the estimate
+    /// immune to a missed tick, but it means the travel time is read as though
+    /// it had applied for the whole move. So changing a travel time *while a
+    /// shade is moving* re-interprets everything that already happened.
+    ///
+    /// Concretely, and this is the case it was written for: a shade travelling
+    /// down with a 30 s time is 10 s in, so about 33% closed. An operator
+    /// times it with a stopwatch and saves 10 s — which is the whole of the
+    /// calibration workflow the position-accuracy requirements ask for. The
+    /// next tick computes `elapsed = 10000`, clamps it to the new
+    /// `travel_ms = 10000`, and reports **arrived, fully closed**: the
+    /// controller plans a stop that halts the motor at 33% and then tells
+    /// everybody the shade is shut.
+    ///
+    /// Re-anchoring first makes the new time apply only to the travel that has
+    /// not happened yet, which is the only reading of it that can be right —
+    /// nothing knows what the *old* number should have been.
+    pub fn reanchor(&mut self, now_ms: u64, up_time_ms: u32, down_time_ms: u32) {
+        // Advance to where the *old* travel times say it is, then treat that as
+        // the new starting point. The order matters: reading the position after
+        // the config changed would be reading it through the very number that
+        // has just moved.
+        let snapshot = self.tick(now_ms, up_time_ms, down_time_ms);
+        self.start_pos = snapshot.pos;
+        self.move_start_ms = now_ms;
+    }
+
     /// Advance the estimate for one tick, applying the direction-specific
     /// integration formula below (downward and upward travel are
     /// integrated from opposite ends, see the branches inline).
