@@ -36,6 +36,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { ApiErrorDto } from '../src/api/generated/ApiErrorDto.ts';
+import type { CalibrationStepDto } from '../src/api/generated/CalibrationStepDto.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
 import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
 import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
@@ -59,6 +60,7 @@ const KNOWN_ACTIONS: Record<CommandAction, true> = {
   stepDown: true,
   goTo: true,
   setMy: true,
+  vent: true,
 };
 
 /**
@@ -77,6 +79,13 @@ const KNOWN_ACTIONS: Record<CommandAction, true> = {
  *   address belongs to another controller — so it is a conflict with resource
  *   state rather than a malformed body, and a UI that highlighted a form field
  *   over it would be pointing at nothing.
+ * - **`ventBandNotMeasured` is 409 for the same reason.** `{"action":"vent"}` is
+ *   a well-formed request; what makes it inapplicable is that the shade's
+ *   slat-separation band has never been measured, and the vent position *is*
+ *   that number.
+ * - **`notCalibrating` is 409, not 400.** Marking or finishing a run that is not
+ *   running is a conflict with the shade's state, not a bad body — and it is
+ *   what a stale browser tab produces, so it must not read as a client bug.
  */
 const ERROR_STATUS: Record<ApiErrorCode, number> = {
   nameEmpty: 400,
@@ -88,6 +97,10 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   registryFull: 409,
   notFound: 404,
   addressNotAllocated: 409,
+  invalidDeadBand: 400,
+  ventBandNotMeasured: 409,
+  notCalibrating: 409,
+  calibrationImplausible: 400,
 };
 
 export function mockApi(): Plugin {
@@ -228,9 +241,20 @@ async function handle(
           : undefined;
 
     if (applied === undefined) return sendJson(response, 404, { error: 'no such collection' });
-    return applied
-      ? sendNoContent(response)
+    if (applied) return sendNoContent(response);
+    // A shade that exists refuses a vent only when its slat-separation band has
+    // never been measured, which is the one refusal this route has that is not
+    // "no such target".
+    return collection === 'shades' && command.action === 'vent' && world.getShade(id) !== undefined
+      ? sendError(response, 'ventBandNotMeasured')
       : sendJson(response, 404, { error: 'no such target' });
+  }
+
+  if (method === 'POST' && collection === 'shades' && action === 'calibrate') {
+    const step = parseCalibrationStep(await readJson(request));
+    if (!step) return sendJson(response, 400, { error: 'malformed calibration step' });
+    const outcome = world.calibrate(id, step);
+    return 'error' in outcome ? sendError(response, outcome.error) : sendNoContent(response);
   }
 
   return sendJson(response, 404, { error: 'no such route' });
@@ -258,6 +282,41 @@ function parseCommand(value: unknown): CommandDto | undefined {
       return typeof position === 'number' ? { action: 'setMy', position } : undefined;
     default:
       return { action: action as Exclude<CommandAction, 'goTo' | 'setMy'> };
+  }
+}
+
+/** Every step tag the generated {@link CalibrationStepDto} union carries. */
+type CalibrationStep = CalibrationStepDto['step'];
+
+/**
+ * The same drift gate as {@link KNOWN_ACTIONS}, for the calibration
+ * conversation: a step added in Rust grows this union and fails `tsc` here.
+ */
+const KNOWN_STEPS: Record<CalibrationStep, true> = {
+  begin: true,
+  mark: true,
+  finish: true,
+  cancel: true,
+};
+
+/**
+ * Shape-check an inbound calibration step, as `somfy-api`'s hand-written
+ * `Deserialize` does: `begin` without a leg and `mark` without a mark are
+ * malformed rather than defaulted — guessing a direction would drive a shade the
+ * wrong way across its whole range.
+ */
+function parseCalibrationStep(value: unknown): CalibrationStepDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { step, leg, mark } = value as { step?: unknown; leg?: unknown; mark?: unknown };
+  if (typeof step !== 'string' || !(step in KNOWN_STEPS)) return undefined;
+
+  switch (step as CalibrationStep) {
+    case 'begin':
+      return leg === 'up' || leg === 'down' ? { step: 'begin', leg } : undefined;
+    case 'mark':
+      return mark === 'motionBegan' || mark === 'curtainMoved' ? { step: 'mark', mark } : undefined;
+    default:
+      return { step: step as Exclude<CalibrationStep, 'begin' | 'mark'> };
   }
 }
 

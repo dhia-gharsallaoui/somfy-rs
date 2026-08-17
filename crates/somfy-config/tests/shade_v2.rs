@@ -212,7 +212,7 @@ fn the_fixture_carries_the_checksum_the_previous_build_computed() {
 fn a_migrated_record_re_encodes_as_the_current_version_and_keeps_its_confirmations() {
     let migrated = ShadeRecord::decode(&v2_record()).expect("readable");
     let bytes = migrated.encode();
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
 
     let rewritten = ShadeRecord::decode(&bytes).expect("its own output is readable");
     assert_eq!(rewritten, migrated);

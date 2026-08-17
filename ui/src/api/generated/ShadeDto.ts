@@ -29,4 +29,46 @@ import type { PairingState } from "./PairingState";
  * seconds of Up travel off the closed limit. See the note on
  * [`crate::PatchShadeDto`].
  */
-export type ShadeDto = { id: number, name: string, address: number, addressOrigin: AddressOrigin, pairingState: PairingState, kind: number, tiltMode: number, position: number, target: number, tiltPosition: number, myPosition: number | null, direction: number, upTimeMs: number, upTimeSource: CalibrationSource, downTimeMs: number, downTimeSource: CalibrationSource, tiltTimeMs: number, tiltTimeSource: CalibrationSource, };
+export type ShadeDto = { id: number, name: string, address: number, addressOrigin: AddressOrigin, pairingState: PairingState, kind: number, tiltMode: number, position: number, target: number, tiltPosition: number, myPosition: number | null, direction: number, upTimeMs: number, upTimeSource: CalibrationSource, downTimeMs: number, downTimeSource: CalibrationSource, tiltTimeMs: number, tiltTimeSource: CalibrationSource, 
+/**
+ * Milliseconds between a command being sent and the motor moving. See
+ * [`somfy_domain::ShadeConfig::start_lag_ms`].
+ */
+startLagMs: number, 
+/**
+ * Milliseconds an Up command spends separating the slats at the closed
+ * limit, and therefore where `vent` stops. Zero means it has never been
+ * measured, and `vent` is refused until it has. See
+ * [`somfy_domain::ShadeConfig::vent_band_ms`].
+ */
+ventBandMs: number, 
+/**
+ * Milliseconds a Down command spends compressing the slats after the
+ * curtain has reached the sill. See
+ * [`somfy_domain::ShadeConfig::close_band_ms`].
+ */
+closeBandMs: number, 
+/**
+ * How far `position` may be from the truth, in whole percent.
+ *
+ * `0` means the estimate was last set by a physical limit — the one thing a
+ * one-way protocol can be sure of — and `100` means it says nothing at all.
+ * It is what turns a confidently wrong "60%" into an honest "≈60%", and on
+ * a shade still carrying factory travel times it saturates after the first
+ * partial move, which is the correct report rather than a defect.
+ *
+ * **Derived, never stored and never accepted from a client**, like
+ * `addressOrigin`: it is a fact about how the estimate was arrived at.
+ *
+ * # There is deliberately no `calibrating` beside it
+ *
+ * A guided calibration run is a conversation with the operator who started
+ * it, and the screen driving it already knows it is running. What a *second*
+ * viewer would gain from the field is a spinner; what it would cost is a
+ * per-shade slot for something at most one shade uses at a time, on a device
+ * where the whole shade table is copied about five times onto the boot stack
+ * (`crates/firmware/src/heap.rs`). A stale tab is answered instead by
+ * [`crate::ApiErrorCode::NotCalibrating`], which is the honest reply and
+ * costs nothing.
+ */
+positionUncertainty: number, };

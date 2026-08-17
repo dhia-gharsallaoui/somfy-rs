@@ -31,6 +31,10 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   registryFull: 'error.registryFull',
   notFound: 'error.notFound',
   addressNotAllocated: 'error.addressNotAllocated',
+  invalidDeadBand: 'error.invalidDeadBand',
+  ventBandNotMeasured: 'error.ventBandNotMeasured',
+  notCalibrating: 'error.notCalibrating',
+  calibrationImplausible: 'error.calibrationImplausible',
 };
 
 /**

@@ -89,8 +89,9 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    DomainError, FrameWidth, PairingState, RadioProtocol, ShadeConfig, ShadeId, ShadeKind,
-    TiltMode, MAX_SHADES,
+    CalibrationSource, DomainError, FrameWidth, PairingState, RadioProtocol, ShadeConfig, ShadeId,
+    ShadeKind, TiltMode, DEAD_BAND_RESOLUTION_MS, FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS,
+    FACTORY_UP_TIME_MS, MAX_SHADES, START_LAG_RESOLUTION_MS,
 };
 use somfy_rts::RollingCode;
 
@@ -139,7 +140,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"RTSS");
 /// has no reader for is reported as such rather than as damage, so a later
 /// implementation can migrate instead of erasing shades it does not recognise —
 /// and [`VERSION_INITIAL`] is what that promise was written for.
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 
 /// The first layout, still readable: no `announced` word, entries at
 /// [`HEADER_LEN_V1`], and no frame width or protocol in an entry.
@@ -160,6 +161,15 @@ const VERSION_ANNOUNCED: u16 = 2;
 /// layouts are still read at their own offsets. See this module's docs for what
 /// a record without the byte is taken to mean.
 const VERSION_PAIRING: u16 = 3;
+
+/// The version that added the per-shade calibration block: where each travel
+/// time came from, the start lag, and the two dead bands at the closed limit.
+///
+/// It is the first change here that could not be made inside an entry, because
+/// an entry was already full to the byte — 24 bytes of fields and a 32-byte
+/// name is exactly [`ENTRY_LEN`]. So it is a parallel array instead, and it is
+/// paid for out of the linked-remote pool: see [`MAX_LINKS`].
+const VERSION_CALIBRATION: u16 = 4;
 
 const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -213,7 +223,66 @@ const LINK_LEN: usize = 4;
 /// **This is a real limit, not a theoretical one:** 32 shades with two wall
 /// remotes each is 64 links and does not fit. It is refused at the push rather
 /// than dropped at the write, which is this crate's posture everywhere else.
-pub const MAX_LINKS: usize = (OFF_CRC - OFF_LINKS) / LINK_LEN;
+///
+/// # It shrank from 58 to 26 at version 4, and that is a real cost
+///
+/// "Whatever is left over" got smaller: the calibration block took 128 bytes,
+/// and it had to, because an entry was already full to the byte and the values
+/// it carries are what R7 and R8 of the position-accuracy requirements make
+/// mandatory. There was no third option — the two rejected above are rejected
+/// for the same reasons they always were, and 2048 is fixed by the slot buffer
+/// standing on the boot stack.
+///
+/// What it costs, precisely: a record written by an older build that holds more
+/// than 26 links **cannot be re-written by this one** and is refused with
+/// [`ShadeRecordError::LinkCount`] rather than truncated — this crate does not
+/// silently drop a wall remote, because a dropped link is an estimate that
+/// stops being corrected and nothing says why. No such record has ever been
+/// written: the pool arrived one version ago, and the estate it arrived for has
+/// three shades.
+///
+/// **What would give it back:** a 4096-byte slot, which the module docs above
+/// price against the stack, or moving the pool into a region of its own.
+pub const MAX_LINKS: usize = OFF_CALIBRATION.saturating_sub(OFF_LINKS) / LINK_LEN;
+
+/// What [`MAX_LINKS`] was before [`VERSION_CALIBRATION`] took 128 bytes for the
+/// calibration block: the pool ran all the way to the checksum.
+///
+/// Kept so that a record written by an older build is read against **its own**
+/// bound rather than this build's, which is the same rule the entry offsets
+/// already follow.
+const MAX_LINKS_V3: usize = (OFF_CRC - OFF_LINKS) / LINK_LEN;
+
+/// Bytes one shade's calibration occupies. See [`CAL_SOURCES`] for the layout.
+const CAL_LEN: usize = 4;
+
+/// The calibration block: one [`CAL_LEN`]-byte row per registry slot, sitting at
+/// the far end of the record so that everything an older layout knows about
+/// stays exactly where it was.
+///
+/// Anchored to [`OFF_CRC`] rather than to the entries for that reason: growing
+/// it eats the linked-remote pool from the top, and moves nothing else.
+const OFF_CALIBRATION: usize = OFF_CRC - SHADE_TABLE_CAPACITY * CAL_LEN;
+
+// Offsets within one calibration row.
+/// Where each of the three travel times came from, two bits each: up in bits
+/// 0-1, down in 2-3, tilt in 4-5. Bits 6-7 are spare and written zero.
+///
+/// Packed rather than a byte each because the row is paid for out of the
+/// linked-remote pool at 32 rows a byte, and this is the one field that
+/// compresses without losing anything: the values are a three-way choice.
+const CAL_SOURCES: usize = 0;
+/// Start lag, in units of `somfy_domain::START_LAG_RESOLUTION_MS`.
+const CAL_START_LAG: usize = 1;
+/// Slat-separation band, in units of `somfy_domain::DEAD_BAND_RESOLUTION_MS`.
+const CAL_VENT_BAND: usize = 2;
+/// Slat-compression band, in the same units.
+const CAL_CLOSE_BAND: usize = 3;
+
+/// Bits one packed [`CalibrationSource`] occupies in [`CAL_SOURCES`].
+const CAL_SOURCE_BITS: u32 = 2;
+/// Mask for one packed [`CalibrationSource`].
+const CAL_SOURCE_MASK: u8 = (1 << CAL_SOURCE_BITS) - 1;
 
 /// Linked remotes **one shade** may have — the domain's own bound, restated so
 /// a record cannot deliver a shade [`Shade::link_remote`](somfy_domain::Shade::link_remote) would then refuse.
@@ -278,8 +347,32 @@ const _: () = assert!(
 // The pool is defined as "whatever is left", so this is the statement that
 // nothing is left over and nothing overlaps the checksum.
 const _: () = assert!(
-    OFF_LINKS + MAX_LINKS * LINK_LEN == OFF_CRC,
-    "the linked-remote pool must fill the record exactly, up to the checksum"
+    OFF_LINKS + MAX_LINKS * LINK_LEN == OFF_CALIBRATION,
+    "the linked-remote pool must fill the record exactly, up to the calibration block"
+);
+// The calibration block is anchored to the checksum and sized by the table, so
+// "it reaches the checksum" is true by construction and would be a tautology to
+// assert. What is *not* automatic is that it leaves a pool behind it, and that
+// the pool is still worth having — the block grows downward into it, so a wider
+// row eats links a shade later cannot store.
+//
+// The floor is one shade's full complement rather than "more than nothing": a
+// record that could not hold `MAX_LINKED_REMOTES` for a single shade would
+// refuse a link the domain accepts, which is the class of disagreement this
+// whole file exists to prevent.
+const _: () = assert!(
+    OFF_LINKS <= OFF_CALIBRATION,
+    "the calibration block must not overlap the linked-remote pool"
+);
+const _: () = assert!(
+    MAX_LINKS >= MAX_LINKED_REMOTES,
+    "the calibration block has eaten so much of the linked-remote pool that one \
+     shade can no longer hold the remotes the domain lets it link"
+);
+// Three two-bit fields have to fit the byte that packs them.
+const _: () = assert!(
+    3 * CAL_SOURCE_BITS <= u8::BITS,
+    "a calibration row packs three sources into one byte"
 );
 // A pool word carries the row in its top byte, so the table cannot be wider
 // than a byte — and it is not, but the word says so rather than the reader
@@ -612,6 +705,21 @@ pub enum ShadeRecordError {
         /// The byte the record carried.
         raw: u8,
     },
+    /// A calibration row's packed provenance byte holds a value outside the
+    /// three [`CalibrationSource`] has.
+    ///
+    /// Reported rather than defaulted for the same reason the pairing byte is:
+    /// both plausible defaults are wrong in a way somebody pays for. Calling a
+    /// measured value "factory default" invites an operator to re-run a
+    /// calibration that was already right; calling a factory default "measured"
+    /// is the exact misreport that let a 25%-open command move a shade 1% and
+    /// took an afternoon to diagnose.
+    Calibration {
+        /// Which entry.
+        index: usize,
+        /// The packed byte the record carried.
+        raw: u8,
+    },
     /// The entry decoded and the shade it describes would have been refused had
     /// it been entered by hand.
     Shade {
@@ -723,6 +831,20 @@ impl ShadeRecord {
             let name = config.name.as_bytes();
             entry[ENTRY_NAME_LEN] = name.len() as u8;
             entry[ENTRY_NAME..ENTRY_NAME + name.len()].copy_from_slice(name);
+
+            // The calibration row, in the parallel block at the far end of the
+            // record. Same index as the entry; see `OFF_CALIBRATION` for why it
+            // is not part of the entry.
+            let at = OFF_CALIBRATION + index * CAL_LEN;
+            let row = &mut bytes[at..at + CAL_LEN];
+            row[CAL_SOURCES] = pack_sources(config);
+            // Exact divisions: both values are rounded onto their resolution at
+            // every boundary they enter through (`somfy_domain::round_start_lag_ms`
+            // and `round_dead_band_ms`), which is what keeps what the device is
+            // running equal to what a reboot would load.
+            row[CAL_START_LAG] = (config.start_lag_ms as u32 / START_LAG_RESOLUTION_MS) as u8;
+            row[CAL_VENT_BAND] = (config.vent_band_ms as u32 / DEAD_BAND_RESOLUTION_MS) as u8;
+            row[CAL_CLOSE_BAND] = (config.close_band_ms as u32 / DEAD_BAND_RESOLUTION_MS) as u8;
         }
 
         let checksum = CRC.checksum(&bytes[..OFF_CRC]);
@@ -785,7 +907,13 @@ impl ShadeRecord {
             Some(_) => {
                 let claimed =
                     u16::from_le_bytes([bytes[OFF_LINK_COUNT], bytes[OFF_LINK_COUNT + 1]]);
-                if claimed as usize > MAX_LINKS {
+                // Two bounds, and both have to hold. The layout's own is what
+                // the record was written against; `MAX_LINKS` is what this build
+                // can hold and re-write. They differ only for a record from
+                // before the pool was shortened, and a count between them is
+                // refused rather than truncated — see [`MAX_LINKS`] for why a
+                // silently dropped wall remote is the worse failure.
+                if claimed as usize > layout.max_links || claimed as usize > MAX_LINKS {
                     return Err(ShadeRecordError::LinkCount(claimed));
                 }
                 claimed as usize
@@ -826,7 +954,7 @@ impl ShadeRecord {
         // the shades themselves.
         let mut seen: [u32; SHADE_TABLE_CAPACITY] = [0; SHADE_TABLE_CAPACITY];
         for index in 0..header.count {
-            let shade = decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?;
+            let shade = decode_entry(bytes, header.layout, index)?;
             // A repeated address makes the table ambiguous, and the registry
             // would answer it by refusing the second shade — which is a
             // provisioned shade vanishing with only a log line to say so.
@@ -847,10 +975,7 @@ impl ShadeRecord {
 
         // Second pass, reached only once every entry above was accepted.
         for index in 0..header.count {
-            visit(
-                index,
-                decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?,
-            );
+            visit(index, decode_entry(bytes, header.layout, index)?);
         }
         Ok(header)
     }
@@ -870,9 +995,7 @@ impl ShadeRecord {
         let header = ShadeRecord::header(bytes)?;
         let mut seen: [u32; SHADE_TABLE_CAPACITY] = [0; SHADE_TABLE_CAPACITY];
         for (index, address) in seen.iter_mut().enumerate().take(header.count) {
-            *address = decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?
-                .config
-                .address;
+            *address = decode_entry(bytes, header.layout, index)?.config.address;
         }
         check_links(bytes, &header, &seen)?;
         for index in 0..header.links {
@@ -991,6 +1114,14 @@ pub struct Layout {
     /// that predates it, where the byte is zero and zero would be the wrong
     /// answer — see [`ENTRY_PAIRING`].
     per_shade_pairing: bool,
+    /// Byte offset of the calibration block, or `None` in a version that
+    /// predates it. See [`decode_calibration`] for what a record without one is
+    /// taken to mean.
+    calibration: Option<usize>,
+    /// Linked remotes this version's pool can hold. Not a constant, because
+    /// [`VERSION_CALIBRATION`] shortened the pool and an older record's links
+    /// still run to where its own pool ended.
+    max_links: usize,
 }
 
 impl Layout {
@@ -1004,6 +1135,8 @@ impl Layout {
                 links: None,
                 per_shade_radio: false,
                 per_shade_pairing: false,
+                calibration: None,
+                max_links: 0,
             }),
             VERSION_ANNOUNCED => Some(Layout {
                 entries: OFF_ENTRIES,
@@ -1011,6 +1144,8 @@ impl Layout {
                 links: Some(OFF_LINKS),
                 per_shade_radio: true,
                 per_shade_pairing: false,
+                calibration: None,
+                max_links: MAX_LINKS_V3,
             }),
             VERSION_PAIRING => Some(Layout {
                 entries: OFF_ENTRIES,
@@ -1018,6 +1153,17 @@ impl Layout {
                 links: Some(OFF_LINKS),
                 per_shade_radio: true,
                 per_shade_pairing: true,
+                calibration: None,
+                max_links: MAX_LINKS_V3,
+            }),
+            VERSION_CALIBRATION => Some(Layout {
+                entries: OFF_ENTRIES,
+                announced: Some(OFF_ANNOUNCED),
+                links: Some(OFF_LINKS),
+                per_shade_radio: true,
+                per_shade_pairing: true,
+                calibration: Some(OFF_CALIBRATION),
+                max_links: MAX_LINKS,
             }),
             _ => None,
         }
@@ -1053,10 +1199,11 @@ fn entry_at(bytes: &[u8; SHADE_RECORD_LEN], layout: Layout, index: usize) -> &[u
 
 /// One entry's bytes as a shade, or which field was wrong and in which entry.
 fn decode_entry(
-    entry: &[u8],
+    bytes: &[u8; SHADE_RECORD_LEN],
     layout: Layout,
     index: usize,
 ) -> Result<StoredShade, ShadeRecordError> {
+    let entry = entry_at(bytes, layout, index);
     let name_len = entry[ENTRY_NAME_LEN] as usize;
     if name_len > MAX_NAME_LEN {
         return Err(ShadeRecordError::NameLength {
@@ -1129,11 +1276,107 @@ fn decode_entry(
         PairingState::ConfirmedByOperator
     };
 
+    decode_calibration(bytes, layout, index, &mut config)?;
+
     let initial_code = RollingCode(u16::from_le_bytes([
         entry[ENTRY_CODE],
         entry[ENTRY_CODE + 1],
     ]));
     StoredShade::new(config, initial_code).map_err(|error| ShadeRecordError::Shade { index, error })
+}
+
+/// The three [`CalibrationSource`]s packed into one byte, two bits each.
+fn pack_sources(config: &ShadeConfig) -> u8 {
+    let mut packed = 0u8;
+    for (slot, source) in [
+        config.up_time_source,
+        config.down_time_source,
+        config.tilt_time_source,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        packed |= (source as u8) << (slot as u32 * CAL_SOURCE_BITS);
+    }
+    packed
+}
+
+/// Read one shade's calibration row into `config`.
+///
+/// # What a record from before the block existed is taken to mean
+///
+/// Two different answers, because the two halves are not the same kind of
+/// unknown.
+///
+/// **The provenance is reconstructed the way it always was**: a travel time
+/// equal to what a shade is created with is a value nobody chose, and anything
+/// else is a value somebody typed. That is exactly the rule the API applied
+/// before this block existed, so a board upgrading into version 4 reports the
+/// same three sources it reported yesterday, and the field it gains is the
+/// ability to say `Measured` — which nothing could produce before because
+/// nothing could store it.
+///
+/// **The lag and the bands are read as zero**, because zero is not a guess
+/// here: it is the un-compensated linear model, which is precisely what those
+/// boards have been running. Substituting a plausible dead band would move every
+/// estimate on the strength of a number nobody measured, which is the failure
+/// this whole area exists to end.
+fn decode_calibration(
+    bytes: &[u8; SHADE_RECORD_LEN],
+    layout: Layout,
+    index: usize,
+    config: &mut ShadeConfig,
+) -> Result<(), ShadeRecordError> {
+    let Some(offset) = layout.calibration else {
+        config.up_time_source = derived_source(config.up_time_ms, FACTORY_UP_TIME_MS);
+        config.down_time_source = derived_source(config.down_time_ms, FACTORY_DOWN_TIME_MS);
+        config.tilt_time_source = derived_source(config.tilt_time_ms, FACTORY_TILT_TIME_MS);
+        config.start_lag_ms = 0;
+        config.vent_band_ms = 0;
+        config.close_band_ms = 0;
+        return Ok(());
+    };
+    // Panic-free by construction: `index` is below a `count` the header has
+    // bounded by `SHADE_TABLE_CAPACITY`, and the block holds that many rows
+    // (asserted at compile time above).
+    let row = &bytes[offset + index * CAL_LEN..offset + (index + 1) * CAL_LEN];
+
+    let packed = row[CAL_SOURCES];
+    let mut sources = [CalibrationSource::FactoryDefault; 3];
+    for (slot, source) in sources.iter_mut().enumerate() {
+        let raw = (packed >> (slot as u32 * CAL_SOURCE_BITS)) & CAL_SOURCE_MASK;
+        *source = CalibrationSource::from_raw(raw)
+            .ok_or(ShadeRecordError::Calibration { index, raw: packed })?;
+    }
+    config.up_time_source = sources[0];
+    config.down_time_source = sources[1];
+    config.tilt_time_source = sources[2];
+
+    config.start_lag_ms = (row[CAL_START_LAG] as u32 * START_LAG_RESOLUTION_MS) as u16;
+    config.vent_band_ms = (row[CAL_VENT_BAND] as u32 * DEAD_BAND_RESOLUTION_MS) as u16;
+    config.close_band_ms = (row[CAL_CLOSE_BAND] as u32 * DEAD_BAND_RESOLUTION_MS) as u16;
+
+    // The same judgement the API and the provisioning tool make, restated here
+    // for the same reason every other rule in this file is restated: flash must
+    // not be able to deliver a shade whose lag and band leave no travel behind
+    // them, because the estimator answers that by reporting every move as
+    // instantly arrived.
+    config
+        .checked_bands()
+        .map_err(|error| ShadeRecordError::Shade {
+            index,
+            error: ShadeError::Domain(error),
+        })
+}
+
+/// The pre-version-4 rule: a travel time equal to the factory default is one
+/// nobody chose.
+fn derived_source(value_ms: u32, factory_ms: u32) -> CalibrationSource {
+    if value_ms == factory_ms {
+        CalibrationSource::FactoryDefault
+    } else {
+        CalibrationSource::OperatorSupplied
+    }
 }
 
 /// Four bytes at `at` within one entry. Panic-free by construction: every call
@@ -1390,9 +1633,21 @@ mod tests {
         assert_eq!(ENTRY_LEN, 56);
         assert_eq!(SHADE_TABLE_CAPACITY, 32);
         assert_eq!(HEADER_LEN, 20);
-        assert_eq!(MAX_LINKS, 58);
+        assert_eq!(CAL_LEN, 4);
+        assert_eq!(MAX_LINKS, 26);
+        // What version 3 had, and what a record written by that build is still
+        // read against. The gap between the two is the calibration block.
+        assert_eq!(MAX_LINKS_V3, 58);
         assert_eq!(
-            HEADER_LEN + SHADE_TABLE_CAPACITY * ENTRY_LEN + MAX_LINKS * LINK_LEN + CRC_LEN,
+            (MAX_LINKS_V3 - MAX_LINKS) * LINK_LEN,
+            SHADE_TABLE_CAPACITY * CAL_LEN,
+        );
+        assert_eq!(
+            HEADER_LEN
+                + SHADE_TABLE_CAPACITY * ENTRY_LEN
+                + MAX_LINKS * LINK_LEN
+                + SHADE_TABLE_CAPACITY * CAL_LEN
+                + CRC_LEN,
             SHADE_RECORD_LEN,
         );
     }

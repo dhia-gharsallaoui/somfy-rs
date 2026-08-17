@@ -51,36 +51,36 @@
  * can be cleared is `myPosition`, which is excluded above for its own
  * reasons.
  *
- * # No dead-band field, deliberately
+ * # The dead-band fields, and why they are here now
  *
- * R8 records that the first ~4 s of Up travel off the closed limit separates
- * the slats without lifting the curtain — about 13% of a 30 s traverse — and
- * requires the model to carry a per-direction dead band at the closed limit.
- * **No such field is added here, because the spec says the mechanism is not
- * yet established and the two candidates need opposite handling.**
+ * This DTO used to carry a note saying there was deliberately **no** dead-band
+ * field, because two mechanisms could produce the reported symptom — a
+ * mechanical band during ordinary travel, or a distinct tilt operation selected
+ * by burst length — and the estimator would have to do opposite things with an
+ * identical number.
  *
- * If it is a *mechanical* dead band, the estimator must subtract that time
- * from lift travel: it happens during every ordinary traverse. If instead
- * these motors honour the reference's `euromode`, where burst length selects
- * the operation, then the same seconds are a *separate command's* effect that
- * a full-length burst never produces, and subtracting them from lift travel
- * would corrupt every estimate. The number would be identical and what the
- * estimator must do with it is opposite, so a field named for it is not a
- * neutral placeholder — it is an unresolved question with somewhere to write
- * a value.
+ * The spec settled it by elimination on 2026-08-17: this project's ordinary
+ * commands are three-frame bursts and these motors complete full traverses from
+ * them, which cannot be true of a motor that reads a short burst as a slat
+ * operation. So it is mechanical, and there are three fields rather than one,
+ * because two intervals of a traverse move nothing and they are not the same
+ * interval:
  *
- * Waiting costs nothing structurally, and this is worth stating because it is
- * what makes deferring safe rather than merely cautious:
+ * - `startLagMs` — before the motor moves at all, at the start of any move.
+ * - `ventBandMs` — separating the slats when leaving the closed limit upward.
+ *   Also where [`crate::CommandDto::Vent`] stops, which is the only thing that
+ *   command needs to know.
+ * - `closeBandMs` — compressing them at the end of a full close.
  *
- * - the euromode answer needs **no new field at all** — `tiltMode` already
- *   carries `EuroMode` as a discriminant, and what is missing is tilt
- *   *commands*, which this generation deliberately does not have;
- * - the mechanical answer needs **one additive field** on this DTO and on
- *   [`crate::ShadeDto`], which is exactly the shape `addressOrigin` was added
- *   in and breaks nothing.
+ * All three are **parts of** the travel times rather than additions to them, so
+ * setting one does not silently change what a stored `upTimeMs` means. Each is
+ * rounded onto the resolution its measurement actually has — see
+ * [`somfy_domain::round_start_lag_ms`] — and what comes back from a subsequent
+ * `GET` is the rounded value, because that is the number the device is running.
  *
- * The spec calls the deciding test cheap — send a short Up burst from fully
- * closed and watch whether it stops after the slats separate or runs to the
- * limit — and notes it transmits at a real motor, so it is the owner's to run.
+ * They are settable by hand for the same reason the travel times are, and R9
+ * makes it a MUST: a sweep moves the shade through its full range, which is not
+ * always acceptable, and a measurement with nothing to check itself against is
+ * one nobody can catch being wrong.
  */
-export type PatchShadeDto = { name?: string, kind?: number, tiltMode?: number, upTimeMs?: number, downTimeMs?: number, tiltTimeMs?: number, };
+export type PatchShadeDto = { name?: string, kind?: number, tiltMode?: number, upTimeMs?: number, downTimeMs?: number, tiltTimeMs?: number, startLagMs?: number, ventBandMs?: number, closeBandMs?: number, };

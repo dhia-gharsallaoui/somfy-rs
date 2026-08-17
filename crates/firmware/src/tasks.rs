@@ -38,7 +38,7 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
 use heapless::{String, Vec};
-use somfy_api::{ApiErrorCode, GroupDto, RoomDto, ShadeDto};
+use somfy_api::{ApiErrorCode, CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
 use somfy_config::{Catalog, CatalogError};
 use somfy_domain::{
     allocate_with, AllocateError, DomainError, GroupId, Registry, RemoteIdentity, RoomId,
@@ -508,11 +508,18 @@ fn serve_request(
         rpc::Request::Command(command) => {
             match run_command(machine, store, queue, command, now_ms, emitted) {
                 Ok(dispatched) => (rpc::Reply::Done, dispatched),
-                // Every refusal a movement can draw is about the target not
-                // being there — `command_shade` and `command_group` both start
-                // by looking it up. Anything else is this device's fault and
-                // has just been logged by `run_command`.
+                // Two refusals a movement can draw are about the *request*
+                // rather than about this device, and each needs its own code so
+                // the UI can say something a person can act on: the target is
+                // not there, or a vent was asked for on a shade whose
+                // slat-separation band has never been measured. Anything else is
+                // this device's fault and has just been logged by
+                // `run_command`.
                 Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+                Err(DomainError::VentBandNotMeasured) => (
+                    rpc::Reply::Refused(ApiErrorCode::VentBandNotMeasured),
+                    false,
+                ),
                 Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress), false),
             }
         }
@@ -540,6 +547,61 @@ fn serve_request(
                 }
             }
         },
+        // A calibration is the one request whose four steps do different
+        // amounts of work: two of them transmit nothing, one queues a traverse,
+        // and one rewrites the shade's stored settings. They are one arm because
+        // they are one conversation — see `somfy_api::CalibrationStepDto`.
+        rpc::Request::Calibrate(id, step) => {
+            let outcome = match step {
+                CalibrationStepDto::Begin { leg } => machine
+                    .begin_calibration(store, queue, id, leg.to_domain(), now_ms, emitted)
+                    .map(|dispatch| report(&dispatch)),
+                CalibrationStepDto::Mark { mark } => machine
+                    .mark_calibration(id, mark.to_domain(), now_ms)
+                    .map(|()| false),
+                CalibrationStepDto::Finish => {
+                    machine
+                        .finish_calibration(id, now_ms, emitted)
+                        .map(|measured| {
+                            esp_println::println!(
+                                "calibrate: ShadeId({}) {:?} leg measured {} ms, lag {:?}, band {:?}",
+                                id.0,
+                                measured.leg,
+                                measured.travel_ms,
+                                measured.start_lag_ms,
+                                measured.band_ms,
+                            );
+                            // The settings changed, so the table on flash no
+                            // longer matches the one in memory. Debounced like
+                            // every other table change rather than written here:
+                            // an erase deafens the receiver, and this one has no
+                            // burst to hide behind.
+                            catalog.calibrated(now_ms);
+                            false
+                        })
+                }
+                CalibrationStepDto::Cancel => machine.cancel_calibration(id).map(|()| false),
+            };
+            match outcome {
+                Ok(dispatched) => (rpc::Reply::Done, dispatched),
+                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+                Err(DomainError::NotCalibrating) => {
+                    (rpc::Reply::Refused(ApiErrorCode::NotCalibrating), false)
+                }
+                Err(error) => {
+                    // Everything left is a run whose numbers this device will
+                    // not store — a traverse of zero or past three minutes, or
+                    // marks leaving no travel between them. Reported as one
+                    // code, because the operator's next action is the same for
+                    // all of them: run it again and watch the shade.
+                    esp_println::println!("calibrate: ShadeId({}) refused: {:?}", id.0, error);
+                    (
+                        rpc::Reply::Refused(ApiErrorCode::CalibrationImplausible),
+                        false,
+                    )
+                }
+            }
+        }
         rpc::Request::Edit(edit) => (
             match apply_edit(
                 machine.registry_mut(),

@@ -32,9 +32,32 @@ import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
 import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
 import type { WsEvent } from '../src/api/generated/WsEvent.ts';
+import type { CalibrationSource } from '../src/api/generated/CalibrationSource.ts';
+import type { CalibrationStepDto } from '../src/api/generated/CalibrationStepDto.ts';
 import { originOf, toDto, type StoredShade } from './derive.ts';
-import { GROUPS, MAX_SHADES, MOCK_BASE, ROOMS, SHADES } from './fixtures.ts';
+import {
+  DEAD_BAND_RESOLUTION_MS,
+  FACTORY_DOWN_TIME_MS,
+  FACTORY_TILT_TIME_MS,
+  FACTORY_UP_TIME_MS,
+  GROUPS,
+  MAX_SHADES,
+  MOCK_BASE,
+  ROOMS,
+  SHADES,
+  START_LAG_RESOLUTION_MS,
+} from './fixtures.ts';
 import { validateCreateShade, validatePatchShade } from './validate.ts';
+
+/**
+ * `somfy_api::shades::supplied_source` — a submitted value equal to the factory
+ * default is recorded as one nobody chose, whichever endpoint it arrived on.
+ */
+const sourceOf = (valueMs: number, factoryMs: number): CalibrationSource =>
+  valueMs === factoryMs ? 'factoryDefault' : 'operatorSupplied';
+
+/** `round_onto` in `somfy_domain::types`: nearest multiple of `step`. */
+const roundTo = (ms: number, step: number): number => Math.round(ms / step) * step;
 
 /** `Pos::FULL` — full travel in hundredths of a percent (`somfy-domain`). */
 const FULL_RAW = 10_000;
@@ -82,15 +105,39 @@ export type CreateResult = { ok: ShadeDto } | { error: ApiErrorCode };
  */
 export type PairResult = 'accepted' | { error: ApiErrorCode };
 
+/**
+ * A calibration run in progress: when it started, and whichever moments the
+ * operator has reported so far.
+ *
+ * `somfy_domain`'s `MAX_TRAVEL_TIME_MS`, restated: three minutes is the ceiling
+ * deployed controllers already enforce on a hand-entered travel time, and a run
+ * still going after that is one where somebody walked away.
+ */
+const MAX_TRAVEL_TIME_MS = 180_000;
+
+interface CalibrationRun {
+  leg: 'up' | 'down';
+  startedMs: number;
+  motionBeganMs?: number;
+  curtainMovedMs?: number;
+}
+
 export class World {
   /**
-   * Stored fields only. `addressOrigin` and the three calibration sources are
-   * computed by {@link toDto} on the way out, exactly as `ShadeDto::from_shade`
-   * computes them — so nothing in here can hold a stale copy of a fact that is
-   * really a function of another field.
+   * Stored fields only. `addressOrigin` is computed by {@link toDto} on the way
+   * out, exactly as `ShadeDto::from_shade` computes it — so nothing in here can
+   * hold a stale copy of a fact that is really a function of another field.
    */
   private readonly shades = new Map<number, StoredShade>();
   private readonly motion = new Map<number, Motion>();
+  /**
+   * Calibration runs in progress, keyed by shade.
+   *
+   * Not part of {@link StoredShade}, because a run is not a setting: it holds
+   * wall-clock stamps and disappears when the conversation ends, whichever way
+   * it ends. `shade.calibrating` is the visible half and is kept in step here.
+   */
+  private readonly runs = new Map<number, CalibrationRun>();
   private readonly listeners = new Set<Listener>();
   /**
    * Rooms and groups are copied, not aliased, because deleting a shade now
@@ -182,6 +229,20 @@ export class World {
       upTimeMs: body.upTimeMs,
       downTimeMs: body.downTimeMs,
       tiltTimeMs: body.tiltTimeMs,
+      // `supplied_source` in `somfy_api::shades`: both forms in this UI are
+      // pre-filled, so submitting a field untouched is not evidence anybody
+      // chose the number in it. R7's ruling, applied where a value enters.
+      upTimeSource: sourceOf(body.upTimeMs, FACTORY_UP_TIME_MS),
+      downTimeSource: sourceOf(body.downTimeMs, FACTORY_DOWN_TIME_MS),
+      tiltTimeSource: sourceOf(body.tiltTimeMs, FACTORY_TILT_TIME_MS),
+      // Nothing has been measured on a shade that has never moved, and zero is
+      // the un-compensated model rather than a guess.
+      startLagMs: 0,
+      ventBandMs: 0,
+      closeBandMs: 0,
+      // A shade this controller has never moved has never been anywhere, so its
+      // position is a convention. `Shade::new` makes the same claim.
+      positionUncertainty: 0,
     };
 
     this.shades.set(id, shade);
@@ -214,13 +275,141 @@ export class World {
       ...(body.name !== undefined && { name: body.name }),
       ...(body.kind !== undefined && { kind: body.kind }),
       ...(body.tiltMode !== undefined && { tiltMode: body.tiltMode }),
-      ...(body.upTimeMs !== undefined && { upTimeMs: body.upTimeMs }),
-      ...(body.downTimeMs !== undefined && { downTimeMs: body.downTimeMs }),
-      ...(body.tiltTimeMs !== undefined && { tiltTimeMs: body.tiltTimeMs }),
+      // Each travel time carries its provenance with it, and only the fields
+      // the body actually names move — R7 is per field, not per shade.
+      ...(body.upTimeMs !== undefined && {
+        upTimeMs: body.upTimeMs,
+        upTimeSource: sourceOf(body.upTimeMs, FACTORY_UP_TIME_MS),
+      }),
+      ...(body.downTimeMs !== undefined && {
+        downTimeMs: body.downTimeMs,
+        downTimeSource: sourceOf(body.downTimeMs, FACTORY_DOWN_TIME_MS),
+      }),
+      ...(body.tiltTimeMs !== undefined && {
+        tiltTimeMs: body.tiltTimeMs,
+        tiltTimeSource: sourceOf(body.tiltTimeMs, FACTORY_TILT_TIME_MS),
+      }),
+      // Rounded onto the resolution its measurement actually has, here as in
+      // `somfy_domain::round_start_lag_ms` — so what a later `GET` returns is
+      // the number the device is running rather than the one that was typed.
+      ...(body.startLagMs !== undefined && {
+        startLagMs: roundTo(body.startLagMs, START_LAG_RESOLUTION_MS),
+      }),
+      ...(body.ventBandMs !== undefined && {
+        ventBandMs: roundTo(body.ventBandMs, DEAD_BAND_RESOLUTION_MS),
+      }),
+      ...(body.closeBandMs !== undefined && {
+        closeBandMs: roundTo(body.closeBandMs, DEAD_BAND_RESOLUTION_MS),
+      }),
     };
 
     this.shades.set(id, next);
     return { ok: toDto(next) };
+  }
+
+  /**
+   * `POST /api/v1/shades/{id}/calibrate` — the port of `Shade`'s calibration
+   * run.
+   *
+   * The run is real rather than faked: `begin` sends the traverse and stamps a
+   * start time, the marks are stamped as they arrive, and `finish` turns the
+   * intervals into the same three numbers the device stores. That matters
+   * because the thing being exercised is a **conversation with timing in it** —
+   * a screen that can only be checked against a stub is a screen nobody has
+   * checked.
+   *
+   * What it does not reproduce is the arithmetic's edges: the device refuses a
+   * traverse of zero or over three minutes, and refuses marks that leave no
+   * travel behind them. Those are refusals the UI has to render, so they are
+   * modelled; the rounding is modelled too, because a value that reads back
+   * different from what was typed is exactly the surprise a mock exists to
+   * surface early.
+   */
+  calibrate(id: number, step: CalibrationStepDto): { ok: true } | { error: ApiErrorCode } {
+    const shade = this.shades.get(id);
+    const motion = this.motion.get(id);
+    if (!shade || !motion) return { error: 'notFound' };
+    const now = Date.now();
+
+    switch (step.step) {
+      case 'begin':
+        this.tick();
+        this.setTarget(motion, step.leg === 'up' ? 0 : FULL_RAW);
+        this.runs.set(id, { leg: step.leg, startedMs: now });
+        this.publish(shade, motion);
+        return { ok: true };
+
+      case 'mark': {
+        const run = this.runs.get(id);
+        if (!run) return { error: 'notCalibrating' };
+        if (step.mark === 'motionBegan') run.motionBeganMs = now;
+        else run.curtainMovedMs = now;
+        return { ok: true };
+      }
+
+      case 'finish': {
+        const run = this.runs.get(id);
+        if (!run) return { error: 'notCalibrating' };
+        const elapsed = now - run.startedMs;
+        if (elapsed <= 0 || elapsed > MAX_TRAVEL_TIME_MS) {
+          return { error: 'calibrationImplausible' };
+        }
+
+        const lag =
+          run.motionBeganMs === undefined
+            ? shade.startLagMs
+            : roundTo(run.motionBeganMs - run.startedMs, START_LAG_RESOLUTION_MS);
+        const band =
+          run.curtainMovedMs === undefined
+            ? undefined
+            : roundTo(
+                run.leg === 'up'
+                  ? run.curtainMovedMs - run.startedMs - lag
+                  : now - run.curtainMovedMs,
+                DEAD_BAND_RESOLUTION_MS,
+              );
+
+        // Applied to a copy first, so a run whose numbers do not survive
+        // validation leaves the shade exactly as it was — `Shade::finish_calibration`.
+        const next: StoredShade = { ...shade, startLagMs: lag };
+        if (run.leg === 'up') {
+          next.upTimeMs = elapsed;
+          next.upTimeSource = 'measured';
+          if (band !== undefined) next.ventBandMs = band;
+        } else {
+          next.downTimeMs = elapsed;
+          next.downTimeSource = 'measured';
+          if (band !== undefined) next.closeBandMs = band;
+        }
+        if (
+          lag < 0 ||
+          (band !== undefined && band < 0) ||
+          lag + next.ventBandMs >= next.upTimeMs ||
+          lag + next.closeBandMs >= next.downTimeMs
+        ) {
+          return { error: 'calibrationImplausible' };
+        }
+
+        // The run ended at a physical limit, which the motor enforces whatever
+        // this controller believes — so the estimate is exact again.
+        next.positionUncertainty = 0;
+        const limit = run.leg === 'up' ? 0 : FULL_RAW;
+        motion.raw = limit;
+        motion.targetRaw = limit;
+        motion.direction = IDLE;
+        this.runs.delete(id);
+        this.shades.set(id, next);
+        this.publish(next, motion);
+        return { ok: true };
+      }
+
+      default:
+        // Deliberately does not stop the shade: an operator abandoning a
+        // measurement has not asked for the motor to halt where it happens to
+        // be. `Controller::cancel_calibration`.
+        this.runs.delete(id);
+        return { ok: true };
+    }
   }
 
   /**
@@ -356,6 +545,26 @@ export class World {
         break;
       case 'setMy':
         shade.myPosition = command.position;
+        break;
+      // Close fully, then open just far enough to separate the slats. The
+      // device does it in three timed steps and uses no position estimate at
+      // all, which is the whole point of the command; the mock has no wall
+      // clock worth simulating that against, so it models the *outcome* — the
+      // shade ends fully closed, with the light gaps open and the curtain
+      // exactly where a close leaves it.
+      //
+      // The refusal is modelled properly, though, because that is the part a
+      // user meets: a shade whose slat-separation band has never been measured
+      // has nothing for the vent to aim at.
+      case 'vent':
+        if (shade.ventBandMs === 0) return false;
+        this.setTarget(motion, FULL_RAW);
+        motion.raw = FULL_RAW;
+        motion.targetRaw = FULL_RAW;
+        motion.direction = IDLE;
+        // Reaching a limit is the one thing this protocol can be sure of, so
+        // the estimate is exact again. `Shade::reach_limit`.
+        shade.positionUncertainty = 0;
         break;
       default:
         return assertNever(command);

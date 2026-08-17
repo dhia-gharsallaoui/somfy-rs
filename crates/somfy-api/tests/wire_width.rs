@@ -112,7 +112,7 @@ fn an_ordinary_shade_is_a_little_over_half_the_bound() {
     let json = serde_json::to_string(&ShadeDto::from_shade(ShadeId(3), &shade)).unwrap();
     assert_eq!(
         json.len(),
-        373,
+        443,
         "an ordinary shade's width moved; the ceiling above may have moved too",
     );
     assert!(json.len() < SHADE_JSON_MAX_BYTES);

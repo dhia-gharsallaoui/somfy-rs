@@ -465,13 +465,14 @@ fn linked_remotes_round_trip_and_name_their_shade() {
 /// the layout that produced it.
 #[test]
 fn the_pool_is_what_is_left_of_the_record() {
-    assert_eq!(MAX_LINKS, 58);
+    // Was 58 before the version-4 calibration block took 128 bytes of it. The
+    // figure moves with the layout, which is the point of asserting it here.
+    assert_eq!(MAX_LINKS, 26);
     assert_eq!(MAX_LINKED_REMOTES, 7);
     // The reason the bound is shared, stated as the arithmetic rather than as
     // a claim: seven remotes on every one of thirty-two shades is more links
     // than a 2048-byte slot has room for, whatever else it gives up.
     assert_eq!(SHADE_TABLE_CAPACITY * MAX_LINKED_REMOTES, 224);
-    assert_eq!(MAX_LINKS, 58);
 }
 
 /// A full pool fits, and a full pool is still a record the device reads.

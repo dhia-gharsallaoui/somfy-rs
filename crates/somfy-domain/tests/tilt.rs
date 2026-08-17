@@ -1,4 +1,4 @@
-use somfy_domain::{tilt_first, Direction, Motion, Pos, TiltMode};
+use somfy_domain::{tilt_first, Direction, Motion, Pos, TiltMode, TravelProfile};
 
 #[test]
 fn integrated_mode_tilts_before_lifting() {
@@ -51,6 +51,6 @@ fn tilt_axis_is_a_motion_with_tilt_time() {
     // time regardless of direction.
     let mut t = Motion::new(Pos::ZERO);
     t.set_target(Pos::FULL, 0);
-    let s = t.tick(3_500, 7_000, 7_000);
+    let s = t.tick(3_500, TravelProfile::linear(7_000, 7_000));
     assert_eq!(s.pos, Pos::from_percent(50));
 }

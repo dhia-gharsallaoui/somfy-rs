@@ -74,15 +74,22 @@ mod shade;
 mod tilt;
 mod types;
 
-pub use controller::{Controller, StateDelta, DELTA_CAPACITY, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
+pub use controller::{
+    Controller, StateDelta, DELTA_CAPACITY, MAX_ACTIVITIES, RX_DEDUPE_WINDOW_MS, TX_CAPACITY,
+};
 pub use motion::{Motion, MotionSnapshot};
 pub use pairing::{
     allocate_if_absent, allocate_with, AllocateError, Allocated, RemoteIdentity, PAIR_REPEATS,
 };
 pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MAX_SHADES};
-pub use shade::{PlannedTx, Repeats, Shade, ShadeCommand, MAX_LINKED_REMOTES};
+pub use shade::{
+    Activity, Calibrating, CalibrationLeg, CalibrationMark, CalibrationOutcome, PlannedTx, Repeats,
+    Shade, ShadeCommand, MAX_LINKED_REMOTES, MAX_TRAVEL_TIME_MS, ROUTE_VIA_LIMIT_RAW, STOP_REPEATS,
+};
 pub use tilt::tilt_first;
 pub use types::{
-    Direction, DomainError, FrameWidth, PairingState, Pos, RadioProtocol, ShadeConfig, ShadeKind,
-    TiltMode,
+    round_dead_band_ms, round_start_lag_ms, CalibrationSource, Direction, DomainError, FrameWidth,
+    PairingState, Pos, RadioProtocol, ShadeConfig, ShadeKind, TiltMode, TravelProfile,
+    DEAD_BAND_RESOLUTION_MS, FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS,
+    MAX_DEAD_BAND_MS, MAX_START_LAG_MS, START_LAG_RESOLUTION_MS,
 };

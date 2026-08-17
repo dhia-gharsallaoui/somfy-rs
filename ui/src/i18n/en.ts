@@ -39,6 +39,9 @@ export const en = {
   'shade.idle': 'Stopped',
   'shade.favourite': 'Favourite at {percent}% open',
   'shade.noFavourite': 'No favourite set',
+  'shade.openPercentApprox': 'about {percent}% open',
+  'shade.uncertainAria':
+    'The device has not seen this shade reach a limit since it last moved part way, so this figure may be up to {margin} percentage points out. Opening or closing it fully makes it exact again.',
 
   'command.up': 'Open',
   'command.my': 'Favourite',
@@ -47,6 +50,11 @@ export const en = {
   'command.myAria': 'Move {name} to its favourite position, or stop it',
   'command.downAria': 'Close {name}',
   'command.sliderAria': 'Openness of {name}, percent',
+  'command.vent': 'Vent',
+  'command.ventAria':
+    'Close {name} fully, then open the slats just enough to let light through',
+  'command.ventUnavailable':
+    'The slat-separation time has not been measured, so there is nothing for a vent to aim at. Measure it under Travel times.',
 
   'tilt.none': 'No tilt',
   'tilt.motor': 'Separate tilt motor',
@@ -85,8 +93,36 @@ export const en = {
   'calib.revert': 'Undo changes',
   'calib.saved': 'Saved.',
   'calib.failed': 'The device refused these values: {reason}',
-  'calib.autoPending':
-    'Automatic measurement — where the device sweeps the shade and times it — is not built yet. Until it is, hand-measured values are the accurate ones.',
+
+  'calib.startLag': 'Start delay',
+  'calib.ventBand': 'Slat separation',
+  'calib.closeBand': 'Slat compression',
+  'calib.bandsHint':
+    'Not all of a travel moves the curtain. The first fraction of a second goes on getting the command to the motor and starting it; on a perforated shutter the first few seconds of opening only separate the slats, and the last few seconds of closing only squeeze them shut again. These three are parts of the times above, not extra time on top — measuring one makes part-open positions more accurate without changing how long a full travel takes.',
+  'calib.ventBandHint':
+    'This is also where Vent stops. Leave it at zero and the Vent control is not offered.',
+
+  'calib.autoTitle': 'Measure automatically',
+  'calib.autoHint':
+    'The device times the shade while you watch it. Put the shade at the far limit first, start the run, and tap as each thing happens. Nothing is stored until you finish, and cancelling stores nothing.',
+  'calib.autoUp': 'Measure opening',
+  'calib.autoDown': 'Measure closing',
+  'calib.autoUpPrep':
+    'Close the shade fully and wait for it to stop. Then start — the shade will open, and you will be asked to tap three times.',
+  'calib.autoDownPrep':
+    'Open the shade fully and wait for it to stop. Then start — the shade will close, and you will be asked to tap twice.',
+  'calib.autoStart': 'Start and open',
+  'calib.autoStartDown': 'Start and close',
+  'calib.autoRunning': 'Running — {elapsed} s',
+  'calib.autoMarkMotion': 'It has started moving',
+  'calib.autoMarkCurtainUp': 'The curtain has started to rise',
+  'calib.autoMarkCurtainDown': 'The curtain has reached the bottom',
+  'calib.autoFinish': 'It has stopped',
+  'calib.autoCancel': 'Cancel',
+  'calib.autoMarked': 'Noted.',
+  'calib.autoDone':
+    'Measured. The times above have been updated, and the shade is at a limit, so its position is exact again.',
+  'calib.autoOptional': 'Each tap is optional — skip one and that value is left as it was.',
 
   'detail.linkedRemotes': 'Linked remotes',
   'detail.linkedRemotesPending': 'Not built yet.',
@@ -238,6 +274,13 @@ export const en = {
   'error.registryFull': 'this controller is full — 32 shades is the limit',
   'error.notFound': 'that shade no longer exists',
   'error.addressNotAllocated': 'this shade’s address belongs to another controller',
+  'error.invalidDeadBand':
+    'the start delay and slat times have to leave some travel behind them — they are parts of a travel time, not extra time on top',
+  'error.ventBandNotMeasured':
+    'the slat-separation time has never been measured, and it is the only thing a vent aims at',
+  'error.notCalibrating': 'that measurement is no longer running',
+  'error.calibrationImplausible':
+    'the device will not store those numbers — a travel of zero, or longer than three minutes, or taps that leave no travel between them',
   'error.unknown': 'the device did not say why',
 
   'stub.heading': '{screen}',

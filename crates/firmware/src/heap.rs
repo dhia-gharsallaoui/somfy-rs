@@ -135,9 +135,11 @@
 /// **This is the term that was wrong**, and the shape of being wrong is worth
 /// keeping: [`REQUIRED_STACK_BYTES`] named the right chain and had not been
 /// re-read since three of that chain's four frames grew. It said 49,592. The
-/// image that boot-looped needed **73,280** — short by 23,688 — and this image,
-/// with the inlining fixed, needs 54,720, so it was short by 5,128 even after
-/// the bug it hid was gone.
+/// image that boot-looped needed **73,280** — short by 23,688 — and the image
+/// with the inlining fixed needed 54,720, so it was short by 5,128 even after
+/// the bug it hid was gone. **And it went stale again**, by a further 1,072,
+/// which is what the re-measurement below found: the failure is not a one-off,
+/// it is what a hand-read constant does.
 ///
 /// Nothing checked it, because nothing written here can: a stack requirement is
 /// a property of what the compiler emitted. `crate::stack_used` is the answer to
@@ -145,16 +147,34 @@
 /// on every boot instead of a date.
 ///
 /// One straight line, no branch and no recursion, from the executor into the
-/// spawn of the state task. Measured 2026-08-17 on this commit:
+/// spawn of the state task. Re-measured 2026-08-18 on this commit:
 ///
 /// | | ESP32 | ESP32-S3 | ESP32-C3 |
 /// |---|---|---|---|
 /// | `main`, `Executor::run`, `run_inner` | 144 | 144 | 112 |
 /// | `TaskStorage<__embassy_main_task>::poll` | 3,856 | 3,856 | 3,840 |
-/// | [`crate::start`] | 19,552 | 19,536 | 19,472 |
-/// | [`crate::tasks::state`], building the task token | 14,720 | 14,720 | 14,704 |
-/// | `UninitCell::write_in_place`, moving the future into its static | 14,736 | 14,736 | 14,736 |
-/// | **total** | **53,008** | **52,992** | **52,864** |
+/// | [`crate::start`] | 20,080 | 20,064 | not re-measured |
+/// | [`crate::tasks::state`], building the task token | 14,992 | 14,992 | not re-measured |
+/// | `UninitCell::write_in_place`, moving the future into its static | 15,008 | 15,008 | not re-measured |
+/// | **total** | **54,080** | **54,064** | see below |
+///
+/// **The figure this replaced was stale by 1,072 bytes, and had been before the
+/// change that prompted the re-measurement.** It said 53,008; the ESP32 needed
+/// 54,080. That is not a small discrepancy in context: the whole allowance for
+/// [`INTERRUPT_FRAMES_BYTES`] is 1,712, so a boot that reported "72 bytes of the
+/// requirement unspent" was really reporting that a nested interrupt had almost
+/// nowhere to land. Nothing in this file can notice that — a stack requirement
+/// is a property of what the compiler emitted — which is exactly why
+/// `crate::stack_used` prints a measurement beside the claim on every boot, and
+/// why the claim has to be re-read whenever the state machine changes shape.
+///
+/// **The ESP32-C3 was not re-measured.** It is RISC-V, so its frames are
+/// `addi sp, sp, -N` rather than Xtensa's `entry a1, N`, and reading them needs
+/// different tooling than the commands at the top of this file. The three
+/// figures above are within 16 bytes of each other and the C3 sat 144 *below*
+/// the ESP32 when all three were last read together, so taking the ESP32's is
+/// still taking the maximum — but that is an inference, and it is the row to
+/// re-read first if the C3 ever reports a stale requirement.
 ///
 /// The last row is the leaf: it calls nothing but `memcpy`. It is the state
 /// task's 14 KB future being materialised and then copied into the static
@@ -176,7 +196,7 @@
 /// against 66,724 of stack. `#[inline(never)]` on `crate::start_network` is what
 /// separates them — 18,576 bytes, and the whole of the boot loop — and
 /// [`NETWORK_CHAIN_BYTES`] is what that branch costs once separated.
-const BOOT_CHAIN_BYTES: usize = 53_008;
+const BOOT_CHAIN_BYTES: usize = 54_080;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
 ///
@@ -275,7 +295,7 @@ const INTERRUPT_FRAMES_BYTES: usize = 1_712;
 /// of being re-derived by hand.
 ///
 /// Today, on every configuration in the matrix, [`BOOT_CHAIN_BYTES`] wins:
-/// 53,008 + 1,712 = **54,720**.
+/// 54,080 + 1,712 = **55,792**.
 ///
 /// Checked at run time by `crate::check_stack_headroom` rather than asserted at
 /// compile time, because the quantity it is checked *against* cannot be a
@@ -314,10 +334,10 @@ const fn larger(left: usize, right: usize) -> usize {
 ///
 /// It used to be written as `49_592 + 16_688` — a requirement plus a margin —
 /// and **both halves of that were wrong while their sum was right.** The
-/// requirement is 54,720, so the margin this division actually buys was, and
-/// still is, 66,280 − 54,720 = 11,560 rather than 16,688. Nothing available now
-/// was unavailable then; only the account of it was wrong, which is why the sum
-/// is kept unchanged and every heap figure measured against it stays valid.
+/// requirement is 55,792, so the margin this division actually buys is
+/// 66,280 − 55,792 = 10,488 rather than 16,688. Nothing available then was
+/// unavailable now; only the account of it was wrong, which is why the sum is
+/// kept unchanged and every heap figure measured against it stays valid.
 ///
 /// The figure is fixed **by the ESP32's heap**, which is the binding constraint
 /// on the whole design and the reason a "pick the stack first" rule cannot be
@@ -343,7 +363,7 @@ const fn larger(left: usize, right: usize) -> usize {
 ///
 /// ### What the difference buys
 ///
-/// 66,280 − [`REQUIRED_STACK_BYTES`] = 11,560 bytes, and
+/// 66,280 − [`REQUIRED_STACK_BYTES`] = 10,488 bytes, and
 /// [`STACK_MARGIN_FLOOR_BYTES`] is the least of it this division may leave.
 pub const STACK_BUDGET_BYTES: usize = 66_280;
 
@@ -357,7 +377,7 @@ pub const STACK_BUDGET_BYTES: usize = 66_280;
 /// measurement, and 8 KiB is chosen as roughly five times the entry cost
 /// [`INTERRUPT_FRAMES_BYTES`] does account for.
 ///
-/// The actual margin today is 11,560, so this floor is 3,368 bytes of slack
+/// The actual margin today is 10,488, so this floor is 2,296 bytes of slack
 /// before the build stops. That is deliberate: it is a *gate*, not a target, and
 /// it exists so that the failure of a growing call graph is a build error naming
 /// two numbers rather than a device that passes its own boot check and then

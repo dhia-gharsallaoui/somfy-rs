@@ -25,7 +25,11 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::InvalidAddress
         | ApiErrorCode::RegistryFull
         | ApiErrorCode::NotFound
-        | ApiErrorCode::AddressNotAllocated => true,
+        | ApiErrorCode::AddressNotAllocated
+        | ApiErrorCode::InvalidDeadBand
+        | ApiErrorCode::VentBandNotMeasured
+        | ApiErrorCode::NotCalibrating
+        | ApiErrorCode::CalibrationImplausible => true,
     }
 }
 
@@ -42,6 +46,18 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
         ApiErrorCode::AddressNotAllocated,
         "addressNotAllocated",
         409,
+    ),
+    (ApiErrorCode::InvalidDeadBand, "invalidDeadBand", 400),
+    (
+        ApiErrorCode::VentBandNotMeasured,
+        "ventBandNotMeasured",
+        409,
+    ),
+    (ApiErrorCode::NotCalibrating, "notCalibrating", 409),
+    (
+        ApiErrorCode::CalibrationImplausible,
+        "calibrationImplausible",
+        400,
     ),
 ];
 

@@ -68,7 +68,9 @@ use picoserve::response::{ws, Content, IntoResponse, NoContent, ResponseWriter, 
 use picoserve::routing::{get, parse_path_segment, post, PathRouter};
 use picoserve::{ResponseSent, Router};
 use serde::Serialize;
-use somfy_api::{ApiErrorCode, ApiErrorDto, CommandDto, CreateShadeDto, PatchShadeDto};
+use somfy_api::{
+    ApiErrorCode, ApiErrorDto, CalibrationStepDto, CommandDto, CreateShadeDto, PatchShadeDto,
+};
 use somfy_domain::{GroupId, ShadeId};
 use somfy_tasks::ControlCommand;
 
@@ -150,6 +152,14 @@ fn router() -> Router<impl PathRouter> {
         .route(
             ("/api/v1/shades", parse_path_segment::<u8>(), "/command"),
             post(command_shade),
+        )
+        // Same `(&str, id, &str)` shape as the three above, which is why it adds
+        // no frame to the router's monomorphised call chain — see
+        // `crate::heap::REQUEST_CHAIN_BYTES`, and `somfy_api::CalibrationStepDto`
+        // for why the whole conversation is one route with a step in the body.
+        .route(
+            ("/api/v1/shades", parse_path_segment::<u8>(), "/calibrate"),
+            post(calibrate_shade),
         )
         .route("/api/v1/groups", get(list_groups))
         .route(
@@ -527,6 +537,29 @@ async fn command_group(id: u8, Json(command): Json<CommandDto>) -> impl IntoResp
         command: command.to_domain(),
     })
     .await
+}
+
+/// One step of a guided travel-time calibration.
+///
+/// `204` for every step that is accepted, and the body is deliberately empty
+/// even for `finish`: what the run measured is now part of the shade, so the
+/// client re-reads `GET /api/v1/shades/{id}` and gets the travel times, the
+/// bands **and** their `calibrationSource` — which is the thing that actually
+/// changed and the thing the screen has to show. Returning the raw measurement
+/// instead would be a second, narrower view of the same fact, free to disagree
+/// with the first.
+///
+/// It is not `202`: unlike `/pair`, the device is not making a claim about
+/// something it will never learn. `begin` has queued a traverse and started a
+/// clock, and `finish` has stored numbers — both are facts about this device
+/// that the client can act on immediately.
+async fn calibrate_shade(id: u8, Json(step): Json<CalibrationStepDto>) -> impl IntoResponse {
+    match RPC.call(Rpc::Calibrate(ShadeId(id), step)).await {
+        Some(Reply::Done) => Ok((StatusCode::NO_CONTENT, NoContent)),
+        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        None => Err(Err(Unavailable)),
+    }
 }
 
 /// Hand one command to the state task and render what it says.

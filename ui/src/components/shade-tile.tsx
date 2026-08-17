@@ -21,12 +21,36 @@ import {
 import { useT, type Translate } from '../i18n';
 import { kindKey } from './kind';
 
-/** The endpoints get words; everything between them gets a number. */
-function openLabel(open: OpenPercent, t: Translate): string {
+/**
+ * The endpoints get words; everything between them gets a number.
+ *
+ * A number the device is not sure of gets "about", and that is not decoration.
+ * RTS is one-way, so an intermediate position is dead reckoning from the last
+ * time the shade reached a limit — and on a shade whose travel times nobody has
+ * measured it is dead reckoning from a number nobody chose. A flat "60%" there
+ * is a claim the device cannot support; "about 60%" is what it actually knows.
+ *
+ * The endpoints stay exact whatever the uncertainty says, because they are the
+ * one thing this protocol is sure of: the motor stops itself at its own end
+ * stops, and reaching one resets the doubt to zero.
+ */
+function openLabel(open: OpenPercent, t: Translate, uncertain = false): string {
   if (open === PERCENT_MAX) return t('shade.open');
   if (open === PERCENT_MIN) return t('shade.closed');
-  return t('shade.openPercent', { percent: open });
+  return uncertain
+    ? t('shade.openPercentApprox', { percent: open })
+    : t('shade.openPercent', { percent: open });
 }
+
+/**
+ * How much doubt, in percentage points, before the reading is hedged.
+ *
+ * A presentation figure rather than a threshold the device acts on — it has its
+ * own, and it is about whether to spend a whole extra traverse re-anchoring.
+ * Two points is roughly where a rounded whole-percent reading stops being the
+ * number it claims to be, and below it hedging would be noise on every tile.
+ */
+const HEDGE_AT_PERCENT = 2;
 
 const MOTION_KEY = {
   opening: 'shade.opening',
@@ -51,6 +75,9 @@ export function ShadeTile({ shade, detail = false }: ShadeTileProps) {
 
   const open = dragged ?? openPercent(shade.position);
   const motion = motionOf(shade.direction);
+  // A dragged value is what the finger is asking for, not what the device
+  // believes, so it is never hedged.
+  const uncertain = dragged === undefined && shade.positionUncertainty >= HEDGE_AT_PERCENT;
 
   // The fill is the *closed* fraction, which is the wire value by definition —
   // no conversion, and deliberately not routed through `position.ts`.
@@ -75,7 +102,15 @@ export function ShadeTile({ shade, detail = false }: ShadeTileProps) {
       )}
 
       <p class="tile__state">
-        <strong>{openLabel(open, t)}</strong>
+        <strong
+          title={
+            uncertain
+              ? t('shade.uncertainAria', { margin: shade.positionUncertainty })
+              : undefined
+          }
+        >
+          {openLabel(open, t, uncertain)}
+        </strong>
         {motion !== 'idle' && <span class="tile__motion">{t(MOTION_KEY[motion])}</span>}
       </p>
 
@@ -113,6 +148,26 @@ export function ShadeTile({ shade, detail = false }: ShadeTileProps) {
           </span>
           {t('command.down')}
         </button>
+        {/*
+          Offered only where it can do something. The vent position *is* the
+          shade's measured slat-separation time — the command drives to the
+          closed limit and runs up for exactly that long, which is why it needs
+          no position estimate and why it has nothing to aim at until somebody
+          measures it. A button that always refused would be worse than none.
+        */}
+        {shade.ventBandMs > 0 && (
+          <button
+            type="button"
+            class="btn"
+            aria-label={t('command.ventAria', { name: shade.name })}
+            onClick={() => void commandShade(shade.id, { action: 'vent' })}
+          >
+            <span class="btn__glyph" aria-hidden="true">
+              ≡
+            </span>
+            {t('command.vent')}
+          </button>
+        )}
       </div>
 
       <label class="tile__slider">
@@ -123,7 +178,7 @@ export function ShadeTile({ shade, detail = false }: ShadeTileProps) {
           max={100}
           step={1}
           value={open}
-          aria-valuetext={openLabel(open, t)}
+          aria-valuetext={openLabel(open, t, uncertain)}
           onInput={(event) => setDragged(Number(event.currentTarget.value))}
           onChange={(event) => {
             const next = Number(event.currentTarget.value);

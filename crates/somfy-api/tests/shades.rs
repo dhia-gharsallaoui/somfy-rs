@@ -188,12 +188,12 @@ fn address_origin_serializes_as_a_camel_case_string() {
 // --------------------------------------------------------------- calibration
 
 /// The whole R7 mechanism rests on these three numbers being the ones
-/// `ShadeConfig::new` actually hands out. `somfy-api` restates them because the
-/// domain returns them inside a value rather than exposing constants, so this
-/// is the pin that stops the restatement drifting: a domain default changed
-/// without changing these would otherwise make every shade in the estate
-/// silently report itself as *calibrated*, which is precisely the failure R7
-/// was raised to a MUST to prevent.
+/// `ShadeConfig::new` actually hands out. They are the domain's constants now
+/// rather than a copy, but the pin is still worth having: they are what decides
+/// whether a *submitted* value counts as one somebody chose, and a default
+/// changed on one side only would make every shade in the estate silently
+/// report itself as calibrated — precisely the failure R7 was raised to a MUST
+/// to prevent.
 #[test]
 fn the_restated_factory_defaults_are_the_domain_s_own() {
     let fresh = ShadeConfig::new("pin", ALLOCATED).unwrap();
@@ -218,14 +218,34 @@ fn hand_measured_times_report_as_operator_supplied_per_field() {
     // The real measurement from that day: 30 s up, 27 s down — a ~10% asymmetry,
     // because closing is gravity-assisted. Tilt was left alone, and must still
     // read as uncalibrated: the states are per field, not per shade.
-    let mut config = ShadeConfig::new("Measured", ALLOCATED).unwrap();
-    config.up_time_ms = 30_000;
-    config.down_time_ms = 27_000;
+    //
+    // Through the PATCH rather than by assigning the fields, because that is now
+    // the difference that matters: provenance is *stored*, so it is set by the
+    // route a value arrives on and not inferred from the number afterwards.
+    let config = patch(serde_json::json!({ "upTimeMs": 30_000, "downTimeMs": 27_000 }))
+        .apply(&ShadeConfig::new("Measured", ALLOCATED).unwrap())
+        .unwrap();
     let dto = ShadeDto::from_shade(ShadeId(0), &Shade::new(config));
 
     assert_eq!(dto.up_time_source, CalibrationSource::OperatorSupplied);
     assert_eq!(dto.down_time_source, CalibrationSource::OperatorSupplied);
     assert_eq!(dto.tilt_time_source, CalibrationSource::FactoryDefault);
+}
+
+/// The gap the stored provenance closes, stated as a test: a travel time set
+/// **without** going through a route that records who set it stays uncalibrated,
+/// however plausible the number is.
+///
+/// Before the record carried provenance this was impossible to express — the
+/// classification was a comparison against the default, so any unusual number
+/// read as operator-supplied whether anybody had chosen it or not, and
+/// `Measured` was unreachable.
+#[test]
+fn a_travel_time_set_behind_the_api_s_back_stays_uncalibrated() {
+    let mut config = ShadeConfig::new("Measured", ALLOCATED).unwrap();
+    config.up_time_ms = 30_000;
+    let dto = ShadeDto::from_shade(ShadeId(0), &Shade::new(config));
+    assert_eq!(dto.up_time_source, CalibrationSource::FactoryDefault);
 }
 
 #[test]
@@ -375,6 +395,105 @@ fn a_patch_may_set_a_tilt_time_of_zero() {
     assert_eq!(next.tilt_time_ms, 0);
 }
 
+// ------------------------------------------------- the lag and the dead bands
+
+/// R9's second half: the three compensations are hand-settable on an existing
+/// shade, exactly as the travel times are. A sweep runs the shade end to end,
+/// which is not always acceptable — and a measurement with nothing to check
+/// itself against is one nobody can catch being wrong.
+#[test]
+fn the_lag_and_the_bands_are_settable_by_hand() {
+    let next = patch(serde_json::json!({
+        "startLagMs": 110,
+        "ventBandMs": 4_000,
+        "closeBandMs": 1_500,
+    }))
+    .apply(&configured())
+    .unwrap();
+
+    assert_eq!(next.start_lag_ms, 110);
+    assert_eq!(next.vent_band_ms, 4_000);
+    assert_eq!(next.close_band_ms, 1_500);
+    // And the travel times they are parts of are untouched.
+    assert_eq!(next.up_time_ms, 8_000);
+    assert_eq!(next.down_time_ms, 7_000);
+}
+
+/// Rounded onto the resolution the measurement actually has, at the boundary
+/// rather than on the way to flash — so what a later `GET` returns is the number
+/// the device is running, not the one that was typed.
+#[test]
+fn a_hand_entered_band_is_rounded_where_it_enters() {
+    let next = patch(serde_json::json!({ "startLagMs": 117, "ventBandMs": 4_049 }))
+        .apply(&configured())
+        .unwrap();
+    assert_eq!(next.start_lag_ms, 120);
+    assert_eq!(next.vent_band_ms, 4_000);
+
+    let dto = ShadeDto::from_shade(ShadeId(0), &Shade::new(next));
+    assert_eq!(
+        dto.start_lag_ms, 120,
+        "what is read back is what is running"
+    );
+    assert_eq!(dto.vent_band_ms, 4_000);
+}
+
+/// A band is a *part of* its direction's travel time, so it has to leave travel
+/// behind it — and the rule is checked against the **result**, so a body naming
+/// only one half of the pair is still weighed against the other.
+#[test]
+fn a_band_that_leaves_no_travel_is_refused_whichever_half_the_body_names() {
+    // The band alone, against a stored travel time.
+    assert_eq!(
+        patch(serde_json::json!({ "ventBandMs": 9_000 })).apply(&configured()),
+        Err(ApiErrorCode::InvalidDeadBand),
+    );
+
+    // And the travel time alone, against a stored band.
+    let mut banded = configured();
+    banded.vent_band_ms = 4_000;
+    assert_eq!(
+        patch(serde_json::json!({ "upTimeMs": 3_000 })).apply(&banded),
+        Err(ApiErrorCode::InvalidDeadBand),
+    );
+
+    // Both together, consistent, is accepted.
+    assert!(
+        patch(serde_json::json!({ "upTimeMs": 30_000, "ventBandMs": 4_000 }))
+            .apply(&banded)
+            .is_ok()
+    );
+}
+
+/// Past what the model can express is refused rather than clamped: a silently
+/// substituted ceiling is a position estimate computed from a number nobody
+/// entered.
+#[test]
+fn a_band_past_the_models_ceiling_is_refused() {
+    for body in [
+        serde_json::json!({ "startLagMs": 3_000 }),
+        serde_json::json!({ "ventBandMs": 30_000 }),
+        serde_json::json!({ "closeBandMs": 30_000 }),
+    ] {
+        assert_eq!(
+            patch(body.clone()).apply(&configured()),
+            Err(ApiErrorCode::InvalidDeadBand),
+            "for {body}",
+        );
+    }
+}
+
+/// A freshly created shade has measured nothing, and zero is the un-compensated
+/// linear model rather than a guess at a dead band.
+#[test]
+fn a_created_shade_carries_no_compensation_at_all() {
+    let dto = ShadeDto::from_shade(ShadeId(0), &Shade::new(configured()));
+    assert_eq!(dto.start_lag_ms, 0);
+    assert_eq!(dto.vent_band_ms, 0);
+    assert_eq!(dto.close_band_ms, 0);
+    assert_eq!(dto.position_uncertainty, 0);
+}
+
 // --------------------------------------------------------------------- errors
 
 #[test]
@@ -395,6 +514,10 @@ fn error_codes_round_trip() {
         ApiErrorCode::RegistryFull,
         ApiErrorCode::NotFound,
         ApiErrorCode::AddressNotAllocated,
+        ApiErrorCode::InvalidDeadBand,
+        ApiErrorCode::VentBandNotMeasured,
+        ApiErrorCode::NotCalibrating,
+        ApiErrorCode::CalibrationImplausible,
     ] {
         let text = serde_json::to_string(&ApiErrorDto::from(code)).unwrap();
         let back: ApiErrorDto = serde_json::from_str(&text).unwrap();

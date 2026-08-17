@@ -1538,12 +1538,30 @@ fn decode_command(
     // possible shade id, which is an eighth of the work (32 against 256).
     for shade in inventory.ids().iter().copied() {
         if topic == config.shade_topic(shade, ShadeTopic::Command).as_str() {
-            // Home Assistant's own cover defaults, which the discovery payload
-            // deliberately does not override — see `CoverDiscovery::render`.
+            // The first three are Home Assistant's own cover defaults, which
+            // the discovery payload deliberately does not override — see
+            // `CoverDiscovery::render`.
+            //
+            // **`VENT` is ours, and it is not one Home Assistant will ever
+            // send.** It is here so the broker surface reaches every behaviour
+            // the HTTP surface does, which is this project's standing rule; an
+            // automation or a button card gets at it with `mqtt.publish`.
+            //
+            // Why a fourth payload rather than a second per-shade button
+            // entity: a shade's entity identity is `(device, component, shade
+            // id)` throughout `somfy_mqtt`, so two `button`s on one shade would
+            // collide on both `object_id` and `unique_id`. Giving a shade more
+            // than one entity of a component means adding a per-shade entity
+            // dimension mirroring `somfy_mqtt::DeviceEntity`, which is a change
+            // to the identity that every retained discovery config on the
+            // broker is keyed by — not a change to make in passing for one
+            // command. Adding a payload here cannot confuse the cover, because
+            // Home Assistant only ever sends the three above.
             let command = match text {
                 "OPEN" => ShadeCommand::Up,
                 "CLOSE" => ShadeCommand::Down,
                 "STOP" => ShadeCommand::My,
+                "VENT" => ShadeCommand::Vent,
                 _ => return None,
             };
             return Some(ControlCommand::Shade { id: shade, command });

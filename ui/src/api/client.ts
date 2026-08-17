@@ -12,6 +12,7 @@
  */
 
 import { ApiError } from './errors';
+import type { CalibrationStepDto } from './generated/CalibrationStepDto';
 import type { CommandDto } from './generated/CommandDto';
 import type { CreateShadeDto } from './generated/CreateShadeDto';
 import type { GroupDto } from './generated/GroupDto';
@@ -128,6 +129,25 @@ export const deleteShade = (id: number): Promise<void> =>
  */
 export const pairShade = (id: number): Promise<void> =>
   request(`/shades/${id}/pair`, { method: 'POST' }).then(() => undefined);
+
+/**
+ * One step of a guided travel-time measurement.
+ *
+ * All four steps share a route because a calibration is one session rather than
+ * four resources — see `somfy_api::CalibrationStepDto`, which also carries the
+ * firmware-side reason (its HTTP router costs stack per *path shape*).
+ *
+ * Resolving means the device accepted the step. For `finish` that means the
+ * numbers are stored, and the caller re-reads the shade: what changed is the
+ * travel times **and** their `calibrationSource`, and the shade is the one place
+ * both are true at once.
+ */
+export const calibrateShade = (id: number, step: CalibrationStepDto): Promise<void> =>
+  request(`/shades/${id}/calibrate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(step),
+  }).then(() => undefined);
 
 /**
  * Tell the device that an operator commanded this shade and watched it move.
