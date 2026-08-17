@@ -223,10 +223,34 @@ The estate's shades are currently provisioned as `kind = roller`,
 `tilt_mode = none`, and they do complete full traverses from our ordinary
 3-frame bursts — which is evidence **against** euromode press-length semantics
 being active on them, since a 3-frame burst is far below `TILT_REPEATS`. That is
-inference from one behaviour, not a test. **The test is cheap**: send a
-short Up burst from fully closed and see whether it stops after separating the
-slats or continues to the limit. It transmits at a real motor, so it is the
-owner's to run.
+inference from one behaviour, not a test.
+
+**Settled 2026-08-17 by elimination, without transmitting a test frame.** Two
+observations, taken together, rule euromode out:
+
+1. **This project's ordinary commands are 3-frame bursts** (`DEFAULT_REPEATS` =
+   2, so one frame plus two repeats) and these motors **complete full
+   traverses** from them — verified repeatedly across Plan 4a/4b and every
+   Home Assistant command since. Under euromode press-length semantics a burst
+   that short is *tilt*, not travel: the reference requires `TILT_REPEATS` = 15
+   repeats — 16 frames — for a full traverse, and reads anything below that as
+   the slat operation.
+2. **The owner describes the separation happening during a normal Up command**,
+   with elevation continuing afterwards in the same motion — "4 seconds in up
+   direction to open just the sun holes before starting elevating the full
+   thing". That is one continuous traverse with a non-linear first phase, not
+   two distinct commands.
+
+If these motors honoured euromode, (1) could not be true: every Up we have ever
+sent would have stopped at the vent position. So the mechanism is a
+**mechanical dead band**, and R8 is designed against that: a per-direction,
+per-shade dead band at the closed limit, measured rather than assumed.
+
+This is inference rather than a direct experiment — but it is inference from
+every command this controller has ever sent, not from a single trial, which is
+the distinction the project's verification rule draws. A short-burst experiment
+would still be the cheapest way to *falsify* it, and remains worth running if
+anything downstream behaves as though a tilt command exists.
 
 **The user-visible behaviour is settled regardless of which mechanism applies**,
 by the owner's instruction of 2026-08-17:
@@ -251,11 +275,11 @@ and time from there", applied to the position that will be asked for most.
 The cost is deliberate and the owner accepted it: a shade already open travels
 its whole range down before venting. Slower, and correct every time.
 
-The hardware test above still matters for **implementation** rather than for
-behaviour. If these motors honour euromode press-length semantics, a short burst
-from the closed limit is the native way to do step 2 — no timing, no arrival
-stop, and nothing to calibrate. If they do not, step 2 is timed against the R8
-dead band and inherits R9's hand-override.
+Since euromode is eliminated above, **step 2 is timed** against the R8 dead band
+and inherits R9's hand-override: the operator can enter the separation time by
+hand rather than sweeping for it. The dead band is the only value this command
+needs, and it is the same one R8 requires anyway — so the vent command adds a
+transition, not a new measurement.
 
 ### R9 — Calibration must be overridable by hand (MUST)
 
