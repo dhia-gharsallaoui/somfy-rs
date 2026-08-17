@@ -165,14 +165,33 @@ const RETRY_LOG_INTERVAL: u32 = 10;
 /// complete, and the reconnect loop never runs. `minimq`'s own keepalive
 /// detects a silent broker too, but only once it has managed to *write* a
 /// PINGREQ; this covers the case where the write itself never completes.
-const SOCKET_TIMEOUT_S: u64 = 20;
+/// It **must exceed [`KEEPALIVE_S`]**, and by enough to cover a late PINGREQ.
+/// A socket timeout shorter than the keepalive does not detect a dead broker
+/// sooner; it kills a session the protocol considers perfectly healthy, on a
+/// timer, forever. Observed against a real broker on 2026-08-17 at 20 s
+/// against a 60 s keepalive: CONNACK, then `Mqtt(Transport)` at 20226, 20083
+/// and 20083 ms — the reconnect loop working exactly as designed on a fault
+/// that was ours.
+const SOCKET_TIMEOUT_S: u64 = 90;
 
 /// MQTT keepalive advertised in CONNECT.
 ///
 /// `minimq` drives PINGREQ itself from inside `recv`, so this is the interval
 /// at which a dead broker becomes visible. Sixty seconds is the protocol's own
-/// common default and well inside the socket timeout above.
+/// common default.
 const KEEPALIVE_S: u16 = 60;
+
+// The two constants above are only correct relative to each other, and nothing
+// else ties them together: the transport layer and the protocol layer each look
+// reasonable read alone. Inverting them costs no build error and no link error
+// — the session simply dies on a timer and reconnects forever, which reads as a
+// flaky broker rather than as a configuration fault. 1.5x is the same ratio a
+// broker applies to its own keepalive before declaring a client gone.
+const _: () = assert!(
+    SOCKET_TIMEOUT_S >= (KEEPALIVE_S as u64) * 3 / 2,
+    "the socket timeout must outlast the keepalive, or the transport kills \
+     healthy sessions on a timer"
+);
 
 /// How often the controller's own diagnostics are republished.
 ///
