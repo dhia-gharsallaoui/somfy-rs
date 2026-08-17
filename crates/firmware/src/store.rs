@@ -369,6 +369,41 @@ impl<'d> FlashStore<'d> {
         )
     }
 
+    /// Lend the flash peripheral to another region of the same chip.
+    ///
+    /// # Why this exists at all
+    ///
+    /// There is one flash peripheral, and this store owns it for the life of
+    /// the program — it must, because a rolling code has to be committed before
+    /// every transmission and the store that does that cannot be handed around.
+    /// The shade table lives on the same chip and is now written at runtime, so
+    /// something has to reconcile the two.
+    ///
+    /// The alternatives were both worse. A second `FlashStorage` obtained by
+    /// stealing the peripheral is an `unsafe` assertion that two writers never
+    /// overlap, with nothing checking it. Splitting this store into "geometry"
+    /// and "flash owner" would restructure the one module in this firmware that
+    /// has been proved on hardware across reboots.
+    ///
+    /// A borrow makes the guarantee structural instead: `&mut self` here is the
+    /// same `&mut self` a commit needs, so a shade write and a rolling-code
+    /// commit cannot be in flight together, and the borrow ends when the
+    /// closure returns.
+    ///
+    /// **This does not make the flash safe to write anywhere.** The callee can
+    /// address any offset on the chip, including this store's own region and the
+    /// app partition. What it buys is exclusion, not confinement; the confining
+    /// is each region's own partition lookup, which is why every one of them
+    /// resolves its base by label rather than by a compiled-in offset.
+    #[allow(
+        dead_code,
+        reason = "the controller's only caller is the shade store; `config-check` \
+                  includes this file by path and has no shade region"
+    )]
+    pub fn with_flash<T>(&mut self, f: impl FnOnce(&mut FlashStorage<'d>) -> T) -> T {
+        f(&mut self.flash)
+    }
+
     /// Walk every slot and report what is there.
     ///
     /// Unlike [`RollingCodeStore::load`] this never refuses: it is the

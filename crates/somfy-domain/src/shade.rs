@@ -281,7 +281,8 @@ impl Shade {
             .map_err(|_| DomainError::RegistryFull)
     }
 
-    /// Forget a linked remote. [`DomainError::NotFound`] if it was not linked.
+    /// Forget a linked remote. [`NotFound`](crate::DomainError::NotFound) if it
+    /// was not linked.
     ///
     /// The shade's **own** address is not a link and cannot be removed this
     /// way: it is what the controller transmits as, and dropping it would leave

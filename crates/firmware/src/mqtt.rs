@@ -74,7 +74,7 @@
 use core::fmt::Write as _;
 use core::net::SocketAddrV4;
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_sync::pubsub::WaitResult;
@@ -88,11 +88,13 @@ use somfy_config::{MqttSettings, Namespaces};
 use somfy_domain::{Direction, Pos, ShadeCommand, ShadeId, StateDelta, MAX_SHADES};
 use somfy_mqtt::{
     reconfigure, Component, ConfigError, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig,
-    NodeId, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, PAYLOAD_CAPACITY,
+    NodeId, Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step,
+    PAYLOAD_CAPACITY,
 };
 use somfy_tasks::{Backoff, ControlCommand};
 
 use crate::config::MAX_SUPERSEDED;
+use crate::edits::{AckSender, EventReceiver, ShadeAck, ShadeEvent};
 use crate::inventory::Inventory;
 use crate::store::Survey;
 use crate::tasks::{CommandSender, DeltaSubscriber};
@@ -244,8 +246,17 @@ pub struct Broker {
     /// spec R5, and `somfy_mqtt::reconfigure`, which is the only way to ask for
     /// the two halves in that order.
     stale: Vec<MqttConfig, MAX_SUPERSEDED>,
-    /// The shades to announce, copied at boot.
+    /// The shades to announce, copied at boot and kept current by
+    /// [`ShadeEvent`]s from the state task.
     inventory: Inventory,
+    /// Ids that were announced and no longer exist.
+    ///
+    /// **The only thing that can name them.** A removed shade's retained
+    /// discovery config outlives it on the broker, and clearing it needs an id
+    /// nothing else in the system remembers — so the id is carried here, from
+    /// the persisted `announced` set, until the tombstones have landed and the
+    /// state task has been told it may forget.
+    orphans: Vec<ShadeId, MAX_SHADES>,
     /// The last state observed for each shade, so a fresh broker session can be
     /// given it without waiting for the next change.
     known: Known,
@@ -259,7 +270,24 @@ pub struct Broker {
     version_logged: bool,
     /// How often the two broker-driven log lines have fired. See [`Rare`].
     rare: Rare,
+    /// Where "the entities are on/off the broker" goes back to the state task,
+    /// which is what persists it. See `crate::edits`.
+    acks: AckSender,
 }
+
+/// Steps one shade's retirement costs: a discovery config per member of
+/// `somfy_mqtt::SHADE_COMPONENTS`, plus one per published topic.
+///
+/// Collected rather than walked lazily, because the plan borrows the config and
+/// each step needs `&mut self` to execute. Ten is comfortably above the seven
+/// the current entity set produces, and a plan that outgrew it would silently
+/// clear fewer topics than it announced — so the assertion below is the check
+/// rather than the constant.
+const RETIRE_STEPS: usize = 10;
+
+/// Steps one shade's announcement costs: a discovery config per component it
+/// owns, plus one subscription per command topic.
+const ANNOUNCE_STEPS: usize = 10;
 
 impl Broker {
     /// Assemble a session from what boot found.
@@ -273,13 +301,16 @@ impl Broker {
         config: MqttConfig,
         stale: Vec<MqttConfig, MAX_SUPERSEDED>,
         inventory: Inventory,
+        orphans: Vec<ShadeId, MAX_SHADES>,
         survey: Survey,
+        acks: AckSender,
     ) -> Broker {
         let known = Known::new(&inventory);
         Broker {
             config,
             stale,
             inventory,
+            orphans,
             known,
             diagnostics: Diagnostics {
                 rollcode_damaged: survey.damaged,
@@ -287,6 +318,7 @@ impl Broker {
             payload: String::new(),
             version_logged: false,
             rare: Rare::default(),
+            acks,
         }
     }
 }
@@ -369,6 +401,8 @@ enum Woken {
     Delta(StateDelta),
     /// The diagnostic interval elapsed.
     Diagnostics,
+    /// The state task added or removed a shade.
+    Shade(ShadeEvent),
 }
 
 /// Bring up the broker session.
@@ -387,9 +421,12 @@ pub fn start(
     settings: MqttSettings,
     superseded: Vec<Namespaces, MAX_SUPERSEDED>,
     inventory: Inventory,
+    orphans: Vec<ShadeId, MAX_SHADES>,
     survey: Survey,
     commands: CommandSender,
     deltas: DeltaSubscriber,
+    events: EventReceiver,
+    acks: AckSender,
 ) -> Result<(), embassy_executor::SpawnError> {
     let device_id = device_id();
     let config = match topic_config(
@@ -432,8 +469,8 @@ pub fn start(
         }
     }
 
-    let broker = Broker::new(config, stale, inventory, survey);
-    spawner.spawn(session(stack, settings, broker, commands, deltas)?);
+    let broker = Broker::new(config, stale, inventory, orphans, survey, acks);
+    spawner.spawn(session(stack, settings, broker, commands, deltas, events)?);
     Ok(())
 }
 
@@ -489,6 +526,7 @@ async fn session(
     mut broker: Broker,
     commands: CommandSender,
     mut deltas: DeltaSubscriber,
+    events: EventReceiver,
 ) -> ! {
     // Declared before the session below, so they outlive the borrows it takes
     // of them. Locals of a `#[task]` body live in the task's statically
@@ -566,7 +604,7 @@ async fn session(
         let outcome = match socket.connect(endpoint).await {
             Ok(()) => {
                 broker
-                    .serve(&mut session, socket, &commands, &mut deltas)
+                    .serve(&mut session, socket, &commands, &mut deltas, &events)
                     .await
             }
             Err(error) => {
@@ -626,6 +664,7 @@ impl Broker {
         socket: TcpSocket<'_>,
         commands: &CommandSender,
         deltas: &mut DeltaSubscriber,
+        events: &EventReceiver,
     ) -> Result<(), SessionEnd> {
         let mut connection = session.connect(socket).await.map_err(SessionEnd::mqtt)?;
         let event = connection.connect_event();
@@ -712,10 +751,15 @@ impl Broker {
             // The inbound branch is handled *inside* the match and yields
             // nothing borrowed: an `InboundPublish` borrows the connection
             // mutably, and the publishes below need that borrow back.
-            let woken = match select3(connection.recv(), deltas.next_message(), diagnostics.next())
-                .await
+            let woken = match select4(
+                connection.recv(),
+                deltas.next_message(),
+                diagnostics.next(),
+                events.receive(),
+            )
+            .await
             {
-                Either3::First(inbound) => {
+                Either4::First(inbound) => {
                     let inbound = inbound.map_err(SessionEnd::mqtt)?;
                     dispatch(
                         &mut Wire {
@@ -730,19 +774,43 @@ impl Broker {
                     );
                     None
                 }
-                Either3::Second(WaitResult::Message(delta)) => Some(Woken::Delta(delta)),
+                Either4::Second(WaitResult::Message(delta)) => Some(Woken::Delta(delta)),
                 // The subscriber fell behind and the channel dropped deltas for
                 // it. Worth one line: it means this task was blocked long enough
                 // for the state task to publish `DELTA_QUEUE_DEPTH` updates, so
                 // the position now on the broker is behind the shade.
-                Either3::Second(WaitResult::Lagged(missed)) => {
+                Either4::Second(WaitResult::Lagged(missed)) => {
                     esp_println::println!("mqtt: fell behind, {} state updates dropped", missed);
                     None
                 }
-                Either3::Third(()) => Some(Woken::Diagnostics),
+                Either4::Third(()) => Some(Woken::Diagnostics),
+                Either4::Fourth(event) => Some(Woken::Shade(event)),
             };
 
             match woken {
+                Some(Woken::Shade(ShadeEvent::Added { id, name, pairable })) => {
+                    self.inventory.insert(
+                        id,
+                        &name,
+                        if pairable {
+                            Pairing::Offered
+                        } else {
+                            Pairing::Withheld
+                        },
+                    );
+                    self.known.track(id);
+                    self.announce_one(&mut connection, id, commands).await?;
+                }
+                // **The entities go before the shade is forgotten.** The state
+                // task has already removed it from the registry and written the
+                // record with its announced bit still set, so the id survives a
+                // power cut here; `retire` acknowledges only once the broker
+                // has confirmed every tombstone.
+                Some(Woken::Shade(ShadeEvent::Removed { id })) => {
+                    self.retire(&mut connection, id, commands).await?;
+                    self.inventory.remove(id);
+                    self.known.forget(id);
+                }
                 Some(Woken::Delta(delta)) => {
                     self.known.record(&delta);
                     for state in self.known.of(delta.id) {
@@ -880,7 +948,33 @@ impl Broker {
         // Every step through `perform`, which settles. See it for why that is
         // not optional: an announcement now costs `1 + 5N + k` operations for
         // `N` shades and `k` device entities, and `minimq` holds eight.
+        // **The orphans first, before anything the current configuration
+        // publishes.** These are shades that were announced and have since been
+        // removed, and their retained discovery configs are on the broker with
+        // nothing behind them. Clearing them is what `retire_shade` was written
+        // for and has never had a caller for.
+        //
+        // Retried on every fresh session until the state task acknowledges each
+        // one, which it does only after these have been settled — so a power
+        // cut here costs a repeat, and the id survives in flash either way.
+        if !self.orphans.is_empty() {
+            esp_println::println!(
+                "mqtt: clearing the entities of {} removed shade(s)",
+                self.orphans.len(),
+            );
+        }
+        let orphans: Vec<ShadeId, MAX_SHADES> = self.orphans.clone();
+        for id in orphans {
+            self.retire(connection, id, commands).await?;
+        }
+
         {
+            // Captured by value as a bitmap, not borrowed: the plan's closure
+            // has to outlive a `&mut Wire` that already borrows the inventory,
+            // and a `u32` sidesteps that entirely. One bit per registry slot,
+            // which is the same shape the persisted announced set has and for
+            // the same reason.
+            let pairable = self.pairable_bits();
             let mut wire = Wire {
                 config: &self.config,
                 inventory: &self.inventory,
@@ -888,7 +982,13 @@ impl Broker {
                 payload: &mut self.payload,
                 rare: &mut self.rare,
             };
-            for step in reconfigure(&self.stale, &self.config, self.inventory.ids(), HAS_TILT) {
+            for step in reconfigure(
+                &self.stale,
+                &self.config,
+                self.inventory.ids(),
+                HAS_TILT,
+                move |id| pairing_of(pairable, id),
+            ) {
                 perform(connection, &step, &mut wire).await?;
             }
         }
@@ -945,6 +1045,95 @@ impl Broker {
         // network path — a region whose other half holds Wi-Fi credentials.
         self.stale.clear();
         Ok(())
+    }
+
+    /// Which shades own a pairing button, as one bit per registry slot.
+    fn pairable_bits(&self) -> u32 {
+        self.inventory
+            .ids()
+            .iter()
+            .filter(|id| matches!(self.inventory.pairing(**id), Pairing::Offered))
+            .fold(0u32, |bits, id| bits | slot_bit(*id))
+    }
+
+    /// Clear everything the broker holds for one shade, then tell the state
+    /// task it may forget that the entities ever existed.
+    ///
+    /// **The acknowledgement is sent after the tombstones have settled, never
+    /// before.** `perform` settles each step, so by the time this returns the
+    /// broker has acknowledged every removal. Clearing the persisted bit first
+    /// would mean a power cut between the two lost the only record that the
+    /// entities are there — which is the failure the bit exists to prevent, one
+    /// step further along.
+    async fn retire<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        id: ShadeId,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        // Collected first because the plan borrows `self.config` and
+        // `perform_one` takes `&mut self`. A shade's retirement is seven steps.
+        let steps: Vec<Step<'static>, RETIRE_STEPS> = self.config.retire_shade(id).collect();
+        for step in &steps {
+            self.perform_one(connection, step, commands).await?;
+        }
+        self.acks.send(ShadeAck::Retired { id }).await;
+        self.orphans.retain(|held| *held != id);
+        Ok(())
+    }
+
+    /// Announce one shade that has just been added, without re-announcing the
+    /// rest.
+    async fn announce_one<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        id: ShadeId,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        let pairing = self.inventory.pairing(id);
+        let steps: Vec<Step<'static>, ANNOUNCE_STEPS> =
+            self.config.announce_shade(id, HAS_TILT, pairing).collect();
+        for step in &steps {
+            self.perform_one(connection, step, commands).await?;
+        }
+
+        // The name, which no plan can carry because `somfy-mqtt` does not hold
+        // names. Same reasoning as in `announce`, including why a name that
+        // does not fit is skipped rather than published: an empty retained
+        // payload is a tombstone.
+        if let Some(held) = self.inventory.name(id) {
+            let mut name: String<{ somfy_mqtt::MAX_NAME_LEN }> = String::new();
+            if name.push_str(held).is_ok() {
+                let published =
+                    PublishedTopic::of(ShadeTopic::Name).expect("a shade's name is published");
+                let publish = Step::Send(self.config.state(id, published, name.as_bytes()));
+                self.perform_one(connection, &publish, commands).await?;
+            }
+        }
+
+        self.acks.send(ShadeAck::Announced { id }).await;
+        Ok(())
+    }
+}
+
+/// The bit `id` occupies in a per-registry-slot bitmap.
+///
+/// Zero for an id past the registry, which is not reachable — every id comes
+/// from the registry — and is a shift that would otherwise be undefined.
+fn slot_bit(id: ShadeId) -> u32 {
+    if (id.0 as usize) < MAX_SHADES {
+        1u32 << id.0
+    } else {
+        0
+    }
+}
+
+/// Read one shade's pairing status out of the bitmap.
+fn pairing_of(bits: u32, id: ShadeId) -> Pairing {
+    if bits & slot_bit(id) != 0 {
+        Pairing::Offered
+    } else {
+        Pairing::Withheld
     }
 }
 
@@ -1431,6 +1620,35 @@ impl Known {
             }
         }
         Known { shades }
+    }
+
+    /// Start tracking a shade that has just been added.
+    ///
+    /// `seen` stays false, which is the honest state: nothing has reported a
+    /// position for it yet, and publishing `Pos::ZERO` retained would hand
+    /// every later subscriber a value this device does not know.
+    fn track(&mut self, id: ShadeId) {
+        if self.shades.iter().flatten().any(|slot| slot.id == id) {
+            return;
+        }
+        if let Some(free) = self.shades.iter_mut().find(|slot| slot.is_none()) {
+            *free = Some(Observed {
+                id,
+                pos: Pos::ZERO,
+                direction: Direction::Idle,
+                seen: false,
+            });
+        }
+    }
+
+    /// Stop tracking a shade that has been removed, so its last position is not
+    /// republished on the next reconnect to a topic that has just been cleared.
+    fn forget(&mut self, id: ShadeId) {
+        for slot in self.shades.iter_mut() {
+            if slot.is_some_and(|held| held.id == id) {
+                *slot = None;
+            }
+        }
     }
 
     /// Note what a delta said.

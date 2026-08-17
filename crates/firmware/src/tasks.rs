@@ -29,24 +29,30 @@
 //! removed it in favour of exactly-sized statics. There is no arena to size.
 
 use embassy_executor::task;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_sync::pubsub::{ImmediatePublisher, Subscriber};
-use embassy_time::{Duration, Instant, Ticker};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
 use heapless::Vec;
-use somfy_domain::{StateDelta, DELTA_CAPACITY};
-use somfy_rts::Frame;
+use somfy_config::Catalog;
+use somfy_domain::{
+    allocate_if_absent, Registry, RemoteIdentity, ShadeId, StateDelta, DELTA_CAPACITY,
+};
+use somfy_rts::{Frame, RollingCode};
+use somfy_store::{seed_if_absent, RegionState, Seeded};
 use somfy_tasks::{
     ControlCommand, Dispatch, RadioEvent, RadioLoop, StateMachine, TransmitQueueHandle,
     COMMAND_QUEUE_DEPTH, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, FRAME_QUEUE_DEPTH,
     TRANSMIT_QUEUE_DEPTH,
 };
 
+use crate::edits::{AckReceiver, EditReceiver, EventSender, ShadeAck, ShadeEdit, ShadeEvent};
 use crate::radio::{air::Air, rmt_rx::RmtPulseSource};
+use crate::shades::ShadeStore;
 use crate::store::{FlashStore, StoreError};
 
 /// The mutex kind every channel in this firmware uses.
@@ -216,21 +222,65 @@ pub async fn radio(mut radio: Radio) -> ! {
 pub async fn state(
     mut machine: StateMachine,
     mut store: FlashStore<'static>,
+    mut table: Table,
     mut queue: TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
     frames: Receiver<'static, Mutex, Frame, FRAME_QUEUE_DEPTH>,
     commands: Receiver<'static, Mutex, ControlCommand, COMMAND_QUEUE_DEPTH>,
     deltas: Deltas,
 ) -> ! {
+    let Table {
+        ref mut shades,
+        ref mut catalog,
+        identity,
+        edits,
+        acks,
+        ref events,
+    } = table;
     let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
     loop {
-        // `select3` polls its arms in order and returns on the first that is
+        // The table's own clock. `due_at` is `None` when nothing is pending, and
+        // a far-future deadline then keeps this arm out of the way rather than
+        // making it a fourth thing that is always ready. See
+        // `somfy_config::Catalog` for why a shade table is debounced while a
+        // rolling code is not.
+        let write_due = catalog.due_at();
+        let persist = async {
+            match write_due {
+                Some(at) => {
+                    Timer::at(Instant::from_millis(at)).await;
+                }
+                None => core::future::pending::<()>().await,
+            }
+        };
+
+        // `select4` polls its arms in order and returns on the first that is
         // ready, so a permanently-ready earlier arm would starve a later one.
         // The order is chosen for that: a command is the thing a person is
-        // waiting on, a frame is an observation, and the tick is what plans
-        // arrival stops. It is safe because none of the three can be
-        // continuously ready — the two channels are drained faster than any
-        // radio can fill them, and the ticker fires at `TICK_MS`.
-        let event = select3(commands.receive(), frames.receive(), ticker.next()).await;
+        // waiting on, an edit is a person too but a rarer one, a frame is an
+        // observation, and the last arm is either the tick that plans arrival
+        // stops or the flash write that is already overdue. It is safe because
+        // none of them can be continuously ready — the channels are drained
+        // faster than any radio or any person can fill them, and the ticker
+        // fires at `TICK_MS`.
+        let edit_or_ack = async {
+            match select(edits.receive(), acks.receive()).await {
+                Either::First(edit) => Edited::Edit(edit),
+                Either::Second(ack) => Edited::Ack(ack),
+            }
+        };
+        let tick_or_write = async {
+            match select(ticker.next(), persist).await {
+                Either::First(()) => Timed::Tick,
+                Either::Second(()) => Timed::Persist,
+            }
+        };
+        let event = select4(
+            commands.receive(),
+            edit_or_ack,
+            frames.receive(),
+            tick_or_write,
+        )
+        .await;
         // Sampled after the wait, not before it: the wait is the part that
         // takes time, and the domain dead-reckons from this number.
         let now_ms = Instant::now().as_millis();
@@ -240,7 +290,7 @@ pub async fn state(
         let mut emitted: Vec<StateDelta, DELTA_CAPACITY> = Vec::new();
 
         let dispatched = match event {
-            Either3::First(command) => {
+            Either4::First(command) => {
                 match machine.apply(&mut store, &mut queue, command, now_ms, &mut emitted) {
                     Ok(dispatch) => report(&dispatch),
                     Err(error) => {
@@ -249,7 +299,29 @@ pub async fn state(
                     }
                 }
             }
-            Either3::Second(frame) => {
+            Either4::Second(Edited::Edit(edit)) => {
+                apply_edit(
+                    machine.registry_mut(),
+                    catalog,
+                    &mut store,
+                    &identity,
+                    events,
+                    edit,
+                    now_ms,
+                );
+                false
+            }
+            // The other half of the round trip a removal makes: the broker has
+            // cleared the entities, so the persisted bit that names them may go
+            // — and not before. `somfy_config::Catalog` carries the ordering.
+            Either4::Second(Edited::Ack(ack)) => {
+                match ack {
+                    ShadeAck::Announced { id } => catalog.mark_announced(id, now_ms),
+                    ShadeAck::Retired { id } => catalog.mark_retired(id, now_ms),
+                }
+                false
+            }
+            Either4::Third(frame) => {
                 esp_println::println!(
                     "state: heard {:?} from {:#08X} (code {})",
                     frame.command,
@@ -259,9 +331,18 @@ pub async fn state(
                 machine.on_rx_frame(&frame, now_ms, &mut emitted);
                 false
             }
-            Either3::Third(()) => {
+            Either4::Fourth(Timed::Tick) => {
                 let dispatch = machine.tick(&mut store, &mut queue, now_ms, &mut emitted);
                 report(&dispatch)
+            }
+            // The debounce has run out. **Written here, on the state task**,
+            // because this is the task that owns both the flash and the
+            // registry the record is built from — and because a write is an
+            // erase with interrupts disabled, which must not happen on the
+            // radio task's clock.
+            Either4::Fourth(Timed::Persist) => {
+                persist_table(&mut store, shades, catalog, machine.registry());
+                false
             }
         };
 
@@ -275,6 +356,255 @@ pub async fn state(
             // commit. See the note on this task.
             yield_now().await;
         }
+    }
+}
+
+/// Everything the state task needs in order to change the shade table and say
+/// so.
+///
+/// One value rather than six arguments, and the six are genuinely one thing: a
+/// change arrives on `edits`, is applied to `catalog`, is written through
+/// `shades`, is announced on `events`, and is confirmed back on `acks`. A board
+/// with no shade region has `shades: None` and everything else still works —
+/// the change is applied and commandable, and only its durability is lost.
+pub struct Table {
+    /// The flash region, if the partition table has one.
+    pub shades: Option<ShadeStore>,
+    /// The table as the controller believes it, plus the debounce.
+    pub catalog: Catalog,
+    /// This controller's virtual-remote identity, which is what a new shade's
+    /// address is allocated from.
+    pub identity: RemoteIdentity,
+    /// Changes coming in.
+    pub edits: EditReceiver,
+    /// Confirmations coming back from the broker session.
+    pub acks: AckReceiver,
+    /// Changes going out to the broker session.
+    pub events: EventSender,
+}
+
+/// Which of the two message kinds the second select arm delivered.
+enum Edited {
+    /// Somebody asked for a change to the table.
+    Edit(ShadeEdit),
+    /// The broker session finished announcing or retiring one.
+    Ack(ShadeAck),
+}
+
+/// Which of the two the last select arm delivered.
+enum Timed {
+    /// The estimator's clock.
+    Tick,
+    /// The shade table's debounce ran out.
+    Persist,
+}
+
+/// Apply one edit to the registry and the table, and tell the broker session.
+///
+/// Every refusal is reported and nothing else happens: an edit that cannot be
+/// applied must not leave the registry and the table disagreeing, which is why
+/// each arm below either completes or returns before touching the second one.
+fn apply_edit(
+    registry: &mut Registry,
+    catalog: &mut Catalog,
+    store: &mut FlashStore<'static>,
+    identity: &RemoteIdentity,
+    events: &EventSender,
+    edit: ShadeEdit,
+    now_ms: u64,
+) {
+    match edit {
+        ShadeEdit::Add { name } => {
+            // The id is the registry's lowest free slot, and the address is
+            // allocated inside the branch where that slot is empty — see
+            // `somfy_domain::allocate_if_absent` for why reallocating is not a
+            // thing it declines to do but a thing it cannot express.
+            let Some(id) = free_shade_id(registry) else {
+                esp_println::println!("shades: cannot add '{}' — the registry is full", name);
+                return;
+            };
+            let allocated = match allocate_if_absent(registry, identity, id, &name) {
+                Ok(allocated) => allocated,
+                Err(error) => {
+                    esp_println::println!("shades: cannot add '{}' ({:?})", name, error);
+                    return;
+                }
+            };
+            let address = allocated.address();
+
+            // **A freshly allocated address needs a rolling code before its
+            // first transmission.** `seed_if_absent` is where that rule lives:
+            // it reads first and writes only into the branch where the store
+            // held nothing, so this cannot move an existing counter backwards
+            // — which is what would stop a motor obeying.
+            //
+            // The region state is `Intact` because this address is new by
+            // construction: it came from the allocator, which stepped over
+            // every address the table holds. A damaged region is a reason not
+            // to believe an *empty read for an old address*, and there is no
+            // old address here.
+            let seed = RollingCode(1);
+            match seed_if_absent(store, address, seed, RegionState::Intact) {
+                Ok(Seeded::Planted(code)) => {
+                    esp_println::println!(
+                        "shades: ShadeId({}) '{}' allocated {:#08X}, rolling code seeded at {}",
+                        id.0,
+                        name,
+                        address,
+                        code.0,
+                    );
+                }
+                Ok(other) => {
+                    // Unreachable: the address is new. Reported rather than
+                    // ignored, because the two ways it could happen — an
+                    // address the allocator handed out twice, or a store that
+                    // remembers one it should not — are both worth knowing.
+                    esp_println::println!(
+                        "shades: ShadeId({}) allocated {:#08X} and the store answered {:?}",
+                        id.0,
+                        address,
+                        other,
+                    );
+                }
+                Err(error) => {
+                    // The shade exists and cannot transmit. Left in place
+                    // rather than rolled back: removing it would burn the
+                    // address, and a shade that reports `NoStoredCode` is
+                    // recoverable by a person who is told.
+                    esp_println::println!(
+                        "shades: ShadeId({}) at {:#08X} has no rolling code ({:?}) — it will \
+                         refuse to transmit until the region is repaired",
+                        id.0,
+                        address,
+                        error,
+                    );
+                }
+            }
+
+            catalog.add(id, seed, now_ms);
+            let event = ShadeEvent::Added {
+                id,
+                name,
+                pairable: RemoteIdentity::is_allocated(address),
+            };
+            announce(events, event);
+        }
+        ShadeEdit::Remove { id } => {
+            // **The entities go before the shade does.** The record is written
+            // with the shade gone and its announced bit still set, so from here
+            // on flash names an orphan — which is the only thing that can name
+            // it once the id is out of the registry.
+            if let Err(error) = catalog.remove(registry, id, now_ms) {
+                esp_println::println!("shades: cannot remove ShadeId({}) ({})", id.0, error);
+                return;
+            }
+            esp_println::println!("shades: ShadeId({}) removed", id.0);
+            announce(events, ShadeEvent::Removed { id });
+        }
+        ShadeEdit::Link { id, address } => match catalog.link(registry, id, address, now_ms) {
+            Ok(()) => esp_println::println!(
+                "shades: ShadeId({}) now follows the remote at {:#08X}",
+                id.0,
+                address,
+            ),
+            Err(error) => esp_println::println!(
+                "shades: cannot link {:#08X} to ShadeId({}) ({})",
+                address,
+                id.0,
+                error,
+            ),
+        },
+        ShadeEdit::Unlink { id, address } => match catalog.unlink(registry, id, address, now_ms) {
+            Ok(()) => esp_println::println!(
+                "shades: ShadeId({}) no longer follows the remote at {:#08X}",
+                id.0,
+                address,
+            ),
+            Err(error) => esp_println::println!(
+                "shades: cannot unlink {:#08X} from ShadeId({}) ({})",
+                address,
+                id.0,
+                error,
+            ),
+        },
+    }
+}
+
+/// The lowest id the registry has free, or `None` if it is full.
+///
+/// Asked here rather than by `add_shade`, because the address has to be
+/// allocated *for* an id and the allocation must happen inside the branch where
+/// the slot is empty.
+fn free_shade_id(registry: &Registry) -> Option<ShadeId> {
+    (0..somfy_domain::MAX_SHADES as u8)
+        .map(ShadeId)
+        .find(|id| registry.shade(*id).is_none())
+}
+
+/// Tell the broker session what changed, or say that nothing heard.
+///
+/// `try_send`, never `send`: a board with no broker provisioned has nothing
+/// draining this queue, and a state task parked on it would stop estimating
+/// positions and stop planning arrival stops. Anything dropped here is
+/// recovered by the next full announcement, which is built from the table.
+fn announce(events: &EventSender, event: ShadeEvent) {
+    if events.try_send(event).is_err() {
+        esp_println::println!(
+            "shades: nothing is listening for entity changes — the broker will catch up on \
+             its next session"
+        );
+    }
+}
+
+/// Write the shade table, and report whichever way it went.
+///
+/// The debounce is cleared **only** on a durable write. A failure leaves the
+/// table dirty, so the next deadline tries again rather than silently believing
+/// in a record the flash did not take.
+fn persist_table(
+    store: &mut FlashStore<'static>,
+    shades: &mut Option<ShadeStore>,
+    catalog: &mut Catalog,
+    registry: &Registry,
+) {
+    // No region, nothing to write to. The change stays in memory and the
+    // controller keeps working; `written` is called anyway so the deadline does
+    // not fire again every debounce for a region that is not coming back.
+    let Some(shades) = shades.as_mut() else {
+        esp_println::println!(
+            "shades: there is no shade region, so this change will not survive a reboot"
+        );
+        catalog.written();
+        return;
+    };
+    let (record, dropped) = catalog.record(registry);
+    if dropped.links > 0 {
+        esp_println::println!(
+            "shades: {} linked remote(s) did not fit the record's pool and will not survive \
+             the next boot",
+            dropped.links,
+        );
+    }
+    let shade_count = record.shades.len();
+    // One borrow of the flash, for the length of this call. See
+    // `FlashStore::with_flash` for why a borrow rather than a second owner.
+    match store.with_flash(|flash| shades.store(flash, &record)) {
+        Ok(seq) => {
+            catalog.written();
+            esp_println::println!(
+                "shades: table written (seq {}, {} shade(s), {} link(s))",
+                seq,
+                shade_count,
+                record.links.len(),
+            );
+        }
+        // Left dirty on purpose: the next deadline retries. A controller that
+        // believed in a table the flash refused would lose every shade at the
+        // next boot with nothing to say why.
+        Err(error) => esp_println::println!(
+            "shades: the table could not be written ({:?}) — it will be retried",
+            error,
+        ),
     }
 }
 

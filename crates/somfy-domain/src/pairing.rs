@@ -118,8 +118,9 @@ impl RemoteIdentity {
 
     /// Whether `address` is one this project's allocator produced.
     ///
-    /// The whole test is [`OWN_SPACE`], and it is exact in one direction: no
-    /// address below `0x80_0000` can have come from [`address_for`], because
+    /// The whole test is the marker bit, and it is exact in one direction: no
+    /// address below `0x80_0000` can have come from
+    /// [`address_for`](RemoteIdentity::address_for), because
     /// every base carries the bit and nothing added to a base can clear it. So
     /// a `false` here means "this address came from somewhere else" — an
     /// imported table, a wall remote — with certainty.

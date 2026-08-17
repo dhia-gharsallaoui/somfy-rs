@@ -76,11 +76,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod catalog;
 mod credentials;
 mod mqtt;
 mod record;
 mod shade;
 
+pub use catalog::{Catalog, CatalogError, Dropped, DEBOUNCE_MS, MAX_DEFER_MS};
 pub use credentials::{
     CredentialError, Field, WifiCredentials, MAX_PSK_LEN, MAX_SSID_LEN, MIN_PSK_LEN,
 };

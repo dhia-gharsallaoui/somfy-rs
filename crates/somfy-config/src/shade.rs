@@ -190,7 +190,7 @@ const LINK_LEN: usize = 4;
 pub const MAX_LINKS: usize = (OFF_CRC - OFF_LINKS) / LINK_LEN;
 
 /// Linked remotes **one shade** may have — the domain's own bound, restated so
-/// a record cannot deliver a shade [`Shade::link_remote`] would then refuse.
+/// a record cannot deliver a shade [`Shade::link_remote`](somfy_domain::Shade::link_remote) would then refuse.
 pub const MAX_LINKED_REMOTES: usize = somfy_domain::MAX_LINKED_REMOTES;
 
 /// Bits of a pool word the address occupies. An RTS address is 24 bits and
@@ -875,7 +875,7 @@ fn decode_link(bytes: &[u8; SHADE_RECORD_LEN], index: usize) -> LinkedRemote {
 /// Every rule a linked remote has to satisfy, checked against the shade
 /// addresses `addresses[..header.count]` already decoded.
 ///
-/// The rules are the domain's — [`Shade::link_remote`]'s — restated here for
+/// The rules are the domain's — [`Shade::link_remote`](somfy_domain::Shade::link_remote)'s — restated here for
 /// the same reason every other rule in this file is: flash must not be able to
 /// deliver a link the registry would then refuse, because the refusal would
 /// arrive one shade at a time in a log line nobody reads.
