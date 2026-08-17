@@ -87,68 +87,304 @@
 //! equally true of the shared constant — no ESP32 and no ESP32-C3 had ever run
 //! that either. What changes it is that the rule is now identical on every chip
 //! and only its input differs, and that both quantities it is built from are
-//! measurements rather than arguments: `main::REQUIRED_STACK_BYTES` against a
-//! painted stack, and [`WIFI_WORKING_SET_BYTES`] against a live broker.
+//! measurements rather than arguments: [`REQUIRED_STACK_BYTES`] out of the
+//! linked ELF, and [`WIFI_WORKING_SET_BYTES`] against a live broker.
+//!
+//! ## The stack half was measured once and then left
+//!
+//! It is worth being exact about how that failed, because the shape of it is
+//! general. `REQUIRED_STACK_BYTES` was read off a linked image and was right
+//! when it was read. Three of the four frames on the chain it names then grew,
+//! the web server added a fourth branch beneath them, and the constant did not
+//! move — so `crate::check_stack_headroom` compared a real 66,724 against a
+//! fictional 49,592, passed, and the board wrote through its stack guard about a
+//! second later. **A check that passes and then the device dies is worse than no
+//! check**, because it launders an overflow as a green light.
+//!
+//! Two things are different now. [`REQUIRED_STACK_BYTES`] is a `max` over the
+//! chains this build actually contains rather than one figure, so a
+//! configuration cannot silently need more than the constant admits; and the
+//! `assert!` beneath [`STACK_MARGIN_FLOOR_BYTES`] turns "it no longer fits" into
+//! a build failure. Neither of those can notice the constant itself going stale
+//! — nothing written in this file can — which is what `crate::stack_used` is
+//! for: it paints the unused stack at boot and reads back how far down the paint
+//! was destroyed, so every boot prints a *measurement* next to the claim.
+
+// How every stack figure below is read off a linked image. The commands are
+// here because these are the rows that go stale — one of them already did, and
+// the cost was a boot loop on the only hardware that exists.
+//
+//     RUSTFLAGS="-Zemit-stack-sizes -C link-arg=-Tlinkall.x" \
+//       cargo build --release --features chip-s3 \
+//         --target xtensa-esp32s3-none-elf --bin firmware
+//     # frame sizes: a 4-byte address then a ULEB128 size, one entry per function
+//     readelf -x .stack_sizes target/xtensa-esp32s3-none-elf/release/firmware
+//     # the chain they sit on: who calls whom
+//     xtensa-esp32s3-elf-objdump -d -C target/xtensa-esp32s3-none-elf/release/firmware
+//     # what the linker actually left, which is the boot line's own figure
+//     readelf -S target/xtensa-esp32s3-none-elf/release/firmware | grep '\.stack '
+//
+// A chain has to be *walked*, not guessed at, and on Xtensa that is less obvious
+// than it sounds: a far call is an `l32r` of the target into a register followed
+// by `callx8`, so the callee's name appears in the listing as a resolved literal
+// rather than as a branch target. A reader grepping for `call8` finds almost
+// nothing and concludes the function calls nobody.
+
+/// The deepest chain this firmware runs, and where it runs.
+///
+/// **This is the term that was wrong**, and the shape of being wrong is worth
+/// keeping: [`REQUIRED_STACK_BYTES`] named the right chain and had not been
+/// re-read since three of that chain's four frames grew. It said 49,592. The
+/// image that boot-looped needed **73,280** — short by 23,688 — and this image,
+/// with the inlining fixed, needs 54,720, so it was short by 5,128 even after
+/// the bug it hid was gone.
+///
+/// Nothing checked it, because nothing written here can: a stack requirement is
+/// a property of what the compiler emitted. `crate::stack_used` is the answer to
+/// that, and it is why this constant now has a measurement standing next to it
+/// on every boot instead of a date.
+///
+/// One straight line, no branch and no recursion, from the executor into the
+/// spawn of the state task. Measured 2026-08-17 on this commit:
+///
+/// | | ESP32 | ESP32-S3 | ESP32-C3 |
+/// |---|---|---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 | 144 | 112 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 | 3,856 | 3,840 |
+/// | [`crate::start`] | 19,552 | 19,536 | 19,472 |
+/// | [`crate::tasks::state`], building the task token | 14,720 | 14,720 | 14,704 |
+/// | `UninitCell::write_in_place`, moving the future into its static | 14,736 | 14,736 | 14,736 |
+/// | **total** | **53,008** | **52,992** | **52,864** |
+///
+/// The last row is the leaf: it calls nothing but `memcpy`. It is the state
+/// task's 14 KB future being materialised and then copied into the static
+/// `#[embassy_executor::task]` declares for it, and it lands *below*
+/// [`crate::start`]'s own frame rather than after it has been given back.
+///
+/// The worst chip's figure is taken, as [`INTERRUPT_FRAMES_BYTES`] is, because a
+/// boot check that differs per chip is three numbers to keep true instead of
+/// one.
+///
+/// **What this chain no longer contains, and the bug that put it there.**
+/// `crate::start_network` is the *other* branch out of that same `poll` — it
+/// runs after [`crate::start`] has returned — and it used to be inlined into it.
+/// Inlining does not make two sequential calls share a peak; it makes the
+/// callee's slots part of the caller's frame, live for as long as the caller is,
+/// including while a 48,992-byte call runs underneath. That put the web server's
+/// bring-up **beneath** the deepest thing this firmware does: the ESP32-S3's
+/// `poll` frame was 22,432 bytes instead of 3,856 and the chain came to 71,568
+/// against 66,724 of stack. `#[inline(never)]` on `crate::start_network` is what
+/// separates them — 18,576 bytes, and the whole of the boot loop — and
+/// [`NETWORK_CHAIN_BYTES`] is what that branch costs once separated.
+const BOOT_CHAIN_BYTES: usize = 53_008;
+
+/// The chain that brings up Wi-Fi, the web server and the broker session.
+///
+/// A sibling of [`BOOT_CHAIN_BYTES`] rather than a part of it — same `poll`,
+/// different branch — and **the only one of the three that depends on which
+/// transports are compiled in**, which is why it is here rather than folded into
+/// a single figure. Measured 2026-08-17 on this commit, whole chain including
+/// the 144 bytes above `poll` and `poll`'s own 3,856:
+///
+/// | build | `crate::start_network` | chain |
+/// |---|---|---|
+/// | ESP32-S3, `mqtt` + `ui` | 18,784 | 23,280 |
+/// | ESP32-S3, `mqtt` | 9,568 | 13,936 |
+/// | ESP32, `mqtt` | 9,568 | 14,416 |
+/// | ESP32-C3, `mqtt` + `ui` | 8,176 | 12,352 |
+///
+/// The web server adds 9,216 bytes to `crate::start_network`'s own frame, and it
+/// is dominated by one line: `api::start` hands `BUFFERS.init` an
+/// `[Buffers; HTTP_TASKS]` **by value**, which is `HTTP_TASKS` × 3,584 = 14,336
+/// bytes materialised on this stack on its way into a static. It is affordable
+/// here and would not be under [`BOOT_CHAIN_BYTES`]; that is the whole reason the
+/// two are kept apart. A `static_cell::ConstStaticCell` would take it to zero and
+/// is the first thing to reach for if this branch ever needs to shrink.
+#[cfg(feature = "http")]
+const NETWORK_CHAIN_BYTES: usize = 23_280;
+/// See the `http` definition above.
+#[cfg(not(feature = "http"))]
+const NETWORK_CHAIN_BYTES: usize = 14_416;
+
+/// The deepest chain a *request* runs, once the device is up.
+///
+/// `picoserve`'s router is a type per route wrapping the previous one, so a
+/// request walks a nest of monomorphised frames rather than a loop. Measured
+/// 2026-08-17 on the ESP32-S3 with `mqtt` + `ui`, from the executor down through
+/// `TaskStorage<connection>::poll` (2,064), the connection's `select` (7,600 +
+/// 7,552), the path-parameter route for `/api/v1/shades/:id` (8,720) and the
+/// response writers beneath it: **33,504 bytes**, about 19 KB clear of
+/// [`BOOT_CHAIN_BYTES`].
+///
+/// It is a term in [`REQUIRED_STACK_BYTES`] rather than a comment because that
+/// clearance is the thing that could stop being true: a route added to
+/// `api::routes` deepens this and nothing else, and the `max` below is what
+/// notices.
+///
+/// Zero without the web server, which is not a rounding — there is no connection
+/// task in that image at all.
+#[cfg(feature = "http")]
+const REQUEST_CHAIN_BYTES: usize = 33_504;
+/// See the `http` definition above.
+#[cfg(not(feature = "http"))]
+const REQUEST_CHAIN_BYTES: usize = 0;
+
+/// What an interrupt costs on top of whatever chain it lands on.
+///
+/// An interrupt lands on whatever stack was running, and on this firmware that
+/// is the main one — **observed, not assumed**: the boot loop this file was
+/// rewritten for died at `0x40378954`, the first instruction of
+/// `xtensa_lx_rt`'s `__default_naked_exception`, whose second and third
+/// instructions drop the stack pointer by 256 and store through it. That store
+/// is what reached the guard word.
+///
+/// `xtensa-lx-rt` allocates `XT_STK_FRMSZ` = 256 bytes per entry
+/// (`xtensa-lx-rt-0.22.0/src/exception/asm.rs:81`, and visible as
+/// `addmi a1, a1, 0xffffff00` at the top of every vector) and then calls a
+/// handler with its own frame; the five entries that can nest —
+/// `__user_exception`, `__level_1`, `__level_2`, `__level_3` and
+/// `__default_double_exception` — cost 5 × 256 plus 432 of handler frames on the
+/// worst chip. All five stacked at once is not a scenario anyone has seen; it is
+/// the bound.
+///
+/// **It does not cover the bodies those handlers dispatch into.**
+/// `esp_radio`'s `Handler::dispatch` calls straight into the closed Wi-Fi driver
+/// from interrupt context (`esp-radio-0.18.0/src/interrupt_dispatch.rs:24`), and
+/// neither that blob nor masked ROM carries stack-size metadata, so no sum over
+/// them is available. [`STACK_MARGIN_FLOOR_BYTES`] is what stands behind that,
+/// and [`crate::stack_used`] is what will eventually price it.
+const INTERRUPT_FRAMES_BYTES: usize = 1_712;
+
+/// Main stack this firmware refuses to start without.
+///
+/// The largest chain in this build plus what an interrupt adds to it. It is a
+/// `max` rather than a sum because the three chains are alternatives — the
+/// executor is in exactly one of them at a time — and it is a `max` rather than
+/// a single figure because **which one is largest is a property of the enabled
+/// features**, and the day that changes this arithmetic changes with it instead
+/// of being re-derived by hand.
+///
+/// Today, on every configuration in the matrix, [`BOOT_CHAIN_BYTES`] wins:
+/// 53,008 + 1,712 = **54,720**.
+///
+/// Checked at run time by `crate::check_stack_headroom` rather than asserted at
+/// compile time, because the quantity it is checked *against* cannot be a
+/// constant: esp-hal's linker script gives the stack whatever DRAM is left after
+/// the statics, so it moves every time a static is added — and since
+/// [`RADIO_HEAP_BYTES`] is the largest static in the image, every time that
+/// changes too. What *is* asserted at compile time is that this fits the
+/// division below.
+pub const REQUIRED_STACK_BYTES: usize = larger(
+    larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
+    REQUEST_CHAIN_BYTES,
+) + INTERRUPT_FRAMES_BYTES;
+
+/// `usize::max`, which is not a `const fn`.
+const fn larger(left: usize, right: usize) -> usize {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
 
 /// The main stack every chip is left, before the heap takes the rest.
 ///
-/// **This is the design's one free variable, and everything else follows from
-/// it.** `esp_alloc::heap_allocator!` declares a static array and esp-hal's
-/// linker script gives the main stack whatever DRAM is left once the statics
-/// are placed, so the heap and the stack are two shares of one fixed quantity —
+/// **This is the division, and it is one number for all three chips.**
+/// `esp_alloc::heap_allocator!` declares a static array and esp-hal's linker
+/// script gives the main stack whatever DRAM is left once the statics are
+/// placed, so the heap and the stack are two shares of one fixed quantity —
 /// measurably so, and checked rather than assumed: the heap moved by +4,096 on
 /// the ESP32, +109,568 on the ESP32-S3 and +96,256 on the ESP32-C3 when this
 /// constant was introduced, and each chip's stack fell by exactly that, to the
 /// byte, in the relinked ELF. There is no third option and no slack between
 /// them; choosing one chooses the other.
 ///
-/// So this crate chooses the *stack*, once, for all chips, and
-/// [`RADIO_HEAP_BYTES`] is the arithmetic that follows. The other order — pick a
-/// heap and hope the stack survives — is what produced a 56 KB heap sized by the
-/// smallest chip that was then in the matrix, and an ESP32-S3 running that heap
-/// 96% full with 2,724 bytes to spare at the announcement peak.
+/// ### Why it is 66,280 and why it must not rise
 ///
-/// ### The two terms
+/// It used to be written as `49_592 + 16_688` — a requirement plus a margin —
+/// and **both halves of that were wrong while their sum was right.** The
+/// requirement is 54,720, so the margin this division actually buys was, and
+/// still is, 66,280 − 54,720 = 11,560 rather than 16,688. Nothing available now
+/// was unavailable then; only the account of it was wrong, which is why the sum
+/// is kept unchanged and every heap figure measured against it stays valid.
 ///
-/// **49,592 bytes are required.** `main::REQUIRED_STACK_BYTES` derives that
-/// frame by frame from the linked ELF and checks it on the ESP32-S3 against a
-/// painted stack on real hardware, where the computed figure and the measured
-/// one agree exactly. It is the boot path, not the frame path: the deepest thing
-/// this firmware does is move the state task's 14 KB future into place,
-/// underneath `start`'s own 13.7 KB frame, and `RmtTx::transmit_frame`'s
-/// celebrated 6.5 KB never comes close.
-///
-/// **16,688 bytes are the margin, and it is measured rather than rounded.** What
-/// the derivation cannot see is what an interrupt handler *calls*: those paths
-/// run into `esp-radio`'s closed driver and into masked ROM, and neither carries
-/// stack-size metadata, so no sum over them exists to be taken. The margin has
-/// to cover being wrong about that, so it is set to **the largest single stack
-/// frame emitted anywhere in any of the three images** — one more frame of the
-/// worst size this compiler has actually produced here is the smallest unit in
-/// which this call graph can grow.
-///
-/// That worst frame is **not** the same one on every chip, and getting this
-/// wrong is easy: on the ESP32 and the ESP32-S3 the largest frame is
-/// `UninitCell::write` at 14,320 bytes, but on the ESP32-C3 it is `entry`'s own
-/// body — where `start` is inlined into it — at **16,688**. A margin of 14,320
-/// would therefore have been smaller than one worst-case frame on one of the
-/// three chips actually shipped, which is exactly the property the margin exists
-/// to buy. The maximum is taken across all three:
+/// The figure is fixed **by the ESP32's heap**, which is the binding constraint
+/// on the whole design and the reason a "pick the stack first" rule cannot be
+/// followed all the way down:
 ///
 /// ```text
-/// RUSTFLAGS="-Zemit-stack-sizes -C link-arg=-Tlinkall.x" \
-///   cargo build --release --features chip-c3 --target riscv32imc-unknown-none-elf --bin firmware
-/// readelf -x .stack_sizes target/riscv32imc-unknown-none-elf/release/firmware
+/// ESP32 DRAM for stack and heap                                125,116
+///   − this budget                                               66,280
+///   = 58,836, rounded down to a whole KiB                        58,368   heap
+///   − the largest heap high-water yet measured                   54,424
+///   = what the ESP32 has left at the announcement burst           3,944
 /// ```
 ///
-/// — each entry in that section is a 4-byte address followed by a ULEB128 frame
-/// size, and the largest of them is this figure. Read on 2026-08-17: ESP32
-/// 14,320; ESP32-S3 14,320; ESP32-C3 16,688.
+/// **3,944 bytes is the entire slack in this design**, and it is inside the
+/// heap's own ~4,216-byte boot-to-boot noise, which is why that figure is the
+/// one to watch on that chip. Every byte added to this budget comes out of it.
+/// Raising the budget by 4 KiB does not cost the ESP32 a margin; it costs it the
+/// ability to finish announcing.
 ///
-/// 49,592 + 16,688 = **66,280**, and the boot check fires at 49,592 — so the
-/// margin is the distance between "this still works" and "this stops booting and
-/// says why", rather than a number nobody would notice being spent.
-pub const STACK_BUDGET_BYTES: usize = 49_592 + 16_688;
+/// The two chips with DRAM to spare are not the constraint and do not get to set
+/// it: at this budget the ESP32-S3 runs a 93,184-byte heap against the same
+/// 54,424 peak, and the ESP32-C3 79,872.
+///
+/// ### What the difference buys
+///
+/// 66,280 − [`REQUIRED_STACK_BYTES`] = 11,560 bytes, and
+/// [`STACK_MARGIN_FLOOR_BYTES`] is the least of it this division may leave.
+pub const STACK_BUDGET_BYTES: usize = 66_280;
+
+/// The least the division may leave over the measured requirement.
+///
+/// **A policy figure, and said so rather than dressed up.** What it stands
+/// behind is the one thing [`REQUIRED_STACK_BYTES`] cannot see: the bodies
+/// `esp-radio`'s interrupt handlers dispatch into, which are a closed blob and
+/// masked ROM with no stack-size metadata to sum over. There is no derivation
+/// available for a quantity nobody can read, so this is a reserve rather than a
+/// measurement, and 8 KiB is chosen as roughly five times the entry cost
+/// [`INTERRUPT_FRAMES_BYTES`] does account for.
+///
+/// The actual margin today is 11,560, so this floor is 3,368 bytes of slack
+/// before the build stops. That is deliberate: it is a *gate*, not a target, and
+/// it exists so that the failure of a growing call graph is a build error naming
+/// two numbers rather than a device that passes its own boot check and then
+/// writes through its stack guard.
+///
+/// The one measurement that ever priced the unseen part found it at zero: a
+/// painted stack on an ESP32-S3, associated with a real access point and
+/// announcing to a real broker, read back exactly the chain the ELF computed and
+/// not one byte more. `crate::stack_used` makes that measurement permanent, so
+/// this figure can eventually be replaced by one.
+const STACK_MARGIN_FLOOR_BYTES: usize = 8 * 1024;
+
+// **The gate, and it is the one thing here that can stop a build.**
+//
+// A configuration whose deepest chain has grown past what the division leaves
+// fails to compile, naming both numbers — which is what the ESP32 + `http`
+// refusal below already does for a different reason, generalised to the reason
+// that actually bit.
+//
+// It is deliberately *not* satisfied by construction: `STACK_BUDGET_BYTES` is
+// the DRAM division, fixed by the ESP32's heap, and `REQUIRED_STACK_BYTES` is
+// what the compiler emitted. Neither is defined in terms of the other, so the
+// comparison is a real one.
+//
+// The two ways out when it fires are both real work and neither is editing this
+// line: make the chain shallower — `crate::start_network`'s `#[inline(never)]`
+// is what that looks like, and it recovered 18,576 bytes — or move the division
+// and pay for it out of the ESP32's 3,944-byte heap slack, which needs hardware.
+const _: () = assert!(
+    STACK_BUDGET_BYTES >= REQUIRED_STACK_BYTES + STACK_MARGIN_FLOOR_BYTES,
+    "the deepest stack chain in this configuration no longer fits the DRAM \
+     division: see heap::REQUIRED_STACK_BYTES for what it needs, \
+     heap::STACK_BUDGET_BYTES for what the division leaves, and \
+     heap::STACK_MARGIN_FLOOR_BYTES for the reserve that must survive between \
+     them. Re-read the chains from a linked ELF before changing any of the \
+     three — the commands are in this file.",
+);
 
 /// DRAM this chip has to divide between the main stack and the heap.
 ///
@@ -170,12 +406,20 @@ pub const STACK_BUDGET_BYTES: usize = 49_592 + 16_688;
 /// anywhere in the image, silently and in the direction that costs stack, which
 /// is why the command that regenerates it sits next to it.
 ///
-/// It **had** gone stale, by 3,520 bytes on every chip, and the symptom was
+/// It **had** gone stale once, by 3,520 bytes on every chip, and the symptom was
 /// visible on a serial console for anyone who compared two numbers: the boot
 /// line read `stack: 63796 bytes available` where these constants implied
-/// 66,788. The margin was therefore 14,324 rather than the 16,688 the budget
-/// above buys, and nothing was going to say so. Re-measured 2026-08-17 against
-/// the images below.
+/// 66,788, so the stack was 3,520 bytes shorter than the budget claimed and
+/// nothing was going to say so. Re-measured 2026-08-17 against the images below.
+///
+/// **Re-checked again 2026-08-17** while the stack requirement was being
+/// re-derived, and all three are still exact. The check is a subtraction that
+/// needs no serial console: `readelf -S | grep '\.stack '` gives the region the
+/// linker left, and it must equal `DRAM_FOR_STACK_AND_HEAP - RADIO_HEAP_BYTES`.
+/// It read 66,748 on the ESP32 (125,116 − 58,368), 66,724 on the ESP32-S3
+/// (159,908 − 93,184) and 66,800 on the ESP32-C3 (146,672 − 79,872) — and the
+/// ESP32-S3 figure is the same 66,724 the boot loop printed, which is what says
+/// this row was not the one at fault.
 ///
 /// # Measured per chip *and* per configuration
 ///
@@ -243,13 +487,23 @@ compile_error!(
 /// that fails silently — a heap that is a kilobyte small panics and says so,
 /// while a stack that is a kilobyte small corrupts whatever it grows into.
 ///
-/// | chip | DRAM to divide | heap | stack left | was, at 56 KB |
+/// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] |
 /// |---|---|---|---|---|
-/// | ESP32 | 128,348 | 60 KiB = 61,440 | 66,908 | 57,344 heap / 71,004 stack |
-/// | ESP32-S3 | 233,700 | **163 KiB = 166,912** | 66,788 | 57,344 / 176,356 |
-/// | ESP32-C3 | 220,456 | 150 KiB = 153,600 | 66,856 | 57,344 / 163,112 |
+/// | ESP32 | 125,116 | 57 KiB = 58,368 | 66,748 | 12,028 |
+/// | ESP32-S3 | 159,908 | 91 KiB = 93,184 | 66,724 | 12,004 |
+/// | ESP32-C3 | 146,672 | 78 KiB = 79,872 | 66,800 | 12,080 |
 ///
-/// Nothing in that table is chosen; it is what the rule returns.
+/// Nothing in that table is chosen; it is what the rule returns. Every `stack
+/// left` column was read back out of the linked ELF on 2026-08-17 — they are the
+/// `.stack` section's own size, and the middle one is the 66,724 the boot loop
+/// printed.
+///
+/// **The table used to read 233,700 for the ESP32-S3 and a 163 KiB heap, and
+/// that was a measurement of an image without the web server in it.** It went
+/// stale in the same commit that added one, alongside the `DRAM` figures below,
+/// which *were* updated. Two tables describing one division, only one of them
+/// maintained — recorded here because the fix is that this one is now derived
+/// from the same constants rather than transcribed beside them.
 ///
 /// ### What the ESP32-S3 gained, measured rather than asserted
 ///
@@ -258,18 +512,27 @@ compile_error!(
 /// two older `report` call sites both run before that burst, so neither ever
 /// showed the number this constant is chosen from:
 ///
-/// | | 56 KB heap | 163 KiB heap |
-/// |---|---|---|
-/// | heap total | 57,344 | 166,912 |
-/// | steady use | 47,464 – 47,608 | 47,464 – 47,608 |
-/// | worst peak seen | 54,620 | 54,424 |
-/// | **free at that peak** | **2,724** | **112,488** |
+/// | | 56 KB heap | 163 KiB heap | today, 91 KiB |
+/// |---|---|---|---|
+/// | heap total | 57,344 | 166,912 | 93,184 |
+/// | steady use | 47,464 – 47,608 | 47,464 – 47,608 | *unchanged* |
+/// | worst peak seen | 54,620 | 54,424 | *not re-measured* |
+/// | **free at that peak** | **2,724** | **112,488** | **38,760** |
 ///
 /// The steady figure does not move, which is the point: the driver's resting
 /// working set was never the problem. The old margin was 2,724 bytes against a
 /// peak that itself varied by about 2,000 bytes between boots of one unchanged
 /// image — a margin inside its own noise, which is a coincidence with a good
 /// track record rather than a design.
+///
+/// **The third column is arithmetic, not a fresh measurement**, and the
+/// difference matters: the web server took 73,728 bytes of this heap when it
+/// took its DRAM, so what is left is 93,184 rather than 166,912. The peak it is
+/// compared against is still the one read at 163 KiB, because the heap's
+/// consumers — the Wi-Fi driver's packet buffers and the announcement burst —
+/// are not what the web server changed. A boot that prints `heap: session
+/// announced` on the current image is what would turn that reasoning into a
+/// reading.
 ///
 /// ### Three questions this retires
 ///

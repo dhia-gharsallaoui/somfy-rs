@@ -44,10 +44,18 @@
 //!
 //! The lines this prints are the ones that cannot be established anywhere else:
 //! the store's survey (a device that has never stored a code versus one whose
-//! codes are gone), the stack headroom the transmit path needs, and every frame
-//! the receiver decodes. None of it is the radio reporting on its own
-//! transmissions — a transmitter's account of itself is wrong in the same way
-//! its output is.
+//! codes are gone), how much stack the boot path actually spent against how much
+//! it was budgeted, and every frame the receiver decodes. None of it is the
+//! radio reporting on its own transmissions — a transmitter's account of itself
+//! is wrong in the same way its output is.
+//!
+//! **The stack pair is two lines and the point is the gap between them.**
+//! `stack: … available, … required` compares two written-down numbers and can
+//! only catch a bad *division* of DRAM; `stack: … used at the deepest point of
+//! boot` is the one that was measured, and it is the only thing here that can
+//! catch the requirement itself having gone stale — which it had, by 23,688
+//! bytes, and the symptom was a board that passed its own check and then wrote
+//! through its stack guard. See [`report_stack_use`] and `heap`.
 
 #![no_std]
 #![no_main]
@@ -149,98 +157,30 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// clear of both.
 const SPI_HZ: u32 = 4_000_000;
 
-/// Main stack this firmware refuses to start without.
-///
-/// **This was 8,192, and it was wrong by a factor of six.** It was reasoned from
-/// `RmtTx::transmit_frame`, which needs about 6.5 KB and is the deepest thing on
-/// the *frame* path — but the frame path is nowhere near the deepest thing this
-/// firmware does. The boot path is, and it is nearly six times larger.
-///
-/// The old figure never fired, and that is the point rather than a defence: at
-/// the 56 KB heap every chip in the matrix had at least 71,004 bytes of stack,
-/// so a check set at 8,192 passed on all of them for a reason unrelated to
-/// whether it was right. It would have gone on passing until a heap change took
-/// the stack below the real requirement — which is exactly what
-/// [`heap::RADIO_HEAP_BYTES`] now does deliberately, and why this had to be
-/// derived before that could be.
-///
-/// ## Where the number comes from
-///
-/// Every frame below is read out of the linked ELF, from the `.stack_sizes`
-/// section `-Zemit-stack-sizes` emits, and they are summed along one call chain
-/// rather than guessed at. On Xtensa and RISC-V alike a frame is allocated whole
-/// in the prologue, so a chain's cost is the sum of its frames.
-///
-/// The deepest chain is the boot path, and it is one straight line — no branch,
-/// no recursion, nothing conditional:
-///
-/// | | ESP32 | ESP32-S3 | ESP32-C3 |
-/// |---|---|---|---|
-/// | executor poll above the main task | 152 | 152 | 152 |
-/// | `TaskStorage<__embassy_main_task>::poll` | 12,272 | 12,272 | 16 |
-/// | [`start`] | 13,952 | 13,744 | *inlined* |
-/// | `entry`'s body, where `start` inlined into it | — | — | 16,688 |
-/// | [`tasks::state`], building the task token | 7,184 | 7,184 | 7,168 |
-/// | `UninitCell::write`, moving the future into its static | 14,320 | 14,320 | 14,320 |
-/// | **total** | **47,880** | **47,672** | **38,344** |
-///
-/// The last row is the state task's 14 KB future being materialised on the stack
-/// and then copied into the static `#[embassy_executor::task]` declares for it.
-/// It is the largest frame in two of the three images, it is unavoidable at this
-/// Embassy version, and it lands *below* `start`'s own 13.7 KB frame rather than
-/// after it has been given back.
-///
-/// **The ESP32-S3 column was checked against the silicon.** A throwaway build
-/// (not committed, like the `rx_raw` diagnostics before it) painted the free
-/// stack with a known word at the top of `entry` and read back how far down the
-/// pattern had been destroyed, on a board associating with a real access point
-/// and announcing to a real broker: **47,672 bytes**, against the 47,672 the
-/// table computes. Not close — equal. The mark is reached during boot and never
-/// moves again, which is what makes the boot path, and not the frame path, the
-/// thing this constant has to cover. The other two columns are computed and not
-/// measured.
-///
-/// ## What is added on top of it
-///
-/// **1,712 bytes of interrupt frames.** An interrupt lands on whatever stack was
-/// running, and here that is this one. `xtensa-lx-rt` allocates `XT_STK_FRMSZ` =
-/// 256 bytes per entry (`xtensa-lx-rt-0.22.0/src/exception/asm.rs:81`) and then
-/// calls a handler with its own frame; the five entries that can nest —
-/// `__user_exception`, `__level_1`, `__level_2`, `__level_3` and
-/// `__default_double_exception` — cost 5 × 256 plus 432 of handler frames on the
-/// worst chip. All five stacked at once is not a scenario anyone has seen; it is
-/// the bound.
-///
-/// So **47,880 + 1,712 = 49,592**, and that is this constant. It is the worst
-/// chip's figure rather than a per-chip one, because a boot check that differs
-/// per chip is three numbers to keep true instead of one — and the worst chip is
-/// the ESP32, which is also the one whose interrupt frames are counted above.
-/// The ESP32-C3 is RISC-V and enters interrupts differently, but it arrives with
-/// 9,536 bytes of slack against the ESP32's boot path, which is more than the
-/// whole Xtensa allowance.
-///
-/// ## What it does *not* cover, said plainly
-///
-/// The bodies interrupt handlers dispatch into. `esp_radio`'s `Handler::dispatch`
-/// calls straight into the closed Wi-Fi driver from interrupt context
-/// (`esp-radio-0.18.0/src/interrupt_dispatch.rs:24`), so those frames land here,
-/// and neither that blob nor masked ROM carries stack-size metadata — no sum
-/// over them is available. The hardware measurement above is what stands in for
-/// it, since it was taken with the driver's interrupts live, and
-/// [`heap::STACK_BUDGET_BYTES`] carries the margin that covers being wrong about
-/// it.
-///
-/// Checked at run time rather than asserted at compile time because it cannot be
-/// a constant: esp-hal's linker script gives the stack **whatever DRAM is left
-/// after the statics**, so the figure moves every time a static is added — and
-/// now that [`heap::RADIO_HEAP_BYTES`] is the largest static in the image, it
-/// moves every time that changes too. When it fires it names both numbers, which
-/// is worth more than a corrupted pulse train.
-const REQUIRED_STACK_BYTES: usize = 49_592;
-
 /// How long the panic handler waits for the serial line to drain before it
 /// resets the board. See the handler for why this is not optional.
 const PANIC_DRAIN_MS: u32 = 100;
+
+/// The word painted over unused stack so the depth reached can be read back.
+///
+/// Any value that is not plausibly a pointer, a small integer or ASCII, so that
+/// live data being mistaken for paint needs a coincidence rather than a common
+/// case. A mistake in that direction under-reports by one word and then stops,
+/// because the scan ends at the first word that differs.
+const STACK_PAINT: u32 = 0xA5A5_5A5A;
+
+/// How much stack immediately below the painting frame is left alone.
+///
+/// The paint runs with interrupts live, and an interrupt lands on this stack
+/// just below the running frame — at most `heap::INTERRUPT_FRAMES_BYTES`,
+/// 1,712, at the worst nesting this firmware bounds. 4 KiB is that rounded up
+/// past another full nest, and it is the difference between an instrument and a
+/// way to corrupt the frame that is running it.
+///
+/// The cost is that the shallowest 4 KiB is never painted, so [`stack_used`]
+/// reports at least this much even on a boot that used nothing. That is the
+/// harmless direction and the shallow end is the one nothing is ever near.
+const PAINT_HEADROOM_BYTES: usize = 4 * 1024;
 
 /// Transmissions from the state task to the radio task.
 ///
@@ -347,8 +287,8 @@ enum StartError {
         claimed: u8,
         documented: u8,
     },
-    /// The main stack is smaller than the transmit path needs. See
-    /// [`REQUIRED_STACK_BYTES`].
+    /// The main stack is smaller than the deepest chain in this image needs.
+    /// See [`heap::REQUIRED_STACK_BYTES`].
     StackTooSmall {
         available: usize,
         required: usize,
@@ -409,6 +349,13 @@ struct MqttBoot {
 
 #[esp_rtos::main]
 async fn entry(spawner: Spawner) {
+    // **Before anything else, because everything else is what is being
+    // measured.** This is the shallowest point the firmware ever reaches after
+    // the executor starts, so painting from here covers every frame that
+    // follows. See [`report_stack_use`] for what is done with it, and
+    // `heap::REQUIRED_STACK_BYTES` for the constant it exists to keep honest.
+    paint_stack();
+
     let pending = match start(spawner) {
         Ok(pending) => pending,
         Err(error) => {
@@ -440,6 +387,7 @@ async fn entry(spawner: Spawner) {
 
     start_network(spawner, pending);
     heap::report("controller started");
+    report_stack_use();
     esp_println::println!("controller: running");
     // Returning is correct: the executor outlives this function and keeps
     // polling the tasks that were spawned.
@@ -1078,6 +1026,35 @@ fn seed(store: &mut FlashStore<'_>, address: u32, code: RollingCode, region: Reg
 /// No `Result`, on purpose. A caller cannot propagate what it is not given, so
 /// the "network failure stops the controller" path is not something to avoid
 /// writing — it is not expressible from here.
+///
+/// # Why it must not be inlined
+///
+/// **`#[inline(never)]` here is worth 18,576 bytes of stack on the ESP32-S3, and
+/// without it the default build does not boot.** The mechanism is worth stating
+/// because it is invisible in the source and general:
+///
+/// This function and [`start`] are two sequential calls out of [`entry`]. Only
+/// one of them runs at a time — `start` has returned before this begins — so
+/// their stack costs look like they should overlap rather than add. Inlining
+/// breaks that. An inlined callee's locals become slots in the *caller's* frame,
+/// allocated in its prologue and live for as long as the caller is; so with this
+/// function inlined into `entry`, the web server's bring-up — dominated by
+/// `api::start` handing `BUFFERS.init` an `[Buffers; HTTP_TASKS]` by value,
+/// 14,336 bytes — sat underneath the 48,992-byte call to `start` for the whole
+/// of it. The two costs added instead of overlapping, the total reached 71,568
+/// against 66,724 of stack, and the board wrote through esp-hal's stack guard
+/// and rebooted, forever.
+///
+/// The tell was that enabling `http` deepened the *main task's own frame* by
+/// 9,200 bytes, in a build where no HTTP code can have run yet: nothing had
+/// connected, and the panic landed before Wi-Fi had even been asked to join.
+///
+/// Marked here rather than on `api::start` because the boundary that matters is
+/// this one — everything the network bring-up allocates should live below
+/// `entry`'s frame, not inside it, whichever of these functions grows next.
+/// `heap::NETWORK_CHAIN_BYTES` is what this branch costs once separated, and
+/// `heap::REQUIRED_STACK_BYTES` takes the larger of it and the boot path.
+#[inline(never)]
 fn start_network(spawner: Spawner, pending: Pending) {
     let Some(credentials) = pending.credentials else {
         esp_println::println!(
@@ -1233,37 +1210,201 @@ fn report_store(store: &mut FlashStore<'_>) -> Result<store::Survey, StartError>
     Ok(survey)
 }
 
-/// Refuse to start if the main stack is smaller than the transmit path needs.
+/// Where the main stack is, and where it is safe to paint.
 ///
-/// See [`REQUIRED_STACK_BYTES`] for why this is a runtime check rather than a
-/// `const` assertion. A stack overflow here would present as random corruption
-/// in a pulse train — a shade that responds intermittently, with nothing
-/// anywhere pointing at the cause — so it is worth a number at boot.
-fn check_stack_headroom() -> Result<(), StartError> {
-    // The symbols esp-hal's own linker script defines for the main stack, read
-    // exactly as esp-hal itself reads them (`soc::ensure_stack_pointer_in_range`),
-    // which is `pub(crate)` and so cannot be called from here.
+/// Returns the lowest address this firmware may write for its own purposes and
+/// the top of the stack, or `None` if the image's layout is not the one assumed
+/// — in which case nothing is painted and nothing is measured, which is the only
+/// honest response to not recognising the ground.
+///
+/// The symbols are esp-hal's own, read exactly as esp-hal reads them
+/// (`soc::ensure_stack_pointer_in_range`), which is `pub(crate)` and so cannot
+/// be called from here. **`__stack_chk_guard` is the one that must be respected
+/// rather than merely known about**: esp-hal places it
+/// `ESP_HAL_CONFIG_STACK_GUARD_OFFSET` (60) bytes above the bottom and puts a
+/// hardware data watchpoint on it, so a write there is a panic by design.
+/// Painting starts one word past it.
+///
+/// **There is exactly one such word, and this is why that was checked rather
+/// than hoped.** `esp-rtos` keeps a guard per task too, and for the main task it
+/// takes the same offset from the same symbol
+/// (`esp-rtos-0.3.0/src/lib.rs:331`, `task/mod.rs::set_up_stack_guard`) and
+/// deliberately leaves the value alone when it already matches — so its guard
+/// *is* `__stack_chk_guard` rather than a second word at some other offset. Its
+/// other two overflow checks are unaffected by writes below the frame:
+/// `sw-task-overflow-detection` is off by default and reads only that same word,
+/// and `stack-pointer-range-check` compares the stack pointer against the
+/// region's bounds.
+fn stack_region() -> Option<(usize, usize, usize)> {
     unsafe extern "C" {
         static _stack_end_cpu0: u32;
         static _stack_start_cpu0: u32;
+        static __stack_chk_guard: u32;
     }
-    // Neither is dereferenced — only the addresses themselves are taken, which
-    // is what makes this safe and why no `unsafe` block is needed for it.
+    // None is dereferenced — only the addresses themselves are taken, which is
+    // what makes this safe and why no `unsafe` block is needed for it.
     let bottom = (&raw const _stack_end_cpu0) as usize;
     let top = (&raw const _stack_start_cpu0) as usize;
+    let guard = (&raw const __stack_chk_guard) as usize;
+    // Everything below rests on the guard lying inside the region, on the region
+    // being non-empty, and on both ends being word-aligned. All three hold for
+    // the linker script this crate builds against; none is assumed.
+    let floor = guard.checked_add(4)?;
+    if bottom > guard || floor >= top || !floor.is_multiple_of(4) || !top.is_multiple_of(4) {
+        return None;
+    }
+    Some((bottom, floor, top))
+}
+
+/// Fill the unused stack with [`STACK_PAINT`] so [`stack_used`] can read back how
+/// far down it was destroyed.
+///
+/// **This is the only thing in this firmware that can tell the truth about the
+/// stack**, and the reason it exists is that the constant it stands next to went
+/// stale and took the board down with it. Everything else — the boot check, the
+/// compile-time gate — compares one written-down number against another.
+///
+/// Called at the top of [`entry`], so it covers everything except the 144 bytes
+/// of executor frames above it, which do not move.
+///
+/// # Why it cannot corrupt a live frame
+///
+/// The ceiling is [`PAINT_HEADROOM_BYTES`] below `probe`, a local of *this*
+/// function — so it is below this function's own frame, which `#[inline(never)]`
+/// guarantees is the deepest live one when the loop runs. Reading the stack
+/// pointer out of the register would be the obvious way to establish that and is
+/// **not** used: `core::arch::asm!` is unstable on Xtensa, and this crate's
+/// `impl_trait_in_assoc_type` is deliberately its only unstable language feature.
+/// The address of a local is stable, arch-independent, and a stronger argument
+/// anyway — it does not depend on what a register is claimed to hold.
+///
+/// An interrupt taken while the loop runs lands immediately below the frame and
+/// so inside the reserved headroom, above every byte this touches. And the floor
+/// is one word above esp-hal's stack guard, which is watched by hardware and
+/// must not be written. If any of that cannot be established from the linker's
+/// own symbols the function returns having written nothing.
+#[inline(never)]
+fn paint_stack() {
+    let probe = 0u32;
+    let frame = (&raw const probe) as usize;
+    let Some((_, floor, top)) = stack_region() else {
+        return;
+    };
+    if frame > top || frame <= floor {
+        return;
+    }
+    let ceiling = frame.saturating_sub(PAINT_HEADROOM_BYTES);
+    let mut at = floor;
+    while at < ceiling {
+        // SAFETY: `at` is a 4-aligned address in `floor..ceiling`, which the
+        // checks above have established lies strictly inside the linker's stack
+        // region, strictly above esp-hal's guard word, and at least
+        // PAINT_HEADROOM_BYTES below a local of this frame. Nothing else owns
+        // stack memory that far below the running frame; an interrupt arriving
+        // mid-loop uses the reserved headroom and has returned before anything
+        // reads back what is written here.
+        unsafe { (at as *mut u32).write_volatile(STACK_PAINT) };
+        at += 4;
+    }
+}
+
+/// How deep the stack has been since [`paint_stack`] ran.
+///
+/// Scans up from the bottom for the first word that is no longer
+/// [`STACK_PAINT`]: everything below it is still virgin, so the distance from
+/// there to the top is what has been used. Reads only.
+///
+/// It is a **floor**, in two ways worth naming rather than glossing. The
+/// shallowest [`PAINT_HEADROOM_BYTES`] were never painted, so a boot that never
+/// went deep reports that headroom as though it had been spent; and live data
+/// that happens to equal the pattern reads as virgin. Both err toward reporting
+/// *less* depth than was reached — which is the direction that matters, because
+/// a figure close to the available stack is then certainly close.
+fn stack_used() -> usize {
+    let Some((_, floor, top)) = stack_region() else {
+        return 0;
+    };
+    let mut at = floor;
+    while at < top {
+        // SAFETY: `at` is a 4-aligned address strictly inside the linker's stack
+        // region, established by `stack_region` and bounded by this loop.
+        if unsafe { (at as *const u32).read_volatile() } != STACK_PAINT {
+            break;
+        }
+        at += 4;
+    }
+    top - at
+}
+
+/// Refuse to start if the main stack is smaller than the deepest chain needs.
+///
+/// See [`heap::REQUIRED_STACK_BYTES`] for why this is a runtime check rather
+/// than a `const` assertion, and for what it covers. A stack overflow presents
+/// either as a stack-guard panic and a boot loop — which is what it did — or,
+/// if the guard word happens not to be written, as random corruption in a pulse
+/// train, a shade that responds intermittently with nothing pointing at the
+/// cause. Both are worth a number at boot.
+fn check_stack_headroom() -> Result<(), StartError> {
+    let Some((bottom, _, top)) = stack_region() else {
+        // Not a failure to start: the check could not be performed, which is a
+        // different thing from failing it, and the controller has no business
+        // refusing to receive over a diagnostic it could not take.
+        esp_println::println!(
+            "stack: cannot locate the main stack region — headroom unchecked. \
+             This build's linker layout is not the one crate::stack_region assumes."
+        );
+        return Ok(());
+    };
     let available = top.saturating_sub(bottom);
     esp_println::println!(
         "stack: {} bytes available, {} required",
         available,
-        REQUIRED_STACK_BYTES,
+        heap::REQUIRED_STACK_BYTES,
     );
-    if available < REQUIRED_STACK_BYTES {
+    if available < heap::REQUIRED_STACK_BYTES {
         return Err(StartError::StackTooSmall {
             available,
-            required: REQUIRED_STACK_BYTES,
+            required: heap::REQUIRED_STACK_BYTES,
         });
     }
     Ok(())
+}
+
+/// Print how much of the stack the boot actually used, against what was claimed.
+///
+/// **The point of this line is the gap between its two numbers.** `available`
+/// and `required` are both written down; `used` is the only one that was
+/// measured, and it is what would have said — in one line, on the first boot
+/// after the web server landed — that the requirement had stopped being true.
+///
+/// Printed after the network is up, because that is past the deepest chain this
+/// firmware has: the boot path, which ends in the state task's future being
+/// moved into its static. The request path is about 19 KB shallower, so a later
+/// reading would not be a larger one; if that ever stops holding, this figure is
+/// what will show it.
+fn report_stack_use() {
+    let used = stack_used();
+    let headroom = heap::REQUIRED_STACK_BYTES.saturating_sub(used);
+    esp_println::println!(
+        "stack: {} bytes used at the deepest point of boot, of {} required — \
+         {} bytes of the requirement unspent",
+        used,
+        heap::REQUIRED_STACK_BYTES,
+        headroom,
+    );
+    if used > heap::REQUIRED_STACK_BYTES {
+        // Not a panic and not a refusal: the board is already past the deepest
+        // point and is running. It is a statement that the constants in
+        // `crate::heap` are now describing a different program from this one,
+        // which is exactly the state that produced a boot loop last time and
+        // said nothing.
+        esp_println::println!(
+            "stack: THE REQUIREMENT IS STALE — this boot used more than \
+             heap::REQUIRED_STACK_BYTES claims is needed. Re-read the chains \
+             from a linked ELF (the commands are in crates/firmware/src/heap.rs) \
+             before this margin runs out."
+        );
+    }
 }
 
 /// Check the pins actually claimed against the map `chip::pins` documents.
