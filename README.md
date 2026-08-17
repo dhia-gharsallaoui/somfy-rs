@@ -113,6 +113,18 @@ policy-free:
   name shifted every field, which can yield a *plausible but wrong* rolling code),
   so Plan 6 must show the user the imported values for confirmation instead of
   silently applying them.
+
+  **(3) and (4) are discharged for the shade table, 2026-08-17**, by
+  `provision_shades --from-backup` (`crates/somfy-config/examples/provision_shades/`).
+  An unknown kind or tilt byte is imported as `Roller`/`TiltMode::None` and
+  reported per shade by name, and a nonzero `skipped_resyncs` prints the whole
+  table and refuses to write without a typed `yes`. That covers the shades and
+  their rolling codes — the values that cost a physical re-pairing to get wrong
+  — on the host, before anything is flashed. **What is still Plan 6's** is
+  everything else in (1) and (2): rooms, groups (including the v19–v22
+  fabricated codes and the linked remotes whose codes the file never carries),
+  MQTT settings, and applying any of it on the device rather than into a
+  provisioning image.
 - **Group commands stay per-shade fan-out in v1.0.** The domain executes a group
   command by fanning it out to each member shade (Plan 2 `Controller::command_group`),
   not by transmitting a single group virtual-remote frame. Even so, group

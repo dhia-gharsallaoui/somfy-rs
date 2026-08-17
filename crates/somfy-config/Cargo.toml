@@ -30,3 +30,26 @@ somfy-domain = { path = "../somfy-domain" }
 # `RollingCode`, so the seed a record carries is the same type the store holds
 # and there is no bare `u16` anywhere on the path between them.
 somfy-rts = { path = "../somfy-rts" }
+
+[dev-dependencies]
+# The backup parser behind `provision_shades --from-backup`, which recovers a
+# shade table — names, addresses, kinds, travel times and the next-to-send
+# rolling code — from a file exported by the controller being replaced.
+#
+# A dev-dependency, not a dependency, and the distinction is the point:
+# importing a backup is a host-side provisioning step that happens once, on a
+# workstation, before anything is flashed. The device links the *record*, which
+# is this crate's lib; it has no reason to carry a parser for a file it will
+# never see. So `cargo build -p somfy-config --target thumbv7em-none-eabihf`
+# does not build this, and neither does the firmware.
+somfy-migrate = { path = "../somfy-migrate" }
+
+# `provision_shades` is listed explicitly for one reason: `test = true`, which
+# is what makes `cargo test` run the unit tests inside it. Its mapping and
+# refusal rules are pure logic — which shade kind a byte means, which backups
+# are refused and why — and pure logic that no test reaches is pure logic
+# nobody has checked. The other example is found by autodiscovery as usual.
+[[example]]
+name = "provision_shades"
+path = "examples/provision_shades/main.rs"
+test = true
