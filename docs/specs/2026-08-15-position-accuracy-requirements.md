@@ -228,6 +228,35 @@ short Up burst from fully closed and see whether it stops after separating the
 slats or continues to the limit. It transmits at a real motor, so it is the
 owner's to run.
 
+**The user-visible behaviour is settled regardless of which mechanism applies**,
+by the owner's instruction of 2026-08-17:
+
+> "I do prefer having a dedicated command that ensure that it's fully closed
+> going fully down than opening to reach only sun holes"
+
+So the vent position is **its own command**, and it is reached **from the closed
+limit**, not from wherever the shade happens to be:
+
+1. Drive **Down** to the physical limit and let the motor self-stop there.
+2. Then **Up** for the measured slat-separation time.
+3. Then the arrival `My`, which the existing mid-range stop already plans.
+
+**This needs no position estimate at all**, which is the whole point. The closed
+limit is the one piece of ground truth in a one-way protocol — the motor stops
+itself there — so anchoring on it makes the most-used position immune to every
+source of drift in this document: wrong travel times, missed overheard frames,
+accumulated partial-move error. It is R3's "route via the nearest limit first
+and time from there", applied to the position that will be asked for most.
+
+The cost is deliberate and the owner accepted it: a shade already open travels
+its whole range down before venting. Slower, and correct every time.
+
+The hardware test above still matters for **implementation** rather than for
+behaviour. If these motors honour euromode press-length semantics, a short burst
+from the closed limit is the native way to do step 2 — no timing, no arrival
+stop, and nothing to calibrate. If they do not, step 2 is timed against the R8
+dead band and inherits R9's hand-override.
+
 ### R9 — Calibration must be overridable by hand (MUST)
 
 *Added 2026-08-17 at the owner's request.*

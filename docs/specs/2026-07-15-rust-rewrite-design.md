@@ -238,6 +238,33 @@ atomic and always self-consistent.
   issues a random session token (cookie); mutating endpoints require it;
   auth attempts rate-limited. No user database.
 
+**Deferred by the owner, 2026-08-17: no authentication for now.** The remaining
+features come first. Recorded here rather than dropped, with the exposure stated
+so the decision is revisited on evidence and not rediscovered:
+
+- **The device serves an unauthenticated API on the LAN.** Once the settings
+  screen exists it will also *serve* the Wi-Fi PSK and MQTT password, which
+  turns an open API from an actuation risk into a credential-disclosure one.
+  That is the point at which this must be reconsidered.
+- **"LAN-only" is weaker than it sounds.** Any page in any browser tab can issue
+  requests to the device's address; reachability does not require being on the
+  network. This is the classic router attack.
+- **Two mitigations are not authentication and should ship regardless**, since
+  they need no password, no session and no login screen:
+  - **Origin/Host validation** — reject requests whose `Origin` is not the
+    device. This, not the password, is the actual defence against the item
+    above.
+  - **Rate limiting per shade.** Every command commits a rolling code to flash
+    *before* transmitting, and that ordering is a correctness guarantee that
+    cannot be dropped. So a request loop causes flash wear and makes the
+    receiver deaf while it writes — a physical-damage path that authentication
+    would not close anyway, since an authenticated client can loop too.
+
+TLS was considered and declined for now: `esp-mbedtls` handshake buffers want
+32–64 KB against the S3's ~38 KB of heap headroom, it would likely end C3
+support as it already ended ESP32's, and self-signed certificates train users to
+click through warnings. Revisit if the heap picture changes.
+
 ### 7.4 MQTT + Home Assistant
 
 - `rust-mqtt` over `embassy-net`. LWT availability topic; per-shade state
