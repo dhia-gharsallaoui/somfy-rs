@@ -78,6 +78,39 @@ The riskiest task in the plan, so it goes first and alone.
 - Whatever happens, the hardware checklist must state exactly what an operator
   does to a provisioned board, and what happens if they get it wrong.
 
+## The acceptance test for the whole system
+
+Set by the owner, 2026-08-17, and it is a better definition of done than any
+per-task criterion because it exercises the seams rather than the parts:
+
+> **Remove the shades, pair them through the UI, add them back — and at some
+> point delete the imported configuration entirely.**
+
+The import from the C++ backup was a bootstrap, not the destination. A shade
+this controller *paired itself* owns its own virtual remote, which is what
+finally ends the identity collision: today our board transmits as
+`1032469/70/71`, the same virtual remote the C++ controller uses, with two
+independent rolling-code counters.
+
+Three things currently block that test, and they are all in this plan:
+
+1. **The shades region is host-provisioned only.** There is no runtime write
+   path, so the firmware cannot add or remove a shade — only replay a table
+   written by `provision_shades`. Task 2 owns this.
+2. **`retire_shade` has no caller.** It is written and tested; `inventory.rs`
+   records that the firmware "cannot retire". So removing a shade today would
+   leave its retained discovery config on the broker forever, and the user would
+   see a permanently-unavailable entity in Home Assistant. Task 2 owns this too:
+   with stable, bounded ids the announced set is **a `u32` bitmap — 4 bytes** —
+   small enough to live in an existing record.
+3. **Pairing itself**, in flight separately, plus the UI's pairing assistant
+   (Plan 7 §8).
+
+Note the ordering constraint: **deleting the imported configuration must retire
+its entities first.** Clearing config and then discovering the orphans is the
+failure the spec was written from — cleaning up after its experiments meant
+deleting 49 retained topics by hand.
+
 ## Task 2 — The real config store
 
 Replaces the stopgap. Per §6: shades, groups, rooms, network, MQTT, security —
