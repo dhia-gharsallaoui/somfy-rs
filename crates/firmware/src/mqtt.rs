@@ -948,26 +948,6 @@ impl Broker {
         // Every step through `perform`, which settles. See it for why that is
         // not optional: an announcement now costs `1 + 5N + k` operations for
         // `N` shades and `k` device entities, and `minimq` holds eight.
-        // **The orphans first, before anything the current configuration
-        // publishes.** These are shades that were announced and have since been
-        // removed, and their retained discovery configs are on the broker with
-        // nothing behind them. Clearing them is what `retire_shade` was written
-        // for and has never had a caller for.
-        //
-        // Retried on every fresh session until the state task acknowledges each
-        // one, which it does only after these have been settled — so a power
-        // cut here costs a repeat, and the id survives in flash either way.
-        if !self.orphans.is_empty() {
-            esp_println::println!(
-                "mqtt: clearing the entities of {} removed shade(s)",
-                self.orphans.len(),
-            );
-        }
-        let orphans: Vec<ShadeId, MAX_SHADES> = self.orphans.clone();
-        for id in orphans {
-            self.retire(connection, id, commands).await?;
-        }
-
         {
             // Captured by value as a bitmap, not borrowed: the plan's closure
             // has to outlive a `&mut Wire` that already borrows the inventory,
@@ -1043,6 +1023,32 @@ impl Broker {
         // back and repeats the retirement once more. That is idempotent and it
         // is the honest cost of not rewriting the configuration region from the
         // network path — a region whose other half holds Wi-Fi credentials.
+        // **The orphans, after the live configuration and not before it.**
+        // These are shades that were announced and have since been removed, and
+        // their retained discovery configs are on the broker with nothing
+        // behind them; clearing them is what `retire_shade` was written for and
+        // has never had a caller for.
+        //
+        // Their topics belong to ids no live shade holds, so nothing above
+        // publishes to them and the order is free — which makes it a latency
+        // question, and there `online` and the covers win. A board with several
+        // orphans would otherwise hold availability behind seven tombstones
+        // each.
+        //
+        // Retried on every fresh session until the state task acknowledges each
+        // one, which it does only once these have settled — so a power cut here
+        // costs a repeat, and the id survives in flash either way.
+        if !self.orphans.is_empty() {
+            esp_println::println!(
+                "mqtt: clearing the entities of {} removed shade(s)",
+                self.orphans.len(),
+            );
+        }
+        let orphans: Vec<ShadeId, MAX_SHADES> = self.orphans.clone();
+        for id in orphans {
+            self.retire(connection, id, commands).await?;
+        }
+
         self.stale.clear();
         Ok(())
     }

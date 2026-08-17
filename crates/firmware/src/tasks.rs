@@ -585,6 +585,18 @@ fn persist_table(
             dropped.links,
         );
     }
+    if dropped.seeds > 0 {
+        // Unreachable, and loud because of what it would cost if it were not:
+        // a zero seed is ignored while the rolling-code region holds a code for
+        // that address, and planted the moment that region is lost — at which
+        // point the motor stops obeying and only a walk to it fixes that.
+        esp_println::println!(
+            "shades: {} shade(s) were written with a rolling-code seed of 0 because this \
+             table holds none for them. That is a bug, and it costs a re-pairing if the \
+             rolling-code region is ever lost.",
+            dropped.seeds,
+        );
+    }
     let shade_count = record.shades.len();
     // One borrow of the flash, for the length of this call. See
     // `FlashStore::with_flash` for why a borrow rather than a second owner.

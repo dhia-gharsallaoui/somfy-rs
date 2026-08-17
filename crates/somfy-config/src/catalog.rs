@@ -143,6 +143,17 @@ impl core::error::Error for CatalogError {}
 pub struct Dropped {
     /// Linked remotes that did not fit the pool.
     pub links: usize,
+    /// Shades the registry holds that this table has no rolling-code seed for,
+    /// and which were therefore written with a seed of zero.
+    ///
+    /// **Unreachable, and reported rather than asserted.** Every path that puts
+    /// a shade in the registry also calls [`Catalog::place`] or
+    /// [`Catalog::add`]. If one ever did not, the consequence is delayed and
+    /// severe: the zero is ignored for as long as the rolling-code store holds
+    /// a code for that address, and is planted the moment that region is lost —
+    /// at which point the motor, which is at some high code, stops obeying and
+    /// only a physical re-pairing fixes it.
+    pub seeds: usize,
 }
 
 impl Catalog {
@@ -307,11 +318,13 @@ impl Catalog {
         let mut dropped = Dropped::default();
 
         for (id, shade) in registry.shades() {
-            let seed = self
-                .seeds
-                .get(id.0 as usize)
-                .and_then(|held| *held)
-                .unwrap_or(RollingCode(0));
+            let seed = match self.seeds.get(id.0 as usize).and_then(|held| *held) {
+                Some(seed) => seed,
+                None => {
+                    dropped.seeds += 1;
+                    RollingCode(0)
+                }
+            };
             let row = shades.len();
             let entry = StoredShade {
                 config: shade.config.clone(),
@@ -560,6 +573,27 @@ mod tests {
                 address: 0x00_2001,
             }],
         );
+    }
+
+    /// The seed fallback is reported rather than silent.
+    ///
+    /// It is unreachable through this type — every path that puts a shade in
+    /// the registry also records its seed — so the only way to reach it is to
+    /// go round the back, which is what this does. It matters because the
+    /// consequence is delayed: a seed of zero is ignored for as long as the
+    /// rolling-code store holds a code for that address, and planted the moment
+    /// that region is lost, at which point the motor stops obeying.
+    #[test]
+    fn a_shade_with_no_recorded_seed_is_reported_rather_than_written_as_zero_in_silence() {
+        let mut registry = Registry::new();
+        let catalog = Catalog::new();
+        registry
+            .add_shade(ShadeConfig::new("Kitchen", 0x00_1001).unwrap())
+            .unwrap();
+
+        let (record, dropped) = catalog.record(&registry);
+        assert_eq!(dropped.seeds, 1);
+        assert_eq!(record.shades[0].initial_code, RollingCode(0));
     }
 
     /// A removal reaches the record, and the announced bit does not.
