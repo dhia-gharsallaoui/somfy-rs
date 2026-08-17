@@ -18,3 +18,6 @@ crates/somfy-migrate/tests/fixtures/*.backup
 # embeds it in the firmware image, so it is a build artefact like /target.
 /ui/node_modules
 /ui/dist
+
+# Browser-automation artifacts (MCP writes to the repo root, not the worktree)
+.playwright-mcp/
