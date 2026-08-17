@@ -493,14 +493,29 @@ const _: () = assert!(
 /// the per-architecture difference in what a generator lays out. Four connection
 /// tasks are 52,384 of it (`api::HTTP_TASKS` × a 13,096-byte future, which is
 /// `picoserve`'s router recursion) and their buffers are 14,336.
+/// **Re-measured 2026-08-18, and the reason is worth recording.** Two branches
+/// were merged that each added statics — the mDNS/SNTP services and the
+/// calibration state — and each had re-measured this row against a tree without
+/// the other. Resolving the conflict by taking one side kept a figure that was
+/// correct for neither, and the merged S3 image claimed 159,908 where the linker
+/// gave 146,700. **The board refused to boot rather than overflowing**, printing
+/// `StackTooSmall { available: 53516, required: 55792 }`, which is
+/// `check_stack_headroom` doing precisely the job the stale-figure story above
+/// describes — the first time it has caught a real one.
+///
+/// The lesson is about the merge, not the arithmetic: this row is a property of
+/// *the whole image*, so two correct measurements of two different images do not
+/// combine, and a conflict here can only be settled by measuring again. The
+/// subtraction below was cross-checked against the serial console — the ELF gave
+/// 53,516 for the S3 and the board reported `available: 53516`.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 125_116;
+const DRAM_FOR_STACK_AND_HEAP: usize = 124_508;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 159_908;
+const DRAM_FOR_STACK_AND_HEAP: usize = 146_700;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 146_672;
+const DRAM_FOR_STACK_AND_HEAP: usize = 133_512;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
