@@ -73,7 +73,7 @@ use somfy_tasks::Backoff;
 ///
 /// Two: the UDP socket the exchange runs on, and the DNS socket
 /// `embassy_net::new` adds because this feature turns `embassy-net/dns` on. See
-/// [`crate::net::SOCKETS`]'s neighbours for the accounting.
+/// the neighbours of `crate::net`'s `SOCKETS` for the accounting.
 pub const SOCKETS: usize = 2;
 
 /// The time source.
@@ -224,7 +224,7 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
 
 /// Ask for the time, forever.
 ///
-/// Same shape as [`crate::net::wifi_link`]: attempt, report, wait. The wait is
+/// Same shape as `crate::net`'s `wifi_link`: attempt, report, wait. The wait is
 /// outside the match so there is no path around it.
 #[embassy_executor::task]
 async fn client(stack: Stack<'static>) -> ! {
