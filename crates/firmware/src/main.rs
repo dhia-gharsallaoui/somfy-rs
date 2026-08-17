@@ -27,13 +27,18 @@
 //! an empty registry, no entity to command, and keys the transmitter never,
 //! which is the ordinary state of a freshly flashed device.
 //!
-//! Two things follow, and both are deliberate. A shade cannot be commanded
-//! before somebody has flashed a shade table with `provision_shades` — the
-//! firmware has no path that writes one. And a shade that *is* provisioned
-//! still cannot transmit until its rolling code exists in the store, which
-//! [`provision_shades`] does once, from the record, and never again: a code
-//! re-seeded at every boot would walk backwards and desync the motor. See
-//! `somfy_store::seed_if_absent`.
+//! A shade that is in the table still cannot transmit until its rolling code
+//! exists in the store, which [`provision_shades`] does once, from the record,
+//! and never again: a code re-seeded at every boot would walk backwards and
+//! desync the motor. See `somfy_store::seed_if_absent`.
+//!
+//! **What has changed is where the table comes from.** It used to be flashed by
+//! `provision_shades` and nothing else — the firmware had no path that wrote
+//! one — and now it does: `shades::ShadeStore::store`, driven by the state task
+//! on a debounce. `provision_shades` remains how an installation is imported
+//! from another controller, and it is still the only way to get a table onto a
+//! board that has never had one; adding, removing and linking are the device's
+//! own from here.
 //!
 //! ## What a boot proves
 //!

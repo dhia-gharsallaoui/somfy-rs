@@ -304,10 +304,16 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         }
     }
 
+    // The half of a linked remote that *is* recoverable, and the half that is
+    // not, said in one line because the distinction is the whole point:
+    // recognising a wall remote's frames needs its address, which the backup
+    // carries; transmitting *as* one would need its rolling code, which the old
+    // controller kept outside the backup — and this controller never does that.
     if !imported.links.is_empty() {
         eprintln!(
-            "  {} linked remote(s) written — a wall remote's presses are the only thing \
-             that can correct a shade's position estimate.",
+            "  {} linked remote(s) written. A wall remote's presses are the only thing that \
+             can correct a shade's position estimate, and only its address is needed to \
+             hear them — the rolling codes are not in the backup and are not wanted.",
             imported.links.len(),
         );
     }
