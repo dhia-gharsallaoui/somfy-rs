@@ -21,3 +21,12 @@ crc = "3"
 # the topic builder refuses is a device that boots without MQTT and says so
 # three flashes after the value was typed.
 somfy-mqtt = { path = "../somfy-mqtt" }
+# The shade record's fields *are* `somfy_domain::ShadeConfig` — what
+# `Registry::add_shade` takes — and its address, name and kind rules are the
+# domain's, reached through `ShadeConfig::new` and `ShadeKind::from_raw` rather
+# than restated here. A record that decoded to a shade the registry would then
+# refuse is a provisioned shade vanishing at boot with a log line to say so.
+somfy-domain = { path = "../somfy-domain" }
+# `RollingCode`, so the seed a record carries is the same type the store holds
+# and there is no bare `u16` anywhere on the path between them.
+somfy-rts = { path = "../somfy-rts" }

@@ -79,6 +79,7 @@
 mod credentials;
 mod mqtt;
 mod record;
+mod shade;
 
 pub use credentials::{
     CredentialError, Field, WifiCredentials, MAX_PSK_LEN, MAX_SSID_LEN, MIN_PSK_LEN,
@@ -88,3 +89,7 @@ pub use mqtt::{
     DEFAULT_STATE_ROOT, MAX_BROKER_PASSWORD_LEN, MAX_BROKER_USERNAME_LEN, MAX_TOPIC_ROOT_LEN,
 };
 pub use record::{ConfigRecord, RecordError, CONFIG_RECORD_LEN};
+pub use shade::{
+    ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError, StoredShade, TravelField,
+    SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
+};

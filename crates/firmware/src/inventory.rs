@@ -13,14 +13,24 @@
 //! snapshot: they change, and they arrive on the delta channel, which is the
 //! seam that exists for exactly that.
 //!
-//! # What this costs today, honestly
+//! # Where the shades come from
 //!
-//! Nothing, because the registry is empty. There is still no way to provision a
-//! shade — the persisted configuration carries Wi-Fi credentials and MQTT
-//! settings and no shades — so a boot of this firmware announces availability
-//! and no entities. The code path is real and the plans are host-tested; what
-//! is missing is a source of shades, which Plan 6's configuration store
-//! supplies.
+//! The `shades` flash region, read by [`crate::shades`] into the registry
+//! before either task exists — so by the time this snapshot is taken, the
+//! registry holds exactly what was provisioned, and a board with that region
+//! erased still announces availability and no entities, which is the ordinary
+//! state of a freshly flashed device.
+//!
+//! # The one thing a snapshot cannot do
+//!
+//! It records the shades that **exist**, and nothing anywhere records which
+//! were **announced**. So a shade removed from the table between two boots
+//! leaves a retained discovery config the next boot has no way to learn of and
+//! therefore cannot retire — `somfy_mqtt::MqttConfig::retire_shade` is written
+//! and host-tested and still has no caller. Closing it needs the *announced*
+//! set persisted, which is a record-format decision and belongs with Plan 6.
+//! The same applies to a shade whose id moved: see `somfy_config`'s shade
+//! record for why appending is safe and reordering is not.
 
 use core::fmt::Write as _;
 

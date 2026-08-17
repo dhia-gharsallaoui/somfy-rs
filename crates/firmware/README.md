@@ -5,18 +5,18 @@ the parts of the controller that can only exist against real hardware.
 
 | Binary | What it does | Puts RF on the air |
 |---|---|---|
-| `firmware` | The controller: radio task, state task, the two flash regions, and — when credentials are provisioned — Wi-Fi and the TCP/IP stack | only when commanded — and nothing commands it yet |
+| `firmware` | The controller: radio task, state task, the three flash regions, and — when credentials are provisioned — Wi-Fi and the TCP/IP stack | only when a broker commands a provisioned shade |
 | `tx-check` | Brings up the CC1101 and transmits one Somfy frame plus repeats, at a synthetic address | **yes** |
 | `store-check` | Reads the rolling-code region, commits the next code, reads it back | no — flash only |
 | `config-check` | Reads the Wi-Fi config region, writes a **placeholder** credential, reads it back | no — flash only, and no network |
 
 They are separate binaries so that proving the rolling-code store survives a
 power cycle never involves keying a transmitter, and so that flashing the
-controller cannot put a frame on the band by itself. There is still no command
-source — Plan 5 Task 3's MQTT client is the first — and the persisted
-configuration carries Wi-Fi credentials and nothing else, so `firmware` boots
-with an empty shade registry and transmits nothing at all; it receives, decodes
-and logs. `docs/hardware-checklist.md` has the procedure for each.
+controller cannot put a frame on the band by itself. `firmware` transmits only
+what the MQTT session commands, and it can only be commanded to move a shade
+the `shades` region names — so a board whose shade table is erased receives,
+decodes and logs, and keys the transmitter never.
+`docs/hardware-checklist.md` has the procedure for each.
 
 **The network is optional and cannot take the radio down.** A board with no
 credentials provisioned — which is what a freshly flashed one is — boots
@@ -24,8 +24,9 @@ cleanly, says so, and runs the radio; so does one whose credentials are wrong,
 retrying with bounded backoff. `src/net.rs` documents the four structural
 reasons that holds.
 
-The rolling-code store needs a `rollcode` partition and the config store needs
-a `wificfg` one, which is why this crate carries its own `partitions.csv` and
+The rolling-code store needs a `rollcode` partition, the config store a
+`wificfg` one, and the shade table a `shades` one — which is why this crate
+carries its own `partitions.csv` and
 an `espflash.toml` pointing espflash at it. Run `espflash` from this directory so it finds them; a device flashed with
 espflash's default table reports `PartitionMissing` and stops rather than
 running without durable storage.

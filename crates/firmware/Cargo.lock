@@ -1765,7 +1765,9 @@ version = "0.1.0"
 dependencies = [
  "crc",
  "heapless 0.8.0",
+ "somfy-domain",
  "somfy-mqtt",
+ "somfy-rts",
 ]
 
 [[package]]

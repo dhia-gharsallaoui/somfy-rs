@@ -578,15 +578,125 @@ than as an old format. The survey line at boot says so; the remedy is the
 
 ---
 
+## Shade provisioning
+
+Putting shades on a board. **This procedure touches flash only** — nothing goes
+out on 433 MHz, and it is the step that turns a listening controller into a
+commandable one.
+
+### The rolling code is the field that can break a pairing
+
+Every other value here is a preference. The rolling code is not: a motor stores
+the last code it accepted and **rejects anything at or below it as a replay**,
+which looks exactly like a broken transmitter and is undone only by re-pairing
+at the motor.
+
+So the record's code is a **seed**, and the firmware applies it *only* when its
+rolling-code store holds nothing for that address. On the second boot, and every
+boot after, the stored code wins and the record's value is ignored — the serial
+line says which of the two happened, per shade. What to enter:
+
+- **A motor another controller has driven:** a value **above** the last code
+  that controller sent. `somfy-migrate` recovers it from a C++ backup as
+  `next_code`, already corrected from the stored last-sent value.
+- **A motor you will pair fresh:** anything. The pairing procedure teaches the
+  motor whatever the transmitter sends.
+
+If you are unsure, **enter a value comfortably above your best guess.** Skipping
+codes forward is free — the motor accepts any code ahead of its stored one — and
+landing below it is not.
+
+### Order is identity
+
+Shade ids come from the order entered: the first is `ShadeId(0)`, which Home
+Assistant sees as `shade_0`. **Appending is safe. Reordering or removing
+renumbers everything after the change**, which in Home Assistant means new
+entities, and the old ones left behind as retained orphans nothing will clear.
+
+### 1. Write the region image
+
+```bash
+cargo run -p somfy-config --example provision_shades -- shades.bin
+# [0] name (empty to finish): <typed>
+#   radio address (decimal, or 0x-prefixed hex): <typed>
+#   kind [roller] (roller, blind, drapery-left, awning, shutter, ...): <return>
+#   tilt mode [none] (none, tilt-motor, integrated, tilt-only, euro): <return>
+#   full travel up time in ms [10000]: <return>
+#   full travel down time in ms [10000]: <return>
+#   full tilt time in ms [7000]: <return>
+#   next rolling code to send — ...: <typed>
+# [1] name (empty to finish): <return to finish>
+```
+
+It validates before writing — a sentinel address (0 or 0xFFFFFF), a name over
+32 bytes, a travel time of zero, a repeated address — so a typo is refused here
+rather than as a shade that silently never appears. Travel times are the
+factory defaults unless measured; they are what the position estimate is
+computed from, and `docs/specs/2026-08-15-position-accuracy-requirements.md` is
+the argument for calibrating them.
+
+### 2. Put it on the board
+
+Step 0 above — **identify the board** — applies here too, every time.
+
+```bash
+cd crates/firmware
+espflash erase-parts --port /dev/ttyUSB0 --partition-table partitions.csv shades
+espflash write-bin   --port /dev/ttyUSB0 0x204000 shades.bin
+```
+
+The erase is **not optional when re-provisioning**, for the same reason as
+`wificfg`: the tool writes sequence number 0, so an existing record with a
+higher sequence number stays newest and the new table is ignored.
+
+A board flashed before this region existed has no `shades` partition at all and
+says so (`region unavailable (PartitionMissing)`); reflash the firmware from
+this directory so espflash writes the current `partitions.csv`. `rollcode` and
+`wificfg` keep their offsets, so rolling codes and credentials survive it.
+
+### 3. Confirm it landed
+
+```bash
+espflash monitor --port /dev/ttyUSB0 --non-interactive   # reset the board
+```
+
+```
+shades: partition 'shades' at 0x00204000, 4 slots of 2048 bytes
+shades: survey slots=4 valid=1 blank=3 damaged=0 newest_seq=Some(0)
+shades: ShadeId(0) address 0x00C0DE — entry 0
+shades: 0x00C0DE had no stored rolling code; seeded 42 from the shade record. This happens once.
+controller: 1 shades provisioned
+```
+
+**Reset the board again and the last line must change**, to:
+
+```
+shades: 0x00C0DE keeps its stored rolling code 42 — the provisioned starting
+ value 42 is ignored, which is what every boot after the first looks like
+```
+
+That is the check that matters. A board that prints `seeded` on every boot is
+walking its rolling code backwards, and every shade on it will stop responding.
+
+| Quantity | Value |
+|---|---|
+| Partition | `shades`, data/undefined, 0x204000, 8 KB |
+| Record | 2048 bytes: magic `RTSS`, version 1, count, seq, then 56 bytes per shade — address, seed code, kind, tilt mode, up/down/tilt times, name(32) — CRC-32 |
+| Slots | 4, in 2 erase sectors of 2 |
+| Capacity | 32 shades, which is the registry's own limit |
+| Written by | the host tool only — the firmware has no write path for this region |
+
+---
+
 ## Controller
 
-The real firmware: the radio task, the state task, the two flash stores and —
+The real firmware: the radio task, the state task, the three flash stores and —
 when credentials are present — Wi-Fi and the TCP/IP stack, wired together.
-**It keys the transmitter only when commanded, and a command names a shade —
-of which there are still none**, because the persisted configuration carries no
-shade registry. So flashing it produces a controller that listens and tracks
-and puts nothing on the 433 MHz band. That is deliberate — no boot of this
-image can move a shade — and it is also why the harnesses above still exist.
+**It keys the transmitter only when commanded, and a command names a shade the
+`shades` region provisioned.** So flashing it onto a board with that region
+erased produces a controller that listens and tracks and puts nothing on the
+433 MHz band, which is deliberate — no boot of an unprovisioned image can move
+a shade — and it is also why the harnesses above still exist.
 
 Step 0 above — **identify the board** — applies here too, every time.
 
@@ -605,10 +715,15 @@ freshly flashed one is — prints this, and nothing about it is an error:
 stack: 176876 bytes available, 8192 required
 config: partition 'wificfg' at 0x00202000, 16 slots of 512 bytes
 config: survey slots=16 valid=0 blank=16 damaged=0 newest_seq=None
+shades: partition 'shades' at 0x00204000, 4 slots of 2048 bytes
+shades: survey slots=4 valid=0 blank=4 damaged=0 newest_seq=None
+shades: none provisioned — the controller receives, decodes and tracks, and has
+ nothing to command
 store: partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
 store: survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
-controller: 0 shades provisioned — receiving and tracking only, nothing will
- transmit until a shade registry exists to command
+controller: no shades provisioned — receiving and tracking only, and nothing can
+ be commanded until a shade table is flashed. Build one with `cargo run -p
+ somfy-config --example provision_shades`.
 network: no credentials provisioned — running radio-only. This board still
  receives and decodes; see docs/hardware-checklist.md to provision one.
 heap: controller started — 0 of 57344 bytes used, peak 0
@@ -630,8 +745,12 @@ Each line is there because nothing else can establish it:
 - **store survey** — "this device has never stored a code" versus "this
   device's codes are gone". `damaged` above zero on a board nobody power-cut
   deserves a look.
-- **0 shades provisioned** — a silent empty controller and a broken one look
-  identical from the serial line.
+- **no shades provisioned** — a silent empty controller and a broken one look
+  identical from the serial line, and from Home Assistant, where both announce
+  availability and no entity. On a board that *does* have a table, this is
+  where the per-shade `seeded`/`keeps its stored rolling code` lines appear;
+  see **Shade provisioning** above for why the second boot's wording is the
+  check that matters.
 - **network: no credentials** — the ordinary state of a new board, said out
   loud so it is not mistaken for a failure. The radio is unaffected.
 - **mqtt: no broker provisioned** — the same, one layer up, and it is a

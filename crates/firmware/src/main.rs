@@ -22,17 +22,18 @@
 //! ## This image transmits only what a broker tells it to
 //!
 //! The state task transmits only what it is commanded to, and the command
-//! channel's one producer is the MQTT session. The configuration this crate
-//! persists carries Wi-Fi credentials and MQTT settings and **no shades**, so
-//! the registry starts and stays empty — and a command names a shade, so there
-//! is nothing for one to name. Flashing this therefore still produces a
-//! controller that listens, decodes, logs what it hears, and keys the
-//! transmitter never.
+//! channel's one producer is the MQTT session. So what this image can move is
+//! exactly what the `shades` region names: a board with that region erased has
+//! an empty registry, no entity to command, and keys the transmitter never,
+//! which is the ordinary state of a freshly flashed device.
 //!
-//! That is intended, and it is also a safety property worth being explicit
-//! about: no boot of this image can move a shade until a shade is provisioned,
-//! which needs Plan 6's configuration store. `tx-check` is the binary that keys
-//! the radio, at a synthetic address, on purpose.
+//! Two things follow, and both are deliberate. A shade cannot be commanded
+//! before somebody has flashed a shade table with `provision_shades` — the
+//! firmware has no path that writes one. And a shade that *is* provisioned
+//! still cannot transmit until its rolling code exists in the store, which
+//! [`provision_shades`] does once, from the record, and never again: a code
+//! re-seeded at every boot would walk backwards and desync the motor. See
+//! `somfy_store::seed_if_absent`.
 //!
 //! ## What a boot proves
 //!
@@ -61,6 +62,7 @@ mod inventory;
 mod mqtt;
 mod net;
 mod radio;
+mod shades;
 mod store;
 mod tasks;
 
@@ -91,7 +93,11 @@ use inventory::Inventory;
 use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
-use somfy_config::{MqttSettings, Namespaces, WifiCredentials};
+use shades::ShadeStore;
+use somfy_config::{MqttSettings, Namespaces, StoredShade, WifiCredentials};
+use somfy_domain::{Registry, MAX_SHADES};
+use somfy_rts::RollingCode;
+use somfy_store::{seed_if_absent, RegionState, Seeded};
 use store::{FlashStore, StoreError};
 use tasks::Mutex;
 
@@ -325,6 +331,13 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let mut flash = peripherals.FLASH;
     let (credentials, broker, superseded) = report_config(FlashStorage::new(flash.reborrow()));
 
+    // Read **before** the rolling-code store takes the flash singleton for
+    // good, because that store owns it for the life of the program and this
+    // region cannot be reached afterwards. The shades are therefore carried
+    // across the two calls below — 2,312 bytes for a full table, which is the
+    // smallest form that survives; see `provision_shades` for what is not held.
+    let shades = report_shades(FlashStorage::new(flash.reborrow()));
+
     // Mounted here rather than inside the state task: `mount` wants roughly
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
@@ -379,22 +392,37 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let mut air = Air::new(cc1101, RmtTx::new(transmit));
     air.listen().map_err(StartError::Air)?;
 
-    // An empty registry: the configuration this crate persists carries Wi-Fi
-    // credentials and MQTT settings and no shades, so nothing is provisioned
-    // and nothing can be commanded. Said out loud because a silent empty
-    // controller and a broken one look identical from the serial line.
-    let machine = StateMachine::new(TxProfile::default());
+    // The controller, and then both halves of provisioning in one place and in
+    // this order: a shade reaches the registry, and its rolling code reaches
+    // the store only if the store has none.
+    //
+    // **Before anything is spawned**, because a commit runs with interrupts
+    // disabled on this core and the receiver is not armed yet, so nothing on
+    // the air can be missed by it — and **after** the survey, which is what
+    // tells the seeding whether an empty read can be believed. It is also after
+    // `FlashStore::mount`, deliberately: a `StateMachine` is 8,016 bytes and
+    // mounting wants about 5 KB of stack, and on the tightest chip this builds
+    // for the whole stack is 14,588.
+    let mut machine = StateMachine::new(TxProfile::default());
+    provision_shades(machine.registry_mut(), &mut store, shades, survey.damaged);
 
     // Copied **here**, before the state task takes ownership of the machine.
     // The MQTT session works from this copy rather than from the registry, so
     // there is no shared state between the broker and the radio at all — see
     // `mqtt`'s module docs for the other three things that keep them apart.
     let inventory = Inventory::snapshot(machine.registry());
-    esp_println::println!(
-        "controller: {} shades provisioned — receiving and tracking only, \
-         nothing will transmit until a shade registry exists to command",
-        inventory.len(),
-    );
+    if inventory.len() == 0 {
+        // Said out loud, because a controller with nothing provisioned and a
+        // broken one look identical from the serial line and from Home
+        // Assistant, where both announce availability and no entity.
+        esp_println::println!(
+            "controller: no shades provisioned — receiving and tracking only, and \
+             nothing can be commanded until a shade table is flashed. Build one with \
+             `cargo run -p somfy-config --example provision_shades`."
+        );
+    } else {
+        esp_println::println!("controller: {} shades provisioned", inventory.len());
+    }
 
     // Both tokens first, then both spawns. `#[task]` hands back a token or a
     // `SpawnError` and `Spawner::spawn` is infallible once it has one, so
@@ -538,6 +566,176 @@ fn report_config(
         );
     }
     (record.wifi, record.mqtt, survey.superseded)
+}
+
+/// The shades a boot found, in the order their registry ids will follow.
+///
+/// This is what is carried from [`report_shades`] across `FlashStore::mount`
+/// to [`provision_shades`], and it is the smallest form that can be: 2,312
+/// bytes for a full table. What is deliberately *not* carried is a decoded
+/// `somfy_config::ShadeRecord` per slot — see `shades::ShadeStore::load_with`.
+type Shades = Vec<StoredShade, MAX_SHADES>;
+
+/// Read the persisted shade table and say what was found.
+///
+/// Answers "no shades" for every outcome that is not a readable table, and
+/// prints which one it was — the same posture as [`report_config`], and for the
+/// same reason: a board with nothing provisioned is the ordinary state of a
+/// freshly flashed device, and it still receives and decodes.
+///
+/// Nothing is placed anywhere here. The registry does not exist yet, and that
+/// is the point: reading this region has to happen before the rolling-code
+/// store takes the flash, and a `StateMachine` alive across that mount is 8,016
+/// bytes standing next to a 5 KB spike.
+fn report_shades(flash: FlashStorage<'_>) -> Shades {
+    let mut shades = Shades::new();
+
+    let mut store = match ShadeStore::mount(flash) {
+        Ok(store) => store,
+        Err(error) => {
+            esp_println::println!(
+                "shades: region unavailable ({:?}) — no shades. A board flashed with an \
+                 older partition table has no '{}' partition; reflash it with this \
+                 crate's partitions.csv.",
+                error,
+                shades::PARTITION_LABEL,
+            );
+            return shades;
+        }
+    };
+
+    let (base, slots, slot_len) = store.geometry();
+    esp_println::println!(
+        "shades: partition '{}' at {:#010X}, {} slots of {} bytes",
+        shades::PARTITION_LABEL,
+        base,
+        slots,
+        slot_len,
+    );
+
+    // The closure is where the shades are collected. `push` cannot fail — the
+    // record's own capacity is `MAX_SHADES`, the same bound as this vector —
+    // and a failure is ignored rather than `expect`ed because a panic here
+    // would take the radio off the air over a shade table.
+    let survey = match store.load_with(|_, shade| {
+        let _ = shades.push(shade);
+    }) {
+        Ok(survey) => survey,
+        Err(error) => {
+            esp_println::println!("shades: unreadable ({:?}) — no shades", error);
+            return Shades::new();
+        }
+    };
+    esp_println::println!(
+        "shades: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
+        survey.slots,
+        survey.valid,
+        survey.blank,
+        survey.damaged,
+        survey.newest_seq,
+    );
+    if let Some(error) = survey.first_error {
+        // Printed with the entry index it carries, because that is the shade to
+        // correct — a bare damaged count leaves an operator guessing which one
+        // the record refused. A refused table places **no** shades at all, on
+        // purpose: see `somfy_config::ShadeRecord::for_each`.
+        esp_println::println!(
+            "shades: a table did not decode ({:?}). If it was the newest one, no shade \
+             from it was loaded — re-provision it.",
+            error,
+        );
+    }
+    if shades.is_empty() {
+        esp_println::println!(
+            "shades: none provisioned — the controller receives, decodes and tracks, \
+             and has nothing to command"
+        );
+    }
+    shades
+}
+
+/// Put every shade in the registry, and give each one a rolling code if and
+/// only if the store has none for it.
+///
+/// **The seeding rule is the one that costs a re-pairing when it is broken.**
+/// The record is read at every boot and names a starting code; writing it every
+/// boot would move the counter backwards, and a motor rejects any code at or
+/// below the last one it accepted. `somfy_store::seed_if_absent` is where that
+/// is enforced — the commit is inside the branch where the read found nothing —
+/// and this function only reports what it decided.
+///
+/// A shade the registry refuses is reported and skipped rather than stopping
+/// the rest. `add_shade` refuses a duplicate address and a full registry, and
+/// the record's own decode has already refused both — so reaching either here
+/// means the two disagree, which is worth a line rather than a silent gap in
+/// the ids.
+fn provision_shades(
+    registry: &mut Registry,
+    store: &mut FlashStore<'_>,
+    shades: Shades,
+    damaged: usize,
+) {
+    // The rolling-code region's own state, as the survey found it a moment ago.
+    // A missing code in a region with damaged slots may be a lost code rather
+    // than a new shade, so it is refused rather than planted.
+    let region = RegionState::from_damaged(damaged);
+
+    for (index, shade) in shades.into_iter().enumerate() {
+        let address = shade.config.address;
+        let id = match registry.add_shade(shade.config) {
+            Ok(id) => id,
+            Err(error) => {
+                esp_println::println!(
+                    "shades: entry {} at {:#08X} refused by the registry ({:?}) — it is not \
+                     announced and cannot be commanded",
+                    index,
+                    address,
+                    error,
+                );
+                continue;
+            }
+        };
+        esp_println::println!(
+            "shades: ShadeId({}) address {:#08X} — entry {}",
+            id.0,
+            address,
+            index,
+        );
+        seed(store, address, shade.initial_code, region);
+    }
+}
+
+/// Give one address its first rolling code, and say which of the three things
+/// happened.
+fn seed(store: &mut FlashStore<'_>, address: u32, code: RollingCode, region: RegionState) {
+    match seed_if_absent(store, address, code, region) {
+        Ok(Seeded::Kept(stored)) => esp_println::println!(
+            "shades: {:#08X} keeps its stored rolling code {} — the provisioned starting \
+             value {} is ignored, which is what every boot after the first looks like",
+            address,
+            stored.0,
+            code.0,
+        ),
+        Ok(Seeded::Planted(planted)) => esp_println::println!(
+            "shades: {:#08X} had no stored rolling code; seeded {} from the shade record. \
+             This happens once.",
+            address,
+            planted.0,
+        ),
+        Ok(Seeded::Refused { damaged }) => esp_println::println!(
+            "shades: {:#08X} has no stored rolling code and the rolling-code region reports \
+             {} damaged slot(s) — NOT seeding, because an empty read there may be a lost \
+             code rather than a new shade. This shade will refuse to transmit until the \
+             region is repaired or deliberately erased.",
+            address,
+            damaged,
+        ),
+        Err(error) => esp_println::println!(
+            "shades: {:#08X} could not be seeded ({:?}) — it will refuse to transmit",
+            address,
+            error,
+        ),
+    }
 }
 
 /// Start the network if there is one to start, and never fail.

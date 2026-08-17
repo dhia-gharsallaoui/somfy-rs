@@ -23,8 +23,18 @@
 # `rollcode` because the two have different write rates and very different
 # consequences on loss, and one erase must never touch both.
 #
-# Note `rollcode` keeps its offset. A board reflashed with this table keeps its
-# rolling codes; only the new region beyond it is added.
+# `shades` is the third, and it is a third region rather than more fields in
+# `wificfg` because the shades do not fit there: a config record is 512 bytes
+# with 228 free after its last field, or four shades' worth, against the 32 the
+# registry holds. Its slots are 2048 bytes — one whole shade table per record,
+# for the reason `somfy_store::Record` gives about erasing a ring — so two
+# records tile a 4 KB sector and the region is two sectors for the same
+# guarantee as the other two. **The firmware only ever reads it**; the host-side
+# `provision_shades` example writes it.
+#
+# Note `rollcode` and `wificfg` keep their offsets. A board reflashed with this
+# table keeps its rolling codes and its credentials; only the new region beyond
+# them is added.
 #
 # Name,     Type, SubType,   Offset,   Size,     Flags
 nvs,        data, nvs,       0x9000,   0x6000,
@@ -32,3 +42,4 @@ phy_init,   data, phy,       0xf000,   0x1000,
 factory,    app,  factory,   0x10000,  0x1F0000,
 rollcode,   data, undefined, 0x200000, 0x2000,
 wificfg,    data, undefined, 0x202000, 0x2000,
+shades,     data, undefined, 0x204000, 0x2000,

@@ -41,6 +41,12 @@
 //! a physical re-pairing procedure. So they live here, host-tested, and
 //! `crates/firmware` is left with the flash I/O and nothing else.
 //!
+//! [`seed_if_absent`] is here for the same reason and answers the same hazard
+//! from the other side: a provisioned shade needs a *first* code, that number
+//! comes from a configuration record which is re-read at every boot, and a boot
+//! path that wrote it every time would walk the counter backwards until the
+//! motor rejected everything. Its own docs carry the argument.
+//!
 //! ## Why a crate of its own
 //!
 //! `somfy-domain` states in its own module docs that it "owns no clock, no
@@ -56,11 +62,13 @@
 #![cfg_attr(not(test), no_std)]
 
 mod record;
+mod seed;
 mod slots;
 mod store;
 mod transmit;
 
 pub use record::{CodeTable, Record, RecordError, TableError, MAX_CODES, RECORD_LEN};
+pub use seed::{seed_if_absent, RegionState, Seeded};
 pub use slots::{newest_slot, SectorRing, SlotLayout, SlotWrite};
 pub use store::RollingCodeStore;
 pub use transmit::{
