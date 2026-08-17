@@ -71,8 +71,30 @@ pub enum CommandDto {
     My,
     StepUp,
     StepDown,
-    GoTo { position: u8 },
-    SetMy { position: Option<u8> },
+    GoTo {
+        position: u8,
+    },
+    SetMy {
+        position: Option<u8>,
+    },
+    /// Close fully, then open just far enough to separate the slats.
+    ///
+    /// A command rather than a position, because it is not one: it is reached
+    /// **from the closed limit** by timing, and the whole reason to have it is
+    /// that it therefore uses no position estimate at all. See
+    /// [`somfy_domain::ShadeCommand::Vent`].
+    ///
+    /// It carries no `position` field for that reason. What it aims at is the
+    /// shade's own measured `ventBandMs`, and the device refuses the command
+    /// with [`ApiErrorCode::VentBandNotMeasured`] while that is zero rather than
+    /// guessing one.
+    ///
+    /// Unlike [`somfy_domain::ShadeCommand::Pair`], which is absent from this
+    /// enum, a vent **is** a movement anybody can watch and undo — so it is an
+    /// ordinary command here and it may be aimed at a group.
+    ///
+    /// [`ApiErrorCode::VentBandNotMeasured`]: crate::ApiErrorCode::VentBandNotMeasured
+    Vent,
 }
 
 impl CommandDto {
@@ -88,6 +110,7 @@ impl CommandDto {
             CommandDto::StepDown => ShadeCommand::StepDown,
             CommandDto::GoTo { position } => ShadeCommand::GoTo(Pos::from_percent(position)),
             CommandDto::SetMy { position } => ShadeCommand::SetMy(position.map(Pos::from_percent)),
+            CommandDto::Vent => ShadeCommand::Vent,
         }
     }
 }
@@ -104,6 +127,7 @@ enum ActionTag {
     StepDown,
     GoTo,
     SetMy,
+    Vent,
 }
 
 /// Flat wire form: the tag plus the one optional numeric field every payload
@@ -139,6 +163,9 @@ impl<'de> Deserialize<'de> for CommandDto {
             ActionTag::SetMy => CommandDto::SetMy {
                 position: wire.position,
             },
+            // No position: the vent point is the shade's measured
+            // slat-separation band, not something a caller may name.
+            ActionTag::Vent => CommandDto::Vent,
         })
     }
 }

@@ -335,6 +335,25 @@ impl Catalog {
         Ok(changed)
     }
 
+    /// Note that a finished calibration changed a shade's stored settings.
+    ///
+    /// # Why this is not [`Catalog::reconfigure`]
+    ///
+    /// Because the change has already happened, and it happened somewhere this
+    /// type has no business reaching into. A calibration run lives in the domain
+    /// — it holds a start time and the operator's marks, and it turns them into
+    /// travel times, a start lag and a dead band at the moment the run ends.
+    /// Routing that back through `reconfigure` would mean building a
+    /// `ShadeConfig` out of the shade's own fields and handing it back to the
+    /// shade, which is a copy with a re-anchor in the middle rather than an
+    /// edit.
+    ///
+    /// So the domain owns the change and this owns the consequence: the table on
+    /// flash no longer matches the table in memory, and a write is due.
+    pub fn calibrated(&mut self, now_ms: u64) {
+        self.touch(now_ms);
+    }
+
     /// Replace one shade's configuration, and note that the table has to be
     /// written again.
     ///

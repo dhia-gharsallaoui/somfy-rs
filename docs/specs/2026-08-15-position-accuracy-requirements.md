@@ -305,6 +305,46 @@ Manual values MUST be distinguishable from measured ones and from factory
 defaults — R7 requires flagging the last of those, and "the operator typed this"
 is a third state, not the same as "the device measured it".
 
+## Implementation status, 2026-08-18
+
+R1–R5, R7, R8, R9 and the vent command are built. What is worth recording is the
+handful of places the implementation **decided** something this document left
+open, and the one place it went against the wording.
+
+- **Acceptance criterion 5 (the field check) was not run, and was not skipped
+  lightly.** Its stated purpose is to decide whether cause A or cause B
+  dominated — "if accuracy is restored by the antenna alone, cause A was
+  dominant and R1 is confirmed as the priority". The 2026-08-17 field evidence
+  above already settled that: the travel times were the reference's compiled-in
+  defaults, which accounts for the whole reported error without appeal to a lost
+  frame. The check's question has a cheaper answer and it has been answered. R1
+  is built regardless — it is a MUST, and a single point of failure does not stop
+  being one because it was not the cause this time.
+- **Open question 2 is settled: one burst with a floor, not repeated `My`s.**
+  Deployed controllers read a `My` burst held long enough while a shade is idle
+  as "store the favourite here", so re-issuing until the estimate believes the
+  shade has stopped risks writing a setting inside the motor. The floor is 5
+  repeats — a six-frame burst — which sits well below both that threshold and
+  the one a tilt-capable motor reads as a tilt press.
+- **Open question 3 is answered: yes.** The C++ `repeats` field is extra repeat
+  frames after the first, identical to this project's. `docs/provenance.md`
+  carries the call sites.
+- **The vent's lift position is `Pos::FULL`, not a small open percentage.** The
+  curtain does not rise during a vent — that is what a vent *is* — so reporting
+  it as partly open would be a claim about the curtain that is false. The light
+  gaps are a slat state, and this generation has no slat axis.
+- **R8's two mechanisms both got fields, not one.** The spec settled the
+  mechanism as a mechanical dead band, and building it showed that the "dead
+  time" of R5 and the "dead band" of R8 are separate intervals in separate
+  places: the lag applies at the start of every move in either direction, the
+  slat separation only when leaving the closed limit upward, and the slat
+  compression only at the end of a full close. Three figures, not one.
+- **A limitation the requirements did not anticipate: at most four shades may be
+  part-way through a multi-step movement at once** (`somfy_domain::MAX_ACTIVITIES`).
+  The bound is forced by boot stack, not chosen — see that constant and
+  `crates/firmware/src/heap.rs`. It is what a group vent of more than four shades
+  meets, and it is refused loudly rather than dropped.
+
 ## Acceptance criteria
 
 Host-testable, consistent with the project's existing culture:

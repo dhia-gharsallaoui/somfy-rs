@@ -42,6 +42,9 @@ export const fr: Record<MessageKey, string> = {
   'shade.idle': 'Arrêté',
   'shade.favourite': 'Position favorite : ouvert à {percent} %',
   'shade.noFavourite': 'Aucune position favorite',
+  'shade.openPercentApprox': 'ouvert à environ {percent} %',
+  'shade.uncertainAria':
+    'L’appareil n’a pas vu ce volet atteindre une butée depuis son dernier déplacement partiel : ce chiffre peut être faux de {margin} points de pourcentage. L’ouvrir ou le fermer complètement le rendra de nouveau exact.',
 
   'command.up': 'Ouvrir',
   'command.my': 'Favori',
@@ -50,6 +53,11 @@ export const fr: Record<MessageKey, string> = {
   'command.myAria': 'Mettre {name} en position favorite, ou l’arrêter',
   'command.downAria': 'Fermer {name}',
   'command.sliderAria': 'Ouverture de {name}, en pourcentage',
+  'command.vent': 'Aération',
+  'command.ventAria':
+    'Fermer complètement {name}, puis écarter les lames juste assez pour laisser passer la lumière',
+  'command.ventUnavailable':
+    'Le temps d’écartement des lames n’a pas été mesuré : l’aération n’a donc rien à viser. Mesurez-le dans Temps de course.',
 
   'tilt.none': 'Sans inclinaison',
   'tilt.motor': 'Moteur d’inclinaison séparé',
@@ -88,8 +96,37 @@ export const fr: Record<MessageKey, string> = {
   'calib.revert': 'Annuler les modifications',
   'calib.saved': 'Enregistré.',
   'calib.failed': 'L’appareil a refusé ces valeurs : {reason}',
-  'calib.autoPending':
-    'La mesure automatique — l’appareil fait parcourir le volet et le chronomètre — n’est pas encore implémentée. En attendant, les valeurs mesurées à la main sont les valeurs justes.',
+
+  'calib.startLag': 'Délai de démarrage',
+  'calib.ventBand': 'Écartement des lames',
+  'calib.closeBand': 'Serrage des lames',
+  'calib.bandsHint':
+    'Une course ne fait pas bouger le tablier sur toute sa durée. La première fraction de seconde sert à transmettre la commande au moteur et à le démarrer ; sur un volet à lames perforées, les premières secondes d’ouverture ne font qu’écarter les lames, et les dernières secondes de fermeture ne font que les resserrer. Ces trois durées font partie des temps ci-dessus, elles ne s’y ajoutent pas : les mesurer rend les positions intermédiaires plus justes sans changer la durée d’une course complète.',
+  'calib.ventBandHint':
+    'C’est aussi là que s’arrête la commande Aération. Laissée à zéro, la commande n’est pas proposée.',
+
+  'calib.autoTitle': 'Mesurer automatiquement',
+  'calib.autoHint':
+    'L’appareil chronomètre le volet pendant que vous le regardez. Placez d’abord le volet à la butée opposée, lancez la mesure, puis appuyez au fur et à mesure. Rien n’est enregistré avant la fin, et annuler n’enregistre rien.',
+  'calib.autoUp': 'Mesurer l’ouverture',
+  'calib.autoDown': 'Mesurer la fermeture',
+  'calib.autoUpPrep':
+    'Fermez complètement le volet et attendez son arrêt. Lancez ensuite : le volet s’ouvrira et il vous sera demandé d’appuyer trois fois.',
+  'calib.autoDownPrep':
+    'Ouvrez complètement le volet et attendez son arrêt. Lancez ensuite : le volet se fermera et il vous sera demandé d’appuyer deux fois.',
+  'calib.autoStart': 'Lancer et ouvrir',
+  'calib.autoStartDown': 'Lancer et fermer',
+  'calib.autoRunning': 'En cours — {elapsed} s',
+  'calib.autoMarkMotion': 'Il a commencé à bouger',
+  'calib.autoMarkCurtainUp': 'Le tablier commence à monter',
+  'calib.autoMarkCurtainDown': 'Le tablier est arrivé en bas',
+  'calib.autoFinish': 'Il s’est arrêté',
+  'calib.autoCancel': 'Annuler',
+  'calib.autoMarked': 'Noté.',
+  'calib.autoDone':
+    'Mesuré. Les temps ci-dessus ont été mis à jour, et le volet est à une butée : sa position est de nouveau exacte.',
+  'calib.autoOptional':
+    'Chaque appui est facultatif — si vous en sautez un, la valeur correspondante reste inchangée.',
 
   'detail.linkedRemotes': 'Télécommandes associées',
   'detail.linkedRemotesPending': 'Pas encore implémenté.',
@@ -244,6 +281,13 @@ export const fr: Record<MessageKey, string> = {
   'error.registryFull': 'ce contrôleur est plein — 32 volets au maximum',
   'error.notFound': 'ce volet n’existe plus',
   'error.addressNotAllocated': 'l’adresse de ce volet appartient à un autre contrôleur',
+  'error.invalidDeadBand':
+    'le délai de démarrage et les temps de lames doivent laisser de la course derrière eux — ce sont des parties d’un temps de course, pas du temps en plus',
+  'error.ventBandNotMeasured':
+    'le temps d’écartement des lames n’a jamais été mesuré, et c’est la seule chose que vise l’aération',
+  'error.notCalibrating': 'cette mesure n’est plus en cours',
+  'error.calibrationImplausible':
+    'l’appareil refuse ces valeurs — une course nulle, ou de plus de trois minutes, ou des appuis ne laissant aucune course entre eux',
   'error.unknown': 'l’appareil n’en a pas donné la raison',
 
   'stub.heading': '{screen}',

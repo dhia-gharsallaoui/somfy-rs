@@ -218,7 +218,7 @@ fn a_migrated_record_re_encodes_as_the_current_version_and_round_trips() {
     // since v1, so a record that still claimed version 1 would decode its own
     // bytes as garbage rather than as itself.
     let bytes = migrated.encode();
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
     assert_eq!(
         u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
         migrated.announced.bits(),

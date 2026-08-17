@@ -17,6 +17,7 @@
 import type { AddressOrigin } from '../api/generated/AddressOrigin';
 import type { ShadeDto } from '../api/generated/ShadeDto';
 import { openPercent } from '../api/position';
+import { Calibrate } from '../components/calibrate';
 import { DeleteShade } from '../components/delete-shade';
 import { formatAddress } from '../components/format';
 import { kindKey, TILT_NONE } from '../components/kind';
@@ -125,6 +126,16 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
         untouched defaults moved 1% for a 25% command — see `TravelTimes`.
       */}
       <TravelTimes shade={shade} onSaved={device.reload} />
+
+      {/*
+        The measurement itself, beside the values it writes. Two panels rather
+        than one because they are two different acts: correcting a number you
+        already know, and standing at a window with the device timing you. R9
+        insists both exist — a sweep runs the shade end to end, which is not
+        always acceptable, and a sweep with nothing to check itself against
+        cannot be caught being wrong.
+      */}
+      <Calibrate shade={shade} onFinished={device.reload} />
 
       <section class="panel">
         <h3>{t('detail.tilt')}</h3>

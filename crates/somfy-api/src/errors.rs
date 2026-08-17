@@ -85,6 +85,34 @@ pub enum ApiErrorCode {
     /// and the two-controllers-one-identity clash the address carries would
     /// survive the whole procedure.
     AddressNotAllocated,
+    /// A start lag or a dead band past what the model can express, or one that
+    /// does not leave any travel behind it.
+    ///
+    /// Both bands and the lag are intervals *inside* their direction's travel
+    /// time, so a shade whose 30 s Up is 30 s of slat separation has no phase in
+    /// which the curtain rises. The estimator answers that by reporting every
+    /// move as instantly arrived, which is a shade that claims to be wherever it
+    /// was last sent — so it is refused at the boundary instead.
+    InvalidDeadBand,
+    /// A vent was asked for on a shade whose slat-separation band has never
+    /// been measured.
+    ///
+    /// The vent position **is** that band — it is not derived from a position
+    /// estimate, which is the whole reason the command is trustworthy — so with
+    /// nothing measured there is nothing to aim at. A vent that ran anyway would
+    /// close the shade, send an Up and stop it in the same instant, which looks
+    /// to the user like the button does nothing.
+    ///
+    /// 409 rather than 400 for the same reason as
+    /// [`AddressNotAllocated`](ApiErrorCode::AddressNotAllocated): the request
+    /// is well-formed, and what makes it inapplicable is the state of the shade.
+    VentBandNotMeasured,
+    /// A calibration was marked or finished when none was running.
+    NotCalibrating,
+    /// A calibration run produced numbers the device will not store — a
+    /// traverse of zero or past three minutes, or marks that leave no travel
+    /// between them. Nothing is stored and the shade is left as it was.
+    CalibrationImplausible,
 }
 
 impl ApiErrorCode {
@@ -126,9 +154,14 @@ impl ApiErrorCode {
             | ApiErrorCode::NameTooLong
             | ApiErrorCode::InvalidKind
             | ApiErrorCode::InvalidTiltMode
-            | ApiErrorCode::TravelTimeZero => 400,
+            | ApiErrorCode::TravelTimeZero
+            | ApiErrorCode::InvalidDeadBand
+            | ApiErrorCode::CalibrationImplausible => 400,
             ApiErrorCode::NotFound => 404,
-            ApiErrorCode::RegistryFull | ApiErrorCode::AddressNotAllocated => 409,
+            ApiErrorCode::RegistryFull
+            | ApiErrorCode::AddressNotAllocated
+            | ApiErrorCode::VentBandNotMeasured
+            | ApiErrorCode::NotCalibrating => 409,
             ApiErrorCode::InvalidAddress => 500,
         }
     }

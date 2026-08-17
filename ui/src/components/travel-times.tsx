@@ -21,17 +21,21 @@
  *   sleeping room, or on an awning in wind — and a sweep with nothing to check
  *   itself against cannot be caught being wrong.
  *
- * ## What is deliberately not here
+ * ## The two things that used to be missing here
  *
- * **A "measure automatically" button.** The guided calibration of R2 does not
- * exist. A control promising a measurement nothing performs is worse than no
- * control, so the panel says the measurement is not built rather than offering
- * it. `CalibrationSource` already carries `measured` for when it is.
+ * **Automatic measurement (R2)** is the second panel now. It is guided rather
+ * than automatic in any deeper sense: nothing on the device can see the shade,
+ * so a measurement is the device's clock and the operator's eye. Three numbers
+ * come out of one Up traverse, which is what keeps the dead time and the dead
+ * band from costing extra shade travel.
  *
- * **A dead-band field.** R8 records that the first ~4 s of Up travel off the
- * closed limit separates the slats without lifting — but the spec says the
- * mechanism is unresolved, and its two candidates need the same number handled
- * in opposite ways. `PatchShadeDto` in `crates/somfy-api` carries the argument.
+ * **The dead bands (R5, R8)** are three more rows. The spec settled the
+ * mechanism by elimination on 2026-08-17 — these motors complete full traverses
+ * from three-frame bursts, which a motor reading burst length as a slat command
+ * could not do — so it is mechanical, and the estimator subtracts it. They are
+ * presented as *parts of* the travel times, because that is what they are:
+ * measuring one makes part-open positions more accurate without changing how
+ * long a full travel takes.
  */
 import { useState } from 'preact/hooks';
 
@@ -56,12 +60,34 @@ const SOURCE_TEXT: Record<CalibrationSource, { label: MessageKey; tone: 'warn' |
   measured: { label: 'calib.measured', tone: 'ok' },
 };
 
-/** One editable travel time, paired with where its current value came from. */
+/**
+ * One editable duration.
+ *
+ * `source` is present only on the three travel times: a dead band has no
+ * provenance of its own, because it is measured by the same run — and stored
+ * beside — the travel time it is a part of. Marking it separately would invite
+ * the reading that it is an independent setting, which is the misunderstanding
+ * this panel's copy exists to prevent.
+ */
 interface Row {
   label: MessageKey;
-  field: 'upTimeMs' | 'downTimeMs' | 'tiltTimeMs';
-  source: CalibrationSource;
+  field: 'upTimeMs' | 'downTimeMs' | 'tiltTimeMs' | 'startLagMs' | 'ventBandMs' | 'closeBandMs';
+  source?: CalibrationSource;
+  /** Smallest step the device stores this at, in seconds. */
+  step: number;
+  hint?: MessageKey;
 }
+
+/**
+ * `somfy_domain::START_LAG_RESOLUTION_MS` and `DEAD_BAND_RESOLUTION_MS`, in
+ * seconds.
+ *
+ * The device rounds onto them as a value arrives, so the input steps by the
+ * same amount — a field that accepts 4.25 s and reads back 4.3 s looks like a
+ * bug and is not one.
+ */
+const LAG_STEP_S = 0.01;
+const BAND_STEP_S = 0.1;
 
 export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () => void }) {
   const t = useT();
@@ -71,21 +97,42 @@ export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () =
   const [saved, setSaved] = useState(false);
 
   const rows: Row[] = [
-    { label: 'detail.upTime', field: 'upTimeMs', source: shade.upTimeSource },
-    { label: 'detail.downTime', field: 'downTimeMs', source: shade.downTimeSource },
+    { label: 'detail.upTime', field: 'upTimeMs', source: shade.upTimeSource, step: 0.1 },
+    { label: 'detail.downTime', field: 'downTimeMs', source: shade.downTimeSource, step: 0.1 },
     ...(shade.tiltMode !== TILT_NONE
-      ? ([{ label: 'detail.tiltTime', field: 'tiltTimeMs', source: shade.tiltTimeSource }] as Row[])
+      ? ([
+          {
+            label: 'detail.tiltTime',
+            field: 'tiltTimeMs',
+            source: shade.tiltTimeSource,
+            step: 0.1,
+          },
+        ] as Row[])
       : []),
+    { label: 'calib.startLag', field: 'startLagMs', step: LAG_STEP_S },
+    { label: 'calib.ventBand', field: 'ventBandMs', step: BAND_STEP_S, hint: 'calib.ventBandHint' },
+    { label: 'calib.closeBand', field: 'closeBandMs', step: BAND_STEP_S },
   ];
 
   const uncalibrated = rows.filter((row) => row.source === 'factoryDefault');
   const seconds = (row: Row): number => draft[row.field] ?? shade[row.field] / 1000;
   const changed = rows.filter((row) => Math.round(seconds(row) * 1000) !== shade[row.field]);
-  // The lift times are the estimate's divisor; zero is not a slow shade, it is
-  // an estimator with no scale. Refused here as well as by the device.
-  const valid = rows.every(
-    (row) => row.field === 'tiltTimeMs' || (seconds(row) > 0 && Number.isFinite(seconds(row))),
-  );
+  const at = (field: Row['field']): number =>
+    Math.round((draft[field] ?? shade[field] / 1000) * 1000);
+  // Three rules, all of them the device's, restated so the button is disabled
+  // rather than the request refused:
+  //
+  // - a lift time of zero is not a slow shade, it is an estimator with no scale;
+  // - nothing here may be negative;
+  // - the lag and a band are *parts of* their direction's travel time, so
+  //   together they have to leave some travel behind them — a 30 s Up that is
+  //   30 s of slat separation has no phase in which the curtain rises.
+  const valid =
+    rows.every((row) => Number.isFinite(seconds(row)) && seconds(row) >= 0) &&
+    at('upTimeMs') > 0 &&
+    at('downTimeMs') > 0 &&
+    at('startLagMs') + at('ventBandMs') < at('upTimeMs') &&
+    at('startLagMs') + at('closeBandMs') < at('downTimeMs');
 
   const save = (event: Event) => {
     event.preventDefault();
@@ -138,6 +185,8 @@ export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () =
         />
       ))}
 
+      <p class="field__hint">{t('calib.bandsHint')}</p>
+
       <div class="actions">
         <button
           type="submit"
@@ -153,8 +202,6 @@ export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () =
         )}
       </div>
 
-      {/* R2 lands here. Named as missing rather than offered as a button. */}
-      <p class="field__hint">{t('calib.autoPending')}</p>
     </form>
   );
 }
@@ -170,23 +217,24 @@ function TravelRow({
   t: Translate;
   onChange: (value: number) => void;
 }) {
-  const { label, tone } = SOURCE_TEXT[row.source];
+  const source = row.source === undefined ? undefined : SOURCE_TEXT[row.source];
   return (
     <label class="field field--inline">
       <span class="field__label">
         {t(row.label)}
-        <span class={`tag tag--${tone}`}>{t(label)}</span>
+        {source && <span class={`tag tag--${source.tone}`}>{t(source.label)}</span>}
       </span>
       <input
         type="number"
         class="field__input field__input--short"
-        min={row.field === 'tiltTimeMs' ? 0 : 0.1}
+        min={0}
         max={600}
-        step={0.1}
+        step={row.step}
         value={seconds}
         onInput={(event) => onChange(Number(event.currentTarget.value))}
       />
       <span class="field__suffix">s</span>
+      {row.hint && <span class="field__hint">{t(row.hint)}</span>}
     </label>
   );
 }

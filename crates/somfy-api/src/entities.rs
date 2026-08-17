@@ -11,7 +11,7 @@
 // std prelude `String` (e.g. `fn ident() -> String`); a `use heapless::String`
 // here would shadow it and break the derive.
 use serde::{Deserialize, Serialize};
-use somfy_domain::{RemoteIdentity, Shade, ShadeId};
+use somfy_domain::{Pos, RemoteIdentity, Shade, ShadeId};
 
 /// Where a shade's remote address came from, and therefore whether pairing it
 /// can accomplish anything.
@@ -153,19 +153,15 @@ impl PairingState {
     }
 }
 
-/// The reference firmware's compiled-in travel-time defaults, which are also
-/// [`somfy_domain::ShadeConfig::new`]'s.
+/// The travel-time defaults a shade is created with, which are also the ones
+/// deployed devices ship with.
 ///
-/// Restated here rather than imported because `ShadeConfig::new` returns them
-/// inside a value instead of exposing them as constants. `tests/shades.rs`
-/// pins each one against what that constructor actually produces, so the
-/// restatement cannot drift silently — which matters, because a wrong default
-/// here would misclassify a *measured* value as uncalibrated.
-pub const FACTORY_UP_TIME_MS: u32 = 10_000;
-/// See [`FACTORY_UP_TIME_MS`].
-pub const FACTORY_DOWN_TIME_MS: u32 = 10_000;
-/// See [`FACTORY_UP_TIME_MS`].
-pub const FACTORY_TILT_TIME_MS: u32 = 7_000;
+/// **Re-exported rather than restated.** They used to be copied here, pinned
+/// against the constructor by a test, because the domain returned them inside a
+/// value instead of naming them. It names them now — the record decoder needs
+/// them too, to reconstruct provenance for a table written before provenance was
+/// stored — so there is one definition and nothing left to drift.
+pub use somfy_domain::{FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS};
 
 /// Where a travel time came from — and therefore how much the position
 /// estimate computed from it is worth.
@@ -208,48 +204,41 @@ pub enum CalibrationSource {
     /// A human supplied it — typed in, or carried over from a device where
     /// somebody had typed it in.
     OperatorSupplied,
-    /// The device measured it by sweeping the shade.
-    ///
-    /// **Not produced yet**: the guided calibration of R2 does not exist. The
-    /// variant is here so that building it later adds behaviour rather than
-    /// changing this contract, and so the UI's exhaustive map already has a
-    /// branch waiting for it.
+    /// The device measured it, through the guided calibration.
     Measured,
 }
 
 impl CalibrationSource {
-    /// Classify one travel time against the factory default for that field.
+    /// Carry the domain's provenance onto the wire.
     ///
-    /// # What this can and cannot tell apart today
+    /// A separate type rather than a `serde` derive on the domain's, for the
+    /// reason every DTO here is separate — and exhaustive, so a fourth state
+    /// added in the domain stops this compiling.
     ///
-    /// It separates [`FactoryDefault`](CalibrationSource::FactoryDefault) from
-    /// everything else, and nothing more, because a shade's stored
-    /// configuration currently has nowhere to record provenance — only the
-    /// number survives. So a value that differs from the default is reported as
-    /// [`OperatorSupplied`](CalibrationSource::OperatorSupplied), which is true
-    /// in the sense that matters: some human put that number there, whether
-    /// here or on the device this setup was migrated from.
+    /// # This used to be a guess, and the guess was the bug
     ///
-    /// **The upgrade path is one line and no contract change.** When the
-    /// persisted shade record grows a provenance field (Plan 6's record-format
-    /// task), [`ShadeDto::from_shade`] reads it instead of calling this, and
-    /// [`Measured`](CalibrationSource::Measured) starts appearing. Nothing on
-    /// the wire moves.
+    /// It took the *value* and the factory default and compared them, because
+    /// the persisted shade record had nowhere to keep provenance. That made
+    /// [`Measured`](CalibrationSource::Measured) unreachable — nothing could
+    /// produce it — and it misreported both directions: an operator who
+    /// measured exactly 10.0 s was told the shade was uncalibrated, and a
+    /// factory default that somebody had genuinely chosen was indistinguishable
+    /// from one nobody had touched.
     ///
-    /// # The false positive, and why it is the right one to accept
-    ///
-    /// An operator who measures a shade and gets exactly 10.0 s is told it is
-    /// uncalibrated. That is wrong, and it is deliberate: R7 rules that "a
-    /// value that is merely *plausible* is not evidence anybody chose it". The
-    /// two errors are not symmetric — being invited to re-measure something
-    /// already correct costs a minute, while presenting a factory default as
-    /// configured is the failure that produced a 25% command moving a shade
-    /// 1%, and it cost an afternoon to diagnose.
-    pub fn of(value_ms: u32, factory_default_ms: u32) -> CalibrationSource {
-        if value_ms == factory_default_ms {
-            CalibrationSource::FactoryDefault
-        } else {
-            CalibrationSource::OperatorSupplied
+    /// The record carries it now, so this is a mapping rather than an inference.
+    /// The one thing that has not changed is what happens to a *migrated* value:
+    /// a table written before the field existed still has its provenance
+    /// reconstructed by that same comparison, once, in the record decoder — see
+    /// `somfy_config`'s calibration block. R7's ruling stands there and is what
+    /// makes it the right reconstruction: "a value that is merely *plausible* is
+    /// not evidence anybody chose it".
+    pub fn of(source: somfy_domain::CalibrationSource) -> CalibrationSource {
+        match source {
+            somfy_domain::CalibrationSource::FactoryDefault => CalibrationSource::FactoryDefault,
+            somfy_domain::CalibrationSource::OperatorSupplied => {
+                CalibrationSource::OperatorSupplied
+            }
+            somfy_domain::CalibrationSource::Measured => CalibrationSource::Measured,
         }
     }
 }
@@ -280,7 +269,7 @@ impl CalibrationSource {
 /// bytes for one, so the name alone reaches 192 — and nothing refuses such a
 /// name, so it is reachable rather than hypothetical. An ordinary shade is
 /// under half this.
-pub const SHADE_JSON_MAX_BYTES: usize = 640;
+pub const SHADE_JSON_MAX_BYTES: usize = 672;
 
 /// Live snapshot of one shade for REST/WS payloads. Field names are
 /// camelCase on the wire; positions are whole percent (0-100);
@@ -339,6 +328,40 @@ pub struct ShadeDto {
     pub down_time_source: CalibrationSource,
     pub tilt_time_ms: u32,
     pub tilt_time_source: CalibrationSource,
+    /// Milliseconds between a command being sent and the motor moving. See
+    /// [`somfy_domain::ShadeConfig::start_lag_ms`].
+    pub start_lag_ms: u32,
+    /// Milliseconds an Up command spends separating the slats at the closed
+    /// limit, and therefore where `vent` stops. Zero means it has never been
+    /// measured, and `vent` is refused until it has. See
+    /// [`somfy_domain::ShadeConfig::vent_band_ms`].
+    pub vent_band_ms: u32,
+    /// Milliseconds a Down command spends compressing the slats after the
+    /// curtain has reached the sill. See
+    /// [`somfy_domain::ShadeConfig::close_band_ms`].
+    pub close_band_ms: u32,
+    /// How far `position` may be from the truth, in whole percent.
+    ///
+    /// `0` means the estimate was last set by a physical limit — the one thing a
+    /// one-way protocol can be sure of — and `100` means it says nothing at all.
+    /// It is what turns a confidently wrong "60%" into an honest "≈60%", and on
+    /// a shade still carrying factory travel times it saturates after the first
+    /// partial move, which is the correct report rather than a defect.
+    ///
+    /// **Derived, never stored and never accepted from a client**, like
+    /// `addressOrigin`: it is a fact about how the estimate was arrived at.
+    ///
+    /// # There is deliberately no `calibrating` beside it
+    ///
+    /// A guided calibration run is a conversation with the operator who started
+    /// it, and the screen driving it already knows it is running. What a *second*
+    /// viewer would gain from the field is a spinner; what it would cost is a
+    /// per-shade slot for something at most one shade uses at a time, on a device
+    /// where the whole shade table is copied about five times onto the boot stack
+    /// (`crates/firmware/src/heap.rs`). A stale tab is answered instead by
+    /// [`crate::ApiErrorCode::NotCalibrating`], which is the honest reply and
+    /// costs nothing.
+    pub position_uncertainty: u8,
 }
 
 impl ShadeDto {
@@ -360,17 +383,18 @@ impl ShadeDto {
             my_position: shade.my_pos().map(|p| p.percent()),
             direction: shade.direction().sign(),
             up_time_ms: shade.config.up_time_ms,
-            up_time_source: CalibrationSource::of(shade.config.up_time_ms, FACTORY_UP_TIME_MS),
+            up_time_source: CalibrationSource::of(shade.config.up_time_source),
             down_time_ms: shade.config.down_time_ms,
-            down_time_source: CalibrationSource::of(
-                shade.config.down_time_ms,
-                FACTORY_DOWN_TIME_MS,
-            ),
+            down_time_source: CalibrationSource::of(shade.config.down_time_source),
             tilt_time_ms: shade.config.tilt_time_ms,
-            tilt_time_source: CalibrationSource::of(
-                shade.config.tilt_time_ms,
-                FACTORY_TILT_TIME_MS,
-            ),
+            tilt_time_source: CalibrationSource::of(shade.config.tilt_time_source),
+            start_lag_ms: shade.config.start_lag_ms as u32,
+            vent_band_ms: shade.config.vent_band_ms as u32,
+            close_band_ms: shade.config.close_band_ms as u32,
+            // Raw hundredths of a percent down to whole percent, the same scale
+            // `position` is on — so a client can render "60% ± 3%" without
+            // knowing anything about the domain's fixed point.
+            position_uncertainty: Pos::from_raw(shade.confidence()).percent(),
         }
     }
 }

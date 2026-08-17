@@ -56,6 +56,20 @@ export const FACTORY_DOWN_TIME_MS = 10_000;
 export const FACTORY_TILT_TIME_MS = 7_000;
 
 /**
+ * The resolutions the start lag and the two dead bands are stored at, mirroring
+ * `somfy_domain::START_LAG_RESOLUTION_MS` and `DEAD_BAND_RESOLUTION_MS`.
+ *
+ * They are the *measurement's* resolution rather than the storage's: both
+ * numbers come from a person tapping a button as they watch a shade, and a human
+ * tap lands within a couple of hundred milliseconds of what it aims at. The
+ * device rounds onto them as a value enters, so what a later `GET` returns is
+ * what the device is actually running — and the mock has to do the same or the
+ * UI would look correct against one and wrong against the other.
+ */
+export const START_LAG_RESOLUTION_MS = 10;
+export const DEAD_BAND_RESOLUTION_MS = 100;
+
+/**
  * `ShadeKind` discriminants from `somfy-domain` (`types.rs`): Roller 0x00,
  * Blind 0x01, DraperyLeft 0x02, Awning 0x03, Shutter 0x04, DraperyRight 0x07,
  * DraperyCenter 0x08.
@@ -95,9 +109,12 @@ export const TILT = {
  *
  * Four carry allocated addresses and three imported ones; see the module note.
  *
- * Typed {@link StoredShade}, not `ShadeDto`: `addressOrigin` and the three
- * calibration sources are **derived** (`./derive.ts`), so writing them here
- * would let a fixture claim an origin its own address contradicts.
+ * Typed {@link StoredShade}, not `ShadeDto`: `addressOrigin` is **derived**
+ * (`./derive.ts`), so writing it here would let a fixture claim an origin its
+ * own address contradicts. The three calibration sources are written out,
+ * because they are stored now rather than guessed from the numbers beside them —
+ * which is what lets `Bedroom window` below be genuinely *measured* rather than
+ * merely unusual.
  *
  * ## One shade is deliberately half-finished
  *
@@ -119,6 +136,19 @@ export const TILT = {
  * that day (**30 s up, 27 s down** — closing is gravity-assisted, so the ~10%
  * asymmetry is real) with its tilt time left untouched, so one shade shows the
  * mixed state and proves the flag is per field rather than per shade.
+ *
+ * ## `Bedroom window` is the fully-calibrated one
+ *
+ * It is the only fixture carrying `measured` sources and a non-zero
+ * `ventBandMs`, and both are deliberate: it is the shade the vent control is
+ * offered on, so the flow is exercised by the fixtures rather than only by hand.
+ * Its numbers are the estate's — a 4 s slat-separation band out of a 30 s
+ * traverse, which is the ~13% of a commanded Up that produces no elevation at
+ * all — plus a 110 ms start lag, which is about what a three-frame 56-bit burst
+ * takes to reach a motor.
+ *
+ * `Living room terrace` carries a non-zero `positionUncertainty`, so the "≈"
+ * treatment has something to render without anybody driving a shade first.
  */
 export const SHADES: StoredShade[] = [
   {
@@ -136,6 +166,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: FACTORY_UP_TIME_MS,
     downTimeMs: FACTORY_DOWN_TIME_MS,
     tiltTimeMs: FACTORY_TILT_TIME_MS,
+    upTimeSource: 'factoryDefault',
+    downTimeSource: 'factoryDefault',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 0,
   },
   {
     id: 1,
@@ -152,6 +189,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: FACTORY_UP_TIME_MS,
     downTimeMs: FACTORY_DOWN_TIME_MS,
     tiltTimeMs: FACTORY_TILT_TIME_MS,
+    upTimeSource: 'factoryDefault',
+    downTimeSource: 'factoryDefault',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 0,
   },
   {
     id: 2,
@@ -168,6 +212,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: FACTORY_UP_TIME_MS,
     downTimeMs: FACTORY_DOWN_TIME_MS,
     tiltTimeMs: FACTORY_TILT_TIME_MS,
+    upTimeSource: 'factoryDefault',
+    downTimeSource: 'factoryDefault',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 12,
   },
   {
     id: 3,
@@ -184,6 +235,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: 8_000,
     downTimeMs: 7_000,
     tiltTimeMs: 1_500,
+    upTimeSource: 'operatorSupplied',
+    downTimeSource: 'operatorSupplied',
+    tiltTimeSource: 'operatorSupplied',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 0,
   },
   {
     id: 4,
@@ -200,6 +258,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: 30_000,
     downTimeMs: 27_000,
     tiltTimeMs: FACTORY_TILT_TIME_MS,
+    upTimeSource: 'measured',
+    downTimeSource: 'measured',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 110,
+    ventBandMs: 4000,
+    closeBandMs: 1500,
+    positionUncertainty: 0,
   },
   {
     id: 5,
@@ -216,6 +281,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: 6_000,
     downTimeMs: 6_000,
     tiltTimeMs: 0,
+    upTimeSource: 'operatorSupplied',
+    downTimeSource: 'operatorSupplied',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 0,
   },
   {
     // The half-finished one. Its address is allocated — the device invented it,
@@ -236,6 +308,13 @@ export const SHADES: StoredShade[] = [
     upTimeMs: 12_000,
     downTimeMs: 11_000,
     tiltTimeMs: 0,
+    upTimeSource: 'operatorSupplied',
+    downTimeSource: 'operatorSupplied',
+    tiltTimeSource: 'factoryDefault',
+    startLagMs: 0,
+    ventBandMs: 0,
+    closeBandMs: 0,
+    positionUncertainty: 0,
   },
 ];
 

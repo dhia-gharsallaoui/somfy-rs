@@ -87,12 +87,14 @@
 
 #![cfg_attr(not(any(test, feature = "std", feature = "ts")), no_std)]
 
+mod calibration;
 mod commands;
 mod entities;
 mod errors;
 mod events;
 mod shades;
 
+pub use calibration::{CalibrationLegDto, CalibrationMarkDto, CalibrationStepDto};
 pub use commands::CommandDto;
 pub use entities::{
     AddressOrigin, CalibrationSource, GroupDto, PairingState, RoomDto, ShadeDto,

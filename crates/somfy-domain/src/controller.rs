@@ -13,7 +13,10 @@
 //!   56-bit motor) — see [`Shade`].
 
 use crate::registry::{GroupId, Registry, ShadeId};
-use crate::shade::{PlannedTx, ShadeCommand};
+use crate::shade::{
+    Activity, Calibrating, CalibrationLeg, CalibrationMark, CalibrationOutcome, PlannedTx,
+    ShadeCommand,
+};
 use crate::{Direction, DomainError, Pos};
 use heapless::Vec;
 use somfy_rts::{Frame, RxDeduper};
@@ -69,7 +72,33 @@ pub struct Controller {
     /// address first treats any slot now holding a *different* shade as having
     /// no baseline (i.e. [`RESTING`]).
     last_emitted: [Option<(u32, Pos, Pos, Direction)>; crate::registry::MAX_SHADES],
+    /// The multi-step movements in flight, and the calibration run if there is
+    /// one. See [`MAX_ACTIVITIES`].
+    activities: Vec<(ShadeId, Activity), MAX_ACTIVITIES>,
 }
+
+/// Shades that may be part-way through a multi-step movement at once.
+///
+/// # Why this is here and not a field on every shade
+///
+/// **Because it is measured in boot stack.** The state machine — the whole
+/// registry of thirty-two shades — is materialised on the main stack about five
+/// times on the way into its Embassy task, so a byte added to a `Shade` costs
+/// roughly a hundred and seventy bytes of the deepest chain this firmware runs.
+/// A vent's deadline and a calibration run come to about sixty bytes each, which
+/// per shade is more stack than the whole boot path had left.
+///
+/// A table of four costs sixty-eight bytes total, and the thing being bounded is
+/// not really storage: a vent is a person deciding to vent a window, and a
+/// calibration is a person standing at one with a stopwatch. Four at once is
+/// already more than the estate this was built for has windows facing the same
+/// weather.
+///
+/// **What it costs:** a fifth concurrent sequence is refused with
+/// [`DomainError::TooManySequences`], which is what a group vent of more than
+/// four shades meets. `crates/firmware/src/heap.rs` is where the arithmetic that
+/// forces this lives.
+pub const MAX_ACTIVITIES: usize = 4;
 
 impl Controller {
     pub fn new() -> Controller {
@@ -77,7 +106,51 @@ impl Controller {
             registry: Registry::new(),
             dedupe: RxDeduper::new(RX_DEDUPE_WINDOW_MS),
             last_emitted: [None; crate::registry::MAX_SHADES],
+            activities: Vec::new(),
         }
+    }
+
+    /// Replace what `id` is doing, and say whether it could be stored.
+    ///
+    /// `None` clears the entry, which is what every ordinary command means: it
+    /// abandons whatever preceded it. `Some` replaces or inserts, and an insert
+    /// past [`MAX_ACTIVITIES`] is refused — see that constant for what is being
+    /// traded and why.
+    fn set_activity(&mut self, id: ShadeId, next: Option<Activity>) -> Result<(), DomainError> {
+        let at = self.activities.iter().position(|(held, _)| *held == id);
+        match (at, next) {
+            (Some(at), Some(activity)) => self.activities[at].1 = activity,
+            (Some(at), None) => {
+                self.activities.swap_remove(at);
+            }
+            (None, Some(activity)) => self
+                .activities
+                .push((id, activity))
+                .map_err(|_| DomainError::TooManySequences)?,
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
+    /// What `id` is doing, if anything.
+    fn activity(&self, id: ShadeId) -> Option<Activity> {
+        self.activities
+            .iter()
+            .find(|(held, _)| *held == id)
+            .map(|(_, activity)| *activity)
+    }
+
+    /// The calibration run on `id`, if that is what it is doing.
+    fn run(&self, id: ShadeId) -> Option<Calibrating> {
+        match self.activity(id) {
+            Some(Activity::Calibrating(run)) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Whether a calibration run is in progress on `id`.
+    pub fn is_calibrating(&self, id: ShadeId) -> bool {
+        self.run(id).is_some()
     }
 
     /// Push a [`StateDelta`] for `id` iff its observable state differs from what
@@ -168,8 +241,23 @@ impl Controller {
         deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
     ) -> Result<(), DomainError> {
         let shade = self.registry.shade_mut(id).ok_or(DomainError::NotFound)?;
+        // Refused here rather than inside `Shade::handle`, for the same reason
+        // the group gate below is: `handle` plans frames and cannot decline, so
+        // a command that must not be attempted has to be stopped before it gets
+        // there. A vent with no measured slat-separation band would close the
+        // shade, send an Up and stop it in the same instant — a full traverse
+        // that ends exactly where a plain Close would, and looks to the operator
+        // like the command did nothing.
+        if matches!(cmd, ShadeCommand::Vent) && shade.config.vent_band_ms == 0 {
+            return Err(DomainError::VentBandNotMeasured);
+        }
         let mut local: Vec<PlannedTx, 4> = Vec::new();
-        shade.handle(cmd, now_ms, &mut local);
+        let next = shade.handle(cmd, now_ms, &mut local);
+        // Stored *before* the frames are drained, so a command that starts a
+        // sequence this controller has no room for is refused with nothing on
+        // the queue rather than half-applied — the same standard the group gate
+        // below holds.
+        self.set_activity(id, next)?;
         Self::drain(&local, tx);
         self.emit_if_changed(id, deltas);
         Ok(())
@@ -215,10 +303,94 @@ impl Controller {
         // collect the ids so the fan-out below can take `&mut self`.
         let members: Vec<ShadeId, { crate::registry::MAX_SHADES }> =
             self.registry.group_shades(g).collect();
+        // Vent may fan out — it is a movement somebody can watch and undo, which
+        // is the test `Pair` fails — but it is checked across the *whole* group
+        // first. `command_shade` refuses a member whose slat-separation band was
+        // never measured, and discovering that half way through would leave the
+        // rest of the group already closing with no vent coming. Same standard
+        // as the gate above: no partial fan-out.
+        if matches!(cmd, ShadeCommand::Vent) {
+            for id in &members {
+                let shade = self.registry.shade(*id).ok_or(DomainError::NotFound)?;
+                if shade.config.vent_band_ms == 0 {
+                    return Err(DomainError::VentBandNotMeasured);
+                }
+            }
+        }
         for id in members {
             self.command_shade(id, cmd, now_ms, tx, deltas)?;
         }
         Ok(())
+    }
+
+    /// Start timing a traverse on one shade, and queue the frame that starts
+    /// it.
+    ///
+    /// Plans exactly one frame, so the [`TX_CAPACITY`] arithmetic above is
+    /// unchanged.
+    pub fn begin_calibration(
+        &mut self,
+        id: ShadeId,
+        leg: CalibrationLeg,
+        now_ms: u64,
+        tx: &mut Vec<PlannedTx, TX_CAPACITY>,
+        deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
+    ) -> Result<(), DomainError> {
+        let shade = self.registry.shade_mut(id).ok_or(DomainError::NotFound)?;
+        let mut local: Vec<PlannedTx, 4> = Vec::new();
+        let run = shade.begin_calibration(leg, now_ms, &mut local);
+        self.set_activity(id, Some(run))?;
+        Self::drain(&local, tx);
+        self.emit_if_changed(id, deltas);
+        Ok(())
+    }
+
+    /// Record a moment the operator reported during a run. Transmits nothing.
+    pub fn mark_calibration(
+        &mut self,
+        id: ShadeId,
+        mark: CalibrationMark,
+        now_ms: u64,
+    ) -> Result<(), DomainError> {
+        let mut run = self.run(id).ok_or(DomainError::NotCalibrating)?;
+        run.mark(mark, now_ms);
+        self.set_activity(id, Some(Activity::Calibrating(run)))
+    }
+
+    /// End a run and store what it measured. Transmits nothing — the traverse is
+    /// over, and the run ends at a limit the motor stopped itself at, which is
+    /// why the estimate can be re-anchored there.
+    ///
+    /// Emits a delta, because that re-anchoring may move the reported position.
+    pub fn finish_calibration(
+        &mut self,
+        id: ShadeId,
+        now_ms: u64,
+        deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
+    ) -> Result<CalibrationOutcome, DomainError> {
+        let run = self.run(id).ok_or(DomainError::NotCalibrating)?;
+        let outcome = self
+            .registry
+            .shade_mut(id)
+            .ok_or(DomainError::NotFound)?
+            .finish_calibration(run, now_ms)?;
+        // Cleared only once the run has been accepted: a refused one leaves the
+        // conversation open so the operator can tap again rather than start
+        // over.
+        self.set_activity(id, None)?;
+        self.emit_if_changed(id, deltas);
+        Ok(outcome)
+    }
+
+    /// Abandon a run, storing nothing. Transmits nothing, and deliberately does
+    /// **not** stop the shade: the operator cancelling a measurement has not
+    /// asked for the motor to halt where it happens to be, and a `My` they did
+    /// not ask for is a shade left mid-window.
+    pub fn cancel_calibration(&mut self, id: ShadeId) -> Result<(), DomainError> {
+        if self.run(id).is_none() {
+            return Err(DomainError::NotCalibrating);
+        }
+        self.set_activity(id, None)
     }
 
     /// Route a decoded RX frame to the shade that owns its address (own or a
@@ -243,6 +415,11 @@ impl Controller {
         if let Some(shade) = self.registry.shade_mut(id) {
             shade.apply_overheard(frame.command, now_ms);
         }
+        // A wall remote has taken the motor over, so whatever this controller
+        // had in flight is over too — including a calibration run, whose timing
+        // is now against a movement somebody else caused. Infallible: clearing
+        // never needs a slot.
+        let _ = self.set_activity(id, None);
         self.emit_if_changed(id, deltas);
     }
 
@@ -262,10 +439,19 @@ impl Controller {
         let ids: Vec<ShadeId, { crate::registry::MAX_SHADES }> =
             self.registry.shades().map(|(id, _)| id).collect();
         for id in ids {
+            let activity = self.activity(id);
             if let Some(shade) = self.registry.shade_mut(id) {
                 let mut local: Vec<PlannedTx, 4> = Vec::new();
                 shade.tick(now_ms, &mut local);
+                // The multi-step movements, driven here rather than inside the
+                // shade because that is where they are stored — see
+                // `MAX_ACTIVITIES`.
+                let next =
+                    activity.and_then(|activity| shade.advance(activity, now_ms, &mut local));
                 Self::drain(&local, tx);
+                // Infallible: the entry already exists, so this replaces or
+                // clears rather than inserting.
+                let _ = self.set_activity(id, next);
             }
             self.emit_if_changed(id, deltas);
         }

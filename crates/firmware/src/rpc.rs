@@ -68,7 +68,7 @@
 use embassy_sync::semaphore::{FairSemaphore, Semaphore as _};
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration};
-use somfy_api::{GroupDto, RoomDto, ShadeDto};
+use somfy_api::{CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
 use somfy_domain::ShadeId;
 use somfy_tasks::ControlCommand;
 
@@ -119,6 +119,13 @@ pub enum Request {
     /// another controller must be refused, and only the state task can see the
     /// address to judge that.
     Pair(ShadeId),
+    /// One step of a guided travel-time calibration.
+    ///
+    /// Separate from [`Request::Command`] because only two of its four steps
+    /// transmit anything, and because what it changes is the shade's stored
+    /// *configuration* rather than its position — a finished run has to be
+    /// written to flash the same way an edit is.
+    Calibrate(ShadeId, CalibrationStepDto),
     /// Change the table.
     Edit(ShadeEdit),
 }

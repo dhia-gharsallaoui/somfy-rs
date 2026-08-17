@@ -70,6 +70,7 @@ fn regenerate() {
         somfy_api::CreateShadeDto::export_all().expect("export CreateShadeDto");
         somfy_api::PatchShadeDto::export_all().expect("export PatchShadeDto");
         somfy_api::ApiErrorDto::export_all().expect("export ApiErrorDto");
+        somfy_api::CalibrationStepDto::export_all().expect("export CalibrationStepDto");
     });
 }
 
@@ -119,6 +120,13 @@ fn patch_fields_are_optional_and_exclude_what_the_device_owns() {
         "upTimeMs?: number",
         "downTimeMs?: number",
         "tiltTimeMs?: number",
+        // R9's second half. The three compensations are settable by hand for
+        // the same reason the travel times are: a sweep runs the shade end to
+        // end, and a measurement with nothing to check itself against cannot be
+        // caught being wrong.
+        "startLagMs?: number",
+        "ventBandMs?: number",
+        "closeBandMs?: number",
     ] {
         assert!(
             patch.contains(field),
@@ -137,13 +145,16 @@ fn patch_fields_are_optional_and_exclude_what_the_device_owns() {
         );
     }
 
-    // R8's dead band is deliberately absent until a hardware test says which of
-    // two mechanisms produces it — they need opposite handling of the same
-    // number. See `PatchShadeDto`'s documentation.
+    // R8's dead band arrived as **three** fields rather than one, and that is
+    // the contract: the two intervals of a traverse that move nothing are at
+    // opposite ends of it and are not the same interval, and the start lag is a
+    // third thing again that applies to every move in either direction. A single
+    // `deadBand` would have collapsed them, so its absence is asserted rather
+    // than assumed.
     for absent in ["deadBand", "deadband"] {
         assert!(
             !patch.contains(absent),
-            "a dead-band field was added before the mechanism was established:\n{patch}"
+            "the three compensations must stay separate on the wire:\n{patch}"
         );
     }
 }
@@ -298,6 +309,56 @@ fn command_dto_matches_action_tagged_wire() {
         ts.contains(r#"{ "action": "setMy", position: number | null, }"#),
         "CommandDto setMy must allow a nullable position:\n{ts}"
     );
+
+    // `vent` carries **no** position, and that is the contract rather than an
+    // omission: what it aims at is the shade's own measured slat-separation
+    // band, so a caller has nothing to name. A `position` here would be a
+    // second way to say where the shade should stop, free to disagree with the
+    // one the command exists to depend on.
+    assert!(
+        ts.contains(r#"{ "action": "vent" }"#),
+        "CommandDto vent must be a bare action:\n{ts}"
+    );
+}
+
+/// The calibration conversation, on the wire.
+#[test]
+fn calibration_step_matches_step_tagged_wire() {
+    regenerate();
+    let ts = read("CalibrationStepDto.ts");
+
+    // `begin` REQUIRES a leg: guessing a direction would drive a shade the
+    // wrong way across its whole range.
+    assert!(
+        ts.contains(r#"{ "step": "begin", leg: CalibrationLegDto, }"#),
+        "begin must require a leg:\n{ts}"
+    );
+    assert!(
+        ts.contains(r#"{ "step": "mark", mark: CalibrationMarkDto, }"#),
+        "mark must require a mark:\n{ts}"
+    );
+    for bare in [r#"{ "step": "finish" }"#, r#"{ "step": "cancel" }"#] {
+        assert!(ts.contains(bare), "CalibrationStepDto lost {bare}:\n{ts}");
+    }
+
+    // The two directions are separate values, because they are measured
+    // separately and never mirrored — 30 s up against 27 s down on the estate
+    // that produced the requirement.
+    let leg = read("CalibrationLegDto.ts");
+    for value in [r#""up""#, r#""down""#] {
+        assert!(
+            leg.contains(value),
+            "CalibrationLegDto lost {value}:\n{leg}"
+        );
+    }
+
+    let mark = read("CalibrationMarkDto.ts");
+    for value in [r#""motionBegan""#, r#""curtainMoved""#] {
+        assert!(
+            mark.contains(value),
+            "CalibrationMarkDto lost {value}:\n{mark}"
+        );
+    }
 }
 
 #[test]

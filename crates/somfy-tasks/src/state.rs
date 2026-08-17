@@ -56,8 +56,8 @@ use embassy_sync::pubsub::PubSubChannel;
 use heapless::Vec;
 use somfy_domain::DomainError;
 use somfy_domain::{
-    Controller, GroupId, PlannedTx, Registry, ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY,
-    TX_CAPACITY,
+    CalibrationLeg, CalibrationMark, CalibrationOutcome, Controller, GroupId, PlannedTx, Registry,
+    ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY, TX_CAPACITY,
 };
 use somfy_rts::Frame;
 use somfy_store::{
@@ -269,6 +269,54 @@ impl StateMachine {
         self.controller
             .command_group(group, command, now_ms, &mut planned, deltas)?;
         Ok(self.dispatch(store, queue, &planned))
+    }
+
+    /// Start timing a traverse on one shade, putting the frame that starts it on
+    /// the queue through the same commit-then-enqueue path as any command.
+    pub fn begin_calibration<S, Q>(
+        &mut self,
+        store: &mut S,
+        queue: &mut Q,
+        id: ShadeId,
+        leg: CalibrationLeg,
+        now_ms: u64,
+        deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
+    ) -> Result<Dispatch<S::Error, Q::Error>, DomainError>
+    where
+        S: RollingCodeStore,
+        Q: TransmitQueue,
+    {
+        let mut planned: Vec<PlannedTx, TX_CAPACITY> = Vec::new();
+        self.controller
+            .begin_calibration(id, leg, now_ms, &mut planned, deltas)?;
+        Ok(self.dispatch(store, queue, &planned))
+    }
+
+    /// Record a moment the operator reported. Takes neither store nor queue,
+    /// because a mark transmits nothing — the same way the signature of
+    /// [`StateMachine::on_rx_frame`] states its contract.
+    pub fn mark_calibration(
+        &mut self,
+        id: ShadeId,
+        mark: CalibrationMark,
+        now_ms: u64,
+    ) -> Result<(), DomainError> {
+        self.controller.mark_calibration(id, mark, now_ms)
+    }
+
+    /// End a run and store what it measured. Transmits nothing.
+    pub fn finish_calibration(
+        &mut self,
+        id: ShadeId,
+        now_ms: u64,
+        deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
+    ) -> Result<CalibrationOutcome, DomainError> {
+        self.controller.finish_calibration(id, now_ms, deltas)
+    }
+
+    /// Abandon a run, storing nothing.
+    pub fn cancel_calibration(&mut self, id: ShadeId) -> Result<(), DomainError> {
+        self.controller.cancel_calibration(id)
     }
 
     /// Account for a frame overheard on the air.

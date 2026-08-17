@@ -26,7 +26,10 @@
 //! the two could disagree. One representation, validated on the way in.
 
 use serde::Deserialize as DeriveDeserialize;
-use somfy_domain::{ShadeConfig, ShadeKind, TiltMode};
+use somfy_domain::{
+    round_dead_band_ms, round_start_lag_ms, CalibrationSource, ShadeConfig, ShadeKind, TiltMode,
+    FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS,
+};
 
 use crate::ApiErrorCode;
 
@@ -109,6 +112,9 @@ impl CreateShadeDto {
         config.up_time_ms = self.up_time_ms;
         config.down_time_ms = self.down_time_ms;
         config.tilt_time_ms = self.tilt_time_ms;
+        config.up_time_source = supplied_source(self.up_time_ms, FACTORY_UP_TIME_MS);
+        config.down_time_source = supplied_source(self.down_time_ms, FACTORY_DOWN_TIME_MS);
+        config.tilt_time_source = supplied_source(self.tilt_time_ms, FACTORY_TILT_TIME_MS);
         Ok(config)
     }
 }
@@ -163,37 +169,37 @@ impl CreateShadeDto {
 /// can be cleared is `myPosition`, which is excluded above for its own
 /// reasons.
 ///
-/// # No dead-band field, deliberately
+/// # The dead-band fields, and why they are here now
 ///
-/// R8 records that the first ~4 s of Up travel off the closed limit separates
-/// the slats without lifting the curtain — about 13% of a 30 s traverse — and
-/// requires the model to carry a per-direction dead band at the closed limit.
-/// **No such field is added here, because the spec says the mechanism is not
-/// yet established and the two candidates need opposite handling.**
+/// This DTO used to carry a note saying there was deliberately **no** dead-band
+/// field, because two mechanisms could produce the reported symptom — a
+/// mechanical band during ordinary travel, or a distinct tilt operation selected
+/// by burst length — and the estimator would have to do opposite things with an
+/// identical number.
 ///
-/// If it is a *mechanical* dead band, the estimator must subtract that time
-/// from lift travel: it happens during every ordinary traverse. If instead
-/// these motors honour the reference's `euromode`, where burst length selects
-/// the operation, then the same seconds are a *separate command's* effect that
-/// a full-length burst never produces, and subtracting them from lift travel
-/// would corrupt every estimate. The number would be identical and what the
-/// estimator must do with it is opposite, so a field named for it is not a
-/// neutral placeholder — it is an unresolved question with somewhere to write
-/// a value.
+/// The spec settled it by elimination on 2026-08-17: this project's ordinary
+/// commands are three-frame bursts and these motors complete full traverses from
+/// them, which cannot be true of a motor that reads a short burst as a slat
+/// operation. So it is mechanical, and there are three fields rather than one,
+/// because two intervals of a traverse move nothing and they are not the same
+/// interval:
 ///
-/// Waiting costs nothing structurally, and this is worth stating because it is
-/// what makes deferring safe rather than merely cautious:
+/// - `startLagMs` — before the motor moves at all, at the start of any move.
+/// - `ventBandMs` — separating the slats when leaving the closed limit upward.
+///   Also where [`crate::CommandDto::Vent`] stops, which is the only thing that
+///   command needs to know.
+/// - `closeBandMs` — compressing them at the end of a full close.
 ///
-/// - the euromode answer needs **no new field at all** — `tiltMode` already
-///   carries `EuroMode` as a discriminant, and what is missing is tilt
-///   *commands*, which this generation deliberately does not have;
-/// - the mechanical answer needs **one additive field** on this DTO and on
-///   [`crate::ShadeDto`], which is exactly the shape `addressOrigin` was added
-///   in and breaks nothing.
+/// All three are **parts of** the travel times rather than additions to them, so
+/// setting one does not silently change what a stored `upTimeMs` means. Each is
+/// rounded onto the resolution its measurement actually has — see
+/// [`somfy_domain::round_start_lag_ms`] — and what comes back from a subsequent
+/// `GET` is the rounded value, because that is the number the device is running.
 ///
-/// The spec calls the deciding test cheap — send a short Up burst from fully
-/// closed and watch whether it stops after the slats separate or runs to the
-/// limit — and notes it transmits at a real motor, so it is the owner's to run.
+/// They are settable by hand for the same reason the travel times are, and R9
+/// makes it a MUST: a sweep moves the shade through its full range, which is not
+/// always acceptable, and a measurement with nothing to check itself against is
+/// one nobody can catch being wrong.
 #[derive(Debug, Clone, PartialEq, Eq, Default, DeriveDeserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -218,6 +224,12 @@ pub struct PatchShadeDto {
     pub down_time_ms: Option<u32>,
     #[cfg_attr(feature = "ts", ts(optional))]
     pub tilt_time_ms: Option<u32>,
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub start_lag_ms: Option<u32>,
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub vent_band_ms: Option<u32>,
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub close_band_ms: Option<u32>,
 }
 
 impl PatchShadeDto {
@@ -248,20 +260,44 @@ impl PatchShadeDto {
         if let Some(tilt_mode) = self.tilt_mode {
             next.tilt_mode = checked_tilt_mode(tilt_mode)?;
         }
+        // A travel time this endpoint sets is one a person typed, which is a
+        // different fact from the number itself and the one R7 exists to keep:
+        // three shades carrying 10000/10000 that nobody had ever chosen is what
+        // made a 25%-open command move a shade 1%. So the provenance moves with
+        // the value, and only for the field actually present in the body.
         if let Some(up_time_ms) = self.up_time_ms {
             next.up_time_ms = up_time_ms;
+            next.up_time_source = supplied_source(up_time_ms, FACTORY_UP_TIME_MS);
         }
         if let Some(down_time_ms) = self.down_time_ms {
             next.down_time_ms = down_time_ms;
+            next.down_time_source = supplied_source(down_time_ms, FACTORY_DOWN_TIME_MS);
         }
         if let Some(tilt_time_ms) = self.tilt_time_ms {
             next.tilt_time_ms = tilt_time_ms;
+            next.tilt_time_source = supplied_source(tilt_time_ms, FACTORY_TILT_TIME_MS);
+        }
+        if let Some(start_lag_ms) = self.start_lag_ms {
+            next.start_lag_ms =
+                round_start_lag_ms(start_lag_ms).ok_or(ApiErrorCode::InvalidDeadBand)?;
+        }
+        if let Some(vent_band_ms) = self.vent_band_ms {
+            next.vent_band_ms =
+                round_dead_band_ms(vent_band_ms).ok_or(ApiErrorCode::InvalidDeadBand)?;
+        }
+        if let Some(close_band_ms) = self.close_band_ms {
+            next.close_band_ms =
+                round_dead_band_ms(close_band_ms).ok_or(ApiErrorCode::InvalidDeadBand)?;
         }
 
         // Checked on the *result*, not on the patch, so that a body setting only
         // `upTimeMs` to zero is refused even though it says nothing about the
-        // other direction.
+        // other direction — and so that a new band is weighed against the travel
+        // time already stored, and a new travel time against the bands already
+        // stored, whichever half of the pair the request happens to carry.
         checked_lift_times(next.up_time_ms, next.down_time_ms)?;
+        next.checked_bands()
+            .map_err(|_| ApiErrorCode::InvalidDeadBand)?;
         Ok(next)
     }
 }
@@ -273,6 +309,33 @@ impl PatchShadeDto {
 // is that the two endpoints agree: anything reachable by creating a shade and
 // then patching it must have been reachable by creating it directly.
 // ---------------------------------------------------------------------------
+
+/// The provenance to record for a travel time that arrived in a request body.
+///
+/// **A value equal to the factory default is recorded as a factory default,
+/// whichever endpoint it came in through.** Both forms in the UI are pre-filled
+/// — create with the defaults, patch with what is already stored — so leaving a
+/// field alone and submitting it is not evidence anybody chose the number in it.
+/// That is R7's ruling applied at the point a value enters: "a value that is
+/// merely *plausible* is not evidence anybody chose it", and three shades
+/// carrying identical untouched defaults is what it was raised to a MUST for.
+///
+/// It costs one false negative: an operator who measures a shade and gets
+/// exactly 10.0 s is invited to calibrate something already right. The two
+/// errors are not symmetric, and the guided calibration records
+/// [`somfy_domain::CalibrationSource::Measured`] regardless of the number it
+/// lands on, so the honest path out of the false negative exists.
+///
+/// Applied identically by both endpoints, like every other rule in this section:
+/// anything reachable by creating a shade and then patching it must have been
+/// reachable by creating it directly.
+fn supplied_source(value_ms: u32, factory_ms: u32) -> CalibrationSource {
+    if value_ms == factory_ms {
+        CalibrationSource::FactoryDefault
+    } else {
+        CalibrationSource::OperatorSupplied
+    }
+}
 
 fn checked_name(name: &str) -> Result<&str, ApiErrorCode> {
     if name.is_empty() {

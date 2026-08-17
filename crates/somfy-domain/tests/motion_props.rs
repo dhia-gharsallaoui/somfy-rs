@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use somfy_domain::{Direction, Motion, Pos};
+use somfy_domain::{Direction, Motion, Pos, TravelProfile};
 
 proptest! {
     // Position always lands exactly on target given enough time.
@@ -12,7 +12,7 @@ proptest! {
     ) {
         let mut m = Motion::new(Pos::from_raw(start));
         m.set_target(Pos::from_raw(target), 0);
-        m.tick(u64::from(up.max(down)) + 1_000, up, down);
+        m.tick(u64::from(up.max(down)) + 1_000, TravelProfile::linear(up, down));
         prop_assert_eq!(m.pos(), Pos::from_raw(target));
         prop_assert_eq!(m.direction(), Direction::Idle);
     }
@@ -28,8 +28,8 @@ proptest! {
     ) {
         let mut m = Motion::new(Pos::from_raw(start));
         m.set_target(Pos::from_raw(target), 0);
-        let a = m.tick(t1, 10_000, 10_000).pos;
-        let b = m.tick(t1 + dt, 10_000, 10_000).pos;
+        let a = m.tick(t1, TravelProfile::linear(10_000, 10_000)).pos;
+        let b = m.tick(t1 + dt, TravelProfile::linear(10_000, 10_000)).pos;
         let (lo, hi) = if start <= target {
             (Pos::from_raw(start), Pos::from_raw(target))
         } else {
@@ -50,9 +50,9 @@ proptest! {
     ) {
         let mut m = Motion::new(Pos::from_raw(start));
         m.set_target(Pos::from_raw(target), 0);
-        m.halt(t_halt, 10_000, 10_000);
+        m.halt(t_halt, TravelProfile::linear(10_000, 10_000));
         let frozen = m.pos();
-        let s = m.tick(t_later, 10_000, 10_000);
+        let s = m.tick(t_later, TravelProfile::linear(10_000, 10_000));
         prop_assert_eq!(s.pos, frozen);
         prop_assert_eq!(s.direction, Direction::Idle);
     }
@@ -74,7 +74,7 @@ proptest! {
         // brief's 2_000) can end mid-travel, leaving `arrived` legitimately
         // un-fired — that is correct Motion behaviour, not a missed arrival.
         for i in 1..=steps as u64 {
-            let s = m.tick(i * 6_000, 10_000, 10_000);
+            let s = m.tick(i * 6_000, TravelProfile::linear(10_000, 10_000));
             if s.arrived { arrivals += 1; }
         }
         prop_assert_eq!(arrivals, 1);
