@@ -3,7 +3,8 @@
 /**
  * Live snapshot of one shade for REST/WS payloads. Field names are
  * camelCase on the wire; positions are whole percent (0-100);
- * `kind`/`tiltMode` are the C++ numeric discriminants; `direction`
- * uses the C++ sign convention (-1 up, 0 idle, +1 down).
+ * `kind`/`tiltMode` reuse the numeric discriminants deployed devices
+ * already emit; `direction` uses the same sign convention deployed
+ * devices use (-1 up, 0 idle, +1 down).
  */
 export type ShadeDto = { id: number, name: string, address: number, kind: number, tiltMode: number, position: number, target: number, tiltPosition: number, myPosition: number | null, direction: number, upTimeMs: number, downTimeMs: number, tiltTimeMs: number, };
