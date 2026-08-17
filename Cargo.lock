@@ -495,6 +495,7 @@ dependencies = [
  "crc",
  "heapless 0.8.0",
  "somfy-domain",
+ "somfy-migrate",
  "somfy-mqtt",
  "somfy-rts",
 ]

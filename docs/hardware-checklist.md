@@ -606,6 +606,12 @@ If you are unsure, **enter a value comfortably above your best guess.** Skipping
 codes forward is free — the motor accepts any code ahead of its stored one — and
 landing below it is not.
 
+**If you are replacing a controller, do not guess at all — import its backup.**
+Step 1 below has a `--from-backup` form that reads every field of every shade,
+rolling codes included and already corrected, out of the file that controller
+exports. It is the same tool writing the same 2048 bytes; the only difference is
+that nobody transcribes the one number that costs a walk to the shade.
+
 ### Order is identity
 
 Shade ids come from the order entered: the first is `ShadeId(0)`, which Home
@@ -634,6 +640,48 @@ rather than as a shade that silently never appears. Travel times are the
 factory defaults unless measured; they are what the position estimate is
 computed from, and `docs/specs/2026-08-15-position-accuracy-requirements.md` is
 the argument for calibrating them.
+
+### 1b. Or read it out of the controller you are replacing
+
+Export a backup from that controller's web UI (**Settings → Backup**) and hand
+the file over. Export it **immediately** before importing: any command the old
+controller sends afterwards advances the real rolling code past the file's, and
+the file is the only source this has.
+
+```bash
+cargo run -p somfy-config --example provision_shades -- --from-backup device.backup shades.bin
+# read 4 shades from device.backup (backup format version 25).
+#   the backup also holds 1 group(s) and 1 linked remote(s). ...
+#
+# 1 value(s) could not be carried across as they stand:
+#   !! ShadeId(1) 'Garage': shade kind 0x05 is not one this firmware models — ...
+#
+#   ShadeId(0) 'Kitchen' address ... seed rolling code 42
+#   ...
+# wrote 2048 bytes to shades.bin
+```
+
+The same validation applies, plus three things worth reading rather than
+scrolling past:
+
+- **Every shade is imported or none is.** A backup with one bad field is refused
+  whole and the message names the shade, because dropping the third shade
+  renumbers the fourth and fifth (see *Order is identity*).
+- **Anything that could not be carried across is printed per shade, with `!!`.**
+  A kind this firmware does not model becomes a roller; a shade the old
+  controller drove with 80-bit frames has nowhere to record that and will not
+  respond. Both are stated rather than silently applied.
+- **If the backup's records did not all line up, it stops and asks.** A comma
+  inside a shade's name shifts every field after it, which can produce a
+  perfectly plausible wrong rolling code. In that case the tool prints the whole
+  table and writes nothing unless you type `yes`.
+
+The backup carries your real radio addresses and rolling codes. Treat the file
+like a key: it is what a nearby attacker would need to forge commands to your
+motors. Do not commit it or paste it anywhere.
+
+Rooms, groups and network settings are **not** imported by this step — the
+region holds shades only.
 
 ### 2. Put it on the board
 

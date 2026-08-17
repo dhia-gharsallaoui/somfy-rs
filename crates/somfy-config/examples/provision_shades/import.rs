@@ -1,0 +1,371 @@
+//! Reading a shade table out of an exported backup, instead of typing one.
+//!
+//! ## Why this exists, and what it takes out of a person's hands
+//!
+//! Every field the interactive path asks for can be got wrong and corrected:
+//! a mistyped name is renamed, a wrong travel time is remeasured, a wrong kind
+//! is re-provisioned. **The next rolling code is not one of those.** A motor
+//! stores the last code it accepted and rejects anything at or below it as a
+//! replay, so a value entered too low is a motor that ignores the controller
+//! entirely — indistinguishable from a broken transmitter, and recoverable
+//! only by walking to the shade and pairing it again.
+//!
+//! The controller being replaced already knows that value, and the backup it
+//! exports carries it. So does its name, its address, its kind, and its
+//! measured travel times. Reading them is strictly better than copying them by
+//! eye from another device's screen, and the rolling code is the reason.
+//!
+//! ## What is not carried across
+//!
+//! The backup describes a whole installation; this record holds shades. Rooms,
+//! groups and network settings are not written here, and neither are the
+//! rolling codes of remotes linked to a shade — those are not in the exported
+//! file at all. [`Import`] counts what it saw so the tool can say so rather
+//! than let a person discover it later.
+//!
+//! ## Order is identity, and the backup's own ids are not it
+//!
+//! Shade ids come from position in this table — first entry is `ShadeId(0)`,
+//! and Home Assistant's entity for it is `shade_0`. The backup's own shade ids
+//! are whatever the old controller assigned and are **not** carried: a backup
+//! holding shades 10 and 11 imports as `ShadeId(0)` and `ShadeId(1)`. Nothing
+//! is lost by that — the old controller's entity names were its own — but a
+//! second import of a *reordered* backup renames every entity after the change,
+//! exactly as reordering by hand does.
+//!
+//! ## Three rules this owes the reader, and why they are rules
+//!
+//! - **A kind or tilt mode this firmware does not model becomes a roller (or
+//!   no tilt) and is reported per shade.** Dropping the shade would silently
+//!   shrink the installation; guessing a behaviour would move a garage door
+//!   with a shade's travel times. Substituting and saying so is the only one of
+//!   the three a person can act on.
+//! - **A frame width other than 56 bits is reported, because there is nowhere
+//!   to put it.** This controller transmits at one width for the whole
+//!   installation (`somfy_tasks::TxProfile`), `ShadeConfig` has no field for a
+//!   per-shade width, and so a shade the old controller drove at 80 bits
+//!   imports looking perfectly healthy and will not move. That is the same
+//!   failure as a wrong rolling code — a shade that ignores the controller —
+//!   arriving by a different road, and it is worth exactly as much noise.
+//! - **Records that did not align exactly are surfaced, never applied
+//!   silently.** [`Import::misaligned`] means at least one record's fields did
+//!   not land where they were expected — a comma inside a name shifts every
+//!   field after it — and a shifted field is not obviously wrong. It is a
+//!   *plausible* rolling code that is not the right one, which is the failure
+//!   at the top of this file. The tool shows the table and demands confirmation.
+
+use somfy_config::{ShadeError, StoredShade, SHADE_TABLE_CAPACITY};
+use somfy_domain::{ShadeConfig, ShadeKind, TiltMode};
+use somfy_migrate::{
+    parse_backup, MigrateError, MigrationData, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
+};
+
+/// The frame width this controller transmits, and therefore the only one a
+/// shade can be imported as. It is a single setting for the whole installation
+/// — `somfy_tasks::TxProfile::default` — so a shade paired at any other width
+/// is carried across as data and cannot be driven.
+const TRANSMITTED_BIT_LENGTH: u8 = 56;
+
+/// A value the backup carried that this firmware cannot use as it stands.
+///
+/// Two of these are substitutions — something else was written in the field.
+/// The third is not, and could not be: there is no field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caveat {
+    /// A shade-kind byte outside the set this firmware models. Imported as
+    /// [`ShadeKind::Roller`].
+    Kind(u8),
+    /// A tilt-mode byte outside the set this firmware models. Imported as
+    /// [`TiltMode::None`].
+    TiltMode(u8),
+    /// A frame width other than [`TRANSMITTED_BIT_LENGTH`]. Nothing is
+    /// substituted, because `ShadeConfig` has no width to substitute into: the
+    /// shade is imported exactly as it stands and will be transmitted to at the
+    /// controller's width, which is not the one its motor is paired for.
+    FrameWidth(u8),
+}
+
+impl core::fmt::Display for Caveat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Caveat::Kind(raw) => write!(
+                f,
+                "shade kind {raw:#04X} is not one this firmware models — imported as a roller, \
+                 so it will be driven with a roller's commands and travel times"
+            ),
+            Caveat::TiltMode(raw) => write!(
+                f,
+                "tilt mode {raw:#04X} is not one this firmware models — imported as none, \
+                 which is what every tilt mode does today in any case"
+            ),
+            Caveat::FrameWidth(bits) => write!(
+                f,
+                "the old controller drove this shade with {bits}-bit frames and this one sends \
+                 {TRANSMITTED_BIT_LENGTH}-bit — there is no per-shade width to import it into, \
+                 so the shade will be provisioned and will not respond"
+            ),
+        }
+    }
+}
+
+/// One caveat, and which shade it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    /// The shade's index in the imported table, which is also its `ShadeId`.
+    pub index: usize,
+    /// The shade's name, so the warning names something a person recognises.
+    pub name: String,
+    /// What could not be carried across as it stands.
+    pub caveat: Caveat,
+}
+
+/// A shade table recovered from a backup, and everything about the recovery a
+/// person has to be told before it is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    /// The shades, in the order their ids will follow.
+    pub shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY>,
+    /// Every value that could not be carried across as it stands. Empty is the
+    /// ordinary case.
+    pub warnings: Vec<Warning>,
+    /// Records whose fields did not align exactly. **Nonzero means at least one
+    /// value in this table may be wrong**, including a rolling code — see the
+    /// module docs.
+    pub skipped_resyncs: u16,
+    /// The backup's format version, for the report.
+    pub version: u8,
+    /// Groups the backup carried. None are written here.
+    pub groups: usize,
+    /// Linked remotes the backup carried, summed over every shade. None are
+    /// written here, and their rolling codes are not in the file to begin with.
+    pub linked_remotes: usize,
+}
+
+impl Import {
+    /// Whether any record's fields failed to align, which is the condition that
+    /// makes this table something to confirm rather than something to write.
+    pub fn misaligned(&self) -> bool {
+        self.skipped_resyncs > 0
+    }
+}
+
+/// Why a backup was refused, in whole.
+///
+/// Every one of these refuses the **entire** table rather than importing what
+/// it can. That is the same rule `ShadeRecord::for_each` enforces on the
+/// device, and for the same reason: ids come from position, so dropping the
+/// third shade renumbers the fourth and fifth, and in Home Assistant that is
+/// half an installation quietly renamed to route around one bad field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The bytes are not a backup this tool can read.
+    Unreadable(MigrateError),
+    /// The backup parsed and holds no shades. An empty table is a thing an
+    /// operator can mean — the interactive path writes one — but a backup with
+    /// nothing in it is far likelier to be the wrong file.
+    NoShades,
+    /// More shades than the table holds. Unreachable while the parser's own
+    /// capacity and [`SHADE_TABLE_CAPACITY`] are both 32 — the parser refuses
+    /// first, as [`Refusal::Unreadable`] — and kept because it is the refusal
+    /// that catches them ever differing.
+    TooManyShades,
+    /// A shade with no name. The interactive path cannot produce one either
+    /// (an empty name is how a person ends the list), and an unnamed shade is
+    /// an unnamed entity in Home Assistant.
+    Unnamed {
+        /// The shade's index in the backup's shade order.
+        index: usize,
+    },
+    /// A shade the domain's own rules refuse: a sentinel address, a name that
+    /// does not fit, or a travel time of zero.
+    Shade {
+        /// The shade's index in the backup's shade order.
+        index: usize,
+        /// Its name, so the refusal names something a person recognises.
+        name: String,
+        /// Why it was refused.
+        error: ShadeError,
+    },
+    /// Two shades at one radio address. The record refuses such a table on the
+    /// device, so importing it would produce a file that cannot be loaded.
+    DuplicateAddress {
+        /// The later of the two.
+        index: usize,
+        /// The earlier of the two.
+        first: usize,
+        /// The later one's name.
+        name: String,
+        /// The address they share.
+        address: u32,
+    },
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Refusal::Unreadable(MigrateError::UnsupportedVersion(version)) => write!(
+                f,
+                "the backup declares format version {version}; this tool reads \
+                 {MIN_SUPPORTED_VERSION} to {MAX_SUPPORTED_VERSION}"
+            ),
+            Refusal::Unreadable(MigrateError::UnexpectedEof) => write!(
+                f,
+                "the backup ends in the middle of a record — it is truncated, and a truncated \
+                 backup cannot be told from one whose last shade is missing"
+            ),
+            Refusal::Unreadable(MigrateError::StringTooLong) => write!(
+                f,
+                "a name in the backup is longer than the 32 bytes a shade name holds"
+            ),
+            Refusal::Unreadable(MigrateError::BadNumber) => {
+                write!(f, "a numeric field in the backup could not be read")
+            }
+            Refusal::Unreadable(MigrateError::BadRecord("too_many_shades")) => write!(
+                f,
+                "the backup holds more shades than the {SHADE_TABLE_CAPACITY} this table has \
+                 room for"
+            ),
+            // Every other `BadRecord` the parser raises is also a capacity
+            // overflow — too many rooms, too many groups, too many remotes
+            // linked to one shade — so the class is named and the parser's own
+            // token is quoted, which is the thing to search for.
+            Refusal::Unreadable(MigrateError::BadRecord(what)) => write!(
+                f,
+                "the backup holds more entries than the format allows, and the reader stopped \
+                 at {what:?}"
+            ),
+            Refusal::NoShades => write!(
+                f,
+                "the backup holds no shades. If an empty table is what you meant, run this \
+                 tool without --from-backup and enter an empty name at the first prompt"
+            ),
+            Refusal::TooManyShades => write!(
+                f,
+                "the backup holds more shades than the {SHADE_TABLE_CAPACITY} this table has \
+                 room for"
+            ),
+            Refusal::Unnamed { index } => write!(
+                f,
+                "shade {index} in the backup has no name, and an unnamed shade is an unnamed \
+                 entity; name it on the old controller and export again"
+            ),
+            Refusal::Shade { index, name, error } => {
+                write!(f, "shade {index} {name:?}: {error}")
+            }
+            Refusal::DuplicateAddress {
+                index,
+                first,
+                name,
+                address,
+            } => write!(
+                f,
+                "shade {index} {name:?} is at address {address} ({address:#08X}), which shade \
+                 {first} already holds; the table would be refused on the device"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for Refusal {}
+
+/// Read a backup's bytes as a shade table, or say why it is not one.
+pub fn read_backup(bytes: &[u8]) -> Result<Import, Refusal> {
+    let data = parse_backup(bytes).map_err(Refusal::Unreadable)?;
+    import(&data)
+}
+
+/// Map already-parsed backup data onto the table this tool writes.
+///
+/// Split from [`read_backup`] so the mapping and refusal rules can be exercised
+/// against constructed data, without a backup's bytes standing between the test
+/// and the rule it is checking.
+pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
+    if data.shades.is_empty() {
+        return Err(Refusal::NoShades);
+    }
+
+    let mut shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY> = heapless::Vec::new();
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut linked_remotes = 0usize;
+
+    for (index, migrated) in data.shades.iter().enumerate() {
+        let name = migrated.name.as_str();
+        if name.is_empty() {
+            return Err(Refusal::Unnamed { index });
+        }
+        let refuse = |error| Refusal::Shade {
+            index,
+            name: name.to_string(),
+            error,
+        };
+
+        // Straight through the domain's own constructor, exactly as a
+        // hand-entered shade goes, so this refuses precisely what the registry
+        // refuses and the address and name rules live in one place.
+        let mut config =
+            ShadeConfig::new(name, migrated.address).map_err(|e| refuse(ShadeError::Domain(e)))?;
+
+        let mut note = |caveat| {
+            warnings.push(Warning {
+                index,
+                name: name.to_string(),
+                caveat,
+            })
+        };
+
+        // The two substitutions. A kind or tilt mode outside the modelled set
+        // is imported rather than dropped, and reported rather than assumed —
+        // this module's docs say why those beat the alternatives.
+        config.kind = ShadeKind::from_raw(migrated.kind_raw).unwrap_or_else(|| {
+            note(Caveat::Kind(migrated.kind_raw));
+            ShadeKind::Roller
+        });
+        config.tilt_mode = TiltMode::from_raw(migrated.tilt_mode_raw).unwrap_or_else(|| {
+            note(Caveat::TiltMode(migrated.tilt_mode_raw));
+            TiltMode::None
+        });
+
+        // And the one that is not a substitution: a width there is no field for.
+        if migrated.bit_length != TRANSMITTED_BIT_LENGTH {
+            note(Caveat::FrameWidth(migrated.bit_length));
+        }
+
+        config.up_time_ms = migrated.up_time_ms;
+        config.down_time_ms = migrated.down_time_ms;
+        config.tilt_time_ms = migrated.tilt_time_ms;
+
+        // The same constructor the device decodes through, so a shade this
+        // accepts is a shade the device accepts — and the rolling code goes
+        // across untouched, which is the whole point of reading a file instead
+        // of a person's transcription of one.
+        let shade = StoredShade::new(config, migrated.next_code).map_err(refuse)?;
+
+        if let Some(first) = shades
+            .iter()
+            .position(|placed| placed.config.address == shade.config.address)
+        {
+            return Err(Refusal::DuplicateAddress {
+                index,
+                first,
+                name: name.to_string(),
+                address: shade.config.address,
+            });
+        }
+        shades.push(shade).map_err(|_| Refusal::TooManyShades)?;
+
+        linked_remotes += migrated.linked_addresses.len();
+    }
+
+    Ok(Import {
+        shades,
+        warnings,
+        skipped_resyncs: data.skipped_resyncs,
+        version: data.version,
+        groups: data.groups.len(),
+        linked_remotes,
+    })
+}
+
+#[cfg(test)]
+#[path = "import_tests.rs"]
+mod tests;
