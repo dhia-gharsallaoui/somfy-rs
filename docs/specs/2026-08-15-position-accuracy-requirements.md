@@ -186,6 +186,72 @@ C++ device held — typically the untouched 10 s/10 s defaults. Plan 6 SHOULD
 surface values that look factory-default and invite the user to calibrate,
 rather than presenting them as configured.
 
+### R8 — Travel is not linear at the closed end (MUST)
+
+*Added 2026-08-17 from the owner's observation.*
+
+On a European roller shutter with perforated slats, the slats are compressed
+shut at the fully-closed limit. The first seconds of Up travel **separate the
+slats** — opening the light gaps — before the curtain begins to rise. Measured
+on this estate: **~4 s of a ~30 s up-traverse**, so roughly **13% of the
+commanded time produces no elevation at all**.
+
+A linear position↔time model is therefore wrong near the closed end, and wrong
+in the direction that matters: a "25% open" command spends half its budget
+separating slats and lifts far less than a quarter. This is a **second,
+independent cause of the 25%→1% report**, on top of the factory-default travel
+times, and it does not go away when those are corrected.
+
+The model MUST carry a per-direction **dead band at the closed limit** —
+measured, not assumed, and per shade, since it depends on slat design.
+
+**What is not yet established, and must be tested before this is designed.**
+Two mechanisms produce this symptom and they need different implementations:
+
+- **Mechanical dead band.** The slats separate during ordinary continuous
+  travel; there is one motion and its first phase does not lift. Fits the
+  owner's description ("4 seconds ... before starting elevating"). Fix is a
+  piecewise travel curve.
+- **A distinct tilt command.** The reference models this as
+  `tilt_types::euromode`, where **burst length selects the operation**: a short
+  press tilts, and a long press (`TILT_REPEATS` = 15 repeats, so 16 frames)
+  travels. It reads the same distinction on receive. If these motors honour it,
+  the vent position is a *command*, not a timed fraction, and it becomes an
+  independent axis worth exposing as HA `tilt_position`.
+
+The estate's shades are currently provisioned as `kind = roller`,
+`tilt_mode = none`, and they do complete full traverses from our ordinary
+3-frame bursts — which is evidence **against** euromode press-length semantics
+being active on them, since a 3-frame burst is far below `TILT_REPEATS`. That is
+inference from one behaviour, not a test. **The test is cheap**: send a
+short Up burst from fully closed and see whether it stops after separating the
+slats or continues to the limit. It transmits at a real motor, so it is the
+owner's to run.
+
+### R9 — Calibration must be overridable by hand (MUST)
+
+*Added 2026-08-17 at the owner's request.*
+
+Automatic calibration (R2) MUST NOT be the only way to set travel times. The API
+and UI MUST accept operator-supplied values for `up_time_ms`, `down_time_ms`,
+`tilt_time_ms` and the R8 dead band, on an existing shade and not only at
+creation.
+
+Three reasons, each real:
+
+- A sweep moves the shade through its full range twice per direction, which is
+  not always acceptable — a shade over a desk, a sleeping room, an awning in
+  wind.
+- Some operators already know their numbers. The hand measurement taken on
+  2026-08-17 (30 s up, 27 s down) took minutes and was the fix that worked.
+- **A calibration routine needs something to be checked against.** A sweep
+  reporting 10 s where a stopwatch says 30 s must be visibly wrong, and that
+  comparison is impossible if hand-entered values have nowhere to live.
+
+Manual values MUST be distinguishable from measured ones and from factory
+defaults — R7 requires flagging the last of those, and "the operator typed this"
+is a third state, not the same as "the device measured it".
+
 ## Acceptance criteria
 
 Host-testable, consistent with the project's existing culture:
