@@ -115,6 +115,21 @@ pub enum ShadeEdit {
         /// What to change.
         patch: PatchShadeDto,
     },
+    /// Record that an operator reported this shade working, which is what
+    /// makes it announceable.
+    ///
+    /// **Not a claim about the motor**, and the name says so: RTS is one-way,
+    /// so nothing here observed anything. What happened is that a person
+    /// commanded the shade, watched it move, and said so — see
+    /// `somfy_domain::PairingState`.
+    ///
+    /// It carries only an id because there is nothing else to carry. A payload
+    /// would be a value a client could vary, and the only variation available
+    /// is "unconfirm", which would retire the entities of a working shade.
+    ConfirmPairing {
+        /// Which one.
+        id: ShadeId,
+    },
     /// Remove a shade, and everything the broker holds for it.
     Remove {
         /// Which one.
@@ -138,9 +153,23 @@ pub enum ShadeEdit {
 }
 
 /// What the state task did, for the broker session to reflect.
+///
+/// # There is no event for "a shade was created"
+///
+/// Creating a shade allocates an address **no motor has ever heard**, so the
+/// entities it would announce would appear in Home Assistant, accept commands,
+/// and drive nothing. That is the failure this vocabulary is shaped to make
+/// unreachable: [`Added`](ShadeEvent::Added) is emitted when an operator
+/// reports the shade working, not when the record is written, and
+/// [`Removed`](ShadeEvent::Removed) is emitted only for a shade that reached
+/// that point — a setup abandoned halfway has nothing on the broker, so there
+/// is nothing to clear and nothing is published.
+///
+/// `crates/firmware/src/tasks.rs`'s `announce_shade` is the one gate, and every
+/// producer goes through it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShadeEvent {
-    /// A shade now exists and has no entities yet.
+    /// A shade an operator has reported working now exists and needs entities.
     Added {
         /// Its id.
         id: ShadeId,

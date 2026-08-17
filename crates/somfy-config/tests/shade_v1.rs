@@ -25,7 +25,7 @@
 use somfy_config::{
     Announced, ShadeRecord, ShadeRecordError, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
 };
-use somfy_domain::{FrameWidth, RadioProtocol, ShadeId, ShadeKind, TiltMode};
+use somfy_domain::{FrameWidth, PairingState, RadioProtocol, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
 
 /// Every non-zero byte of one real version-1 record, at its offset.
@@ -149,18 +149,26 @@ fn a_record_from_the_previous_build_still_decodes() {
     assert_eq!(record.shades[2].initial_code, RollingCode(4113));
 }
 
-/// The two fields version 1 had no bytes for.
+/// The three fields version 1 had no bytes for.
 ///
-/// They decode to what such a shade has always been driven as, because 56-bit
-/// RTS is the only thing this firmware has ever transmitted — **not** to
-/// whatever the padding bytes happened to hold, which for a v1 record is zero
-/// and would mean a zero-bit frame.
+/// The radio settings decode to what such a shade has always been driven as,
+/// because 56-bit RTS is the only thing this firmware has ever transmitted —
+/// **not** to whatever the padding bytes happened to hold, which for a v1 record
+/// is zero and would mean a zero-bit frame.
+///
+/// The pairing state is the same shape of judgement and the sharper one: zero
+/// would be `AwaitingConfirmation`, and reading it that way un-announces every
+/// shade on a board that is working today.
 #[test]
-fn a_version_one_shade_arrives_as_the_radio_settings_it_was_always_driven_with() {
+fn a_version_one_shade_arrives_as_the_settings_it_was_always_driven_with() {
     let record = ShadeRecord::decode(&v1_record()).expect("readable");
     for shade in &record.shades {
         assert_eq!(shade.config.frame_width, FrameWidth::Bits56);
         assert_eq!(shade.config.protocol, RadioProtocol::Rts);
+        assert_eq!(
+            shade.config.pairing_state,
+            PairingState::ConfirmedByOperator
+        );
     }
 }
 
@@ -192,7 +200,8 @@ fn the_fixture_carries_the_checksum_the_previous_build_computed() {
     assert_eq!(ShadeRecord::decode(&bytes), Err(ShadeRecordError::Checksum));
 }
 
-/// Re-encoding a migrated record writes version 2, and version 2 round-trips.
+/// Re-encoding a migrated record writes the current version, and that version
+/// round-trips.
 ///
 /// This is what a board does on its first runtime write after the upgrade: it
 /// reads v1, changes something, and writes back. The shades must survive that
@@ -205,11 +214,11 @@ fn a_migrated_record_re_encodes_as_the_current_version_and_round_trips() {
     let rewritten = ShadeRecord::decode(&migrated.encode()).expect("its own output is readable");
     assert_eq!(rewritten, migrated);
 
-    // And the header now really is version 2: the entries have moved, so a
-    // record that still claimed version 1 would decode its own bytes as
-    // garbage rather than as itself.
+    // And the header now really is the current version: the entries have moved
+    // since v1, so a record that still claimed version 1 would decode its own
+    // bytes as garbage rather than as itself.
     let bytes = migrated.encode();
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 2);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
     assert_eq!(
         u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
         migrated.announced.bits(),

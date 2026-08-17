@@ -66,6 +66,25 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
         <p class="detail__kind">{t(kindKey(shade.kind))}</p>
       </header>
 
+      {/*
+        The unfinished banner comes before the controls, because the controls
+        are the thing it is warning about: this shade transmits perfectly and
+        no motor is listening. The tile is still rendered underneath — the
+        Open/Close buttons are how the setup gets tested — but nothing here
+        presents the shade as working.
+      */}
+      {shade.pairingState === 'awaitingConfirmation' && (
+        <section class="panel panel--pending">
+          <h3>{t('detail.unfinishedTitle')}</h3>
+          <p class="prose">{t('detail.unfinishedBody', { name: shade.name })}</p>
+          <div class="actions">
+            <a class="btn btn--primary" href={`/shades/${shade.id}/pair`}>
+              {t('detail.unfinishedResume', { name: shade.name })}
+            </a>
+          </div>
+        </section>
+      )}
+
       <ShadeTile shade={shade} detail />
 
       <section class="panel">
@@ -87,7 +106,13 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
           <strong>{t(ORIGIN_TEXT[shade.addressOrigin].label)}</strong>
         </p>
         <p class="prose">{t(ORIGIN_TEXT[shade.addressOrigin].note)}</p>
-        {shade.addressOrigin === 'allocated' && (
+        {/*
+          Re-pairing an already-working shade is a real need — a motor that has
+          been reset, or a re-pair after a factory reset — so the entry point
+          stays. For an unfinished shade the banner above is the call to action
+          and this would be a second one saying the same thing.
+        */}
+        {shade.addressOrigin === 'allocated' && shade.pairingState !== 'awaitingConfirmation' && (
           <a class="btn" href={`/shades/${shade.id}/pair`}>
             {t('detail.pair')}
           </a>

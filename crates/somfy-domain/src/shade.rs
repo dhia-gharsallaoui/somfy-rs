@@ -297,13 +297,45 @@ impl Shade {
     /// ask it what it learned — so a shade whose address changed is a shade
     /// that stops responding and is fixed only by walking to it. The incoming
     /// value is overwritten with the one this shade already has.
+    ///
+    /// **Neither is [`ShadeConfig::pairing_state`]**, for a related reason: it
+    /// records what a person reported, and an edit is not a report. Carrying it
+    /// through would let a rename confirm a shade nobody has watched move, and
+    /// would let a corrected travel time retire the entities of one that works.
+    /// [`Shade::confirm_pairing`] is the only way it changes.
     pub fn reconfigure(&mut self, mut config: ShadeConfig, now_ms: u64) {
         let (up, down) = (self.config.up_time_ms, self.config.down_time_ms);
         let (tilt_up, tilt_down) = (self.config.tilt_time_ms, self.config.tilt_time_ms);
         self.lift.reanchor(now_ms, up, down);
         self.tilt.reanchor(now_ms, tilt_up, tilt_down);
         config.address = self.config.address;
+        config.pairing_state = self.config.pairing_state;
         self.config = config;
+    }
+
+    /// Record that an operator reported this shade working, and say whether
+    /// that was news.
+    ///
+    /// **This transmits nothing and observes nothing.** It is the one place
+    /// [`PairingState`](crate::PairingState) moves, and what it moves it from
+    /// is a person's account — see that type for why the controller can never
+    /// supply one itself.
+    ///
+    /// One direction only. There is no `unconfirm`, and the omission is the
+    /// same kind as the missing unpair command: the recoverable failure is a
+    /// shade that has to be confirmed again, and the unrecoverable one is a
+    /// working entity retired out from under an automation because something
+    /// decided it looked unconfirmed. Removing the shade is the way to undo
+    /// this, and it is deliberately the loud way.
+    ///
+    /// `false` means it was already confirmed, which the caller uses to avoid
+    /// scheduling a flash write for a change that is not one.
+    pub fn confirm_pairing(&mut self) -> bool {
+        if self.config.pairing_state.is_confirmed() {
+            return false;
+        }
+        self.config.pairing_state = crate::PairingState::ConfirmedByOperator;
+        true
     }
 
     pub fn link_remote(&mut self, addr: u32) -> Result<(), crate::DomainError> {

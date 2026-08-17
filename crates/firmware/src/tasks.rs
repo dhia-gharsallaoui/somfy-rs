@@ -751,15 +751,36 @@ fn apply_edit(
             }
 
             catalog.add(id, seed, now_ms);
-            announce(
-                events,
-                ShadeEvent::Added {
-                    id,
-                    name,
-                    pairable: RemoteIdentity::is_allocated(address),
-                },
-            );
+            // **Nothing is announced here, and that is the change.** The
+            // address was invented a few lines above, so no motor has heard it
+            // and this shade moves nothing. Announcing now would put a cover in
+            // Home Assistant that accepts commands and drives air — the exact
+            // shape of the discovery bug this integration's requirements were
+            // written after. `announce_shade` is called anyway rather than
+            // skipped, so the rule lives in one place and this arm cannot drift
+            // from the other two.
+            announce_shade(events, registry, id);
             Ok(Applied::Added(id))
+        }
+        // The operator's report, which is the only thing that makes a shade
+        // announceable. See `somfy_domain::PairingState` for why the device
+        // cannot supply one itself.
+        ShadeEdit::ConfirmPairing { id } => {
+            let changed = catalog
+                .confirm_pairing(registry, id, now_ms)
+                .map_err(catalog_refusal)?;
+            if changed {
+                esp_println::println!(
+                    "shades: ShadeId({}) confirmed working by the operator — announcing its \
+                     entities",
+                    id.0,
+                );
+            }
+            // Announced whether or not the state moved: a repeat is how a lost
+            // acknowledgement recovers, and republishing a retained discovery
+            // config replaces it in place rather than adding anything.
+            announce_shade(events, registry, id);
+            Ok(Applied::Changed)
         }
         // **Announced as `Added` again, deliberately.** A discovery config is
         // retained and keyed by the entity's `unique_id`, so republishing one
@@ -778,19 +799,21 @@ fn apply_edit(
                 .reconfigure(registry, id, next, now_ms)
                 .map_err(catalog_refusal)?;
             esp_println::println!("shades: ShadeId({}) reconfigured as '{}'", id.0, name);
-            announce(
-                events,
-                ShadeEvent::Added {
-                    id,
-                    name,
-                    pairable: registry
-                        .shade(id)
-                        .is_some_and(|shade| RemoteIdentity::is_allocated(shade.config.address)),
-                },
-            );
+            // Gated like every other announcement: a shade nobody has reported
+            // working must not acquire entities by being renamed. `reconfigure`
+            // cannot move the pairing state either — `Shade::reconfigure`
+            // refuses to take it from an incoming configuration — so the two
+            // halves agree by construction rather than by both remembering.
+            announce_shade(events, registry, id);
             Ok(Applied::Changed)
         }
         ShadeEdit::Remove { id } => {
+            // Read before the removal, because afterwards nothing knows: an
+            // unconfirmed shade was never announced, so there is nothing on the
+            // broker to clear and publishing seven tombstones would be noise.
+            let announced = registry
+                .shade(id)
+                .is_some_and(|shade| shade.config.pairing_state.is_confirmed());
             // **The entities go before the shade does.** The record is written
             // with the shade gone and its announced bit still set, so from here
             // on flash names an orphan — which is the only thing that can name
@@ -799,7 +822,18 @@ fn apply_edit(
                 .remove(registry, id, now_ms)
                 .map_err(catalog_refusal)?;
             esp_println::println!("shades: ShadeId({}) removed", id.0);
-            announce(events, ShadeEvent::Removed { id });
+            if announced {
+                announce(events, ShadeEvent::Removed { id });
+            } else {
+                // An abandoned setup. Said out loud because "nothing was
+                // published" is the claim being made, and a silent path is one
+                // nobody can check from a serial console.
+                esp_println::println!(
+                    "shades: ShadeId({}) had never been confirmed, so it had no entities and \
+                     nothing was published to clear",
+                    id.0,
+                );
+            }
             Ok(Applied::Changed)
         }
         ShadeEdit::Link { id, address } => {
@@ -855,6 +889,50 @@ fn free_shade_id(registry: &Registry) -> Option<ShadeId> {
     (0..somfy_domain::MAX_SHADES as u8)
         .map(ShadeId)
         .find(|id| registry.shade(*id).is_none())
+}
+
+/// Announce one shade's entities — **if an operator has reported it working.**
+///
+/// # The one gate, and why it is a function rather than three `if`s
+///
+/// Three edits could announce a shade: creating it, renaming it, and confirming
+/// it. Only the third is ever allowed to, and the other two reach this for the
+/// same reason `apply_edit` exists at all — a rule that lives in one place
+/// cannot be applied inconsistently by two of the three callers, and "the
+/// rename path announced an unconfirmed shade" is the shape of bug that would
+/// only be found by somebody wondering why an entity had appeared.
+///
+/// A created shade's address was invented by this controller moments earlier,
+/// so **no motor has ever heard it**. An entity for it would appear in Home
+/// Assistant, accept Open and Close, transmit, and move nothing — which is the
+/// discovery failure `docs/specs/2026-08-15-mqtt-ha-discovery-requirements.md`
+/// was written after, arriving through a different door.
+///
+/// This is also what makes [`crate::edits::ShadeEvent::Removed`]'s own gate
+/// exact rather than approximate: since nothing but a confirmed shade is ever
+/// announced, "was it confirmed" and "does the broker hold entities for it" are
+/// the same question, and the removal path can answer it from the registry
+/// without waiting for an acknowledgement that has not arrived yet.
+fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
+    let Some(shade) = registry.shade(id) else {
+        return;
+    };
+    if !shade.config.pairing_state.is_confirmed() {
+        esp_println::println!(
+            "shades: ShadeId({}) is not announced — nobody has reported it working yet, so it \
+             has no Home Assistant entities. Finish its setup in the web UI.",
+            id.0,
+        );
+        return;
+    }
+    announce(
+        events,
+        ShadeEvent::Added {
+            id,
+            name: shade.config.name.clone(),
+            pairable: RemoteIdentity::is_allocated(shade.config.address),
+        },
+    );
 }
 
 /// Tell the broker session what changed, or say that nothing heard.

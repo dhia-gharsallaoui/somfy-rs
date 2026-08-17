@@ -83,7 +83,7 @@ export const TILT = {
 } as const;
 
 /**
- * Six fake shades. Positions are **wire values**: 0 fully open, 100 fully
+ * Seven fake shades. Positions are **wire values**: 0 fully open, 100 fully
  * closed (see `src/api/position.ts`). Travel times are deliberately asymmetric
  * on a couple of them — a roller descends faster than it rises, and the domain
  * has carried per-direction times all along.
@@ -93,11 +93,22 @@ export const TILT = {
  * make the first shade added through the UI take id 0 and sort itself in front
  * of the seed data, which looks like a bug and is not one.
  *
- * Three carry allocated addresses and three imported ones; see the module note.
+ * Four carry allocated addresses and three imported ones; see the module note.
  *
  * Typed {@link StoredShade}, not `ShadeDto`: `addressOrigin` and the three
  * calibration sources are **derived** (`./derive.ts`), so writing them here
  * would let a fixture claim an origin its own address contradicts.
+ *
+ * ## One shade is deliberately half-finished
+ *
+ * `Terrace awning` (id 6) carries `pairingState: 'awaitingConfirmation'` — a
+ * shade somebody added and never finished pairing, which is the state the whole
+ * add-a-shade flow exists to make visible rather than to hide. Without it the
+ * dashboard's "finish setting up" section and the resume path through the
+ * assistant would only ever be exercised by hand.
+ *
+ * Every other shade is `confirmedByOperator`, which is what a working
+ * installation looks like and what a migrated table decodes as.
  *
  * ## Travel times, and why most of these are the factory defaults
  *
@@ -116,6 +127,7 @@ export const SHADES: StoredShade[] = [
     address: MOCK_BASE + 0,
     kind: KIND.roller,
     tiltMode: TILT.none,
+    pairingState: 'confirmedByOperator',
     position: 0,
     target: 0,
     tiltPosition: 0,
@@ -131,6 +143,7 @@ export const SHADES: StoredShade[] = [
     address: MOCK_BASE + 1,
     kind: KIND.roller,
     tiltMode: TILT.none,
+    pairingState: 'confirmedByOperator',
     position: 100,
     target: 100,
     tiltPosition: 0,
@@ -146,6 +159,7 @@ export const SHADES: StoredShade[] = [
     address: 0x7a_ce02,
     kind: KIND.awning,
     tiltMode: TILT.none,
+    pairingState: 'confirmedByOperator',
     position: 60,
     target: 60,
     tiltPosition: 0,
@@ -161,6 +175,7 @@ export const SHADES: StoredShade[] = [
     address: MOCK_BASE + 3,
     kind: KIND.blind,
     tiltMode: TILT.integrated,
+    pairingState: 'confirmedByOperator',
     position: 40,
     target: 40,
     tiltPosition: 20,
@@ -176,6 +191,7 @@ export const SHADES: StoredShade[] = [
     address: 0x7a_ce04,
     kind: KIND.shutter,
     tiltMode: TILT.none,
+    pairingState: 'confirmedByOperator',
     position: 100,
     target: 100,
     tiltPosition: 0,
@@ -191,6 +207,7 @@ export const SHADES: StoredShade[] = [
     address: 0x7a_ce05,
     kind: KIND.draperyCenter,
     tiltMode: TILT.none,
+    pairingState: 'confirmedByOperator',
     position: 0,
     target: 0,
     tiltPosition: 0,
@@ -198,6 +215,26 @@ export const SHADES: StoredShade[] = [
     direction: 0,
     upTimeMs: 6_000,
     downTimeMs: 6_000,
+    tiltTimeMs: 0,
+  },
+  {
+    // The half-finished one. Its address is allocated — the device invented it,
+    // so no motor has heard it — and nobody has reported it working, so it has
+    // no Home Assistant entities and the dashboard offers to finish it rather
+    // than to drive it.
+    id: 6,
+    name: 'Terrace awning',
+    address: MOCK_BASE + 6,
+    kind: KIND.awning,
+    tiltMode: TILT.none,
+    pairingState: 'awaitingConfirmation',
+    position: 0,
+    target: 0,
+    tiltPosition: 0,
+    myPosition: null,
+    direction: 0,
+    upTimeMs: 12_000,
+    downTimeMs: 11_000,
     tiltTimeMs: 0,
   },
 ];

@@ -26,6 +26,10 @@ export const en = {
   'dashboard.unassigned': 'Not in a room',
   'dashboard.groupCount': '{count} shades',
   'dashboard.add': 'Add a shade',
+  'dashboard.unfinished': 'Finish setting up',
+  'dashboard.unfinishedWhy':
+    'These shades have been added but no motor has been taught to answer them yet, so they will not move and they are not in Home Assistant. Finishing takes a couple of minutes at the shade.',
+  'dashboard.unfinishedResume': 'Finish setup',
 
   'shade.open': 'Open',
   'shade.closed': 'Closed',
@@ -93,7 +97,11 @@ export const en = {
     'No other controller uses this address. A motor only obeys it once it has been paired.',
   'detail.originImportedNote':
     'This address belongs to the controller it was imported from. If that controller is still running, both are now one remote keeping two separate counters, and whichever falls behind will stop being obeyed. Pairing cannot fix that — it would teach the motor the same shared address again.',
-  'detail.pair': 'Pair this shade',
+  'detail.pair': 'Pair this shade again',
+  'detail.unfinishedTitle': 'Setup is not finished',
+  'detail.unfinishedBody':
+    '{name} has a remote address of its own, and no motor has been taught it yet — so nothing responds to these controls and there is no entity for it in Home Assistant. Finishing means standing at the shade with a remote that already works.',
+  'detail.unfinishedResume': 'Finish setting up {name}',
   'detail.dangerZone': 'Remove',
   'detail.delete': 'Remove {name}',
   'detail.deleteWarning':
@@ -103,8 +111,9 @@ export const en = {
   'detail.deleting': 'Removing…',
 
   'add.title': 'Add a shade',
+  'add.progress': 'Step 1: what it is',
   'add.intro':
-    'The controller will give this shade a remote address of its own. No motor knows that address yet, so the next step is teaching one — the shade will not move until you do.',
+    'The controller will give this shade a remote address of its own. No motor knows that address yet, so the next step is teaching one — and this takes you straight there. The shade will not appear in Home Assistant until it is set up and you have seen it move.',
   'add.name': 'Name',
   'add.nameHint': '{used} of {max} bytes used. Accented letters take two.',
   'add.kind': 'Type',
@@ -122,17 +131,12 @@ export const en = {
   'add.cancel': 'Cancel',
   'add.failed': 'The device refused this shade: {reason}',
 
-  'add.createdTitle': '{name} added',
-  'add.createdAddress': 'Remote address {address}',
-  'add.createdBody':
-    'That address is new and no motor has heard it yet, so {name} will not move. Teaching one motor to answer to it is the next step, and it needs you at the shade with a remote that already works.',
-  'add.createdPair': 'Pair it now',
-  'add.createdLater': 'Pair it later',
-
-  'pair.title': 'Pairing {name}',
+  'pair.title': 'Setting up {name}',
   'pair.progress': 'Step {step} of {total}',
   'pair.additive':
     'Nothing is taken away. Pairing adds this controller to the motor; every remote that works today keeps working.',
+  'pair.unfinished':
+    '{name} is not finished. Until you have paired it and seen it move, it does not appear in Home Assistant and nothing responds to it.',
 
   'pair.step1Title': 'Before you start',
   'pair.step1Remote':
@@ -162,32 +166,61 @@ export const en = {
   'pair.step3Remaining': 'About {time} of the programming window left.',
   'pair.step3Expired':
     'The two minutes are probably up. Put the motor back into programming mode before sending again.',
-  'pair.step3Sent': 'Sent. Watch the shade now.',
+  'pair.step3Sent': 'Sent. Watch the shade — a short up-and-down jog means the motor took it.',
   'pair.step3NoFeedback':
-    'Nothing more will appear here. The controller transmits and never hears back, so it cannot tell you whether the motor accepted the signal — only you can see that.',
-  'pair.step3Question': 'Did the shade jog?',
-  'pair.step3Yes': 'Yes, it jogged',
-  'pair.step3No': 'No, nothing happened',
+    'Nothing more will appear here. The controller transmits and never hears back, so it cannot tell you whether the motor accepted the signal. The jog is a good sign and it is easy to miss, so it is not what decides — the next step is the real test.',
+  'pair.step3Next': 'Continue — test the shade',
+  'pair.step3No': 'Nothing happened at all',
   'pair.step3Failed': 'The device would not send it: {reason}',
 
-  'pair.doneTitle': '{name} is paired',
+  'pair.step4Title': 'Test it',
+  'pair.step4Body':
+    'Open and close {name} from here, and watch the shade itself. This is the same command Home Assistant will send, so it tests the whole path rather than just whether a signal arrived.',
+  'pair.step4Limit':
+    'If the shade is already fully open, Open does nothing visible — which looks exactly like a failure. Try the other direction before concluding anything.',
+  'pair.step4Why':
+    'Nothing on this screen tells you whether it worked, on purpose. The controller cannot hear the motor, so any position it showed here would just be its own guess. You are the only instrument this has.',
+  'pair.step4Question': 'Did {name} actually move?',
+  'pair.step4OnlyYou':
+    'Answer for what you saw at the shade, not for what happened on screen. Saying yes is what adds {name} to Home Assistant.',
+  'pair.step4Yes': 'Yes — it moved',
+  'pair.step4No': 'No — it did not move',
+  'pair.confirming': 'Finishing…',
+  'pair.confirmFailed': 'The device could not record that: {reason}',
+
+  'pair.doneTitle': '{name} is set up',
   'pair.doneWitness':
-    'You saw the acknowledgement; the controller did not, and could not. That second jog was the motor confirming it has learned this controller.',
+    'You watched it move; the controller did not, and could not. That is why it asked, and it is the only evidence this protocol has.',
+  'pair.doneAnnounced':
+    '{name} is now in Home Assistant, and its entities will come back on their own after a restart of either the device or the broker.',
   'pair.doneEnd':
     'Programming mode ends by itself after a minute or two. To end it now, press PROG on the existing remote again.',
-  'pair.doneTest': 'Now test it: open and close {name} and check that it obeys.',
   'pair.doneBack': 'Go to {name}',
 
-  'pair.retryTitle': 'Nothing happened',
+  'pair.retryTitle': 'It did not work',
   'pair.retryIntro': 'In this order, because the cheap checks come first.',
   'pair.retryWindow':
     'The programming window closed. Two minutes is generous but not unlimited. Put the motor back into programming mode and send again — this is much the most common cause.',
   'pair.retryChannel':
     'The remote was on another channel, so a different shade went into programming mode — or none did.',
+  'pair.retryCode':
+    'The pairing worked and the shade still ignores commands. That is usually the rolling code: a motor refuses any code at or below the last one it accepted. Pairing again fixes it, because pairing teaches the motor whatever is being sent now.',
   'pair.retryRange':
     'The signal did not reach the motor. Move the controller closer to the shade, or check its antenna.',
   'pair.retryAgain': 'Start again from programming mode',
   'pair.retryStop': 'Stop for now',
+
+  'pair.abandon': 'Discard this shade',
+  'pair.abandonWarning':
+    'This removes {name} from the controller. Nothing else is affected: it was never added to Home Assistant, so there is nothing there to clean up, and no remote that works today stops working. You can add it again whenever you like.',
+  'pair.abandonConfirm': 'Yes, discard {name}',
+  'pair.abandonCancel': 'Keep it',
+  'pair.abandoning': 'Discarding…',
+
+  'pair.alreadyTitle': 'Does it already work?',
+  'pair.alreadyBody':
+    'This address came from another controller, so a motor may already answer it. Try opening and closing {name}; if it obeys, its setup is finished and you can say so.',
+  'pair.alreadyConfirm': 'It moved — finish setup',
 
   'pair.blockedTitle': 'Pairing is not available for this shade',
   'pair.blockedBody':

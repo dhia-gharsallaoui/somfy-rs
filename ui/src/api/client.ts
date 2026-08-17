@@ -105,6 +105,13 @@ export const patchShade = (id: number, body: PatchShadeDto): Promise<ShadeDto> =
  * (`somfy_domain::PAIR_REPEATS` pins the burst to a tap), and neither does
  * this. Deleting here removes the controller's knowledge of the shade; the
  * motor keeps obeying every remote it has already learned.
+ *
+ * **It is also how a half-finished setup is abandoned**, and there it really
+ * does leave nothing behind: a shade that was never confirmed has no Home
+ * Assistant entities to orphan, so the device publishes nothing at all. The one
+ * thing that survives is the address's rolling code, which is correct — a
+ * counter that went backwards is what stops a motor obeying, and if the same
+ * address is allocated again its code continues upward from where it was.
  */
 export const deleteShade = (id: number): Promise<void> =>
   request(`/shades/${id}`, { method: 'DELETE' }).then(() => undefined);
@@ -121,6 +128,33 @@ export const deleteShade = (id: number): Promise<void> =>
  */
 export const pairShade = (id: number): Promise<void> =>
   request(`/shades/${id}/pair`, { method: 'POST' }).then(() => undefined);
+
+/**
+ * Tell the device that an operator commanded this shade and watched it move.
+ *
+ * **This is the only thing that gives a shade Home Assistant entities.** A
+ * created shade has an address the device invented, which no motor has ever
+ * heard, so announcing it would put a cover in Home Assistant that accepts
+ * commands and drives nothing. The device therefore announces on this call and
+ * on no other.
+ *
+ * Note what is being reported and what is not. The device cannot observe
+ * pairing — RTS is one-way — so this carries no claim about the motor. It
+ * carries a claim about a *person*: they pressed Open or Close, the shade
+ * responded, and they said so. That is why the flow ends with a functional test
+ * rather than with the jog: a jog proves a frame arrived, and moving proves the
+ * path the user will actually use works end to end.
+ *
+ * Answers with the whole shade, because its `pairingState` has changed and the
+ * UI must stop presenting it as an unfinished setup.
+ */
+export async function confirmPairing(id: number): Promise<ShadeDto> {
+  // No body, so no `content-type` either: there is nothing to vary. The one
+  // thing a payload could have carried is "unconfirmed", and that direction
+  // would retire the entities of a working shade.
+  const response = await request(`/shades/${id}/confirm-pairing`, { method: 'POST' });
+  return response.json() as Promise<ShadeDto>;
+}
 
 /** Everything the dashboard needs, fetched in parallel. */
 export interface Snapshot {

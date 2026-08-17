@@ -26,8 +26,20 @@
 //! Taken once at boot, and then **changed by message** rather than re-read: the
 //! state task tells the broker session what it did to the table, and
 //! [`Inventory::insert`] and [`Inventory::remove`] apply it here. That is what
-//! makes a shade added at runtime appear in Home Assistant without waiting for
-//! a reconnect, without either task holding a lock the other needs.
+//! makes a shade an operator has just confirmed appear in Home Assistant
+//! without waiting for a reconnect, without either task holding a lock the
+//! other needs.
+//!
+//! # It holds fewer shades than the registry does, deliberately
+//!
+//! Only the ones an operator has reported working. A shade that has been
+//! created and not yet confirmed has an address this controller invented, which
+//! means **no motor has ever heard it** — so its entities would appear in Home
+//! Assistant, accept Open and Close, and drive nothing. That is the failure
+//! this integration's requirements were written after, and the shade's absence
+//! from this snapshot is what prevents it. `somfy_domain::PairingState` carries
+//! the argument for why "an operator reported it" is the strongest claim
+//! available in a one-way protocol.
 //!
 //! # What used to be missing
 //!
@@ -68,13 +80,25 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    /// Copy what the registry holds right now.
+    /// Copy the shades an operator has reported working.
+    ///
+    /// **Not every shade in the registry**, and the omission is the whole
+    /// point: a shade awaiting confirmation has an address no motor has heard,
+    /// so an entity for it would appear in Home Assistant, accept commands and
+    /// drive nothing. It is still in the registry, still commandable over the
+    /// local API — which is how the setup flow gets it tested — and simply has
+    /// no entities until somebody says it works.
+    ///
+    /// This is the boot half of the same gate `tasks::announce_shade` applies
+    /// at runtime. Both are needed and neither is redundant: this one decides
+    /// what a *fresh broker session* publishes, and that one decides what an
+    /// *edit* publishes.
     pub fn snapshot(registry: &Registry) -> Inventory {
         let mut inventory = Inventory {
             ids: Vec::new(),
             entries: Vec::new(),
         };
-        for (id, shade) in registry.shades() {
+        for (id, shade) in registry.confirmed_shades() {
             // The pairing button is offered only for an address this controller
             // allocated. Pairing an imported shade would teach a motor an
             // address it already answers to — an action that does nothing, on

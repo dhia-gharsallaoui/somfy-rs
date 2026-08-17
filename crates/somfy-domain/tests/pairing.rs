@@ -9,8 +9,8 @@
 use heapless::Vec;
 use somfy_domain::{
     allocate_if_absent, allocate_with, AllocateError, Allocated, Controller, DomainError,
-    PlannedTx, Pos, Registry, RemoteIdentity, Repeats, Shade, ShadeCommand, ShadeConfig, ShadeId,
-    StateDelta, DELTA_CAPACITY, MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
+    PairingState, PlannedTx, Pos, Registry, RemoteIdentity, Repeats, Shade, ShadeCommand,
+    ShadeConfig, ShadeId, StateDelta, DELTA_CAPACITY, MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
 };
 use somfy_rts::Command;
 
@@ -714,5 +714,149 @@ fn allocate_if_absent_still_reports_a_bare_domain_error() {
             "Kitchen"
         ),
         Err(DomainError::IdOutOfRange),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What an operator's report is, and what it is not
+// ---------------------------------------------------------------------------
+
+/// A freshly allocated shade is **awaiting confirmation**, and the reason is
+/// the address: the allocator invented it, so no motor has ever heard it.
+///
+/// This is what stops a created shade being announced to Home Assistant.
+/// Asserted at the allocator rather than only at the constructor, because that
+/// is the path the API actually takes.
+#[test]
+fn a_freshly_allocated_shade_is_awaiting_confirmation() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+    let made = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+        ShadeConfig::new("Kitchen", address)
+    })
+    .unwrap();
+    assert!(matches!(made, Allocated::Fresh(_)));
+
+    assert_eq!(
+        registry.shade(ShadeId(0)).unwrap().config.pairing_state,
+        PairingState::AwaitingConfirmation,
+    );
+}
+
+/// **The gate everything that publishes a shade walks through.**
+///
+/// `confirmed_shades` is a subset of `shades`, and the difference is the whole
+/// feature: the Home Assistant announcement walks the former, so a shade nobody
+/// has reported working has no entities — while the local API walks the latter,
+/// because an unconfirmed shade has to be commandable or there would be no way
+/// to test it and therefore no way to ever confirm it.
+#[test]
+fn only_confirmed_shades_are_the_ones_anything_publishes() {
+    let mut registry = Registry::new();
+    let awaiting = registry
+        .add_shade(ShadeConfig::new("Fresh", 0x80_0001).unwrap())
+        .unwrap();
+    let confirmed = registry
+        .add_shade(ShadeConfig::new("Working", 0x80_0002).unwrap())
+        .unwrap();
+    registry.shade_mut(confirmed).unwrap().confirm_pairing();
+
+    let all: std::vec::Vec<ShadeId> = registry.shades().map(|(id, _)| id).collect();
+    assert_eq!(all, std::vec![awaiting, confirmed], "both are commandable");
+
+    let publishable: std::vec::Vec<ShadeId> =
+        registry.confirmed_shades().map(|(id, _)| id).collect();
+    assert_eq!(
+        publishable,
+        std::vec![confirmed],
+        "a shade nobody has reported working must not reach an announcement",
+    );
+
+    // And it moves the moment somebody says so, without anything else changing.
+    registry.shade_mut(awaiting).unwrap().confirm_pairing();
+    let publishable: std::vec::Vec<ShadeId> =
+        registry.confirmed_shades().map(|(id, _)| id).collect();
+    assert_eq!(publishable, std::vec![awaiting, confirmed]);
+}
+
+/// Confirming is the operator's report, and it is news exactly once.
+#[test]
+fn confirming_is_news_once_and_then_a_no_op() {
+    let mut s = shade();
+    assert!(s.confirm_pairing(), "the first report is news");
+    assert_eq!(s.config.pairing_state, PairingState::ConfirmedByOperator);
+    assert!(!s.confirm_pairing(), "a repeat changes nothing");
+}
+
+/// **Confirmation transmits nothing and moves nothing.**
+///
+/// It is a record of what somebody saw, not an action on a motor: no frame is
+/// planned and the position estimate is untouched. A confirmation that planned
+/// a frame would put a burst on the air because somebody clicked "yes, it
+/// moved" — at a shade they are standing next to, possibly in programming mode.
+#[test]
+fn confirming_plans_no_frame_and_moves_no_position() {
+    let mut s = shade();
+    let mut out: Vec<PlannedTx, 4> = Vec::new();
+    s.handle(ShadeCommand::GoTo(Pos::from_percent(40)), 0, &mut out);
+    out.clear();
+    let before = (s.pos(), s.target());
+
+    s.confirm_pairing();
+
+    assert!(out.is_empty(), "confirming is not a transmission");
+    assert_eq!((s.pos(), s.target()), before);
+}
+
+/// An edit is not a report, in either direction.
+///
+/// A rename must not confirm a shade nobody has watched move, and a corrected
+/// travel time must not un-confirm one that works — the second would retire a
+/// live Home Assistant entity out from under whatever is automating it. The
+/// same protection `address` already has, for the same reason: the incoming
+/// configuration is a client's, and this field is not a client's to set.
+#[test]
+fn reconfiguring_carries_neither_direction_of_the_report() {
+    let mut s = shade();
+
+    let mut claiming = s.config.clone();
+    claiming.pairing_state = PairingState::ConfirmedByOperator;
+    s.reconfigure(claiming, 0);
+    assert_eq!(
+        s.config.pairing_state,
+        PairingState::AwaitingConfirmation,
+        "a patch cannot claim a report nobody made",
+    );
+
+    s.confirm_pairing();
+    let mut denying = s.config.clone();
+    denying.pairing_state = PairingState::AwaitingConfirmation;
+    denying.up_time_ms = 30_000;
+    s.reconfigure(denying, 0);
+    assert_eq!(
+        s.config.pairing_state,
+        PairingState::ConfirmedByOperator,
+        "a patch cannot withdraw one either",
+    );
+    assert_eq!(s.config.up_time_ms, 30_000, "the rest still applied");
+}
+
+/// Pairing and confirming are separate acts, and the order is forced.
+///
+/// The `Prog` burst is planned by a command; the confirmation is a report made
+/// afterwards by a person who watched. Transmitting must not confirm anything —
+/// that would be the transmitter reporting its own success, which in a one-way
+/// protocol is worth nothing at all.
+#[test]
+fn transmitting_a_pairing_burst_confirms_nothing() {
+    let mut s = shade();
+    let mut out: Vec<PlannedTx, 4> = Vec::new();
+    s.handle(ShadeCommand::Pair, 0, &mut out);
+
+    assert_eq!(tx(&out), std::vec![Command::Prog]);
+    assert_eq!(
+        s.config.pairing_state,
+        PairingState::AwaitingConfirmation,
+        "the device cannot observe what the motor did, so it must claim nothing",
     );
 }
