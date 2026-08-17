@@ -80,6 +80,19 @@ somfy-tasks = { path = "../somfy-tasks" }
 # tested. This crate keeps only the flash I/O, exactly as it does for
 # `somfy-store`.
 somfy-config = { path = "../somfy-config" }
+# Topic construction, config validation, HA discovery payloads, and the
+# lifecycle plans this crate's broker session executes. Everything decided
+# there is host-tested there; what is left here is the transport.
+somfy-mqtt = { path = "../somfy-mqtt" }
+# The MQTT client. Chosen from a survey of all 230 `mqtt`-keyword crates with
+# every no_std client's source read — see CLAUDE.md's evaluation table. It is
+# alloc-free with zero `unsafe` in its source, takes caller-owned fixed rx/tx
+# slices, advertises the rx size as MQTT5 `MaximumPacketSize` so inbound is
+# bounded by construction, and drives keepalive itself. `default-features =
+# false` drops its `defmt` default: this firmware logs through `esp-println`,
+# and a second logging framework would pull `defmt` and its transport into the
+# image for output nothing here reads.
+minimq = { version = "0.13", default-features = false }
 # Embassy, by way of `esp-rtos`. NOT `esp-hal-embassy`: that crate's
 # `executors` feature turns on `esp-hal/__esp_hal_embassy`, a feature esp-hal
 # dropped in 1.0.0-rc.1, so no published version of it resolves against the
@@ -141,7 +154,35 @@ embassy-net = { version = "0.9.1", features = [
 
 [features]
 default = []
+
+# The broker session — the whole of `src/mqtt.rs`, its four packet buffers and
+# the task future that holds them. Every chip feature below enables it **except
+# `chip-s2`, which has no DRAM left for it**, and that is a measurement rather
+# than a preference:
+#
+# - The ESP32-S2's usable `dram_seg` is 184 KB, and `esp-radio`'s statics take
+#   most of it. At the 56 KB heap `src/heap.rs` argues for, Plan 5 Task 2 left
+#   the ESP32-S2 **16,324 bytes** of main stack — everything after the statics.
+# - The broker session's task future is **14,824 bytes** (measured on an
+#   ESP32-S3 image: `nm --print-size` on `firmware4mqtt7session4POOL`), and
+#   `main::REQUIRED_STACK_BYTES` refuses to boot below 8,192.
+# - With it compiled in, the ESP32-S2 image does not link at all: the statics
+#   overrun the end of `dram_seg` by **5,260 bytes** before any stack is carved
+#   at all, so the shortfall against a bootable image is 5,260 + 8,192 = 13,452.
+#
+# Nothing available closes that. Shrinking the heap below the **46,660-byte**
+# high-water mark measured in Task 2 would trade a link error for a
+# heap-exhaustion panic under real traffic, and `src/heap.rs` argues against a
+# per-chip heap for a separate reason. Reclaiming the ESP32-S2's `dram2_seg`
+# (136 KB, reachable through esp-hal's `.dram2_uninit` section) is the one real
+# option and it is unsafe, unvalidated on hardware, and out of scope here.
+#
+# So the ESP32-S2 keeps Wi-Fi and the radio and loses the broker, and says so at
+# boot. **This is a product decision recorded in code, not a workaround**; see
+# `docs/provenance.md`.
+mqtt = []
 chip-esp32 = [
+    "mqtt",
     "esp-hal/esp32",
     "esp-println/esp32",
     "esp-bootloader-esp-idf/esp32",
@@ -160,6 +201,7 @@ chip-s2 = [
     "esp-alloc/esp32s2",
 ]
 chip-s3 = [
+    "mqtt",
     "esp-hal/esp32s3",
     "esp-println/esp32s3",
     "esp-bootloader-esp-idf/esp32s3",
@@ -169,6 +211,7 @@ chip-s3 = [
     "esp-alloc/esp32s3",
 ]
 chip-c3 = [
+    "mqtt",
     "esp-hal/esp32c3",
     "esp-println/esp32c3",
     "esp-bootloader-esp-idf/esp32c3",

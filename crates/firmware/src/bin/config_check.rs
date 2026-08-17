@@ -39,10 +39,12 @@
 #[path = "../config.rs"]
 mod config;
 
+use core::net::Ipv4Addr;
+
 use config::{ConfigError, ConfigStore};
 use esp_hal::main;
 use esp_storage::FlashStorage;
-use somfy_config::WifiCredentials;
+use somfy_config::{MqttSettings, WifiCredentials, DEFAULT_DISCOVERY_PREFIX, DEFAULT_STATE_ROOT};
 
 // Without this the image has no ESP-IDF application descriptor, and espflash
 // refuses to write it. See the note on the same line in `main.rs`.
@@ -59,6 +61,18 @@ const PLACEHOLDER_SSID: &str = "SSID_NOT_PROVISIONED";
 /// characters because that is the shortest a WPA network accepts — writing a
 /// shorter one would exercise the validator's refusal rather than the store.
 const PLACEHOLDER_PSK: &str = "notapass";
+
+/// The broker address this binary writes.
+///
+/// `192.0.2.10` is from **TEST-NET-1** (RFC 5737), a block reserved for
+/// documentation and guaranteed never to be routed. A board left holding this
+/// record tries to reach an address that cannot exist, which is a far better
+/// state to find than one pointing at a real host on somebody's network.
+const PLACEHOLDER_BROKER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+
+/// The broker port this binary writes. The MQTT default, so the record is
+/// ordinary in every respect except the address.
+const PLACEHOLDER_PORT: u16 = 1883;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -112,8 +126,20 @@ fn check() -> Result<(), ConfigError> {
     // the array.
     let placeholder = WifiCredentials::new(PLACEHOLDER_SSID, PLACEHOLDER_PSK)
         .expect("the placeholder above is a valid credential");
-    store.store(Some(placeholder))?;
-    esp_println::println!("config: stored the placeholder credential");
+    // Anonymous, because a placeholder password would be a string in this
+    // repository that looks like a credential. The broker half is written at
+    // all so the round trip covers the whole record rather than half of it.
+    let broker = MqttSettings::new(
+        PLACEHOLDER_BROKER,
+        PLACEHOLDER_PORT,
+        "",
+        "",
+        DEFAULT_DISCOVERY_PREFIX,
+        DEFAULT_STATE_ROOT,
+    )
+    .expect("the placeholder above is a valid setting");
+    store.store(Some(placeholder), Some(broker))?;
+    esp_println::println!("config: stored the placeholder credential and broker");
 
     // Re-read through a fresh scan rather than trusting `store`'s own
     // verification: this is what the next boot will see.

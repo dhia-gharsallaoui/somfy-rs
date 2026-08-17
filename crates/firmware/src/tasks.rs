@@ -32,8 +32,8 @@ use embassy_executor::task;
 use embassy_futures::select::{select3, Either3};
 use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Receiver;
-use embassy_sync::pubsub::ImmediatePublisher;
+use embassy_sync::channel::{Receiver, Sender};
+use embassy_sync::pubsub::{ImmediatePublisher, Subscriber};
 use embassy_time::{Duration, Instant, Ticker};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
@@ -82,9 +82,35 @@ pub type Radio = RadioLoop<
     FRAME_QUEUE_DEPTH,
 >;
 
-/// Deltas out of the state task, for whoever is listening — nobody, in Plan 4.
+/// Deltas out of the state task, for whoever is listening.
 pub type Deltas =
     ImmediatePublisher<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
+
+/// The listening end of [`Deltas`]. The MQTT session holds one.
+///
+/// Publish/subscribe rather than a queue, so a slow subscriber cannot make the
+/// state task wait: `publish_immediate` drops for a subscriber that has fallen
+/// behind, and the subscriber is told how many it missed. That is the right
+/// trade for a delta, which is a report about a position that a later delta
+/// reports again — and it is one of the four things that keep the broker from
+/// being able to affect radio control.
+#[cfg_attr(
+    not(feature = "mqtt"),
+    allow(dead_code, reason = "the broker session is the only subscriber")
+)]
+pub type DeltaSubscriber =
+    Subscriber<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
+
+/// The writing end of the command channel, for whatever produces commands.
+///
+/// Handed to the MQTT session, which uses `try_send` and never `send`: a full
+/// queue must drop the newest command rather than park the sender. See
+/// [`crate::mqtt`].
+#[cfg_attr(
+    not(feature = "mqtt"),
+    allow(dead_code, reason = "the broker session is the only producer")
+)]
+pub type CommandSender = Sender<'static, Mutex, ControlCommand, COMMAND_QUEUE_DEPTH>;
 
 /// One in this many repeats of an anomaly is logged, after the first.
 ///

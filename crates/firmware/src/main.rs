@@ -9,28 +9,30 @@
 //!
 //! ## The network is optional, and the wiring is what makes it so
 //!
-//! Wi-Fi is brought up **after** the radio and state tasks are spawned, by
-//! [`start_network`], which returns nothing. There is no path on which a
-//! missing network, a wrong passphrase or an unreadable configuration region
-//! stops the controller — not because that path is avoided, but because
-//! [`start_network`] gives its caller nothing to propagate. A board with no
-//! credentials provisioned at all is the ordinary state of a freshly flashed
-//! device, and it receives and decodes exactly as it always did. See
-//! [`net`]'s module docs for the other three things that keep the two halves
-//! apart.
+//! Wi-Fi and the broker session are brought up **after** the radio and state
+//! tasks are spawned, by [`start_network`] and [`start_mqtt`], neither of which
+//! returns anything. There is no path on which a missing network, a wrong
+//! passphrase, an unreachable broker or an unreadable configuration region
+//! stops the controller — not because that path is avoided, but because those
+//! two functions give their caller nothing to propagate. A board with nothing
+//! provisioned at all is the ordinary state of a freshly flashed device, and it
+//! receives and decodes exactly as it always did. See [`net`]'s and `mqtt`'s
+//! module docs for the other things that keep the halves apart.
 //!
-//! ## This image transmits nothing on its own
+//! ## This image transmits only what a broker tells it to
 //!
-//! The state task transmits only what it is commanded to, and there is still no
-//! command source — the command channel has no producer until Plan 5's MQTT
-//! client arrives. The configuration this crate does persist carries Wi-Fi
-//! credentials and nothing else, so the shade registry starts and stays empty.
-//! Flashing this therefore produces a controller that listens, decodes, logs
-//! what it hears, and keys the transmitter never.
+//! The state task transmits only what it is commanded to, and the command
+//! channel's one producer is the MQTT session. The configuration this crate
+//! persists carries Wi-Fi credentials and MQTT settings and **no shades**, so
+//! the registry starts and stays empty — and a command names a shade, so there
+//! is nothing for one to name. Flashing this therefore still produces a
+//! controller that listens, decodes, logs what it hears, and keys the
+//! transmitter never.
 //!
 //! That is intended, and it is also a safety property worth being explicit
-//! about: no boot of this image can move a shade. `tx-check` is the binary that
-//! keys the radio, at a synthetic address, on purpose.
+//! about: no boot of this image can move a shade until a shade is provisioned,
+//! which needs Plan 6's configuration store. `tx-check` is the binary that keys
+//! the radio, at a synthetic address, on purpose.
 //!
 //! ## What a boot proves
 //!
@@ -54,6 +56,9 @@ extern crate alloc;
 mod chip;
 mod config;
 mod heap;
+mod inventory;
+#[cfg(feature = "mqtt")]
+mod mqtt;
 mod net;
 mod radio;
 mod store;
@@ -81,10 +86,12 @@ use somfy_tasks::{
 };
 
 use config::ConfigStore;
+use heapless::Vec;
+use inventory::Inventory;
 use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
-use somfy_config::WifiCredentials;
+use somfy_config::{MqttSettings, Namespaces, WifiCredentials};
 use store::{FlashStore, StoreError};
 use tasks::Mutex;
 
@@ -131,12 +138,15 @@ static TRANSMIT: TransmitChannel<Mutex> = TransmitChannel::new();
 /// Decoded frames from the radio task to the state task.
 static FRAMES: FrameChannel<Mutex> = FrameChannel::new();
 
-/// Commands into the state task. **No producer exists yet** — this is the seam
-/// Plan 5's API layer plugs into.
+/// Commands into the state task. The MQTT session is its one producer, and it
+/// uses `try_send`: a full queue drops the newest command rather than parking
+/// the sender, because a queue of shade commands is a queue of intentions and
+/// acting on a stale one is worse than dropping it.
 static COMMANDS: CommandChannel<Mutex> = CommandChannel::new();
 
-/// State deltas out of the state task. **No subscriber exists yet**, for the
-/// same reason; publishing with none discards immediately.
+/// State deltas out of the state task. The MQTT session subscribes; publishing
+/// with no subscriber discards immediately, which is what a board with no
+/// broker provisioned does.
 static DELTAS: DeltaChannel<Mutex> = DeltaChannel::new();
 
 /// Report the panic, then **reboot** — which is the degradable answer, and it
@@ -219,6 +229,18 @@ enum StartError {
 struct Pending {
     wifi: esp_hal::peripherals::WIFI<'static>,
     credentials: Option<WifiCredentials>,
+    /// The broker to talk to, if one is provisioned. `None` is a supported
+    /// configuration, not a failure: the controller receives and decodes with
+    /// no broker at all.
+    broker: Option<MqttSettings>,
+    /// Namespace pairs the ring shows this device has published under before
+    /// and is not publishing under now. Their retained configs have to be
+    /// cleared before the current ones go out — see spec R5, and
+    /// `somfy_mqtt::reconfigure`, which is the only way to ask for the two in
+    /// that order.
+    superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
+    /// The shades to announce, copied before the state task owns the registry.
+    inventory: Inventory,
 }
 
 #[esp_rtos::main]
@@ -252,7 +274,7 @@ async fn entry(spawner: Spawner) {
     // before control returns here.
     yield_now().await;
 
-    start_network(spawner, pending.wifi, pending.credentials);
+    start_network(spawner, pending);
     heap::report("controller started");
     esp_println::println!("controller: running");
     // Returning is correct: the executor outlives this function and keeps
@@ -292,7 +314,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // boot and never again, so nothing needs to hold it open, and the store
     // that *is* held open is the one a running controller writes to.
     let mut flash = peripherals.FLASH;
-    let credentials = report_config(FlashStorage::new(flash.reborrow()));
+    let (credentials, broker, superseded) = report_config(FlashStorage::new(flash.reborrow()));
 
     // Mounted here rather than inside the state task: `mount` wants roughly
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
@@ -349,13 +371,20 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     air.listen().map_err(StartError::Air)?;
 
     // An empty registry: the configuration this crate persists carries Wi-Fi
-    // credentials and nothing else, so no shade is provisioned and nothing can
-    // be commanded. Said out loud because a silent empty controller and a
-    // broken one look identical from the serial line.
+    // credentials and MQTT settings and no shades, so nothing is provisioned
+    // and nothing can be commanded. Said out loud because a silent empty
+    // controller and a broken one look identical from the serial line.
     let machine = StateMachine::new(TxProfile::default());
+
+    // Copied **here**, before the state task takes ownership of the machine.
+    // The MQTT session works from this copy rather than from the registry, so
+    // there is no shared state between the broker and the radio at all — see
+    // `mqtt`'s module docs for the other three things that keep them apart.
+    let inventory = Inventory::snapshot(machine.registry());
     esp_println::println!(
-        "controller: 0 shades provisioned — receiving and tracking only, \
-         nothing will transmit until a config store and a command source exist"
+        "controller: {} shades provisioned — receiving and tracking only, \
+         nothing will transmit until a shade registry exists to command",
+        inventory.len(),
     );
 
     // Both tokens first, then both spawns. `#[task]` hands back a token or a
@@ -392,6 +421,9 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     Ok(Pending {
         wifi: peripherals.WIFI,
         credentials,
+        broker,
+        superseded,
+        inventory,
     })
 }
 
@@ -408,12 +440,26 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
 /// path. It is what a freshly flashed device looks like, and it is also the
 /// cleanest demonstration that the network is optional: such a board still
 /// receives and decodes.
-fn report_config(flash: FlashStorage<'_>) -> Option<WifiCredentials> {
+#[allow(
+    clippy::type_complexity,
+    reason = "three independent halves of one \
+    read, and a struct for them would be a type used exactly once between two \
+    adjacent lines"
+)]
+fn report_config(
+    flash: FlashStorage<'_>,
+) -> (
+    Option<WifiCredentials>,
+    Option<MqttSettings>,
+    Vec<Namespaces, { config::MAX_SUPERSEDED }>,
+) {
+    let nothing = || (None, None, Vec::new());
+
     let mut store = match ConfigStore::mount(flash) {
         Ok(store) => store,
         Err(error) => {
             esp_println::println!("config: region unavailable ({:?})", error);
-            return None;
+            return nothing();
         }
     };
 
@@ -430,7 +476,7 @@ fn report_config(flash: FlashStorage<'_>) -> Option<WifiCredentials> {
         Ok(found) => found,
         Err(error) => {
             esp_println::println!("config: unreadable ({:?})", error);
-            return None;
+            return nothing();
         }
     };
     esp_println::println!(
@@ -441,12 +487,47 @@ fn report_config(flash: FlashStorage<'_>) -> Option<WifiCredentials> {
         survey.damaged,
         survey.newest_seq,
     );
+    for stale in &survey.superseded {
+        // Printed because it is about to change what the device publishes: the
+        // retained configs under these namespaces are cleared before the
+        // current ones go out. See spec R5.
+        esp_println::println!(
+            "config: superseded namespaces discovery_prefix='{}' state_root='{}' \
+             — their retained topics will be cleared on the next fresh broker session",
+            stale.discovery_prefix(),
+            stale.state_root(),
+        );
+    }
+    if survey.superseded_truncated {
+        esp_println::println!(
+            "config: more superseded namespaces than this build tracks ({}); \
+             the oldest will not be cleared",
+            config::MAX_SUPERSEDED,
+        );
+    }
 
-    // `Debug` on the credentials redacts the passphrase, and only the SSID is
-    // printed here in any case. The SSID is broadcast by the access point
-    // several times a second; the passphrase never leaves flash except into
-    // the driver.
-    record.and_then(|record| record.wifi)
+    // `Debug` on both halves redacts its secret, and only the SSID and the
+    // broker's address are printed here in any case. The SSID is broadcast by
+    // the access point several times a second; neither secret leaves flash
+    // except into the driver or the broker.
+    let Some(record) = record else {
+        return (None, None, survey.superseded);
+    };
+    if let Some(mqtt) = &record.mqtt {
+        esp_println::println!(
+            "config: broker {}:{} ({}), discovery_prefix='{}' state_root='{}'",
+            mqtt.address(),
+            mqtt.port(),
+            if mqtt.is_anonymous() {
+                "anonymous"
+            } else {
+                "authenticated"
+            },
+            mqtt.discovery_prefix(),
+            mqtt.state_root(),
+        );
+    }
+    (record.wifi, record.mqtt, survey.superseded)
 }
 
 /// Start the network if there is one to start, and never fail.
@@ -454,12 +535,8 @@ fn report_config(flash: FlashStorage<'_>) -> Option<WifiCredentials> {
 /// No `Result`, on purpose. A caller cannot propagate what it is not given, so
 /// the "network failure stops the controller" path is not something to avoid
 /// writing — it is not expressible from here.
-fn start_network(
-    spawner: Spawner,
-    wifi: esp_hal::peripherals::WIFI<'static>,
-    credentials: Option<WifiCredentials>,
-) {
-    let Some(credentials) = credentials else {
+fn start_network(spawner: Spawner, pending: Pending) {
+    let Some(credentials) = pending.credentials else {
         esp_println::println!(
             "network: no credentials provisioned — running radio-only. \
              This board still receives and decodes; see docs/hardware-checklist.md \
@@ -467,12 +544,114 @@ fn start_network(
         );
         return;
     };
-    if let Err(error) = net::start(spawner, wifi, &credentials) {
+    let stack = match net::start(spawner, pending.wifi, &credentials) {
+        Ok(stack) => stack,
+        Err(error) => {
+            esp_println::println!(
+                "network: failed to start ({:?}) — running radio-only, which is unaffected",
+                error,
+            );
+            return;
+        }
+    };
+    start_mqtt(
+        spawner,
+        stack,
+        pending.broker,
+        pending.superseded,
+        pending.inventory,
+    );
+}
+
+/// Start the broker session if one is configured, and never fail.
+///
+/// Same shape and same reason as [`start_network`]: no `Result`, so the "MQTT
+/// failure stops the controller" path is not expressible here. Spec R9 is
+/// explicit that a broker which is down, unreachable, or rejecting credentials
+/// must not affect radio control, and a board with no broker at all is the
+/// ordinary state of one provisioned before a broker existed.
+#[cfg(feature = "mqtt")]
+fn start_mqtt(
+    spawner: Spawner,
+    stack: embassy_net::Stack<'static>,
+    broker: Option<MqttSettings>,
+    superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
+    inventory: Inventory,
+) {
+    let Some(settings) = broker else {
         esp_println::println!(
-            "network: failed to start ({:?}) — running radio-only, which is unaffected",
+            "mqtt: no broker provisioned — the controller runs without one. \
+             It still receives, decodes and tracks."
+        );
+        // **A gap R5 names and this configuration model cannot close.** R5 asks
+        // that disabling discovery clear every entity it owns. Clearing the
+        // broker is not the same act — it removes the only route to the
+        // retained topics, so there is nothing to connect to and nothing this
+        // device can do about the orphans it left. There is no separate
+        // "discovery off" switch to attach the obligation to instead.
+        //
+        // What is left is to name them, because a silent orphan is the thing
+        // the requirements were written from. Anyone reading this line has the
+        // two commands that clear it by hand.
+        for stale in &superseded {
+            esp_println::println!(
+                "mqtt: retained topics under discovery_prefix='{}' state_root='{}' \
+                 CANNOT be cleared without a broker — they will outlive this device. \
+                 Clear them with: mosquitto_sub -t '{}/+/+/+/config' -v --retained-only, \
+                 then mosquitto_pub -r -n -t <each topic>; and likewise under '{}/#'.",
+                stale.discovery_prefix(),
+                stale.state_root(),
+                stale.discovery_prefix(),
+                stale.state_root(),
+            );
+        }
+        return;
+    };
+
+    let deltas = match DELTAS.subscriber() {
+        Ok(deltas) => deltas,
+        Err(error) => {
+            esp_println::println!("mqtt: no delta subscription available ({:?})", error);
+            return;
+        }
+    };
+
+    if let Err(error) = mqtt::start(
+        spawner,
+        stack,
+        settings,
+        superseded,
+        inventory,
+        COMMANDS.sender(),
+        deltas,
+    ) {
+        esp_println::println!(
+            "mqtt: failed to start ({:?}) — running without a broker, \
+             which leaves the radio unaffected",
             error,
         );
     }
+}
+
+/// The same seam on a chip whose DRAM the broker session does not fit in.
+///
+/// See the `mqtt` feature in `Cargo.toml` for the measurement. It is a line at
+/// boot rather than a silent omission, because a device that publishes nothing
+/// and a broker that is unreachable look identical from Home Assistant's side.
+#[cfg(not(feature = "mqtt"))]
+fn start_mqtt(
+    _spawner: Spawner,
+    _stack: embassy_net::Stack<'static>,
+    broker: Option<MqttSettings>,
+    _superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
+    _inventory: Inventory,
+) {
+    esp_println::println!(
+        "mqtt: not built into this image — this chip has no DRAM left for a \
+         broker session alongside the Wi-Fi driver. See the `mqtt` feature. \
+         Wi-Fi and the radio are unaffected; {} broker is provisioned.",
+        if broker.is_some() { "a" } else { "no" },
+    );
 }
 
 /// Print what the rolling-code region holds before anything writes to it.

@@ -459,13 +459,34 @@ Delete the intermediate file once the board has it.
 
 ```bash
 cargo run -p somfy-config --example provision -- wificfg.bin
-# SSID: <typed>
+# SSID (empty for no network): <typed>
 # passphrase (empty for an open network): <typed>
+# broker IPv4 address (empty for no broker): <typed>
+# broker port [1883]: <return>
+# broker username (empty for anonymous): <typed>
+# broker password: <typed>
+# discovery_prefix [homeassistant]: <return>
+# state_root [somfyrs]: <return>
 ```
 
 It validates before writing — an SSID over 32 bytes, a passphrase under 8
-characters, an embedded NUL — so a typo is refused here rather than three
-flashes later as a board that silently will not associate.
+characters, an embedded NUL, a broker address no TCP connection could reach, a
+port of zero, a topic root with a wildcard or a trailing slash, or two roots
+that name the same namespace — so a typo is refused here rather than three
+flashes later as a board that silently will not associate or an integration
+that publishes where nothing reads.
+
+Both halves are optional and independent. An empty SSID writes "no network
+configured"; an empty broker address writes "no broker configured". A board
+carrying either still receives and decodes.
+
+**The broker address is an IPv4 address, not a host name**, and that is
+deliberate: `embassy-net` is built here without its `dns` feature, so a name
+would be a value the tool accepts, the flash stores, and the network layer can
+do nothing with.
+
+**Prefer the broker's address on the ESP's own subnet** where it is dual-homed:
+it removes any dependency on inter-VLAN firewall rules from the path.
 
 ### 2. Put it on the board
 
@@ -490,8 +511,9 @@ espflash monitor --port /dev/ttyUSB0 --non-interactive   # reset the board
 ```
 
 ```
-config: partition 'wificfg' at 0x00202000, 32 slots of 256 bytes
-config: survey slots=32 valid=1 blank=31 damaged=0 newest_seq=Some(0)
+config: partition 'wificfg' at 0x00202000, 16 slots of 512 bytes
+config: survey slots=16 valid=1 blank=15 damaged=0 newest_seq=Some(0)
+config: broker 192.0.2.10:1883 (authenticated), discovery_prefix='homeassistant' state_root='somfyrs'
 wifi: joining '<your ssid>'
 wifi: associated on channel 6 (-52 dBm)
 net: address 10.0.0.57/24 gateway Some(10.0.0.1)
@@ -544,9 +566,15 @@ rolling code. Re-provision afterwards.
 | Quantity | Value |
 |---|---|
 | Partition | `wificfg`, data/undefined, 0x202000, 8 KB |
-| Record | 256 bytes: magic `RTSW`, version, flags, lengths, seq, SSID(32), PSK(64), CRC-32 |
-| Slots | 32, in 2 erase sectors of 16 |
+| Record | 512 bytes: magic `RTSW`, version **2**, flags, lengths, seq, broker address+port, SSID(32), PSK(64), username(32), password(64), discovery_prefix(32), state_root(32), CRC-32 |
+| Slots | 16, in 2 erase sectors of 8 |
 | Rolling codes | untouched — `rollcode` keeps its 0x200000 offset in the new table |
+
+**A board provisioned before the MQTT settings existed must be re-provisioned.**
+Version 2 moved every field and changed the record length, so a version 1 record
+read as 512 bytes fails its checksum and is reported as a damaged slot rather
+than as an old format. The survey line at boot says so; the remedy is the
+`erase-parts` + `write-bin` above.
 
 ---
 
@@ -554,11 +582,11 @@ rolling code. Re-provision afterwards.
 
 The real firmware: the radio task, the state task, the two flash stores and —
 when credentials are present — Wi-Fi and the TCP/IP stack, wired together.
-**It keys the transmitter only when commanded, and there is still no command
-source** (Plan 5 Task 3's MQTT client is the first), so flashing it produces a
-controller that listens and tracks and puts nothing on the 433 MHz band. That
-is deliberate — no boot of this image can move a shade — and it is also why the
-harnesses above still exist.
+**It keys the transmitter only when commanded, and a command names a shade —
+of which there are still none**, because the persisted configuration carries no
+shade registry. So flashing it produces a controller that listens and tracks
+and puts nothing on the 433 MHz band. That is deliberate — no boot of this
+image can move a shade — and it is also why the harnesses above still exist.
 
 Step 0 above — **identify the board** — applies here too, every time.
 
@@ -574,13 +602,13 @@ A healthy boot on a board with **no Wi-Fi credentials** — which is what a
 freshly flashed one is — prints this, and nothing about it is an error:
 
 ```
-stack: 193980 bytes available, 8192 required
-config: partition 'wificfg' at 0x00202000, 32 slots of 256 bytes
-config: survey slots=32 valid=0 blank=32 damaged=0 newest_seq=None
+stack: 176876 bytes available, 8192 required
+config: partition 'wificfg' at 0x00202000, 16 slots of 512 bytes
+config: survey slots=16 valid=0 blank=16 damaged=0 newest_seq=None
 store: partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
 store: survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
 controller: 0 shades provisioned — receiving and tracking only, nothing will
- transmit until a config store and a command source exist
+ transmit until a shade registry exists to command
 network: no credentials provisioned — running radio-only. This board still
  receives and decodes; see docs/hardware-checklist.md to provision one.
 heap: controller started — 0 of 57344 bytes used, peak 0
@@ -593,7 +621,8 @@ Each line is there because nothing else can establish it:
   have no stacks of their own, so that comes off the main stack. esp-hal's
   linker script gives the main stack whatever DRAM is left after the statics,
   which moves every time a static is added — and the Wi-Fi heap is a static, so
-  this figure dropped from 304,652 to 193,980 the moment Wi-Fi arrived. The
+  this figure dropped from 304,652 to 193,980 the moment Wi-Fi arrived, and to
+  176,876 when the broker session's 14,824-byte task future joined it. The
   check refuses to start rather than let a future Plan's buffers turn into a
   corrupted pulse train.
 - **config survey** — same distinction as the store's: a region that has never
@@ -605,6 +634,12 @@ Each line is there because nothing else can establish it:
   identical from the serial line.
 - **network: no credentials** — the ordinary state of a new board, said out
   loud so it is not mistaken for a failure. The radio is unaffected.
+- **mqtt: no broker provisioned** — the same, one layer up, and it is a
+  supported configuration rather than a fault. On a board that *does* have one,
+  the first connect prints
+  `mqtt: broker accepted an MQTT v5 CONNECT and answered CONNACK (Connected)`,
+  which is the observation that turns "the add-on ships Mosquitto 2.x, so it
+  speaks v5" into something read off a wire.
 - **heap** — `peak 0` with no network is the check that the heap belongs to
   `esp-radio` alone: nothing else in the firmware allocates a byte. With Wi-Fi
   running the peak was **46,660 of 57,344**, and it is printed again whenever
@@ -614,7 +649,7 @@ Each line is there because nothing else can establish it:
 
 ### Proving the network cannot take the radio down
 
-Spec R9 says the network is a degradable service. Three checks, in increasing
+Spec R9 says the network is a degradable service. Five checks, in increasing
 strength:
 
 1. **No credentials at all.** The boot above. The network is never attempted;
@@ -627,9 +662,43 @@ strength:
    the board is in state 2 and confirm `state: heard … from 0x…` still appears.
    **Ten trials, not one** — the link decodes a minority of frames, so a single
    silent trial proves nothing.
+4. **A broker that is not there.** Provision a real network and the
+   `config-check` placeholder broker (`192.0.2.10`, a TEST-NET-1 address that
+   is never routed). Wi-Fi must associate and get an address while the broker
+   retry runs 1 s → 60 s, with `mqtt: reconnecting in …` and nothing else
+   changing. The delay sequence is the check, exactly as it is for Wi-Fi.
+5. **A broker that is killed mid-session.** Stop the Mosquitto add-on while the
+   device is connected. Expect one `mqtt: session at … ended after … ms` line
+   and a reconnect; the radio must be unaffected throughout, and on restart the
+   entities must repopulate from the **retained** discovery configs without the
+   device being touched.
 
-Checks 1 and 2 were run on the spare ESP32-S3 on 2026-08-16/17. **Check 3 has
-not been run** — it needs a transmitter on the owner's network.
+Checks 1 and 2 were run on the spare ESP32-S3 on 2026-08-16/17. **Checks 3, 4
+and 5 have not been run** — 3 needs a transmitter on the owner's network, and 4
+and 5 need the real broker.
+
+### The ESP32-S2 has no broker session
+
+`chip-s2` builds without MQTT and says so at boot:
+
+```
+mqtt: not built into this image — this chip has no DRAM left for a broker
+ session alongside the Wi-Fi driver. See the `mqtt` feature.
+```
+
+It is a measurement, not a preference: with the session compiled in, the
+ESP32-S2 image does not link at all — the statics overrun the end of its
+184 KB `dram_seg` by 5,260 bytes before any stack is carved, and
+`REQUIRED_STACK_BYTES` needs 8,192 more on top. `crates/firmware/Cargo.toml`
+carries the full arithmetic on the `mqtt` feature. Wi-Fi and the radio are
+unaffected there.
+
+| chip | main stack after Task 3 | broker session future |
+|---|---|---|
+| ESP32 | 71,524 | 14,824 |
+| ESP32-S2 | 14,716 | **not built** |
+| ESP32-S3 | 176,876 | 14,824 |
+| ESP32-C3 | 163,632 | 14,824 |
 
 A fourth thing worth knowing rather than checking: **the controller reboots on
 a panic; the bring-up harnesses halt.** Wi-Fi brings in panics this firmware

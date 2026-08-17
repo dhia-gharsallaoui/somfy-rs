@@ -1082,9 +1082,11 @@ dependencies = [
  "esp-rtos",
  "esp-storage",
  "heapless 0.8.0",
+ "minimq",
  "somfy-cc1101",
  "somfy-config",
  "somfy-domain",
+ "somfy-mqtt",
  "somfy-rmt",
  "somfy-rts",
  "somfy-store",
@@ -1353,6 +1355,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "minimq"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "798e1cbc0a5b94acd5024a1f845d4802002ae5c616711d72209d91af6b2b3380"
+dependencies = [
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+ "heapless 0.9.3",
+ "num_enum",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "nb"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1394,6 +1410,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1728,6 +1765,7 @@ version = "0.1.0"
 dependencies = [
  "crc",
  "heapless 0.8.0",
+ "somfy-mqtt",
 ]
 
 [[package]]
@@ -1736,6 +1774,14 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
  "somfy-rts",
+]
+
+[[package]]
+name = "somfy-mqtt"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "somfy-domain",
 ]
 
 [[package]]

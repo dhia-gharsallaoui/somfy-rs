@@ -186,7 +186,11 @@ impl StateRoot {
 ///
 /// The comparison is at `/` boundaries, so `home` and `homeassistant` are
 /// unrelated namespaces rather than an overlap.
-pub(crate) fn namespaces_overlap(prefix: &DiscoveryPrefix, root: &StateRoot) -> bool {
+///
+/// Public so that the layer which *stores* a configuration can refuse a bad
+/// pair at the moment it is entered rather than at the boot three flashes
+/// later. It is safe to expose for the reason above: it returns a `bool`.
+pub fn namespaces_overlap(prefix: &DiscoveryPrefix, root: &StateRoot) -> bool {
     nests(&prefix.0, &root.0)
 }
 

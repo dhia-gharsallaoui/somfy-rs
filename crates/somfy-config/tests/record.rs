@@ -9,16 +9,34 @@
 //! Cases needing a re-checksummed record — a version bump, a tampered length —
 //! live in `src/record.rs` instead, where the checksum function is reachable.
 
-use somfy_config::{ConfigRecord, RecordError, WifiCredentials, CONFIG_RECORD_LEN};
+use core::net::Ipv4Addr;
+
+use somfy_config::{
+    ConfigRecord, MqttSettings, RecordError, WifiCredentials, CONFIG_RECORD_LEN,
+    DEFAULT_DISCOVERY_PREFIX, DEFAULT_STATE_ROOT,
+};
 
 fn credentials() -> WifiCredentials {
     WifiCredentials::new("example-network", "PLACEHOLDER_PASSPHRASE").expect("valid")
+}
+
+fn mqtt() -> MqttSettings {
+    MqttSettings::new(
+        Ipv4Addr::new(192, 0, 2, 10),
+        1883,
+        "somfy",
+        "PLACEHOLDER_BROKER_PASSWORD",
+        DEFAULT_DISCOVERY_PREFIX,
+        DEFAULT_STATE_ROOT,
+    )
+    .expect("valid")
 }
 
 fn record() -> ConfigRecord {
     ConfigRecord {
         seq: 7,
         wifi: Some(credentials()),
+        mqtt: Some(mqtt()),
     }
 }
 
@@ -33,8 +51,27 @@ fn a_record_round_trips_through_its_bytes() {
 /// last one that had some.
 #[test]
 fn a_record_can_say_that_no_network_is_configured() {
-    let cleared = ConfigRecord { seq: 8, wifi: None };
+    let cleared = ConfigRecord {
+        seq: 8,
+        wifi: None,
+        mqtt: None,
+    };
     assert_eq!(ConfigRecord::decode(&cleared.encode()), Ok(cleared));
+}
+
+/// And the two halves are independent: a device with a network and no broker is
+/// the ordinary state of a board provisioned before a broker existed, and it
+/// must round-trip rather than being repaired into one or the other.
+#[test]
+fn either_half_of_the_record_can_be_absent_on_its_own() {
+    for (wifi, mqtt) in [
+        (Some(credentials()), None),
+        (None, Some(mqtt())),
+        (Some(credentials()), Some(mqtt())),
+    ] {
+        let record = ConfigRecord { seq: 9, wifi, mqtt };
+        assert_eq!(ConfigRecord::decode(&record.encode()), Ok(record));
+    }
 }
 
 /// An erased slot is the ordinary state of every slot the ring has not reached.

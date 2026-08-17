@@ -36,7 +36,10 @@
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_bootloader_esp_idf::partitions::{self, PartitionType};
 use esp_storage::{FlashStorage, FlashStorageError};
-use somfy_config::{ConfigRecord, RecordError, WifiCredentials, CONFIG_RECORD_LEN};
+use heapless::Vec;
+use somfy_config::{
+    ConfigRecord, MqttSettings, Namespaces, RecordError, WifiCredentials, CONFIG_RECORD_LEN,
+};
 use somfy_store::{newest_slot, SectorRing, SlotWrite};
 
 /// Partition holding the config ring. Defined by `partitions.csv` in this
@@ -56,6 +59,28 @@ const MAX_SLOTS: usize = 64;
 
 /// Bytes of partition table read at mount. See [`crate::store`].
 const PARTITION_TABLE_BYTES: usize = 1024;
+
+/// Distinct namespace pairs kept from a scan of the ring.
+///
+/// R5 requires the retained configs published under an *old* `state_root` or
+/// `discovery_prefix` to be cleared before the new ones go out, and the only
+/// record of the old values is the older records still readable in the ring.
+/// **This is the scan's capacity, not the number of stale pairs it yields.**
+/// The scan collects every distinct pair it finds, the one in use included, and
+/// `load` removes that one afterwards — so three slots deliver at most *two*
+/// stale pairs. Two is one more than the case that actually happens, a board
+/// re-provisioned once.
+///
+/// Bounded because each surviving pair becomes a whole `MqttConfig` in the
+/// broker task's statically allocated future, which comes out of the same DRAM
+/// the main stack is carved from.
+///
+/// Two further limits are stated rather than solved. Which pairs win is slot
+/// order, not age order, because the ring wraps — so a device re-provisioned
+/// onto more namespace pairs than this holds may keep the wrong ones.
+/// `superseded_truncated` reports when that happened, and the real fix is to
+/// enumerate the broker's retained store rather than to read the ring.
+pub const MAX_SUPERSEDED: usize = 3;
 
 // The same three relationships `crate::store` asserts, restated for this
 // record length. A divergence would neither fail to build nor fail to link; it
@@ -110,8 +135,9 @@ impl From<FlashStorageError> for ConfigError {
     }
 }
 
-/// What a scan of the config ring found. A diagnostic, not a contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What a scan of the config ring found. A diagnostic, not a contract — except
+/// for `superseded`, which the MQTT session acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigSurvey {
     /// Slots in the ring.
     pub slots: usize,
@@ -123,6 +149,17 @@ pub struct ConfigSurvey {
     pub damaged: usize,
     /// Sequence number of the newest valid record, if there is one.
     pub newest_seq: Option<u32>,
+    /// Namespace pairs seen in the ring that the newest record does not use,
+    /// and which the ring therefore may still be advertising on a broker.
+    ///
+    /// Not `Copy`, which is why [`ConfigSurvey`] is not either. It earns the
+    /// cost: without it a re-provisioned device leaves its old discovery
+    /// configs on the broker forever, which is exactly the orphan R5 forbids.
+    pub superseded: Vec<Namespaces, MAX_SUPERSEDED>,
+    /// True if the ring held more distinct namespace pairs than
+    /// [`MAX_SUPERSEDED`], so some old configs will not be cleared. Reported
+    /// rather than hidden: the alternative is a silently incomplete cleanup.
+    pub superseded_truncated: bool,
 }
 
 /// One slot's bytes, aligned so `esp-storage` reads and writes them directly
@@ -197,27 +234,44 @@ impl<'d> ConfigStore<'d> {
     /// is non-zero: see this module's docs for why the two stores answer
     /// damage differently. The count is returned so the caller can say so.
     pub fn load(&mut self) -> Result<(Option<ConfigRecord>, ConfigSurvey), ConfigError> {
-        let scan = self.scan()?;
+        let mut scan = self.scan()?;
+        let current = scan
+            .newest
+            .as_ref()
+            .and_then(|(_, record)| record.mqtt.as_ref())
+            .map(MqttSettings::namespaces);
+        // The pair in use is not superseded by itself. Everything left is a
+        // namespace this device has published under and is not publishing
+        // under now — see [`MAX_SUPERSEDED`].
+        scan.namespaces
+            .retain(|found| Some(found) != current.as_ref());
         let survey = ConfigSurvey {
             slots: scan.valid + scan.blank + scan.damaged,
             valid: scan.valid,
             blank: scan.blank,
             damaged: scan.damaged,
             newest_seq: scan.newest.as_ref().map(|(_, record)| record.seq),
+            superseded: scan.namespaces,
+            superseded_truncated: scan.namespaces_truncated,
         };
         Ok((scan.newest.map(|(_, record)| record), survey))
     }
 
-    /// Append a record carrying `wifi`, and prove the bytes landed.
+    /// Append a record carrying `wifi` and `mqtt`, and prove the bytes landed.
     ///
-    /// `None` clears the credentials, which is a value the region can hold and
-    /// not the same fact as a blank region — see [`somfy_config::ConfigRecord`].
+    /// `None` in either position clears that half, which is a value the region
+    /// can hold and not the same fact as a blank region — see
+    /// [`somfy_config::ConfigRecord`].
     #[allow(
         dead_code,
         reason = "the controller only reads this region; `config-check` includes \
                   this file by path and is the binary that writes it"
     )]
-    pub fn store(&mut self, wifi: Option<WifiCredentials>) -> Result<(), ConfigError> {
+    pub fn store(
+        &mut self,
+        wifi: Option<WifiCredentials>,
+        mqtt: Option<MqttSettings>,
+    ) -> Result<(), ConfigError> {
         let scan = self.scan()?;
 
         // A write may not proceed on a ring that holds readable records but
@@ -260,7 +314,11 @@ impl<'d> ConfigStore<'d> {
             .write_slot(aim.slot, &scan.free[..slot_count])
             .ok_or(ConfigError::SlotOutOfRange { slot: aim.slot })?;
 
-        let record = ConfigRecord { seq: aim.seq, wifi };
+        let record = ConfigRecord {
+            seq: aim.seq,
+            wifi,
+            mqtt,
+        };
         self.append(slot, &record)
     }
 
@@ -271,12 +329,23 @@ impl<'d> ConfigStore<'d> {
         let mut sequences = [None; MAX_SLOTS];
         let mut free = [false; MAX_SLOTS];
         let (mut valid, mut blank, mut damaged) = (0, 0, 0);
+        let mut namespaces: Vec<Namespaces, MAX_SUPERSEDED> = Vec::new();
+        let mut namespaces_truncated = false;
 
         for slot in 0..slot_count {
             match self.read_slot(slot)? {
                 Ok(record) => {
                     sequences[slot] = Some(record.seq);
                     valid += 1;
+                    // Collected here, while the record is decoded and in hand,
+                    // rather than by a second pass. Which of these is *stale*
+                    // is not knowable until every slot has been read, so the
+                    // filtering happens in `load`.
+                    if let Some(found) = record.mqtt.as_ref().map(MqttSettings::namespaces) {
+                        if !namespaces.contains(&found) && namespaces.push(found).is_err() {
+                            namespaces_truncated = true;
+                        }
+                    }
                 }
                 // Only an erased slot can take a write without an erase first.
                 // A damaged one is emphatically not free.
@@ -310,6 +379,8 @@ impl<'d> ConfigStore<'d> {
             valid,
             blank,
             damaged,
+            namespaces,
+            namespaces_truncated,
         })
     }
 
@@ -377,4 +448,9 @@ struct Scan {
     blank: usize,
     /// Slots holding something that is neither.
     damaged: usize,
+    /// Every distinct namespace pair any readable record names, the newest
+    /// included. `load` removes the one in use; what is left is stale.
+    namespaces: Vec<Namespaces, MAX_SUPERSEDED>,
+    /// True if a distinct pair had to be dropped for lack of room above.
+    namespaces_truncated: bool,
 }

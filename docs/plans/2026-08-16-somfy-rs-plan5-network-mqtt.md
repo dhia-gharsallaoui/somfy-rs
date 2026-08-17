@@ -195,6 +195,80 @@ Then implement R5 and R6, which are where the sharp edges are:
 - Commands are **never retained**, QoS 0 or 1. A retained command replays on
   every reconnect — a shade that closes itself whenever the broker restarts.
 
+### Task 3 outcome — four things that constrain Tasks 4 and 5
+
+**Done, host-tested; nothing yet run against a real broker.** The lifecycle is
+a value (`somfy_mqtt::Step`) and the firmware executes it, so every rule above
+is asserted in `crates/somfy-mqtt/tests/lifecycle.rs` without a socket. The
+four facts that change what comes next:
+
+1. **The ESP32-S2 no longer builds the broker session, and that is measured.**
+   Its `dram_seg` is 184 KB; the session's task future is 14,824 bytes and the
+   boot check needs 8,192 of stack, against the 16,324 that Task 2 left. With
+   MQTT compiled in the image **does not link** — the statics overrun the
+   segment by 5,260 bytes before any stack is carved. `chip-s2` therefore
+   builds without it and says so at boot. Shrinking the heap to fit would put
+   it below Task 2's measured 46,660-byte high-water mark, i.e. trade a link
+   error for a heap-exhaustion panic. The one untried option is reclaiming the
+   ESP32-S2's 136 KB `dram2_seg` via esp-hal's `.dram2_uninit` — unsafe and
+   unvalidated. **This is a product decision worth confirming.**
+2. **The heap mark has still not been read under real MQTT traffic.** Task 2
+   asked Task 3 to do it; Task 3 had no hardware. The obligation moves to
+   Task 5, and `heap::report` prints the figure whenever the network comes up.
+3. **There is still nothing to announce.** The persisted configuration gained
+   MQTT settings and *not* a shade registry, so the inventory the session
+   announces from is empty on every boot: availability is published, no
+   discovery config is. **Task 4's entity set has no subject until a shade can
+   be provisioned**, which is Plan 6's configuration store — or a deliberate
+   stopgap in Task 4.
+4. **The config record is version 2 and 512 bytes.** It had to grow for the
+   broker settings and the two namespaces, so a board provisioned under Task 2
+   must be re-provisioned; a version 1 record fails its checksum at the new
+   length and is reported as a damaged slot. The ring also now hands back the
+   **superseded** namespace pairs it finds, which is what makes R5's
+   "delete the old configs before publishing the new ones" operative on the
+   device rather than only in the tests.
+
+**Two gaps remain open, and both need a decision rather than more code:**
+
+- **Clearing the broker retires nothing.** R5 asks that "disabling discovery"
+  clear every entity it owns. Clearing the broker is not that act — it removes
+  the only route to the retained topics, and this configuration model has no
+  separate discovery switch to attach the obligation to. The device names the
+  orphaned namespaces at boot with the two `mosquitto` commands that clear them
+  by hand, which turns a silent orphan into a stated one. Closing it properly
+  needs the *previous broker's* endpoint kept alongside its namespaces, and a
+  one-shot retire-then-stop session against a broker the operator has just
+  removed — surprising enough to be worth agreeing before building.
+- **A shade deleted between boots cannot be tombstoned.** `Inventory` is a
+  snapshot of the shades that *exist*; nothing records which were *announced*,
+  so the next boot has no way to learn of one that has gone.
+  `MqttConfig::retire_shade` exists and is host-tested, and has no caller. This
+  is a record-format decision and it belongs with whatever first persists a
+  shade — Task 4's stopgap or Plan 6.
+
+Two things found while implementing, reported as spec gaps rather than fixed
+quietly:
+
+- **R5's letter is narrower than the failure it describes.** It says removal
+  means clearing "its config topic"; the evidence behind it is 49 retained
+  topics deleted by hand, most of them *state* topics. Retirement here clears
+  every retained topic a shade owns, not just its config.
+- **R6's subscribe half needs `RetainHandling::Never`**, not merely
+  `retain = false` on publish. A retained message left on a command topic by
+  anything else is replayed to every new subscriber, and suppressing that is a
+  per-subscription option the publisher cannot supply.
+
+And one thing review caught that neither the spec nor the plan anticipated, and
+that no host test could: **an announcement is a burst, and `minimq` holds only
+eight unacknowledged operations.** Publishing never reads, and only reading
+frees a slot, so a plan longer than eight operations fails partway and repeats
+identically on every reconnect — at two shades, or one shade plus one
+superseded namespace. `mqtt::settle` is the answer and `docs/provenance.md`
+carries the arithmetic. Worth naming here because it is a property of the
+*client*, so Task 4's larger entity set makes it worse, not better: every
+entity added to `SHADE_COMPONENTS` adds an operation per shade.
+
 ## Task 4 — The full entity set
 
 R7, and the difference between "MQTT works" and "MQTT is enough". The C++ path

@@ -15,3 +15,9 @@ heapless = "0.8"
 # pins the variant here too, because picking the wrong one out of the
 # catalogue is a mistake the dependency cannot prevent.
 crc = "3"
+# The MQTT topic rules, so a stored `discovery_prefix` or `state_root` is
+# checked by the same validators that will build topics from it. Restating them
+# here is how the two would drift, and a namespace that the record accepts and
+# the topic builder refuses is a device that boots without MQTT and says so
+# three flashes after the value was typed.
+somfy-mqtt = { path = "../somfy-mqtt" }

@@ -98,10 +98,25 @@
 /// The mark above was taken with association **failing**, so it covers driver
 /// init, the task stacks and scan traffic, and not the dynamic RX/TX buffers a
 /// working link fills. [`report`] prints the mark again every time the network
-/// comes up for exactly that reason. **Plan 5 Task 3 must read it under real
-/// MQTT traffic and revisit this number**; if it turns out the working set
-/// exceeds what the ESP32-S2 can give, the honest outcome is to say the
-/// ESP32-S2 is a compile target rather than to quietly under-size every chip.
+/// comes up for exactly that reason, and **it has still not been read under
+/// real MQTT traffic** — Task 3 was written and gated without hardware, so that
+/// obligation carries forward to the integration in Task 5.
+///
+/// ### The ESP32-S2 answered the other half of that question
+///
+/// The note this replaces asked what to do if the working set did not fit the
+/// ESP32-S2. It does not, and the shortfall is not in the heap: it is in what
+/// is left of `dram_seg` after it. The broker session's task future is 14,824
+/// bytes, the boot check needs 8,192 of stack, and at 56 KB the ESP32-S2 has
+/// 16,324 bytes of DRAM after the statics — so the image does not link, by
+/// 5,260 bytes, before any stack is carved at all.
+///
+/// The answer taken is the one this note asked for: **say so.** `chip-s2`
+/// builds without the broker session and prints that at boot; every other chip
+/// is unaffected and the heap stays one constant. Shrinking it to fit would put
+/// the figure below the 46,660-byte mark above, which trades a link error for a
+/// heap-exhaustion panic under exactly the traffic that has not been measured.
+/// `crates/firmware/Cargo.toml`'s `mqtt` feature carries the arithmetic.
 #[allow(
     dead_code,
     reason = "not used by `tx-check`, which includes this file by path and \

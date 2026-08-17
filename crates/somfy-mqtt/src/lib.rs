@@ -98,27 +98,39 @@
 //! # Ok::<(), somfy_mqtt::ConfigError>(())
 //! ```
 //!
+//! ## The lifecycle is here too, and it is also data
+//!
+//! Which message goes to which topic with which retention is pure, so R5 and
+//! R6 live in [`lifecycle`](self#reexports) rather than with the transport: a
+//! [`Step`] is a value, and `tests/lifecycle.rs` asserts the rules without a
+//! broker. Two of them are carried by the types rather than by a note:
+//!
+//! - [`Publish`] holds its [`Retention`] privately and has no constructor that
+//!   takes one, so "was this meant to be retained?" is not a question anyone
+//!   answers at a call site.
+//! - A topic whose [`TopicRole`] is [`TopicRole::Subscribed`] cannot become a
+//!   [`PublishedTopic`], and [`MqttConfig::state`] — the one retained per-shade
+//!   publish — takes nothing else. A retained command replays on every
+//!   reconnect, which is a shade that closes itself each time the broker
+//!   restarts.
+//!
+//! Deleting a shade clears every retained topic it owns with a zero-length
+//! retained publish; [`MqttConfig::retire_shade`] is that plan, and it is
+//! derived from the same [`SHADE_COMPONENTS`] the announcement is, so an entity
+//! cannot be announced without also being removable. Renaming a shade needs no
+//! plan at all: neither [`ObjectId`] nor [`UniqueId`] follows the name, so a
+//! rename is a payload change and the topic stays where it was.
+//!
 //! ## What is deliberately not here
 //!
-//! - **Any network code.** A broker connection, retention flags and the
-//!   lifecycle rules that go with them belong with the transport.
+//! - **Any network code.** A socket, a client, a reconnect schedule and a
+//!   buffer belong with the transport; what is here is the decision it
+//!   executes.
 //! - **The state and command vocabularies.** [`CoverDiscovery::render`] emits
 //!   the topics and lets Home Assistant's defaults stand, because fixing a
 //!   vocabulary before anything publishes it would be guessing.
 //! - **Components other than `cover`.** [`Component`] carries the full set the
 //!   firmware will emit, but only the cover payload is built so far.
-//!
-//! Two obligations follow for whoever adds the transport, and neither is
-//! visible from the types:
-//!
-//! - Topics whose [`TopicRole`] is [`TopicRole::Subscribed`] must never be
-//!   published retained. A retained command replays on every reconnect, which
-//!   is a shade that closes itself each time the broker restarts.
-//! - Deleting a shade means clearing the retained config at its discovery
-//!   topic with a zero-length retained publish, or the entity outlives the
-//!   shade with no way to remove it but by hand. Renaming one does *not*:
-//!   neither [`ObjectId`] nor [`UniqueId`] follows the name, so a rename is a
-//!   payload change and the topic stays where it was.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -126,6 +138,7 @@ mod config;
 mod entity;
 mod error;
 mod ident;
+mod lifecycle;
 mod topic;
 mod validate;
 
@@ -138,6 +151,11 @@ pub use ident::{
     DeviceId, NodeId, ObjectId, UniqueId, MAX_COMPONENT_HEADROOM, MAX_DEVICE_ID_LEN,
     MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
 };
+pub use lifecycle::{
+    reconfigure, Listen, Payload, Publish, PublishedTopic, Retention, Step, SubscribedTopic,
+    OFFLINE, ONLINE, SHADE_COMPONENTS,
+};
 pub use topic::{
-    DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN, MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
+    namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,
+    MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
 };
