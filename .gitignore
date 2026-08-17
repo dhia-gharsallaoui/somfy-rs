@@ -12,3 +12,9 @@ crates/somfy-migrate/tests/fixtures/*.backup
 
 # Agent worktrees created by EnterWorktree/isolation, never part of the project.
 .claude/
+
+# Web UI (Plan 7). The lockfile IS tracked; installed packages and build output
+# are not. `dist/` is produced by `bun run build` and consumed by the xtask that
+# embeds it in the firmware image, so it is a build artefact like /target.
+/ui/node_modules
+/ui/dist
