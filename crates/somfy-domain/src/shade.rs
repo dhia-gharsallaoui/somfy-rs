@@ -14,10 +14,12 @@
 //!    mid-travel, and any non-basic command sent to a 56-bit motor gets
 //!    downgraded to `My` on the wire. See the `stop_is_never_emitted_only_my`
 //!    test.
-//! 2. Rolling codes stay OUT of the domain. [`PlannedTx`] carries only address
-//!    + command; the radio/persistence layer owns `somfy_rts::RollingCode`.
+//! 2. Rolling codes stay OUT of the domain. [`PlannedTx`] carries an address, a
+//!    command and a repeat *policy*; the radio/persistence layer owns
+//!    `somfy_rts::RollingCode` and the repeat count a policy resolves against.
 
 use crate::motion::{Motion, MotionSnapshot};
+use crate::pairing::PAIR_REPEATS;
 use crate::{Direction, Pos, ShadeConfig};
 use heapless::Vec;
 use somfy_rts::Command;
@@ -34,14 +36,60 @@ const FULL_RAW: u32 = 10_000;
 /// plan; this is the shipped default, unchanged.
 const STEP_TRAVEL_MS: u32 = 100;
 
+/// How hard one planned frame is to be transmitted.
+///
+/// A bare count would be the wrong shape here, because the domain does not know
+/// what an ordinary press is worth: how many repeat frames follow the first is a
+/// per-controller radio setting (`somfy_tasks::TxProfile`), and a number chosen
+/// here would silently override it. What the domain *does* know is the policy —
+/// whether this particular frame may take whatever is configured, must not fall
+/// below a floor, or must be a specific count whatever is configured.
+///
+/// All three exist because all three are needed, and two of them for opposite
+/// reasons:
+///
+/// - An **arrival stop** is the single frame that ends a mid-range seek. Lose it
+///   and the motor runs to its limit, because nothing else will ever tell it to
+///   stop. It wants a floor — more than an ordinary command, and more still if
+///   the controller is configured generously.
+///   (`docs/specs/2026-08-15-position-accuracy-requirements.md` R1.)
+/// - A **pairing frame**'s repeat count is part of what it means: a short burst
+///   pairs a remote and a long one removes it. It wants an exact count, immune
+///   to a generous configuration, or a controller tuned for a weak RF path would
+///   unpair the shade it was asked to pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repeats {
+    /// Whatever the controller is configured to send for an ordinary command.
+    Profile,
+    /// At least this many, and more if the controller sends more. For a frame
+    /// that must not be lost.
+    AtLeast(u8),
+    /// Exactly this many, whatever the controller is configured to send. For a
+    /// frame whose repeat count carries meaning of its own.
+    Exactly(u8),
+}
+
+impl Repeats {
+    /// Resolve the policy against the controller's configured repeat count.
+    pub fn resolve(self, profile: u8) -> u8 {
+        match self {
+            Repeats::Profile => profile,
+            Repeats::AtLeast(floor) => floor.max(profile),
+            Repeats::Exactly(count) => count,
+        }
+    }
+}
+
 /// One radio transmission the firmware's radio task must perform.
 ///
 /// Rolling-code state is owned by the radio/persistence layer
-/// (`somfy_rts::RollingCode`) — never by the domain.
+/// (`somfy_rts::RollingCode`) — never by the domain. So is the repeat count the
+/// [`Repeats`] policy resolves against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedTx {
     pub address: u32,
     pub command: Command,
+    pub repeats: Repeats,
 }
 
 /// A high-level shade command from the API / UI / automation layer.
@@ -54,6 +102,15 @@ pub enum ShadeCommand {
     StepDown,
     GoTo(Pos),
     SetMy(Option<Pos>),
+    /// Teach a motor this shade's remote address, so it accepts commands from
+    /// this controller.
+    ///
+    /// The only command here that is not about position, and the only one whose
+    /// effect the position model must ignore entirely — see [`Shade::handle`]'s
+    /// arm for it. It is also the only one that depends on the motor already
+    /// having been put into programming mode by a person standing at the shade;
+    /// `docs/hardware-checklist.md` carries that sequence.
+    Pair,
 }
 
 /// A single shade: its config, a dead-reckoned lift [`Motion`], and the stored
@@ -161,6 +218,35 @@ impl Shade {
             // prog-button pairing flow that sets a favorite on real hardware
             // is a pairing-assistant concern (Plan 5+).
             ShadeCommand::SetMy(p) => self.my_pos = p,
+            // Pairing is NOT motion, and the three lines it does not have are
+            // the point: no `set_target`, no `halt`, no `stop_on_arrival`.
+            // A `Prog` frame tells a motor in programming mode to remember this
+            // address; the motor jogs to acknowledge and goes nowhere. Treating
+            // that jog as travel would leave the estimate reporting a position
+            // the shade never reached, and — worse — would arm an arrival stop
+            // that fires a `My` at a shade in programming mode.
+            //
+            // `stop_on_arrival` IS cleared, and that line is the load-bearing
+            // one. A mid-range seek arms a `My` that [`Shade::tick`] transmits
+            // when the estimate says the target is reached — on a clock this
+            // command has no say over, so without the clear it fires seconds
+            // later, inside the programming window a person has just opened at
+            // the shade. **In programming mode `My` is not a stop**: it is how
+            // a favourite position is stored, so that frame would silently
+            // rewrite a setting inside the motor.
+            //
+            // Dropping the stop leaves the shade running to its physical limit,
+            // which any later command undoes. The trade is one-sided, and it is
+            // the same one [`Shade::step`] and [`Shade::apply_overheard`]
+            // already make when something else takes over the motor.
+            //
+            // The repeat count is pinned rather than configured: see
+            // [`PAIR_REPEATS`](crate::PAIR_REPEATS) for what a longer burst
+            // does.
+            ShadeCommand::Pair => {
+                self.stop_on_arrival = false;
+                self.push_with(out, Command::Prog, Repeats::Exactly(PAIR_REPEATS));
+            }
         }
     }
 
@@ -241,6 +327,18 @@ impl Shade {
             // `UpDown`/`Prog`, sun/wind sensors, ...) do not move the lift
             // estimate in v1.0 — they are telemetry-only from the position
             // model's point of view and never retarget the motor.
+            //
+            // **This arm is not inert, and for `Prog` that is the point.** The
+            // `stop_on_arrival = false` above runs before the match, so an
+            // overheard `Prog` drops any pending arrival stop — and it must.
+            // Step one of the pairing procedure is a PROG press on a linked
+            // wall remote, which arrives here; leaving the stop armed would
+            // transmit a `My` into the programming window that press just
+            // opened, and in programming mode `My` stores a favourite rather
+            // than stopping anything. What it costs is the estimate: the seek
+            // is abandoned without the motor being told, so the position is
+            // wrong until the next move reaches a limit. That is the cheaper
+            // half of the trade, and the same one the arms above make.
             _ => {}
         }
     }
@@ -356,15 +454,28 @@ impl Shade {
         true
     }
 
+    /// Queue one ordinary frame, at whatever redundancy the controller is
+    /// configured for.
+    ///
+    /// Everything the shade plans except pairing goes through here. A frame that
+    /// needs a redundancy of its own calls [`Shade::push_with`] instead and says
+    /// why at the call site — including, when R1 lands, the arrival stop in
+    /// [`Shade::tick`], which is the one frame whose loss cannot be recovered
+    /// from.
+    fn push(&self, out: &mut Vec<PlannedTx, 4>, command: Command) {
+        self.push_with(out, command, Repeats::Profile)
+    }
+
     /// Queue one frame. Capacity 4 is generous: a single `handle`/`tick` call
     /// plans at most 2 frames (a sync-crossed arrival stop plus the command's
     /// own frame). Overflow would mean the caller is not draining `out`
     /// between calls; the frame is dropped rather than panicking on-device,
     /// but debug builds assert.
-    fn push(&self, out: &mut Vec<PlannedTx, 4>, command: Command) {
+    fn push_with(&self, out: &mut Vec<PlannedTx, 4>, command: Command, repeats: Repeats) {
         let pushed = out.push(PlannedTx {
             address: self.config.address,
             command,
+            repeats,
         });
         debug_assert!(pushed.is_ok(), "PlannedTx buffer overflow: out not drained");
     }

@@ -101,10 +101,11 @@ use crate::tasks::{CommandSender, DeltaSubscriber};
 ///
 /// `minimq` advertises this as MQTT 5's `MaximumPacketSize` in CONNECT, so it
 /// is not merely local storage — it is the ceiling the broker is told to obey,
-/// and inbound is bounded by construction rather than by hope. Everything this
-/// device subscribes to is a cover command: `OPEN`, `CLOSE`, `STOP`, or a
-/// number. 512 bytes is two orders of magnitude beyond that and still small
-/// enough to leave the ESP32 — the tightest chip in the matrix — its stack.
+/// and inbound is bounded by construction rather than by hope. Every payload
+/// this device subscribes to is a single word or a number: `OPEN`, `CLOSE`,
+/// `STOP`, `PRESS`, or a position. 512 bytes is two orders of magnitude beyond
+/// that and still small enough to leave the ESP32 — the tightest chip in the
+/// matrix — its stack.
 const MQTT_RX_BYTES: usize = 512;
 
 /// Outbound MQTT arena: the largest packet plus whatever QoS 1 state is in
@@ -877,7 +878,7 @@ impl Broker {
         // configuration once per superseded one, which is a broker's worth of
         // retained publishes repeated for no change.
         // Every step through `perform`, which settles. See it for why that is
-        // not optional: an announcement now costs `1 + 3N + k` operations for
+        // not optional: an announcement now costs `1 + 5N + k` operations for
         // `N` shades and `k` device entities, and `minimq` holds eight.
         {
             let mut wire = Wire {
@@ -965,14 +966,16 @@ impl Broker {
 /// operation with `InflightExhausted`, and then does the same on every
 /// reconnect, at the backoff ceiling, forever.
 ///
-/// An announcement costs `1 + 3N + k` operations for `N` shades and the `k = 5`
-/// entries of `DeviceEntity::ALL` — `online`, then per shade one discovery
-/// config and two subscriptions, then one discovery config per device entity.
-/// The firmware follows it with `N` names, `2N` state publishes and `k`
-/// readings, so a fresh session costs `1 + 6N + 2k` in all. **That is eleven
-/// with no shades provisioned at all** — the ordinary state of a freshly
-/// flashed board — where in Task 3 the same burst was `1 + 6N` and needed two
-/// shades to exceed eight. The plan alone crosses eight at one shade.
+/// An announcement costs `1 + 5N + k` operations for `N` shades and the `k = 5`
+/// entries of `DeviceEntity::ALL` — `online`, then per shade a discovery config
+/// for each entry of `somfy_mqtt::SHADE_COMPONENTS` (a cover and a pairing
+/// button) and one subscription per command topic (direction, target, pair),
+/// then one discovery config per device entity. The firmware follows it with
+/// `N` names, `2N` state publishes and `k` readings, so a fresh session costs
+/// `1 + 8N + 2k` in all. **That is eleven with no shades provisioned at all** —
+/// the ordinary state of a freshly flashed board — where in Task 3 the same
+/// burst was `1 + 6N` and needed two shades to exceed eight. The plan alone
+/// crosses eight at one shade.
 /// `somfy-mqtt/tests/lifecycle.rs::walking_a_plan_without_settling_runs_out_of_slots_partway`
 /// is that failure, executed on the host against a model of the client, and
 /// `an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots`
@@ -1114,30 +1117,21 @@ async fn execute<'buf, IO: minimq::Io>(
                     );
                     return Ok(());
                 };
-                match component {
-                    Component::Cover => {
-                        if config
-                            .cover_discovery(shade, name, HAS_TILT)
-                            .render(payload)
-                            .is_err()
-                        {
-                            // `render` leaves the buffer empty rather than
-                            // half-written, so nothing partial can be sent —
-                            // and a partial config is truncated JSON, which
-                            // Home Assistant discards without saying so.
-                            esp_println::println!(
-                                "mqtt: the discovery config for shade {} does not fit \
-                                 its buffer — the entity will not appear",
-                                shade.0,
-                            );
-                            return Ok(());
-                        }
-                    }
-                    // A shade owns exactly one entity — `SHADE_COMPONENTS` is
-                    // `[Cover]` — so this is unreachable, and it is reported
-                    // loudly rather than skipped in silence: an entity the plan
-                    // announces and nothing publishes is exactly the
-                    // half-configured state this integration exists to prevent.
+                // `render` leaves the buffer empty rather than half-written on
+                // failure, so nothing partial can be sent — and a partial config
+                // is truncated JSON, which Home Assistant discards without
+                // saying so.
+                let rendered = match component {
+                    Component::Cover => config
+                        .cover_discovery(shade, name, HAS_TILT)
+                        .render(payload),
+                    Component::Button => config.button_discovery(shade, name).render(payload),
+                    // A shade owns an entity of each member of
+                    // `SHADE_COMPONENTS`, and every member has an arm above, so
+                    // this is unreachable. It is reported loudly rather than
+                    // skipped in silence: an entity the plan announces and
+                    // nothing publishes is exactly the half-configured state
+                    // this integration exists to prevent.
                     other => {
                         esp_println::println!(
                             "mqtt: no payload renderer for a '{}' entity — \
@@ -1147,6 +1141,15 @@ async fn execute<'buf, IO: minimq::Io>(
                         );
                         return Ok(());
                     }
+                };
+                if rendered.is_err() {
+                    esp_println::println!(
+                        "mqtt: the '{}' discovery config for shade {} does not fit \
+                         its buffer — the entity will not appear",
+                        component.as_str(),
+                        shade.0,
+                    );
+                    return Ok(());
                 }
                 publish_bytes(
                     connection,
@@ -1314,6 +1317,13 @@ fn will_payload(publish: &somfy_mqtt::Publish<'static>) -> &'static [u8] {
     }
 }
 
+/// What Home Assistant publishes when a `button` entity is pressed.
+///
+/// Home Assistant's documented default for `payload_press`, matched rather than
+/// declared — `somfy_mqtt::ButtonDiscovery` carries the argument for why the
+/// literal lives on this side only.
+const PAYLOAD_PRESS: &str = "PRESS";
+
 /// Turn an inbound message into a command, or `None` if it is not one.
 ///
 /// The topic is matched against what this device actually subscribed to rather
@@ -1329,7 +1339,8 @@ fn decode_command(
     // Over the shades this device actually announced, not over every `u8`. Two
     // reasons: it is exactly the set that was subscribed to, so a command
     // addressed to a shade that does not exist is refused here rather than one
-    // layer down; and it is at most 32 topic constructions instead of 512.
+    // layer down; and it builds topics per provisioned shade rather than per
+    // possible shade id, which is an eighth of the work (32 against 256).
     for shade in inventory.ids().iter().copied() {
         if topic == config.shade_topic(shade, ShadeTopic::Command).as_str() {
             // Home Assistant's own cover defaults, which the discovery payload
@@ -1351,6 +1362,25 @@ fn decode_command(
             return Some(ControlCommand::Shade {
                 id: shade,
                 command: ShadeCommand::GoTo(Pos::from_percent(percent)),
+            });
+        }
+        if topic == config.shade_topic(shade, ShadeTopic::Pair).as_str() {
+            // Home Assistant's own default `payload_press`, which the discovery
+            // payload deliberately does not override — see `ButtonDiscovery`.
+            //
+            // **Matched exactly, and anything else ignored.** This is the one
+            // subscribed topic whose command puts `Prog` on the air. The burst
+            // length is pinned to a pairing tap, so this path cannot *unpair* a
+            // motor — but it can pair one that happens to be in programming
+            // mode, and a lenient parse here ("any non-empty payload means
+            // press") would let a stray retained message or a mistyped
+            // `mosquitto_pub` do exactly that, at whichever motor is listening.
+            if text != PAYLOAD_PRESS {
+                return None;
+            }
+            return Some(ControlCommand::Shade {
+                id: shade,
+                command: ShadeCommand::Pair,
             });
         }
     }

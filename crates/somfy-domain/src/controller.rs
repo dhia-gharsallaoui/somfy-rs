@@ -179,6 +179,17 @@ impl Controller {
     /// if the group slot is empty or out of range; an existing but empty group
     /// is `Ok(())` with no work.
     ///
+    /// [`ShadeCommand::Pair`] is refused with [`DomainError::NotAGroupCommand`],
+    /// **before anything is planned**. It is the one command here that is not a
+    /// movement: it teaches a motor a remote address, works only while a person
+    /// standing at that motor has just put it into programming mode, and has no
+    /// inverse a later command can apply. Fanned across a group it is a `Prog`
+    /// burst at every shade in the house with nobody at any of them.
+    ///
+    /// Refused structurally rather than left to whichever caller happens to
+    /// build a [`ShadeCommand`] today — the same standard
+    /// [`Repeats::Exactly`](crate::Repeats::Exactly) holds the burst length to.
+    ///
     /// `tx` is sized to [`TX_CAPACITY`] = 32 members x 2 frames per
     /// [`Shade::handle`](crate::Shade::handle) = 64, the structural worst case of
     /// a full group commanded at once — overflow is impossible, no frame is ever
@@ -191,6 +202,12 @@ impl Controller {
         tx: &mut Vec<PlannedTx, TX_CAPACITY>,
         deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
     ) -> Result<(), DomainError> {
+        // Checked before the group is even looked up, so a group that does not
+        // exist and a command that may not fan out cannot be confused for one
+        // another — and so no partial fan-out is possible.
+        if matches!(cmd, ShadeCommand::Pair) {
+            return Err(DomainError::NotAGroupCommand);
+        }
         if !self.registry.group_exists(g) {
             return Err(DomainError::NotFound);
         }

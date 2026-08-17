@@ -141,6 +141,17 @@ pub enum DomainError {
     /// by removing a shade, and an id of 200 in a 32-slot registry cannot be
     /// fixed by anything except correcting the id.
     IdOutOfRange,
+    /// A command that only means something for one shade at a time was aimed
+    /// at a group.
+    ///
+    /// Raised only by
+    /// [`Controller::command_group`](crate::Controller::command_group), and
+    /// only for [`ShadeCommand::Pair`](crate::ShadeCommand::Pair). Pairing
+    /// depends on a person standing at *one* motor having just put it into
+    /// programming mode; fanned across a group it becomes a `Prog` burst at
+    /// every shade in the house with nobody at any of them. Every other command
+    /// here is a movement somebody can watch and undo.
+    NotAGroupCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

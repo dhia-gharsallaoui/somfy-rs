@@ -328,7 +328,16 @@ impl StateMachine {
                 address: frame.address,
                 command: frame.command,
                 bits: self.profile.bits,
-                repeats: self.profile.repeats,
+                // **The profile is a default, not an override.** The domain
+                // plans a `Repeats` policy rather than a count, because two
+                // kinds of frame cannot take whatever this controller happens
+                // to be configured for: a frame that must not be lost needs a
+                // floor above it, and a pairing frame needs an exact count,
+                // since the length of a `Prog` burst is what distinguishes
+                // pairing a remote from removing one. Resolving here is where
+                // the domain's policy and the radio's configuration meet, and
+                // it is the only place either is read.
+                repeats: frame.repeats.resolve(self.profile.repeats),
             };
             match transmit(store, queue, plan) {
                 Ok(_) => outcome.sent += 1,

@@ -94,7 +94,7 @@ use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
 use shades::ShadeStore;
 use somfy_config::{MqttSettings, Namespaces, StoredShade, WifiCredentials};
-use somfy_domain::{Registry, MAX_SHADES};
+use somfy_domain::{Registry, RemoteIdentity, MAX_SHADES};
 use somfy_rts::RollingCode;
 use somfy_store::{seed_if_absent, RegionState, Seeded};
 use store::{FlashStore, StoreError};
@@ -501,6 +501,22 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         esp_println::println!("controller: {} shades provisioned", inventory.len());
     }
 
+    // This controller's own virtual-remote identity, printed so an operator can
+    // check the provisioning tool against the board rather than against a
+    // derivation done twice. It is a *diagnostic*: nothing here allocates from
+    // it, because the shade table is read-only to this firmware — the addresses
+    // in it were chosen when the table was built.
+    //
+    // What it does NOT prove is that two boards differ. The derivation folds 24
+    // bits of MAC into 20, so two arbitrary boards share a base about one time
+    // in a million — a coincidence, not the OUI defect, and the remedy is a
+    // hand-picked address for one of them rather than a bug report. See
+    // `somfy_domain::RemoteIdentity::from_mac`.
+    esp_println::println!(
+        "pairing: this controller's remote addresses start at {:#08X}",
+        RemoteIdentity::from_mac(base_mac()).base(),
+    );
+
     // Both tokens first, then both spawns. `#[task]` hands back a token or a
     // `SpawnError` and `Spawner::spawn` is infallible once it has one, so
     // spawning as each token is obtained would leave a half-started
@@ -746,6 +762,22 @@ fn report_shades(flash: FlashStorage<'_>) -> Shades {
 /// the record's own decode has already refused both — so reaching either here
 /// means the two disagree, which is worth a line rather than a silent gap in
 /// the ids.
+/// The factory MAC as an array.
+///
+/// `esp-hal` wraps a `[u8; 6]` but hands it back as a `&[u8]`, and this
+/// firmware must not panic in `main` — a boot loop over a diagnostic line is
+/// worse than the diagnostic is worth. So the copy is a `zip` rather than a
+/// `copy_from_slice`, which panics on a length this can never actually be
+/// given.
+fn base_mac() -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    let source = esp_hal::efuse::base_mac_address();
+    for (slot, byte) in mac.iter_mut().zip(source.as_bytes()) {
+        *slot = *byte;
+    }
+    mac
+}
+
 fn provision_shades(
     registry: &mut Registry,
     store: &mut FlashStore<'_>,

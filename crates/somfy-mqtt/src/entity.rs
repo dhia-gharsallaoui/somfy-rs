@@ -335,6 +335,15 @@ pub enum ShadeTopic {
     Command,
     /// A target position to seek.
     SetPosition,
+    /// A request to teach this shade's motor this controller's remote address.
+    ///
+    /// Carried by no key in the **cover** payload — the cover has no such
+    /// control — and named directly by [`ButtonDiscovery`], which is the entity
+    /// that owns it. A second topic claiming `command_topic` would write that
+    /// key twice into one cover payload, so [`ShadeTopic::payload_key`] returns
+    /// `None` here and `tests/pair_button.rs` pins that no two topics claim one
+    /// key.
+    Pair,
     /// Current tilt, where the shade has a tilt axis.
     TiltStatus,
     /// Tilt commands, where the shade has a tilt axis.
@@ -344,12 +353,13 @@ pub enum ShadeTopic {
 impl ShadeTopic {
     /// Every topic, in publish order. Tilt topics are last so that the set for
     /// a non-tilt shade is a prefix of the set for a tilt-capable one.
-    pub const ALL: [ShadeTopic; 7] = [
+    pub const ALL: [ShadeTopic; 8] = [
         ShadeTopic::Position,
         ShadeTopic::State,
         ShadeTopic::Name,
         ShadeTopic::Command,
         ShadeTopic::SetPosition,
+        ShadeTopic::Pair,
         ShadeTopic::TiltStatus,
         ShadeTopic::TiltCommand,
     ];
@@ -371,6 +381,7 @@ impl ShadeTopic {
             ShadeTopic::Name => &["name"],
             ShadeTopic::Command => &["direction", "set"],
             ShadeTopic::SetPosition => &["target", "set"],
+            ShadeTopic::Pair => &["pair", "set"],
             ShadeTopic::TiltStatus => &["tilt"],
             ShadeTopic::TiltCommand => &["tilt", "set"],
         }
@@ -383,9 +394,10 @@ impl ShadeTopic {
             | ShadeTopic::State
             | ShadeTopic::Name
             | ShadeTopic::TiltStatus => TopicRole::Published,
-            ShadeTopic::Command | ShadeTopic::SetPosition | ShadeTopic::TiltCommand => {
-                TopicRole::Subscribed
-            }
+            ShadeTopic::Command
+            | ShadeTopic::SetPosition
+            | ShadeTopic::Pair
+            | ShadeTopic::TiltCommand => TopicRole::Subscribed,
         }
     }
 
@@ -397,6 +409,10 @@ impl ShadeTopic {
             ShadeTopic::Name => None,
             ShadeTopic::Command => Some("command_topic"),
             ShadeTopic::SetPosition => Some("set_position_topic"),
+            // See the variant's docs: the button names this topic itself, and a
+            // second `command_topic` here would be written twice into one cover
+            // payload.
+            ShadeTopic::Pair => None,
             ShadeTopic::TiltStatus => Some("tilt_status_topic"),
             ShadeTopic::TiltCommand => Some("tilt_command_topic"),
         }
@@ -554,6 +570,112 @@ impl CoverDiscovery<'_> {
             }
             write(out, "\"")?;
         }
+
+        write(out, "}")
+    }
+}
+
+/// What a pairing button is called, after the shade's own name.
+///
+/// A suffix rather than a bare "Pair", because Home Assistant shows the entity
+/// name beside the device name and not beside the cover's: thirty-two shades
+/// would otherwise present thirty-two identical buttons, and the cost of
+/// pressing the wrong one is a `Prog` frame at a motor nobody meant to program.
+const PAIR_NAME_SUFFIX: &str = " pairing";
+
+/// A `button` discovery config for one shade's pairing action, as data.
+///
+/// # Why a button and not something with state
+///
+/// Because there is no state. RTS is one-way: the controller transmits `Prog`
+/// and never learns whether the motor took it. The confirmation is the motor
+/// jogging, seen by the person who put it into programming mode — so an entity
+/// offering a state would be offering one it would have to invent.
+///
+/// # Why it carries no vocabulary
+///
+/// Home Assistant's default `payload_press` stands, exactly as
+/// [`CoverDiscovery`] lets its own defaults stand. The firmware matches that
+/// default; stating it here as well would put the same literal in two places
+/// with nothing comparing them, and the failure mode of a mismatch is silent
+/// either way — a button that appears, presses, and transmits nothing. Which,
+/// for a control that puts `Prog` on the air, is the safe direction to fail in.
+#[derive(Debug, Clone)]
+pub struct ButtonDiscovery<'a> {
+    /// The payload's `~`: this shade's state base, absolute and with no leading
+    /// slash.
+    pub base: Topic,
+    /// Absolute, and under the state root. See [`CoverDiscovery::availability`]
+    /// for why it can never be under the discovery prefix.
+    pub availability: Topic,
+    /// The discovery topic's last segment before `config`.
+    pub object_id: ObjectId,
+    /// The identity Home Assistant remembers this entity by.
+    pub unique_id: UniqueId,
+    /// The shade's name. A "pairing" suffix is appended when the payload is
+    /// rendered, so the field holds what the user actually typed.
+    pub name: &'a str,
+    /// The stable device identifier, for the payload's `device` block.
+    pub device_id: &'a str,
+}
+
+impl ButtonDiscovery<'_> {
+    /// Render the JSON Home Assistant reads.
+    ///
+    /// On failure `out` is left empty, for the same reason
+    /// [`CoverDiscovery::render`] leaves it empty.
+    pub fn render(&self, out: &mut String<PAYLOAD_CAPACITY>) -> Result<(), PayloadError> {
+        out.clear();
+        match self.write_into(out) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                out.clear();
+                Err(e)
+            }
+        }
+    }
+
+    fn write_into(&self, out: &mut String<PAYLOAD_CAPACITY>) -> Result<(), PayloadError> {
+        if self.name.len() > MAX_NAME_LEN {
+            return Err(PayloadError::TooLong);
+        }
+        write(out, "{")?;
+
+        write(out, "\"~\":")?;
+        write_json_string(out, self.base.as_str())?;
+
+        write(out, ",\"availability_topic\":")?;
+        write_json_string(out, self.availability.as_str())?;
+
+        write_object_id(out, self.device_id, &self.object_id)?;
+
+        write(out, ",\"unique_id\":")?;
+        write_json_string(out, self.unique_id.as_str())?;
+
+        // Built from two pieces, so both go through the escaper — the shade's
+        // name is arbitrary user text and the suffix is a literal, and treating
+        // only one of them is how a payload stops parsing the first time a name
+        // contains a quote.
+        write(out, ",\"name\":\"")?;
+        write_json_escaped(out, self.name)?;
+        write_json_escaped(out, PAIR_NAME_SUFFIX)?;
+        write(out, "\"")?;
+
+        // Not decoration: without it this lands on the shade's room card beside
+        // its open/close, where a mis-tap transmits `Prog` at a real motor.
+        // `config` files it with the device's settings instead.
+        write(out, ",\"entity_category\":\"config\"")?;
+
+        write_device_block(out, self.device_id)?;
+
+        // Relative to `~`, from the same table the firmware's subscription is
+        // built from — see [`ShadeTopic::Pair`].
+        write(out, ",\"command_topic\":\"~")?;
+        for segment in ShadeTopic::Pair.segments() {
+            write(out, "/")?;
+            write(out, segment)?;
+        }
+        write(out, "\"")?;
 
         write(out, "}")
     }
@@ -827,6 +949,16 @@ const WORST_COVER_PAYLOAD_LEN: usize = WORST_COMMON_LEN
     // ,"<key>":"~<relative>" for every topic, keys bounded by the longest.
     + ShadeTopic::ALL.len() * (6 + 18 + 1 + ShadeTopic::MAX_RELATIVE_LEN);
 
+/// The `button` payload budget, proven the same way.
+const WORST_BUTTON_PAYLOAD_LEN: usize = WORST_COMMON_LEN
+    // "name":"<name><suffix>", with every byte of the name escaped to six. The
+    // suffix is a literal in printable ASCII, so the escaper cannot expand it.
+    + 8 + MAX_NAME_LEN * 6 + PAIR_NAME_SUFFIX.len() + 2
+    // "entity_category":"config",
+    + 28
+    // ,"command_topic":"~<relative>"
+    + 18 + 1 + ShadeTopic::MAX_RELATIVE_LEN + 1;
+
 /// The diagnostic payload budget, proven the same way.
 ///
 /// The three optional attributes are counted as present at their widest even
@@ -845,6 +977,10 @@ const WORST_DIAGNOSTIC_PAYLOAD_LEN: usize = WORST_COMMON_LEN
 const _: () = assert!(
     PAYLOAD_CAPACITY >= WORST_COVER_PAYLOAD_LEN,
     "PAYLOAD_CAPACITY is too small for the longest cover payload this crate can build",
+);
+const _: () = assert!(
+    PAYLOAD_CAPACITY >= WORST_BUTTON_PAYLOAD_LEN,
+    "PAYLOAD_CAPACITY is too small for the longest button payload this crate can build",
 );
 const _: () = assert!(
     PAYLOAD_CAPACITY >= WORST_DIAGNOSTIC_PAYLOAD_LEN,

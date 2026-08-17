@@ -395,6 +395,7 @@ fn shade_topics_are_exact() {
                 ShadeTopic::SetPosition,
                 "somfyrs/shades/3/target/set".to_owned()
             ),
+            (ShadeTopic::Pair, "somfyrs/shades/3/pair/set".to_owned()),
             (ShadeTopic::TiltStatus, "somfyrs/shades/3/tilt".to_owned()),
             (
                 ShadeTopic::TiltCommand,

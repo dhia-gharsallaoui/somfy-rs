@@ -24,6 +24,15 @@ use somfy_domain::{Pos, ShadeCommand};
 /// No tilt actions exist in this generation — tilt modes are config-carriage
 /// only (see [`somfy_domain::ShadeConfig::tilt_mode`]), so the API MUST NOT
 /// surface a tilt command until the domain ports tilt behavior.
+///
+/// [`ShadeCommand::Pair`] is absent **deliberately**, and this is the note that
+/// says so rather than leaving it looking forgotten. Pairing transmits a frame
+/// that teaches a motor a new remote, and it only works while somebody standing
+/// at the shade has just put the motor into programming mode — so it is a step
+/// in a procedure with a human in it, not an action a REST client should be able
+/// to fire at an unattended shade. The controller exposes it as a Home Assistant
+/// `button` per shade instead (`somfy-mqtt`), which is reached from the same
+/// room the motor is in. `docs/hardware-checklist.md` carries the sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 // The wire form is a flat, internally-tagged object (`{"action":"up"}`,

@@ -50,10 +50,11 @@
 //! ## Why a crate of its own
 //!
 //! `somfy-domain` states in its own module docs that it "owns no clock, no
-//! channels, and no rolling codes", and its `PlannedTx` carries only an address
-//! and a command for exactly that reason. A store trait and a transmit queue
-//! are both of the things the domain says it does not hold, so they live here
-//! instead of eroding that boundary.
+//! channels, no rolling codes, and no repeat counts", and its `PlannedTx`
+//! carries an address, a command and a repeat *policy* for exactly that reason —
+//! the count that policy resolves against belongs to whatever owns the radio. A
+//! store trait and a transmit queue are both of the things the domain says it
+//! does not hold, so they live here instead of eroding that boundary.
 //!
 //! `crates/firmware` was never an option: `esp-hal`'s build script rejects a
 //! host target, so nothing in that crate can be tested on the host — and the

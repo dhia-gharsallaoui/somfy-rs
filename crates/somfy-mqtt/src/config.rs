@@ -18,7 +18,9 @@
 //! validated where it is built, but two individually valid roots can still name
 //! the same namespace — see [`crate::ConfigError::Overlap`].
 
-use crate::entity::{Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, ShadeTopic};
+use crate::entity::{
+    ButtonDiscovery, Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, ShadeTopic,
+};
 use crate::error::{ConfigError, Field};
 use crate::ident::{
     DeviceId, NodeId, ObjectId, UniqueId, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS,
@@ -240,6 +242,25 @@ impl MqttConfig {
             name,
             device_id: self.device_id.as_str(),
             has_tilt,
+        }
+    }
+
+    /// The `button` discovery config for one shade's pairing action.
+    ///
+    /// Takes no `has_tilt`: pairing is not a tilt feature, and the topic it
+    /// names exists on every shade.
+    pub fn button_discovery<'a>(&'a self, shade: ShadeId, name: &'a str) -> ButtonDiscovery<'a> {
+        ButtonDiscovery {
+            base: self.shade_base(shade),
+            availability: self.availability_topic(),
+            // The same object id the cover uses. They do not collide: the
+            // component is a separate segment of the discovery topic, and the
+            // payload key is device-scoped and lands in a different Home
+            // Assistant domain (`button.` rather than `cover.`).
+            object_id: ObjectId::for_shade(shade),
+            unique_id: UniqueId::for_shade(&self.device_id, Component::Button, shade),
+            name,
+            device_id: self.device_id.as_str(),
         }
     }
 

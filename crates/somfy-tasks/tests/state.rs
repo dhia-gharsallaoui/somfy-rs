@@ -8,7 +8,7 @@
 use core::cell::RefCell;
 use somfy_domain::{
     Direction, DomainError, GroupId, Pos, ShadeCommand, ShadeConfig, ShadeId, StateDelta,
-    DELTA_CAPACITY,
+    DELTA_CAPACITY, PAIR_REPEATS,
 };
 use somfy_rts::{Command, Frame};
 use somfy_store::{FrameBits, TransmitError};
@@ -610,4 +610,145 @@ fn a_store_failure_does_not_stop_the_dispatch() {
     assert_eq!(dispatch.sent, 1);
     assert_eq!(queue.sent.len(), 1);
     assert_eq!(queue.sent[0].frame.address, B);
+}
+
+// ---------------------------------------------------------------------------
+// Repeat policy: where the domain's `Repeats` meets the controller's profile
+// ---------------------------------------------------------------------------
+
+/// One shade at address `A`, on a controller configured to repeat generously —
+/// the setting an operator reaches for on a weak RF path.
+fn one_shade_repeating(repeats: u8) -> (StateMachine, ShadeId) {
+    let mut state = StateMachine::new(TxProfile {
+        bits: FrameBits::Bits56,
+        repeats,
+    });
+    let id = state
+        .registry_mut()
+        .add_shade(ShadeConfig::new("A", A).unwrap())
+        .unwrap();
+    (state, id)
+}
+
+/// An ordinary command takes the controller's configured repeat count. The
+/// domain plans a policy, not a number, so this is where the number comes from.
+#[test]
+fn an_ordinary_command_takes_the_configured_repeat_count() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, id) = one_shade_repeating(5);
+
+    state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::Down,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(queue.sent.len(), 1);
+    assert_eq!(queue.sent[0].repeats, 5);
+}
+
+/// A pairing burst does **not**. The repeat count of a `Prog` frame is how long
+/// the PROG button was held, and a long hold removes the remote from the motor
+/// instead of adding it — so a controller configured to transmit generously
+/// would unpair every shade it was asked to pair.
+#[test]
+fn a_pairing_burst_ignores_a_generous_profile() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, id) = one_shade_repeating(9);
+
+    state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::Pair,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(queue.sent.len(), 1);
+    assert_eq!(queue.sent[0].frame.command, Command::Prog);
+    assert_eq!(queue.sent[0].repeats, PAIR_REPEATS);
+}
+
+/// A pairing frame still commits its rolling code before it reaches the queue,
+/// like every other transmission: a motor being paired stores the code it is
+/// taught, so a `Prog` sent from an uncommitted counter would leave the store
+/// behind the motor from the very first frame.
+#[test]
+fn a_pairing_frame_commits_before_it_enqueues() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, id) = one_shade();
+
+    state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::Pair,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        log.into_inner(),
+        std::vec![
+            Event::Load { address: A },
+            Event::Commit {
+                address: A,
+                code: 43
+            },
+            Event::Enqueue {
+                address: A,
+                code: 42
+            },
+        ]
+    );
+}
+
+/// The pairing frame is one the radio can actually put on the air.
+///
+/// `somfy_rts::encode56` refuses the extended commands, and the radio loop
+/// checks that *before* it keys anything — so a command it refuses produces a
+/// `RadioEvent::Unencodable` and no carrier at all. For a pairing button that
+/// is the "appears to work, does nothing" failure with a motor at the far end
+/// of it, and nothing else in the path would notice.
+#[test]
+fn a_pairing_frame_encodes_into_a_frame_the_radio_can_send() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, id) = one_shade();
+
+    state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::Pair,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    let request = &queue.sent[0];
+    assert_eq!(request.bits, FrameBits::Bits56);
+    let bytes = somfy_rts::encode56(&request.frame).expect("Prog fits a 56-bit frame");
+    let decoded = somfy_rts::decode56(&bytes).expect("and decodes back");
+    assert_eq!(decoded.command, Command::Prog);
+    assert_eq!(decoded.address, A);
+    assert_eq!(decoded.rolling_code, 42);
 }

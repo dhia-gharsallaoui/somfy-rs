@@ -35,11 +35,22 @@
 //!   toggles simulate-vs-passthrough — is a Plan 4 decision item (see
 //!   [`Shade::handle`]'s `My` arm).
 //!
+//! ## Pairing
+//!
+//! [`RemoteIdentity`] gives this controller a virtual-remote identity of its
+//! own, derived from the device-unique half of its MAC, and allocates a
+//! per-shade address from it; [`ShadeCommand::Pair`] is what teaches a motor
+//! one. Both live in `pairing.rs`, whose docs carry the argument for why a
+//! controller sharing another controller's identity is a controller that will
+//! stop working.
+//!
 //! ## Ownership boundaries
 //!
-//! This crate owns no clock, no channels, and no rolling codes: callers inject
-//! `now_ms` and drain the output buffers; rolling-code state stays in the
-//! radio/persistence layer (`somfy_rts::RollingCode`).
+//! This crate owns no clock, no channels, no rolling codes, and no repeat
+//! counts: callers inject `now_ms` and drain the output buffers; rolling-code
+//! state stays in the radio/persistence layer (`somfy_rts::RollingCode`), and a
+//! [`PlannedTx`] carries a [`Repeats`] *policy* that the radio layer resolves
+//! against its own configured count.
 //!
 //! The TX buffer contract is **per-call**: caller buffers are sized to
 //! [`TX_CAPACITY`] (the structural worst case of one call — a full group
@@ -51,6 +62,7 @@
 
 mod controller;
 mod motion;
+mod pairing;
 mod registry;
 mod shade;
 mod tilt;
@@ -58,7 +70,8 @@ mod types;
 
 pub use controller::{Controller, StateDelta, DELTA_CAPACITY, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
 pub use motion::{Motion, MotionSnapshot};
+pub use pairing::{RemoteIdentity, PAIR_REPEATS};
 pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MAX_SHADES};
-pub use shade::{PlannedTx, Shade, ShadeCommand};
+pub use shade::{PlannedTx, Repeats, Shade, ShadeCommand};
 pub use tilt::tilt_first;
 pub use types::{Direction, DomainError, Pos, ShadeConfig, ShadeKind, TiltMode};

@@ -161,8 +161,8 @@ mod validate;
 
 pub use config::MqttConfig;
 pub use entity::{
-    Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, PayloadError, ShadeTopic,
-    TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
+    ButtonDiscovery, Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, PayloadError,
+    ShadeTopic, TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
 };
 pub use error::{ConfigError, Field};
 pub use ident::{

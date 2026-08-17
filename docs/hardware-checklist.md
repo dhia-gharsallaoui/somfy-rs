@@ -5,7 +5,7 @@ Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
 
-Five independent procedures, because they need different equipment and carry
+Six independent procedures, because they need different equipment and carry
 different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
@@ -17,8 +17,13 @@ different risk:
 - **[Wi-Fi provisioning](#wi-fi-provisioning)** — needs the board and the
   network's passphrase; touches only flash and puts nothing on the 433 MHz
   band.
+- **[Shade provisioning](#shade-provisioning)** — touches only flash, and is
+  where each shade's radio address is chosen.
+- **[Pairing a shade](#pairing-a-shade)** — needs you standing at the motor,
+  and **transmits at a real motor**. It is the only procedure here that can
+  change what a motor in somebody's house responds to.
 - **[Controller](#controller)** — the real firmware: receives, tracks, and
-  transmits nothing on its own.
+  transmits when commanded.
 
 Which binary is which matters here, because they differ in whether they key a
 transmitter:
@@ -28,7 +33,7 @@ transmitter:
 | `tx-check` | **yes**, at a synthetic address | proving the transmit path |
 | `store-check` | no — flash only | proving the rolling-code store |
 | `config-check` | no — flash only | proving the Wi-Fi config region |
-| `firmware` | no, until commanded — and there is still no command source | the controller itself |
+| `firmware` | no, until commanded — and a connected broker is a command source | the controller itself |
 
 ## Transmit path
 
@@ -623,8 +628,12 @@ entities, and the old ones left behind as retained orphans nothing will clear.
 
 ```bash
 cargo run -p somfy-config --example provision_shades -- shades.bin
+# controller MAC, to allocate radio addresses from — ...: <typed, or return>
+#   addresses will be allocated from 0x8XXXXX — check that against the board's
+#   boot line before flashing. Two boards printing the same value is a bug.
+#
 # [0] name (empty to finish): <typed>
-#   radio address (decimal, or 0x-prefixed hex): <typed>
+#   radio address [0x8XXXXX, this controller's own]: <return>
 #   kind [roller] (roller, blind, drapery-left, awning, shutter, ...): <return>
 #   tilt mode [none] (none, tilt-motor, integrated, tilt-only, euro): <return>
 #   full travel up time in ms [10000]: <return>
@@ -633,6 +642,37 @@ cargo run -p somfy-config --example provision_shades -- shades.bin
 #   next rolling code to send — ...: <typed>
 # [1] name (empty to finish): <return to finish>
 ```
+
+### The address decides whose remote this controller is
+
+A Somfy motor learns **remotes**, not controllers: every frame carries a 24-bit
+remote address, and the motor stores the last rolling code it accepted *per
+address*. So two controllers transmitting at one address is not a cosmetic
+clash. Each keeps its own counter, neither knows what the other has sent, and
+the first to fall behind starts sending codes the motor has already accepted and
+rejects as replays. That motor stops answering it, and stays that way until
+somebody re-synchronises at the shade.
+
+That is exactly what an imported table produces if it is flashed and left: the
+addresses in it belong to **the controller it was exported from**, and if that
+controller is still powered, both are now one remote with two counters.
+
+So the first prompt asks for this board's MAC and allocates each shade an
+address derived from the *device-unique* half of it — a space no other
+controller's scheme can reach. Pressing return at the address prompt takes it.
+Three things follow:
+
+- **Check the allocated base against the board's own boot line**
+  (`pairing: this controller's remote addresses start at ...`). The tool and the
+  firmware derive it the same way from the same MAC, so they must agree, and two
+  different boards printing the same value would be a bug worth reporting.
+- **An address already in the table is stepped over**, so a table part imported
+  and part allocated cannot collide with itself.
+- **A newly allocated address means the motor does not know it yet.** Every
+  shade given one has to be paired — [Pairing a shade](#pairing-a-shade) — and
+  until it is, that shade will not move. Leaving the imported address instead
+  keeps the shade working *and* keeps the two-controllers-one-identity problem;
+  there is no third option that does neither.
 
 It validates before writing — a sentinel address (0 or 0xFFFFFF), a name over
 32 bytes, a travel time of zero, a repeated address — so a typo is refused here
@@ -747,6 +787,115 @@ walking its rolling code backwards, and every shade on it will stop responding.
 | Slots | 4, in 2 erase sectors of 2 |
 | Capacity | 32 shades, which is the registry's own limit |
 | Written by | the host tool only — the firmware has no write path for this region |
+
+---
+
+## Pairing a shade
+
+Teaching a motor that this controller's remote address is one to obey. **This is
+the only procedure here that transmits at a real motor and changes what it
+responds to.** Read the whole section before starting one.
+
+### What can go wrong, in one paragraph
+
+The frame this sends is `Prog`, and `Prog` is the same frame a physical remote's
+PROG button sends. On a remote, a **tap** adds a remote to the motor and a
+**hold** removes one — and a controller has no button, so the *length of the
+burst* is what stands in for how long the button was held. somfy-rs pins the
+pairing burst to a tap (`somfy_domain::PAIR_REPEATS`) and offers no unpairing
+command at all, so the dangerous case is not reachable from the button. What
+*is* reachable: pairing the wrong shade, because you pressed the wrong button
+while a motor was in programming mode. The motor a `Prog` frame reaches is
+whichever one is listening, not whichever one the entity is named after.
+
+### Before you start
+
+- [ ] The shade has an address this controller allocated — see
+      [The address decides whose remote this controller is](#the-address-decides-whose-remote-this-controller-is).
+      Pairing a motor to an address another controller also transmits at fixes
+      nothing; it re-creates the problem with an extra step.
+- [ ] The board is on the broker and the shade's entities are in Home
+      Assistant: a cover, and a `<name> pairing` button filed under the device's
+      configuration entities rather than on the room card.
+- [ ] You have a working remote for this shade — a physical wall remote, or
+      another controller that still drives it. **Something has to put the motor
+      into programming mode, and this controller cannot: a motor that has never
+      heard of it ignores everything it sends, including a `Prog`.**
+- [ ] You can see the shade from where you will press the button. The only
+      confirmation this procedure has is the motor jogging; RTS is one-way and
+      the controller never learns whether the motor accepted anything.
+- [ ] **Ideally the shade is stationary.** A mid-range seek ends with the
+      controller transmitting a `My` when its estimate says the target is
+      reached, and in programming mode `My` does not stop anything — it *stores
+      a favourite position* inside the motor. The controller handles this:
+      pairing, and any overheard PROG press from a linked remote, drops the
+      pending stop so it is never transmitted. The cost is that the shade
+      carries on to its physical limit and the position estimate is wrong until
+      the next move reaches a limit, which any Open or Close corrects. Pairing a
+      stationary shade avoids paying that at all.
+
+### The sequence
+
+1. **At the shade**, press and hold the PROG button on the existing remote for
+   about two seconds, until the motor **jogs** (a short up-down movement). It is
+   now in programming mode, for roughly two minutes.
+   - A multi-channel remote must be on this shade's channel first.
+   - On most remotes PROG is a recessed button on the back, needing a pen.
+2. **Within that window**, press the shade's `… pairing` button in Home
+   Assistant.
+3. **The motor jogs again.** That is the acknowledgement, and it is the whole
+   of it — nothing appears in Home Assistant, because there is nothing for the
+   controller to report.
+4. Programming mode ends on its own. Wait it out, or press PROG on the existing
+   remote again.
+5. **Test it**: open and close the shade from Home Assistant's cover entity.
+
+### If it does not jog
+
+In this order, because the cheap checks come first:
+
+- **The window expired.** Two minutes is generous but not unlimited, and a slow
+  MQTT reconnect eats it. Put the motor back into programming mode and press
+  again.
+- **Nothing was transmitted.** The serial monitor prints a line per burst:
+
+  ```
+  radio: sent 3 frame(s), rolling_code=...
+  ```
+
+  Three is the pairing burst — one frame plus `PAIR_REPEATS`. **No line at all**
+  means the command never reached the state task: check the broker, and check
+  that the button published `PRESS` (this firmware matches that exactly and
+  ignores anything else, deliberately — a lenient parse would let a stray
+  retained message transmit `Prog` at a motor). **A count other than three**
+  means something resolved the repeat policy wrongly, and that is worth stopping
+  for rather than pressing again: a long `Prog` burst removes a remote.
+- **The frame was transmitted and not heard.** Range or antenna — the
+  [Transmit path](#transmit-path) procedure is what separates those — or the
+  motor was never actually in programming mode, which on a multi-channel remote
+  usually means the PROG press was made on a different channel.
+- **The shade has no stored rolling code** — the serial line says
+  `will refuse to transmit`. Re-provision the shade region; nothing goes on the
+  air without a committed code.
+
+### If the shade stops responding afterwards
+
+The motor accepted the pairing and something else is wrong — almost always the
+rolling code. A motor rejects any code at or below the last it accepted, so a
+seed that was too low leaves a paired motor that ignores everything. Re-provision
+that shade with a higher seed code, **after** erasing its stored code, or pair it
+again: pairing teaches the motor whatever the transmitter is sending.
+
+### What this does not do
+
+- **It does not remove anything.** A motor holds several remotes at once, so
+  pairing this controller leaves every existing wall remote working. That is the
+  intended end state, not a compromise: `somfy-domain` tracks overheard frames
+  from linked remotes precisely so a wall remote and this controller can drive
+  one shade without the position estimate drifting.
+- **It does not unpair.** There is no command for it here. Removing a remote
+  from a motor is a hold on that motor's own PROG button, done at the shade, and
+  the reason it is absent is that the cost of getting it wrong is paid there too.
 
 ---
 

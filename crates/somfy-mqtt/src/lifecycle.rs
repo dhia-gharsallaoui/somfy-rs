@@ -75,13 +75,21 @@ pub const OFFLINE: &[u8] = b"offline";
 
 /// The components one shade owns an entity of.
 ///
-/// Read by both halves of the lifecycle — see this module's docs. Only `Cover`,
-/// and that is the honest answer rather than a placeholder: a shade reports a
-/// position and a direction, and `somfy-domain` reports nothing else about one.
+/// Read by both halves of the lifecycle — see this module's docs. Adding a
+/// component here adds it to the announcement and to the retirement together.
+///
+/// - `Cover` is what the shade *is*: a position and a direction, which is
+///   everything `somfy-domain` reports about one.
+/// - `Button` is the pairing action. It is per-shade rather than device-level
+///   because pairing is per-motor: a `Prog` frame carries one shade's address
+///   and teaches one motor. The rule that governs [`DeviceEntity`] — an entity
+///   backed by nothing is worse than an absent one — is satisfied here in the
+///   only way a stateless action can satisfy it: the button does something real
+///   every time it is pressed, and reports nothing because there is nothing
+///   to report (RTS is one-way).
+///
 /// R7's fuller entity set is device-level, and [`DeviceEntity`] carries it.
-/// Adding a component here adds it to the announcement and to the retirement
-/// together.
-pub const SHADE_COMPONENTS: [Component; 1] = [Component::Cover];
+pub const SHADE_COMPONENTS: [Component; 2] = [Component::Cover, Component::Button];
 
 /// Whether the broker keeps a message after it has delivered it.
 ///

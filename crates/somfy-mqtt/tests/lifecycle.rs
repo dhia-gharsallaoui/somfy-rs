@@ -536,27 +536,35 @@ fn operations<'a>(steps: impl Iterator<Item = Step<'a>>) -> usize {
 
 /// **The case that would have failed**, and the arithmetic behind it, pinned.
 ///
-/// An announcement costs `1 + 3N + k` operations for `N` shades and the `k`
-/// device entities — `online`, then per shade one discovery config and two
-/// command subscriptions, then one discovery config per device entity. **A
-/// single provisioned shade already puts it past the client's eight slots**, so
-/// this is not a limit reached by an unusual estate; it is reached by the
-/// smallest configuration that does anything at all.
+/// An announcement costs `1 + pN + k` operations for `N` shades and the `k`
+/// device entities — `online`, then per shade one discovery config for each
+/// member of `SHADE_COMPONENTS` and one subscription per command topic, then one
+/// discovery config per device entity. **A single provisioned shade already puts
+/// it past the client's eight slots**, so this is not a limit reached by an
+/// unusual estate; it is reached by the smallest configuration that does
+/// anything at all.
 ///
-/// The figures are pinned rather than merely bounded because the bound is what
-/// the settle discipline exists for: if a change ever brought an announcement
-/// back under eight, the discipline would stop being load-bearing and every
-/// test that depends on it would keep passing while proving nothing.
+/// `p` is derived from the two tables rather than written out, for the reason
+/// the whole crate derives both halves of everything from one source: a per-
+/// shade cost restated here is one that has to be edited by hand every time an
+/// entity is added, and an assertion that fails for a *correct* change teaches
+/// people to change the number rather than to read it.
+///
+/// What is genuinely pinned is the consequence: if a change ever brought an
+/// announcement back under eight operations, the settle discipline would stop
+/// being load-bearing and every test that depends on it would keep passing while
+/// proving nothing.
 #[test]
 fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     let config = default_config();
     let k = DeviceEntity::ALL.len();
+    let per_shade = SHADE_COMPONENTS.len() + SubscribedTopic::for_shade(false).count();
     for shades in 0u8..=3 {
         let ids: Vec<ShadeId> = (1..=shades).map(ShadeId).collect();
         assert_eq!(
             operations(config.announce(&ids, false)),
-            1 + 3 * usize::from(shades) + k,
-            "the announcement's cost is 1 + 3N + k; N={shades}",
+            1 + per_shade * usize::from(shades) + k,
+            "the announcement's cost is 1 + {per_shade}N + k; N={shades}",
         );
     }
 
@@ -570,7 +578,7 @@ fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     // With no shades the plan alone fits — and the *session* still does not.
     // The firmware follows the plan with one reading per device entity, so the
     // burst on a freshly flashed board with a broker and nothing provisioned is
-    // `1 + 3N + k` plus `k` readings: eleven operations, and no shade in sight.
+    // `1 + pN + k` plus `k` readings: eleven operations, and no shade in sight.
     let bare = operations(config.announce(&[], false));
     assert_eq!(bare, 1 + k);
     assert!(

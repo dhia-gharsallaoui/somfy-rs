@@ -73,7 +73,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use somfy_config::{ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY};
-use somfy_domain::{ShadeConfig, ShadeKind, TiltMode};
+use somfy_domain::{RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
 
 /// Factory-default travel times, the same ones `ShadeConfig::new` applies.
@@ -380,13 +380,15 @@ fn from_prompts() -> Result<ShadeRecord, Box<dyn std::error::Error>> {
          out of its exported backup, rolling codes included.\n"
     );
 
+    let identity = read_identity()?;
+
     while record.shades.len() < SHADE_TABLE_CAPACITY {
         let index = record.shades.len();
         let name = read_line(&format!("[{index}] name (empty to finish): "))?;
         if name.is_empty() {
             break;
         }
-        let shade = read_shade(&name, &record)?;
+        let shade = read_shade(&name, &record, identity, index)?;
         // Infallible: the loop condition is the capacity.
         record.shades.push(shade).map_err(|_| "the table is full")?;
     }
@@ -394,6 +396,75 @@ fn from_prompts() -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         eprintln!("that is the {SHADE_TABLE_CAPACITY}-shade limit the registry holds");
     }
     Ok(record)
+}
+
+/// The controller's own virtual-remote identity, so each shade can be offered
+/// an address nobody else allocates.
+///
+/// ## Why this is asked at all
+///
+/// Because the alternative is what happened: a table imported from another
+/// controller carries **that controller's** remote addresses, and a board
+/// flashed with it transmits as a remote the other controller is still
+/// transmitting as. Each keeps its own rolling-code counter, neither knows what
+/// the other has sent, and the first to fall behind starts sending codes the
+/// motor has already accepted and rejects as replays. The motor stops answering
+/// it, and stays that way until somebody re-pairs at the shade.
+///
+/// An address from here belongs to this board and to no other, so pairing a
+/// motor to it ends that. What it costs is a pairing procedure per shade —
+/// `docs/hardware-checklist.md` has the sequence.
+///
+/// Optional, and empty is a legitimate answer: importing a table to run
+/// alongside the controller it came from is exactly what somebody does while
+/// migrating, and typing addresses by hand is what somebody does when the
+/// motors were paired to remotes that already exist.
+fn read_identity() -> Result<Option<RemoteIdentity>, Box<dyn std::error::Error>> {
+    let entered = read_line(
+        "controller MAC, to allocate radio addresses from — the board prints it at boot \n\
+         as 'pairing: this controller's remote addresses start at ...' (empty to enter \n\
+         each address by hand): ",
+    )?;
+    if entered.is_empty() {
+        return Ok(None);
+    }
+    let mac = parse_mac(&entered).inspect_err(|error| {
+        eprintln!("refusing to write: {error}");
+    })?;
+    let identity = RemoteIdentity::from_mac(mac);
+    eprintln!(
+        "  addresses will be allocated from {:#08X} — check that against the board's \n\
+         \x20 boot line before flashing. Two boards printing the same value is a bug.\n",
+        identity.base(),
+    );
+    Ok(Some(identity))
+}
+
+/// Six bytes from `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, or `aabbccddeeff`.
+///
+/// Refuses anything else rather than guessing. A MAC read wrongly produces a
+/// perfectly plausible address that simply is not this board's, and the symptom
+/// — a motor that ignores the controller — looks exactly like a broken
+/// transmitter.
+fn parse_mac(text: &str) -> Result<[u8; 6], String> {
+    let digits: String = text
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.' | ' '))
+        .collect();
+    if digits.len() != 12 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{text:?} is not a MAC address — six hex bytes are needed, \
+             as aa:bb:cc:dd:ee:ff or aabbccddeeff"
+        ));
+    }
+    let mut mac = [0u8; 6];
+    for (index, byte) in mac.iter_mut().enumerate() {
+        // Infallible: the length and the character class were both just
+        // checked, so every two-character window is a hex byte.
+        *byte = u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16)
+            .map_err(|error| format!("{text:?} is not a MAC address: {error}"))?;
+    }
+    Ok(mac)
 }
 
 /// Every shade in the table, one line each — the only view a person gets of
@@ -431,8 +502,10 @@ fn describe(record: &ShadeRecord) {
 fn read_shade(
     name: &str,
     written: &ShadeRecord,
+    identity: Option<RemoteIdentity>,
+    index: usize,
 ) -> Result<StoredShade, Box<dyn std::error::Error>> {
-    let address = read_address(written)?;
+    let address = read_address(written, suggest_address(identity, written, index))?;
 
     // Through `ShadeError::Domain` so the refusal is a sentence rather than a
     // `Debug` spelling of an enum variant.
@@ -461,13 +534,55 @@ fn read_shade(
     Ok(shade)
 }
 
+/// The address this controller would allocate to the shade at `index`, if a
+/// controller identity was given.
+///
+/// The rows already written are what "already taken" means: a table part
+/// imported and part entered can hold another controller's addresses, and
+/// allocating over one of them would recreate the very collision the identity
+/// exists to end. `RemoteIdentity::address_for` steps past them.
+///
+/// `None` when no identity was given, and — in principle — when every candidate
+/// is taken, which the registry's own capacity makes unreachable. Either way the
+/// operator is asked for an address instead of being handed a wrong one.
+fn suggest_address(
+    identity: Option<RemoteIdentity>,
+    written: &ShadeRecord,
+    index: usize,
+) -> Option<u32> {
+    let id = ShadeId(u8::try_from(index).ok()?);
+    identity?.address_for(id, |address| {
+        written
+            .shades
+            .iter()
+            .any(|shade| shade.config.address == address)
+    })
+}
+
 /// A radio address, refused if it is already in the table.
 ///
 /// The duplicate check is here as well as in `ShadeRecord::decode` because the
 /// device's answer to a duplicate is to refuse the *whole* table, and finding
 /// that out after a flash is three steps too late.
-fn read_address(written: &ShadeRecord) -> Result<u32, Box<dyn std::error::Error>> {
-    let entered = read_line("  radio address (decimal, or 0x-prefixed hex): ")?;
+///
+/// `suggested` is the address this controller would allocate, offered as the
+/// value an empty line takes. It is a default rather than the only option
+/// because a motor already paired to a physical remote has an address of its
+/// own, and this tool must be able to record that.
+fn read_address(
+    written: &ShadeRecord,
+    suggested: Option<u32>,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let prompt = match suggested {
+        Some(address) => format!("  radio address [{address:#08X}, this controller's own]: "),
+        None => "  radio address (decimal, or 0x-prefixed hex): ".to_string(),
+    };
+    let entered = read_line(&prompt)?;
+    if entered.is_empty() {
+        if let Some(address) = suggested {
+            return Ok(address);
+        }
+    }
     let address = match entered
         .strip_prefix("0x")
         .or_else(|| entered.strip_prefix("0X"))
@@ -664,5 +779,90 @@ mod tests {
     fn the_usage_text_names_both_paths() {
         assert!(USAGE.contains("--from-backup"));
         assert!(USAGE.contains("shades.bin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The controller identity, and the addresses allocated from it
+    // -----------------------------------------------------------------------
+
+    /// The three spellings a person actually types, all reaching the same six
+    /// bytes.
+    #[test]
+    fn a_mac_is_accepted_in_the_three_forms_people_write_it_in() {
+        let expected = [0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03];
+        for form in ["aa:bb:cc:01:02:03", "AA-BB-CC-01-02-03", "aabbcc010203"] {
+            assert_eq!(parse_mac(form), Ok(expected), "{form}");
+        }
+    }
+
+    /// Anything else is refused rather than guessed at. A MAC read wrongly
+    /// produces a plausible address that is not this board's, and the symptom is
+    /// a motor that ignores the controller.
+    #[test]
+    fn a_malformed_mac_is_refused() {
+        for form in [
+            "",
+            "aa:bb:cc:01:02",
+            "aa:bb:cc:01:02:03:04",
+            "zz:bb:cc:01:02:03",
+        ] {
+            assert!(parse_mac(form).is_err(), "{form:?} was accepted");
+        }
+    }
+
+    fn record_with(addresses: &[u32]) -> ShadeRecord {
+        let mut record = ShadeRecord {
+            seq: 0,
+            shades: heapless::Vec::new(),
+        };
+        for (index, address) in addresses.iter().enumerate() {
+            let config = ShadeConfig::new(&format!("S{index}"), *address).unwrap();
+            record
+                .shades
+                .push(StoredShade::new(config, RollingCode(1)).unwrap())
+                .unwrap();
+        }
+        record
+    }
+
+    /// With no identity there is nothing to suggest, and the operator is asked
+    /// for an address rather than handed one.
+    #[test]
+    fn without_an_identity_nothing_is_suggested() {
+        assert_eq!(suggest_address(None, &record_with(&[]), 0), None);
+    }
+
+    /// Consecutive shades get consecutive addresses in an empty table.
+    #[test]
+    fn consecutive_shades_get_consecutive_addresses() {
+        let identity = RemoteIdentity::from_mac([0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]);
+        let empty = record_with(&[]);
+        let first = suggest_address(Some(identity), &empty, 0).unwrap();
+        assert_eq!(suggest_address(Some(identity), &empty, 1), Some(first + 1));
+        assert_eq!(suggest_address(Some(identity), &empty, 2), Some(first + 2));
+    }
+
+    /// An address already in the table — an imported row carrying another
+    /// controller's address, typically — is stepped over rather than
+    /// duplicated. A duplicate makes the device refuse the **whole** table.
+    #[test]
+    fn a_suggestion_never_repeats_an_address_already_written() {
+        let identity = RemoteIdentity::from_mac([0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03]);
+        let would_be = suggest_address(Some(identity), &record_with(&[]), 0).unwrap();
+        let clashing = record_with(&[would_be]);
+        let suggestion = suggest_address(Some(identity), &clashing, 0).unwrap();
+        assert_ne!(suggestion, would_be);
+    }
+
+    /// Every suggestion is an address `ShadeConfig` will take, so pressing
+    /// return can never produce a row the device refuses.
+    #[test]
+    fn every_suggestion_is_an_address_the_domain_accepts() {
+        let identity = RemoteIdentity::from_mac([0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF]);
+        let empty = record_with(&[]);
+        for index in 0..SHADE_TABLE_CAPACITY {
+            let address = suggest_address(Some(identity), &empty, index).unwrap();
+            assert!(ShadeConfig::new("probe", address).is_ok(), "{address:#08X}");
+        }
     }
 }
