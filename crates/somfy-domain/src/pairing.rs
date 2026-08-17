@@ -270,8 +270,69 @@ pub fn allocate_if_absent(
     id: ShadeId,
     name: &str,
 ) -> Result<Allocated, DomainError> {
+    allocate_with(registry, identity, id, |address| {
+        ShadeConfig::new(name, address)
+    })
+    .map_err(DomainError::from)
+}
+
+/// [`allocate_if_absent`], for a caller that builds the whole configuration.
+///
+/// # Why this exists rather than "add the shade, then set its fields"
+///
+/// A shade created with a name and then configured is a shade that briefly
+/// held the factory travel times, and a device that is asked for its shades in
+/// that instant reports them — as **uncalibrated**, which is what
+/// `somfy_api::CalibrationSource` is for and is exactly the wrong answer about
+/// a shade somebody has just typed measured values into. Building the
+/// configuration before the shade exists removes the instant.
+///
+/// It also removes a whole class of half-applied failure. `describe` is
+/// fallible and runs **before** anything is written, so a configuration the
+/// caller's own rules refuse — a name over the limit, a travel time of zero,
+/// a `kind` byte the domain does not model — leaves the registry untouched and
+/// leaves the address unallocated. Had the shade been created first, refusing
+/// the configuration afterwards would mean either keeping a shade nobody asked
+/// for or removing one and burning its address, and an address that has been
+/// burned is one the next shade does not get.
+///
+/// # What `describe` is handed and what it must not do
+///
+/// The address, and nothing else. It is chosen here — by probing past
+/// everything the table already holds — because that is the decision no caller
+/// is entitled to make: a motor obeys an address, and a controller that lets a
+/// caller pick one produces the two-controllers-one-identity failure this
+/// module exists to end. `describe` may reject the address (that is the whole
+/// point of it returning a `Result`), but it cannot choose a different one.
+///
+/// The error type is the caller's, so a validation layer with its own
+/// vocabulary — `somfy_api::ApiErrorCode`, which the web UI translates — can
+/// report its own refusals rather than having them flattened into
+/// [`DomainError`]. [`AllocateError`] keeps the two apart.
+///
+/// ```
+/// use somfy_domain::{allocate_with, Allocated, Registry, RemoteIdentity, ShadeConfig, ShadeId};
+///
+/// let identity = RemoteIdentity::from_mac([0x00, 0x00, 0x00, 0x12, 0x34, 0x56]);
+/// let mut registry = Registry::new();
+///
+/// let made = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+///     let mut config = ShadeConfig::new("Kitchen", address)?;
+///     config.up_time_ms = 30_000;
+///     Ok::<_, somfy_domain::DomainError>(config)
+/// })?;
+/// assert!(matches!(made, Allocated::Fresh(_)));
+/// assert_eq!(registry.shade(ShadeId(0)).map(|s| s.config.up_time_ms), Some(30_000));
+/// # Ok::<(), somfy_domain::AllocateError<somfy_domain::DomainError>>(())
+/// ```
+pub fn allocate_with<E>(
+    registry: &mut Registry,
+    identity: &RemoteIdentity,
+    id: ShadeId,
+    describe: impl FnOnce(u32) -> Result<ShadeConfig, E>,
+) -> Result<Allocated, AllocateError<E>> {
     if id.0 as usize >= MAX_SHADES {
-        return Err(DomainError::IdOutOfRange);
+        return Err(AllocateError::Domain(DomainError::IdOutOfRange));
     }
     // Read first. Everything below is inside the branch where this said the
     // slot is empty, which is what makes "an address never moves" structural
@@ -291,11 +352,39 @@ pub fn allocate_if_absent(
                 .shades()
                 .any(|(_, shade)| shade.is_linked(candidate))
         })
-        .ok_or(DomainError::AddressUnavailable)?;
+        .ok_or(AllocateError::Domain(DomainError::AddressUnavailable))?;
 
-    // Straight through the ordinary constructor, so a shade created here is
-    // one `Registry::add_shade` and `somfy_config::StoredShade` both accept.
-    let config = ShadeConfig::new(name, address)?;
-    registry.add_shade_with_id(id, config)?;
+    // Before the registry is touched, so a refusal costs nothing.
+    let config = describe(address).map_err(AllocateError::Description)?;
+    registry
+        .add_shade_with_id(id, config)
+        .map_err(AllocateError::Domain)?;
     Ok(Allocated::Fresh(address))
+}
+
+/// Why [`allocate_with`] refused.
+///
+/// Two variants rather than one because the two failures belong to different
+/// people. A [`Domain`](AllocateError::Domain) refusal is about the table — the
+/// id is out of range, every candidate address is taken, the registry is full —
+/// and nothing the caller sent would have changed it. A
+/// [`Description`](AllocateError::Description) refusal is the caller's own
+/// validation speaking, in the caller's own vocabulary, and is the one a person
+/// can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocateError<E> {
+    /// The registry or the allocator refused.
+    Domain(DomainError),
+    /// The caller's `describe` refused the address it was offered.
+    Description(E),
+}
+
+impl From<AllocateError<DomainError>> for DomainError {
+    /// Flatten, for a caller whose own validation already speaks
+    /// [`DomainError`] — which is what [`allocate_if_absent`] is.
+    fn from(error: AllocateError<DomainError>) -> DomainError {
+        match error {
+            AllocateError::Domain(error) | AllocateError::Description(error) => error,
+        }
+    }
 }

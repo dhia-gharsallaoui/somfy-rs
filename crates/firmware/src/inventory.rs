@@ -43,7 +43,9 @@ use core::fmt::Write as _;
 
 use heapless::{String, Vec};
 use somfy_domain::{Registry, RemoteIdentity, ShadeId, MAX_SHADES};
-use somfy_mqtt::{Pairing, MAX_NAME_LEN};
+use somfy_mqtt::Pairing;
+
+use crate::edits::MAX_NAME_LEN;
 
 /// One shade as the broker session sees it.
 struct Entry {
@@ -98,7 +100,7 @@ impl Inventory {
         // fit leaves this **empty** rather than truncated — and an empty `name`
         // in a discovery payload is an entity Home Assistant labels with its
         // object id. The two capacities are equal today
-        // (`somfy_mqtt::MAX_NAME_LEN` and `somfy_domain::ShadeConfig::name`),
+        // (`crate::edits::MAX_NAME_LEN` and `somfy_domain::ShadeConfig::name`),
         // so this cannot happen; nothing ties them together, so the fallback is
         // here anyway and it names the shade rather than nothing.
         if held.push_str(name).is_err() {

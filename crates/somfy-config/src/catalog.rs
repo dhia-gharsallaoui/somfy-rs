@@ -47,7 +47,7 @@
 //! [`Catalog::due_at`] is the whole of the debounce policy, and it is pure.
 
 use heapless::Vec;
-use somfy_domain::{DomainError, Registry, ShadeId};
+use somfy_domain::{DomainError, Registry, ShadeConfig, ShadeId};
 use somfy_rts::RollingCode;
 
 use crate::shade::{
@@ -296,6 +296,49 @@ impl Catalog {
             .shade_mut(id)
             .ok_or(DomainError::NotFound)?
             .unlink_remote(address)?;
+        self.touch(now_ms);
+        Ok(())
+    }
+
+    /// Replace one shade's configuration, and note that the table has to be
+    /// written again.
+    ///
+    /// # Why the address and the id are taken from the shade rather than from
+    /// `config`
+    ///
+    /// Because neither is editable, and a function that *accepts* them would be
+    /// a function that can change them. A motor obeys an address; nothing in
+    /// RTS can tell it the address moved, and nothing can ask it what it
+    /// learned — so a shade whose address changed is a shade that stops
+    /// responding, looks exactly like a dead motor, and is fixed only by
+    /// walking to it. The id is the registry slot and the Home Assistant
+    /// entity's identity, and moving it orphans every automation pointing at
+    /// it.
+    ///
+    /// So the incoming `config` supplies the name, the kind, the tilt mode and
+    /// the three travel times, and its `address` field is **overwritten** with
+    /// the one the shade already has. That is deliberately silent rather than
+    /// an error: the caller that matters builds `config` from the shade's own
+    /// current configuration, so the field it holds is already right, and
+    /// refusing a request over a field the caller never meant to set would
+    /// reject correct edits.
+    ///
+    /// # What this does not do
+    ///
+    /// It does not touch the announced bit, and it must not: the entities still
+    /// exist and still belong to this shade. A renamed shade needs its
+    /// discovery config re-published, which is the caller's to arrange — the
+    /// bit means "there are entities on the broker", not "they are current".
+    pub fn reconfigure(
+        &mut self,
+        registry: &mut Registry,
+        id: ShadeId,
+        mut config: ShadeConfig,
+        now_ms: u64,
+    ) -> Result<(), CatalogError> {
+        let shade = registry.shade_mut(id).ok_or(DomainError::NotFound)?;
+        config.address = shade.config.address;
+        shade.config = config;
         self.touch(now_ms);
         Ok(())
     }
@@ -709,5 +752,61 @@ mod tests {
             catalog.unlink(&mut registry, ShadeId(0), 0x00_2001, 2),
             Err(CatalogError::Domain(DomainError::NotFound)),
         );
+    }
+
+    /// An edit reaches the persisted record, and marks the table for writing —
+    /// otherwise a corrected travel time would be live until the next reboot
+    /// and then gone.
+    #[test]
+    fn reconfiguring_a_shade_reaches_the_record_and_schedules_a_write() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+        catalog.written();
+        assert!(!catalog.is_dirty());
+
+        let mut edited = registry.shade(ShadeId(0)).unwrap().config.clone();
+        edited.name = heapless::String::try_from("Cuisine").unwrap();
+        edited.up_time_ms = 30_000;
+        catalog
+            .reconfigure(&mut registry, ShadeId(0), edited, 5_000)
+            .unwrap();
+
+        assert!(catalog.is_dirty());
+        assert_eq!(catalog.due_at(), Some(5_000 + DEBOUNCE_MS));
+        let (record, _) = catalog.record(&registry);
+        assert_eq!(record.shades[0].config.name.as_str(), "Cuisine");
+        assert_eq!(record.shades[0].config.up_time_ms, 30_000);
+    }
+
+    /// The address is the shade's, whatever the incoming configuration says.
+    /// A motor obeys an address and cannot be told it moved, so this is the one
+    /// field an edit must never carry through.
+    #[test]
+    fn reconfiguring_cannot_move_a_shades_address() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+
+        let mut elsewhere = ShadeConfig::new("Kitchen", 0x00_9999).unwrap();
+        elsewhere.up_time_ms = 30_000;
+        catalog
+            .reconfigure(&mut registry, ShadeId(0), elsewhere, 0)
+            .unwrap();
+
+        let shade = registry.shade(ShadeId(0)).unwrap();
+        assert_eq!(shade.config.address, 0x00_1001);
+        assert_eq!(shade.config.up_time_ms, 30_000, "the rest still applied");
+    }
+
+    /// A shade that is not there is the domain's refusal, and nothing is
+    /// scheduled for writing over it.
+    #[test]
+    fn reconfiguring_a_missing_shade_is_refused_and_writes_nothing() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+        catalog.written();
+
+        let config = ShadeConfig::new("Ghost", 0x00_2002).unwrap();
+        assert_eq!(
+            catalog.reconfigure(&mut registry, ShadeId(7), config, 0),
+            Err(CatalogError::Domain(DomainError::NotFound)),
+        );
+        assert!(!catalog.is_dirty());
     }
 }

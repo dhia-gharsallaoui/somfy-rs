@@ -51,6 +51,22 @@
 
 #![no_std]
 #![no_main]
+// An `#[embassy_executor::task]` allocates a static sized to one concrete
+// future, so it cannot be generic — and `picoserve::Router::route` returns
+// `Router<impl PathRouter>`, a type that exists and has no spelling. This
+// feature is what lets `api::routes::App` give it one, and it is the only
+// unstable language feature this crate uses. It is `picoserve`'s own documented
+// pattern for the same reason; the alternative is boxing a trait object, which
+// needs both an allocator on the request path and object safety that an
+// `async fn` trait does not have.
+#![feature(impl_trait_in_assoc_type)]
+// `picoserve`'s router is a type per route, each wrapping the previous one as
+// its fallback, so a ten-route table is a type ten layers deep and every trait
+// obligation on it recurses to the bottom. The default limit of 128 is reached
+// while resolving them, and the failure is `error: queries overflow the depth
+// limit!` with no span — nothing points at the router. This is the fix, and it
+// costs compile time rather than image size.
+#![recursion_limit = "512"]
 
 // For `esp-radio` and for nothing this firmware writes. Its `StationConfig`
 // holds an `alloc::string::String`, so the one allocation on our side of the
@@ -59,14 +75,24 @@
 // at all, and `heap` explains what the heap is for.
 extern crate alloc;
 
+// The three transports, gated at their module declarations and nowhere else.
+// That restriction is the point rather than a tidiness rule: a `#[cfg]` that
+// had to appear inside `tasks`, `edits` or `somfy-domain` would mean transport
+// logic had leaked into the core, and turning these off is how that gets
+// noticed. `Cargo.toml` carries the argument in full.
+#[cfg(feature = "http")]
+mod api;
 mod chip;
 mod config;
 mod edits;
 mod heap;
+#[cfg(feature = "mqtt")]
 mod inventory;
+#[cfg(feature = "mqtt")]
 mod mqtt;
 mod net;
 mod radio;
+mod rpc;
 mod shades;
 mod store;
 mod tasks;
@@ -95,15 +121,17 @@ use somfy_tasks::{
 use config::ConfigStore;
 use edits::{AckChannel, EditChannel, EventChannel};
 use heapless::Vec;
+#[cfg(feature = "mqtt")]
 use inventory::Inventory;
 use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
 use shades::ShadeStore;
-use somfy_config::{
-    Announced, Catalog, LinkedRemote, MqttSettings, Namespaces, StoredShade, WifiCredentials,
-};
-use somfy_domain::{Registry, RemoteIdentity, ShadeId, MAX_SHADES};
+use somfy_config::{Announced, Catalog, LinkedRemote, StoredShade, WifiCredentials};
+use somfy_config::{MqttSettings, Namespaces};
+#[cfg(feature = "mqtt")]
+use somfy_domain::ShadeId;
+use somfy_domain::{Registry, RemoteIdentity, MAX_SHADES};
 use somfy_rts::RollingCode;
 use somfy_store::{seed_if_absent, RegionState, Seeded};
 use store::{FlashStore, StoreError};
@@ -335,10 +363,27 @@ enum StartError {
 struct Pending {
     wifi: esp_hal::peripherals::WIFI<'static>,
     credentials: Option<WifiCredentials>,
+    /// Everything the broker session needs and nothing else does.
+    ///
+    /// One field rather than five, so that the whole of MQTT's presence in this
+    /// struct is a single `#[cfg]` at a module boundary. That is the same rule
+    /// the module declarations above follow, and it is what stops a build with
+    /// no broker in it carrying five unused fields and their imports.
+    #[cfg(feature = "mqtt")]
+    broker: MqttBoot,
+}
+
+/// Everything the broker session is handed at boot.
+///
+/// Assembled here because boot is where it can be read — the store and the
+/// registry both belong to the state task from the moment they are handed over
+/// — and carried rather than re-read for exactly that reason.
+#[cfg(feature = "mqtt")]
+struct MqttBoot {
     /// The broker to talk to, if one is provisioned. `None` is a supported
     /// configuration, not a failure: the controller receives and decodes with
     /// no broker at all.
-    broker: Option<MqttSettings>,
+    settings: Option<MqttSettings>,
     /// Namespace pairs the ring shows this device has published under before
     /// and is not publishing under now. Their retained configs have to be
     /// cleared before the current ones go out — see spec R5, and
@@ -520,13 +565,18 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // The MQTT session works from this copy rather than from the registry, so
     // there is no shared state between the broker and the radio at all — see
     // `mqtt`'s module docs for the other three things that keep them apart.
+    #[cfg(feature = "mqtt")]
     let inventory = Inventory::snapshot(machine.registry());
     // Announced and gone: entities on the broker with nothing behind them. Read
     // here, before the state task takes the registry, because this is the last
     // moment both halves of the comparison are in one place — and the ids are
     // the only thing that can name what has to be cleared.
+    #[cfg(feature = "mqtt")]
     let orphans: Vec<ShadeId, MAX_SHADES> = catalog.orphans(machine.registry()).collect();
-    if inventory.len() == 0 {
+    // Asked of the registry rather than of the broker session's snapshot of it.
+    // A controller with no shades is a fact about the controller, and a build
+    // with no broker in it still has to be able to say so.
+    if machine.registry().shades().next().is_none() {
         // Said out loud, because a controller with nothing provisioned and a
         // broken one look identical from the serial line and from Home
         // Assistant, where both announce availability and no entity.
@@ -536,7 +586,10 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
              `cargo run -p somfy-config --example provision_shades`."
         );
     } else {
-        esp_println::println!("controller: {} shades provisioned", inventory.len());
+        esp_println::println!(
+            "controller: {} shades provisioned",
+            machine.registry().shades().count(),
+        );
     }
 
     // This controller's own virtual-remote identity, printed so an operator can
@@ -594,14 +647,25 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // expressed as control flow, and it is why this returns the pieces instead
     // of finishing the job: see [`entry`] for what the yield buys, and `net`'s
     // module docs for the other three things that keep the two halves apart.
+    // The configuration region holds the broker's settings whether or not this
+    // build talks to one, and `report_config` prints them either way — an
+    // operator inspecting a radio-only image still wants to see what is
+    // provisioned. Dropping them here is what says "read, reported, and
+    // deliberately unused" rather than leaving a warning to be silenced.
+    #[cfg(not(feature = "mqtt"))]
+    drop((broker, superseded, survey));
+
     Ok(Pending {
         wifi: peripherals.WIFI,
         credentials,
-        broker,
-        superseded,
-        inventory,
-        orphans,
-        survey,
+        #[cfg(feature = "mqtt")]
+        broker: MqttBoot {
+            settings: broker,
+            superseded,
+            inventory,
+            orphans,
+            survey,
+        },
     })
 }
 
@@ -1033,15 +1097,29 @@ fn start_network(spawner: Spawner, pending: Pending) {
             return;
         }
     };
-    start_mqtt(
-        spawner,
-        stack,
-        pending.broker,
-        pending.superseded,
-        pending.inventory,
-        pending.orphans,
-        pending.survey,
-    );
+    // **Before the broker, and independent of it.** A device with no broker
+    // provisioned — the ordinary state of a freshly flashed board — still needs
+    // its own UI, and that UI is how somebody provisions one. Starting it after
+    // `start_mqtt` would work too; starting it first says that it does not
+    // depend on anything MQTT does.
+    #[cfg(feature = "http")]
+    if let Err(error) = api::start(spawner, stack) {
+        esp_println::println!(
+            "api: failed to start ({:?}) — running without a web UI, which leaves the radio \
+             and the broker unaffected",
+            error,
+        );
+    }
+    #[cfg(feature = "mqtt")]
+    start_mqtt(spawner, stack, pending.broker);
+
+    // A build with neither transport still brings the network up, and that is
+    // deliberate rather than an oversight: DHCP is what turns "associated" into
+    // "on the network", `net::address_watch` prints the address it was given,
+    // and an operator commissioning a radio-only board needs both. Nothing
+    // connects *through* the stack, so this is where that is said out loud.
+    #[cfg(not(any(feature = "http", feature = "mqtt")))]
+    let _ = stack;
 }
 
 /// Start the broker session if one is configured, and never fail.
@@ -1051,16 +1129,16 @@ fn start_network(spawner: Spawner, pending: Pending) {
 /// explicit that a broker which is down, unreachable, or rejecting credentials
 /// must not affect radio control, and a board with no broker at all is the
 /// ordinary state of one provisioned before a broker existed.
-fn start_mqtt(
-    spawner: Spawner,
-    stack: embassy_net::Stack<'static>,
-    broker: Option<MqttSettings>,
-    superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
-    inventory: Inventory,
-    orphans: Vec<ShadeId, MAX_SHADES>,
-    survey: store::Survey,
-) {
-    let Some(settings) = broker else {
+#[cfg(feature = "mqtt")]
+fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBoot) {
+    let MqttBoot {
+        settings,
+        superseded,
+        inventory,
+        orphans,
+        survey,
+    } = boot;
+    let Some(settings) = settings else {
         esp_println::println!(
             "mqtt: no broker provisioned — the controller runs without one. \
              It still receives, decodes and tracks."

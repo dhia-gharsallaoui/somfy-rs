@@ -70,7 +70,9 @@ mod types;
 
 pub use controller::{Controller, StateDelta, DELTA_CAPACITY, RX_DEDUPE_WINDOW_MS, TX_CAPACITY};
 pub use motion::{Motion, MotionSnapshot};
-pub use pairing::{allocate_if_absent, Allocated, RemoteIdentity, PAIR_REPEATS};
+pub use pairing::{
+    allocate_if_absent, allocate_with, AllocateError, Allocated, RemoteIdentity, PAIR_REPEATS,
+};
 pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MAX_SHADES};
 pub use shade::{PlannedTx, Repeats, Shade, ShadeCommand, MAX_LINKED_REMOTES};
 pub use tilt::tilt_first;

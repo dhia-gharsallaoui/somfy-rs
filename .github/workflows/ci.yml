@@ -68,18 +68,64 @@ jobs:
       - name: bundle size against the 200 KB gzipped budget (design spec §8)
         run: bun run size
 
+  # Three chips × three transport features is eighteen configurations, and this
+  # builds seven of them. The choice is deliberate, because *silent* partial
+  # coverage is the thing this project keeps being bitten by — five CI holes so
+  # far, every one of them a configuration nobody built.
+  #
+  # What each row buys:
+  #
+  # - **The shipping build, per chip.** What a user flashes.
+  # - **Radio only, per chip.** The structural test: if the core compiles with
+  #   `mqtt` off, `http` off and `ui` off, then no transport logic leaked into
+  #   `somfy-domain`, `somfy-tasks`, `edits` or the state task. It found two
+  #   couplings the first time it was run, and both were fixed rather than
+  #   gated — see `crates/firmware/Cargo.toml`.
+  # - **`http` alone, on one chip.** `ui` off *and* `mqtt` off at once, which is
+  #   what proves the two are separable rather than merely optional together.
+  #
+  # What is deliberately not covered, and why:
+  #
+  # - **The ESP32 with `http` or `ui`.** It cannot be built at all: the chip has
+  #   57,236 bytes of DRAM for a 66,280-byte stack budget once the server is in,
+  #   and `heap.rs` refuses it with a `compile_error!` naming the measurement.
+  #   The refusal was proved by hand rather than by a job, because a CI step
+  #   whose success is a compilation *failure* inverts every other row here.
+  # - **Feature interactions on the ESP32-C3.** They are architecture-
+  #   independent — the same modules, the same statics — and the ESP32-S3 row
+  #   covers them. What the C3 is in the matrix *for* is the RISC-V code path,
+  #   which its two rows exercise.
+  # - **`ui` without `mqtt` as its own row.** The shipping build covers `ui` on
+  #   and the `http` row covers it off, so the module selection in `api/mod.rs`
+  #   is exercised both ways already.
   firmware:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - feature: chip-esp32
+          # The ESP32 tops out at MQTT; see the note above.
+          - label: esp32 (mqtt)
             target: xtensa-esp32-none-elf
-          - feature: chip-s3
+            args: --no-default-features --features chip-esp32,mqtt
+          - label: esp32 (radio only)
+            target: xtensa-esp32-none-elf
+            args: --no-default-features --features chip-esp32
+          - label: s3 (mqtt + ui)
             target: xtensa-esp32s3-none-elf
-          - feature: chip-c3
+            args: --features chip-s3
+          - label: s3 (http, no ui, no mqtt)
+            target: xtensa-esp32s3-none-elf
+            args: --no-default-features --features chip-s3,http
+          - label: s3 (radio only)
+            target: xtensa-esp32s3-none-elf
+            args: --no-default-features --features chip-s3
+          - label: c3 (mqtt + ui)
             target: riscv32imc-unknown-none-elf
+            args: --features chip-c3
+          - label: c3 (radio only)
+            target: riscv32imc-unknown-none-elf
+            args: --no-default-features --features chip-c3
     steps:
       - uses: actions/checkout@v4
       - uses: esp-rs/xtensa-toolchain@v1.5
@@ -87,15 +133,32 @@ jobs:
           default: true
           buildtargets: esp32,esp32s3
           ldproxy: false
+      # The web UI is embedded in the image with `include_bytes!`, so
+      # `crates/firmware/build.rs` needs `ui/dist/` to exist — and it is a build
+      # artefact, not a tracked file. Without this step every row carrying `ui`
+      # fails at the build script with "there is no ../../ui/dist/ to embed",
+      # which is the right message and the wrong place to meet it.
+      #
+      # Run for every row rather than only the `ui` ones: it is a few seconds,
+      # and a conditional here would be one more configuration-dependent thing
+      # to get wrong.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: build the web UI (embedded by build.rs)
+        working-directory: ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
       # The root `cargo fmt --check` above does NOT cover this crate: it is
       # excluded from the root workspace (it builds only for ESP targets), and
       # `--all` only reaches workspace members. So formatting drifted here
       # unnoticed. It is in the matrix job rather than the host one because
       # `rustfmt` has to come from the `esp` toolchain this crate pins.
-      - name: fmt (${{ matrix.feature }})
+      - name: fmt (${{ matrix.label }})
         working-directory: crates/firmware
         run: cargo fmt --check
-      - name: clippy (${{ matrix.feature }})
+      - name: clippy (${{ matrix.label }})
         working-directory: crates/firmware
         # No --all-targets here (unlike the host job above): this crate is a
         # no_std/no_main binary-only target, and --all-targets forces cargo to
@@ -104,7 +167,11 @@ jobs:
         # which no bare-metal target here ever provides, so --all-targets
         # fails unconditionally for this crate — confirmed independent of
         # feature/dependency choices. Plain clippy already covers the bin.
-        run: cargo clippy --features ${{ matrix.feature }} --target ${{ matrix.target }} -- -D warnings
-      - name: build (${{ matrix.feature }})
+        #
+        # Clippy runs on the dev profile and the build below on release, so a
+        # green build does not imply a green lint — the ESP32 lint was silently
+        # red for three tasks that way.
+        run: cargo clippy ${{ matrix.args }} --target ${{ matrix.target }} -- -D warnings
+      - name: build (${{ matrix.label }})
         working-directory: crates/firmware
-        run: cargo build --features ${{ matrix.feature }} --target ${{ matrix.target }} --release
+        run: cargo build ${{ matrix.args }} --target ${{ matrix.target }} --release

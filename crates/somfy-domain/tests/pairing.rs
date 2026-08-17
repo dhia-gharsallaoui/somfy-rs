@@ -8,9 +8,9 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    allocate_if_absent, Allocated, Controller, DomainError, PlannedTx, Pos, Registry,
-    RemoteIdentity, Repeats, Shade, ShadeCommand, ShadeConfig, ShadeId, StateDelta, DELTA_CAPACITY,
-    MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
+    allocate_if_absent, allocate_with, AllocateError, Allocated, Controller, DomainError,
+    PlannedTx, Pos, Registry, RemoteIdentity, Repeats, Shade, ShadeCommand, ShadeConfig, ShadeId,
+    StateDelta, DELTA_CAPACITY, MAX_SHADES, PAIR_REPEATS, TX_CAPACITY,
 };
 use somfy_rts::Command;
 
@@ -613,4 +613,106 @@ fn one_shade_can_still_be_paired_through_the_controller() {
         .unwrap();
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].command, Command::Prog);
+}
+
+// ---------------------------------------------------------------------------
+// `allocate_with` — the same allocation, with the caller building the config
+// ---------------------------------------------------------------------------
+
+/// The configuration is built at the address the allocator chose, and the shade
+/// exists holding it. This is the property that stops a freshly created shade
+/// spending an instant with the factory travel times — which a reader taking a
+/// snapshot in that instant would report as *uncalibrated*.
+#[test]
+fn allocate_with_places_the_configuration_the_caller_built() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let made = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+        let mut config = ShadeConfig::new("Kitchen", address)?;
+        config.up_time_ms = 30_000;
+        config.down_time_ms = 27_000;
+        Ok::<_, DomainError>(config)
+    })
+    .unwrap();
+
+    let shade = registry.shade(ShadeId(0)).unwrap();
+    assert_eq!(made, Allocated::Fresh(shade.config.address));
+    assert_eq!(shade.config.up_time_ms, 30_000);
+    assert_eq!(shade.config.down_time_ms, 27_000);
+    assert!(RemoteIdentity::is_allocated(shade.config.address));
+}
+
+/// A refusal from the caller's own validation leaves **nothing** behind: no
+/// shade, and — the part that matters — no address spent. An address burned by
+/// a rejected request is one the next shade does not get, and nothing in a
+/// one-way protocol can give it back.
+#[test]
+fn a_refused_description_leaves_no_shade_and_spends_no_address() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let refused = allocate_with(&mut registry, &identity, ShadeId(0), |_| {
+        Err::<ShadeConfig, &str>("this caller refuses it")
+    });
+
+    assert_eq!(
+        refused,
+        Err(AllocateError::Description("this caller refuses it"))
+    );
+    assert!(registry.shade(ShadeId(0)).is_none());
+
+    // The next attempt gets the address the refused one would have had, which
+    // is what "spends no address" means concretely.
+    let after = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+        ShadeConfig::new("Kitchen", address)
+    })
+    .unwrap();
+    assert_eq!(after, Allocated::Fresh(identity.base()));
+}
+
+/// An occupied slot is handed back untouched, with the caller's builder never
+/// run — the read-first rule `allocate_if_absent` documents, inherited rather
+/// than restated.
+#[test]
+fn allocate_with_never_reallocates_an_occupied_slot() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+
+    let first = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+        ShadeConfig::new("Kitchen", address)
+    })
+    .unwrap();
+
+    let mut ran = false;
+    let again = allocate_with(&mut registry, &identity, ShadeId(0), |address| {
+        ran = true;
+        ShadeConfig::new("Renamed", address)
+    })
+    .unwrap();
+
+    assert!(!ran, "the builder must not run for an occupied slot");
+    assert_eq!(again, Allocated::Kept(first.address()));
+    assert_eq!(
+        registry.shade(ShadeId(0)).map(|s| s.config.name.as_str()),
+        Some("Kitchen"),
+    );
+}
+
+/// `allocate_if_absent` is a call to `allocate_with` now, and still reports a
+/// domain refusal as a bare [`DomainError`] — the flattening is what keeps its
+/// existing callers unchanged.
+#[test]
+fn allocate_if_absent_still_reports_a_bare_domain_error() {
+    let identity = RemoteIdentity::from_mac(mac([0x12, 0x34, 0x56]));
+    let mut registry = Registry::new();
+    assert_eq!(
+        allocate_if_absent(
+            &mut registry,
+            &identity,
+            ShadeId(MAX_SHADES as u8),
+            "Kitchen"
+        ),
+        Err(DomainError::IdOutOfRange),
+    );
 }

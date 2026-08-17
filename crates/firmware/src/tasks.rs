@@ -29,7 +29,7 @@
 //! removed it in favour of exactly-sized statics. There is no arena to size.
 
 use embassy_executor::task;
-use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_futures::select::{select, select3, select4, Either, Either3, Either4};
 use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
@@ -37,10 +37,12 @@ use embassy_sync::pubsub::{ImmediatePublisher, Subscriber};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
-use heapless::Vec;
-use somfy_config::Catalog;
+use heapless::{String, Vec};
+use somfy_api::{ApiErrorCode, GroupDto, RoomDto, ShadeDto};
+use somfy_config::{Catalog, CatalogError};
 use somfy_domain::{
-    allocate_if_absent, Registry, RemoteIdentity, ShadeId, StateDelta, DELTA_CAPACITY,
+    allocate_with, AllocateError, DomainError, GroupId, Registry, RemoteIdentity, RoomId,
+    ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY,
 };
 use somfy_rts::{Frame, RollingCode};
 use somfy_store::{seed_if_absent, RegionState, Seeded};
@@ -52,6 +54,7 @@ use somfy_tasks::{
 
 use crate::edits::{AckReceiver, EditReceiver, EventSender, ShadeAck, ShadeEdit, ShadeEvent};
 use crate::radio::{air::Air, rmt_rx::RmtPulseSource};
+use crate::rpc;
 use crate::shades::ShadeStore;
 use crate::store::{FlashStore, StoreError};
 
@@ -92,6 +95,12 @@ pub type Radio = RadioLoop<
 pub type Deltas =
     ImmediatePublisher<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
 
+#[allow(
+    dead_code,
+    reason = "held by the broker session and by each websocket; a build with \
+              neither transport publishes deltas into a channel nobody reads, \
+              which is what `publish_immediate` is for"
+)]
 /// The listening end of [`Deltas`]. The MQTT session holds one.
 ///
 /// Publish/subscribe rather than a queue, so a slow subscriber cannot make the
@@ -103,6 +112,12 @@ pub type Deltas =
 pub type DeltaSubscriber =
     Subscriber<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
 
+#[allow(
+    dead_code,
+    reason = "held by the broker session; the web server reaches the same \
+              `run_command` through `crate::rpc` instead, so a build with only \
+              `http` never names this"
+)]
 /// The writing end of the command channel, for whatever produces commands.
 ///
 /// Handed to the MQTT session, which uses `try_send` and never `send`: a full
@@ -262,10 +277,18 @@ pub async fn state(
         // none of them can be continuously ready — the channels are drained
         // faster than any radio or any person can fill them, and the ticker
         // fires at `TICK_MS`.
+        // The web server's requests ride in this arm rather than in a fifth,
+        // because `select4` is as wide as `embassy-futures` goes and because
+        // they belong here: an HTTP request *is* a person, arriving through a
+        // different door than the broker's. It sits after the two channels for
+        // the same ordering reason the arms themselves are ordered — nothing
+        // here can be continuously ready, so this is a preference and not a
+        // starvation risk.
         let edit_or_ack = async {
-            match select(edits.receive(), acks.receive()).await {
-                Either::First(edit) => Edited::Edit(edit),
-                Either::Second(ack) => Edited::Ack(ack),
+            match select3(edits.receive(), acks.receive(), rpc::RPC.next()).await {
+                Either3::First(edit) => Edited::Edit(edit),
+                Either3::Second(ack) => Edited::Ack(ack),
+                Either3::Third(request) => Edited::Request(request),
             }
         };
         let tick_or_write = async {
@@ -290,17 +313,21 @@ pub async fn state(
         let mut emitted: Vec<StateDelta, DELTA_CAPACITY> = Vec::new();
 
         let dispatched = match event {
-            Either4::First(command) => {
-                match machine.apply(&mut store, &mut queue, command, now_ms, &mut emitted) {
-                    Ok(dispatch) => report(&dispatch),
-                    Err(error) => {
-                        esp_println::println!("state: {:?} rejected: {:?}", command, error);
-                        false
-                    }
-                }
-            }
+            Either4::First(command) => run_command(
+                &mut machine,
+                &mut store,
+                &mut queue,
+                command,
+                now_ms,
+                &mut emitted,
+            )
+            .unwrap_or(false),
             Either4::Second(Edited::Edit(edit)) => {
-                apply_edit(
+                // The answer is discarded, and that is the whole difference
+                // between this arm and the one below: a queue has nowhere to
+                // put a refusal, so it is logged by `apply_edit` on the way
+                // past. What the edit *does* is identical.
+                let _ = apply_edit(
                     machine.registry_mut(),
                     catalog,
                     &mut store,
@@ -311,6 +338,17 @@ pub async fn state(
                 );
                 false
             }
+            Either4::Second(Edited::Request(request)) => serve_request(
+                request,
+                &mut machine,
+                &mut store,
+                &mut queue,
+                catalog,
+                &identity,
+                events,
+                now_ms,
+                &mut emitted,
+            ),
             // The other half of the round trip a removal makes: the broker has
             // cleared the entities, so the persisted bit that names them may go
             // — and not before. `somfy_config::Catalog` carries the ordering.
@@ -383,12 +421,187 @@ pub struct Table {
     pub events: EventSender,
 }
 
-/// Which of the two message kinds the second select arm delivered.
+/// Which of the three message kinds the second select arm delivered.
 enum Edited {
     /// Somebody asked for a change to the table.
     Edit(ShadeEdit),
     /// The broker session finished announcing or retiring one.
     Ack(ShadeAck),
+    /// The web server asked something and is waiting to be told.
+    Request(rpc::Request),
+}
+
+/// Apply one command and say whether anything reached the radio.
+///
+/// **The one place a `ControlCommand` is acted on**, and therefore the answer to
+/// "do HTTP and MQTT share a path". They do not merely call the same
+/// `StateMachine::apply`; they arrive at the same six lines around it, so the
+/// logging, the error handling and the `yield_now` that follows a dispatch are
+/// one implementation rather than two that agree today.
+///
+/// `Err` is the domain's refusal, which the HTTP caller renders and the queue
+/// caller has already had logged.
+fn run_command(
+    machine: &mut StateMachine,
+    store: &mut FlashStore<'static>,
+    queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
+    command: ControlCommand,
+    now_ms: u64,
+    emitted: &mut Vec<StateDelta, DELTA_CAPACITY>,
+) -> Result<bool, DomainError> {
+    match machine.apply(store, queue, command, now_ms, emitted) {
+        Ok(dispatch) => Ok(report(&dispatch)),
+        Err(error) => {
+            esp_println::println!("state: {:?} rejected: {:?}", command, error);
+            Err(error)
+        }
+    }
+}
+
+/// Answer one request from the web server, and say whether anything reached the
+/// radio.
+///
+/// Every arm is a call into something that already existed: the registry for a
+/// read, [`run_command`] for a movement, [`apply_edit`] for a change. Nothing
+/// here decides anything a person could disagree with — except one thing, and
+/// it is the pairing rule, which is here because only this task can see the
+/// address it is a rule about.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "these are the state task's own locals, passed rather than \
+              captured so that this stays a function a reader can check \
+              against the arm it replaced"
+)]
+fn serve_request(
+    request: rpc::Request,
+    machine: &mut StateMachine,
+    store: &mut FlashStore<'static>,
+    queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
+    catalog: &mut Catalog,
+    identity: &RemoteIdentity,
+    events: &EventSender,
+    now_ms: u64,
+    emitted: &mut Vec<StateDelta, DELTA_CAPACITY>,
+) -> bool {
+    let (reply, dispatched) = match request {
+        rpc::Request::ShadeFrom(slot) => (
+            rpc::Reply::Shade(
+                machine
+                    .registry()
+                    .shades()
+                    .find(|(id, _)| id.0 >= slot)
+                    .map(|(id, shade)| ShadeDto::from_shade(id, shade)),
+            ),
+            false,
+        ),
+        rpc::Request::Shade(id) => (
+            rpc::Reply::Shade(
+                machine
+                    .registry()
+                    .shade(id)
+                    .map(|shade| ShadeDto::from_shade(id, shade)),
+            ),
+            false,
+        ),
+        rpc::Request::GroupFrom(slot) => (rpc::Reply::Group(group_from(machine, slot)), false),
+        rpc::Request::RoomFrom(slot) => (rpc::Reply::Room(room_from(machine, slot)), false),
+        rpc::Request::Command(command) => {
+            match run_command(machine, store, queue, command, now_ms, emitted) {
+                Ok(dispatched) => (rpc::Reply::Done, dispatched),
+                // Every refusal a movement can draw is about the target not
+                // being there — `command_shade` and `command_group` both start
+                // by looking it up. Anything else is this device's fault and
+                // has just been logged by `run_command`.
+                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+                Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress), false),
+            }
+        }
+        // **The one rule that lives here.** A `Prog` burst at an address this
+        // controller did not allocate teaches the motor an address it already
+        // obeys, so the person standing at the shade watches for a jog that
+        // means nothing — and the two-controllers-one-identity clash survives
+        // the whole procedure. The broker surface enforces the same rule by
+        // never giving such a shade a pairing button (`Inventory::snapshot`);
+        // HTTP has no button to withhold, so it refuses instead.
+        rpc::Request::Pair(id) => match machine.registry().shade(id) {
+            None => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+            Some(shade) if !RemoteIdentity::is_allocated(shade.config.address) => (
+                rpc::Reply::Refused(ApiErrorCode::AddressNotAllocated),
+                false,
+            ),
+            Some(_) => {
+                let command = ControlCommand::Shade {
+                    id,
+                    command: ShadeCommand::Pair,
+                };
+                match run_command(machine, store, queue, command, now_ms, emitted) {
+                    Ok(dispatched) => (rpc::Reply::Done, dispatched),
+                    Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress), false),
+                }
+            }
+        },
+        rpc::Request::Edit(edit) => (
+            match apply_edit(
+                machine.registry_mut(),
+                catalog,
+                store,
+                identity,
+                events,
+                edit,
+                now_ms,
+            ) {
+                Ok(Applied::Added(id)) => rpc::Reply::Created(id),
+                Ok(Applied::Changed) => rpc::Reply::Done,
+                Err(code) => rpc::Reply::Refused(code),
+            },
+            false,
+        ),
+    };
+    rpc::RPC.answer(reply);
+    dispatched
+}
+
+/// The first group at or after `slot`, as a wire DTO.
+///
+/// A free function because the registry exposes groups one accessor at a time —
+/// name, membership and existence are three calls — and doing that inline would
+/// bury the arm it belongs to.
+fn group_from(machine: &StateMachine, slot: u8) -> Option<GroupDto> {
+    let registry = machine.registry();
+    (slot..somfy_domain::MAX_GROUPS as u8)
+        .map(GroupId)
+        .find(|id| registry.group_exists(*id))
+        .map(|id| GroupDto {
+            id: id.0,
+            name: name_of(registry.group_name(id)),
+            shade_ids: registry.group_shades(id).map(|shade| shade.0).collect(),
+        })
+}
+
+/// The first room at or after `slot`, as a wire DTO.
+fn room_from(machine: &StateMachine, slot: u8) -> Option<RoomDto> {
+    let registry = machine.registry();
+    (slot..somfy_domain::MAX_ROOMS as u8)
+        .map(RoomId)
+        .find(|id| registry.room_name(*id).is_some())
+        .map(|id| RoomDto {
+            id: id.0,
+            name: name_of(registry.room_name(id)),
+            shade_ids: registry.room_shades(id).map(|shade| shade.0).collect(),
+        })
+}
+
+/// Copy a registry name into the wire type's buffer.
+///
+/// The two capacities are both 32 and both are `heapless::String<32>`, so this
+/// cannot truncate; `heapless`' `push_str` is all-or-nothing in any case, so the
+/// failure it cannot have would be an empty name rather than a corrupted one.
+fn name_of(name: Option<&str>) -> String<32> {
+    let mut held = String::new();
+    if let Some(name) = name {
+        let _ = held.push_str(name);
+    }
+    held
 }
 
 /// Which of the two the last select arm delivered.
@@ -399,11 +612,57 @@ enum Timed {
     Persist,
 }
 
+/// What an edit did, for a caller that is waiting to be told.
+///
+/// The fire-and-forget path throws it away; the HTTP surface turns it into a
+/// response body, and `Added` is the one that carries something no client could
+/// have known — the id the registry assigned and the address this controller
+/// allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// A shade was created.
+    Added(ShadeId),
+    /// A shade was changed, removed, linked or unlinked.
+    Changed,
+}
+
 /// Apply one edit to the registry and the table, and tell the broker session.
 ///
-/// Every refusal is reported and nothing else happens: an edit that cannot be
-/// applied must not leave the registry and the table disagreeing, which is why
-/// each arm below either completes or returns before touching the second one.
+/// # The only place an edit happens
+///
+/// Both transports reach this function and neither contains any part of it: the
+/// HTTP surface calls it through `crate::rpc` and renders what it returns,
+/// and anything arriving on [`crate::edits::EditChannel`] calls it and logs.
+/// That is what "one command path, two transports" means concretely — a rule
+/// added here is added for both, and there is nowhere else for one of them to
+/// disagree.
+///
+/// # Refusals leave nothing half-applied
+///
+/// An edit that cannot be applied must not leave the registry and the table
+/// disagreeing, which is why each arm either completes or returns before
+/// touching the second one — and why `Add` validates the configuration inside
+/// `allocate_with`, before the address is spent.
+///
+/// # It opens a deaf window that is not next to a burst, and that is accepted
+///
+/// `somfy_tasks::state`'s docs argue that every flash erase in this firmware
+/// sits immediately before a transmission, so the tens of milliseconds it holds
+/// interrupts down extend a window the burst was about to open anyway. **`Add`
+/// breaks that**: `seed_if_absent` writes a rolling-code seed, and nothing is
+/// transmitted afterwards.
+///
+/// It is accepted rather than avoided, for reasons that do not generalise:
+/// adding a shade is a rare, human-initiated act; the person doing it is at a
+/// browser rather than at a wall remote, so there is no press to miss; and the
+/// alternative — deferring the seed — would leave a shade that exists and
+/// cannot transmit until some later write, which is a worse failure than a lost
+/// reception. The debounced *table* write is separate and already lands on the
+/// state task's own clock (`somfy_config::Catalog::due_at`).
+///
+/// The honest residue is that a wall-remote press arriving in the same tens of
+/// milliseconds as somebody clicking "add shade" is lost. Nothing reports it,
+/// because a lost reception and a quiet band are indistinguishable.
 fn apply_edit(
     registry: &mut Registry,
     catalog: &mut Catalog,
@@ -412,25 +671,35 @@ fn apply_edit(
     events: &EventSender,
     edit: ShadeEdit,
     now_ms: u64,
-) {
+) -> Result<Applied, ApiErrorCode> {
     match edit {
-        ShadeEdit::Add { name } => {
+        ShadeEdit::Add { request } => {
             // The id is the registry's lowest free slot, and the address is
             // allocated inside the branch where that slot is empty — see
-            // `somfy_domain::allocate_if_absent` for why reallocating is not a
-            // thing it declines to do but a thing it cannot express.
-            let Some(id) = free_shade_id(registry) else {
-                esp_println::println!("shades: cannot add '{}' — the registry is full", name);
-                return;
-            };
-            let allocated = match allocate_if_absent(registry, identity, id, &name) {
-                Ok(allocated) => allocated,
-                Err(error) => {
-                    esp_println::println!("shades: cannot add '{}' ({:?})", name, error);
-                    return;
-                }
-            };
+            // `somfy_domain::allocate_with` for why reallocating is not a thing
+            // it declines to do but a thing it cannot express.
+            let id = free_shade_id(registry).ok_or(ApiErrorCode::RegistryFull)?;
+            // `to_config` is the *same* validator `PATCH` runs, and it runs
+            // here — at the allocated address, before the shade exists — so a
+            // request the API would refuse never costs an address.
+            let allocated =
+                allocate_with(registry, identity, id, |address| request.to_config(address))
+                    .map_err(|error| match error {
+                        AllocateError::Description(code) => code,
+                        AllocateError::Domain(error) => {
+                            // Unreachable: the id came from `free_shade_id`, so
+                            // it is in range and its slot is empty, and the
+                            // allocator probes one more candidate than the
+                            // registry can hold. Reported rather than
+                            // `expect`ed, because a panic reboots the board.
+                            esp_println::println!("shades: allocator refused ({error:?})");
+                            ApiErrorCode::InvalidAddress
+                        }
+                    })?;
             let address = allocated.address();
+            let name = registry
+                .shade(id)
+                .map_or_else(String::new, |shade| shade.config.name.clone());
 
             // **A freshly allocated address needs a rolling code before its
             // first transmission.** `seed_if_absent` is where that rule lives:
@@ -482,51 +751,98 @@ fn apply_edit(
             }
 
             catalog.add(id, seed, now_ms);
-            let event = ShadeEvent::Added {
-                id,
-                name,
-                pairable: RemoteIdentity::is_allocated(address),
-            };
-            announce(events, event);
+            announce(
+                events,
+                ShadeEvent::Added {
+                    id,
+                    name,
+                    pairable: RemoteIdentity::is_allocated(address),
+                },
+            );
+            Ok(Applied::Added(id))
+        }
+        // **Announced as `Added` again, deliberately.** A discovery config is
+        // retained and keyed by the entity's `unique_id`, so republishing one
+        // with a new name replaces it in place — which is what a rename is. The
+        // broker session's `Inventory::insert` and `Known::track` are both
+        // idempotent on the id, so nothing else moves: the position it has
+        // observed survives, and no entity is created or orphaned.
+        ShadeEdit::Reconfigure { id, patch } => {
+            let current = &registry.shade(id).ok_or(ApiErrorCode::NotFound)?.config;
+            // The same validator `POST /api/v1/shades` runs, resolved against
+            // the shade's real current configuration — which is why the patch
+            // travels rather than a config built when the request arrived.
+            let next = patch.apply(current)?;
+            let name = next.name.clone();
+            catalog
+                .reconfigure(registry, id, next, now_ms)
+                .map_err(catalog_refusal)?;
+            esp_println::println!("shades: ShadeId({}) reconfigured as '{}'", id.0, name);
+            announce(
+                events,
+                ShadeEvent::Added {
+                    id,
+                    name,
+                    pairable: registry
+                        .shade(id)
+                        .is_some_and(|shade| RemoteIdentity::is_allocated(shade.config.address)),
+                },
+            );
+            Ok(Applied::Changed)
         }
         ShadeEdit::Remove { id } => {
             // **The entities go before the shade does.** The record is written
             // with the shade gone and its announced bit still set, so from here
             // on flash names an orphan — which is the only thing that can name
             // it once the id is out of the registry.
-            if let Err(error) = catalog.remove(registry, id, now_ms) {
-                esp_println::println!("shades: cannot remove ShadeId({}) ({})", id.0, error);
-                return;
-            }
+            catalog
+                .remove(registry, id, now_ms)
+                .map_err(catalog_refusal)?;
             esp_println::println!("shades: ShadeId({}) removed", id.0);
             announce(events, ShadeEvent::Removed { id });
+            Ok(Applied::Changed)
         }
-        ShadeEdit::Link { id, address } => match catalog.link(registry, id, address, now_ms) {
-            Ok(()) => esp_println::println!(
+        ShadeEdit::Link { id, address } => {
+            catalog
+                .link(registry, id, address, now_ms)
+                .map_err(catalog_refusal)?;
+            esp_println::println!(
                 "shades: ShadeId({}) now follows the remote at {:#08X}",
                 id.0,
                 address,
-            ),
-            Err(error) => esp_println::println!(
-                "shades: cannot link {:#08X} to ShadeId({}) ({})",
-                address,
-                id.0,
-                error,
-            ),
-        },
-        ShadeEdit::Unlink { id, address } => match catalog.unlink(registry, id, address, now_ms) {
-            Ok(()) => esp_println::println!(
+            );
+            Ok(Applied::Changed)
+        }
+        ShadeEdit::Unlink { id, address } => {
+            catalog
+                .unlink(registry, id, address, now_ms)
+                .map_err(catalog_refusal)?;
+            esp_println::println!(
                 "shades: ShadeId({}) no longer follows the remote at {:#08X}",
                 id.0,
                 address,
-            ),
-            Err(error) => esp_println::println!(
-                "shades: cannot unlink {:#08X} from ShadeId({}) ({})",
-                address,
-                id.0,
-                error,
-            ),
-        },
+            );
+            Ok(Applied::Changed)
+        }
+    }
+}
+
+/// Translate a table refusal into the vocabulary the UI can translate.
+///
+/// Only three of `CatalogError`'s causes are things a person can act on, and
+/// the rest share the one 5xx the contract has — which is the honest place for
+/// them, because each is either unreachable from the API surface or a fault in
+/// this device rather than in the request. They are printed on the way past so
+/// that "500" is never the whole story anybody gets.
+fn catalog_refusal(error: CatalogError) -> ApiErrorCode {
+    match error {
+        CatalogError::Domain(DomainError::NotFound) => ApiErrorCode::NotFound,
+        CatalogError::Domain(DomainError::RegistryFull) => ApiErrorCode::RegistryFull,
+        CatalogError::Domain(DomainError::NameTooLong) => ApiErrorCode::NameTooLong,
+        other => {
+            esp_println::println!("shades: the table refused a change ({other})");
+            ApiErrorCode::InvalidAddress
+        }
     }
 }
 

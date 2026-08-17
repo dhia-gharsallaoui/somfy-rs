@@ -71,7 +71,7 @@ Plans (per [`docs/specs/`](docs/specs/)):
 | 4b | Firmware receive: RMT RX, Embassy tasks, persisted rolling codes — **complete, hardware-proven** |
 | 5 | Network: WiFi, MQTT, Home Assistant discovery — **in progress** (Tasks 1–4 of 5) |
 | 6 | Persistence + OTA (A/B partitions, rollback) |
-| 7 | Web UI (Preact) served from flash |
+| 7 | Web UI (Preact) served from flash + the HTTP/WebSocket server that serves it — **in progress** (UI and device server land; settings, backup and diagnostics screens still stubs) |
 
 ## Contracts for later plans
 
@@ -159,14 +159,20 @@ policy-free:
 TypeScript generation.
 
 ² `firmware` is excluded from the root workspace: it builds only for ESP
-targets, one chip per build (`chip-esp32`/`chip-s3`/`chip-c3`).
+targets, one chip per build (`chip-esp32`/`chip-s3`/`chip-c3`). Its transports
+are features — `mqtt`, `http` and `ui`, all on by default — so that a build with
+every transport off still compiles, which is what proves no transport logic has
+leaked into the domain or the task layer. **`http`/`ui` do not fit the ESP32**;
+see [`crates/firmware/README.md`](crates/firmware/README.md).
 
 ### The web UI
 
 [`ui/`](ui) is the Preact + Vite + TypeScript app the firmware serves from
 flash. It is **mock-driven**: `bun run dev` starts a Vite plugin that serves a
 fake `/api/v1/` REST + WebSocket device, so every screen can be built and
-exercised with no hardware and no firmware running.
+exercised with no hardware and no firmware running. The **device** serves the
+same paths — `crates/firmware/src/api/` — so the same client code runs against
+both with no "mock mode" branch anywhere in the app.
 
 The mock is not a hand-written imitation of the API — it is *typed by* the
 generated bindings in `ui/src/api/generated/`, down to an exhaustive `switch`
