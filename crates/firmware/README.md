@@ -31,10 +31,30 @@ an `espflash.toml` pointing espflash at it. Run `espflash` from this directory s
 espflash's default table reports `PartitionMissing` and stops rather than
 running without durable storage.
 
-This crate is its own Cargo workspace (see the root `Cargo.toml`'s
-`exclude = ["crates/firmware"]`), so building or testing the rest of the
-repository never requires an ESP toolchain. Do not add `crates/firmware` back
-into the root `[workspace] members` list.
+## The partition table, and why `build.rs` checks it
+
+The table is A/B: two equal app slots `ota_0` and `ota_1`, plus the `otadata`
+region the bootloader uses to choose between them. `partitions.csv` carries the
+derivation of every offset in it — the short version is that `rollcode` is
+treated as immovable, which fixes the first slot at 0x10000–0x200000 and leaves
+the rest with no free choices. **The three data regions keep the offsets they
+have always had, so a board already in service keeps its rolling codes, its
+credentials and its shade table across the change.** There is no migration; see
+`docs/hardware-checklist.md` for what an operator actually does.
+
+`build.rs` parses that file with `esp-idf-part` — the same crate espflash uses —
+and fails the build if the layout's invariants are broken. It exists because the
+table is data: an edit that moves `rollcode` compiles, links, lints and passes
+the whole three-chip matrix, and the first thing to notice would be a device
+that had already lost the codes.
+
+This crate is its own Cargo workspace — stated by an empty `[workspace]` table
+in its `Cargo.toml`, not merely implied by the root manifest's
+`exclude = ["crates/firmware"]`, because `exclude` only says "not a member of
+*that* workspace" and cargo then keeps looking upwards. So building or testing
+the rest of the repository never requires an ESP toolchain, and this crate
+builds the same way wherever the checkout happens to sit. Do not add
+`crates/firmware` back into the root `[workspace] members` list.
 
 ## Supported chips
 

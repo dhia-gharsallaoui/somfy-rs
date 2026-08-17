@@ -10,18 +10,77 @@
 # espflash's built-in default. Flashing with the default table instead is not
 # silently wrong — the firmware reports `PartitionMissing` and stops.
 #
-# Everything else is the stock single-app layout. `factory` is 1.9 MB against a
-# ~250 KB image, so the table fits any 4 MB board and leaves room to grow;
-# `rollcode` sits after it, sector-aligned, at 8 KB — two 4 KB erase sectors,
-# which is the minimum the ring needs to guarantee that erasing one sector can
-# never take the newest record with it.
+# ## The layout is derived, not chosen
 #
-# `wificfg` is the second region with the same shape and the same reasons: the
-# Plan 5 configuration store looks it up by label, and it is two 4 KB erase
-# sectors for the same guarantee — erasing one sector can never take the newest
-# record with it. It is a separate partition rather than more slots in
-# `rollcode` because the two have different write rates and very different
-# consequences on loss, and one erase must never touch both.
+# Every offset below is forced by one of four rules, and the whole table falls
+# out of them once `rollcode`'s address is treated as immovable.
+#
+# 1. **The low 64 KB is the ESP-IDF boot flow.** Bootloader, partition table at
+#    0x8000, then `nvs` and `phy_init`. The first byte an app can occupy is
+#    0x10000.
+# 2. **An app partition must start on a 64 KB boundary.** That is the flash
+#    MMU's page size, not a convention; `esp-idf-part` rejects anything else and
+#    so does the ESP-IDF bootloader.
+# 3. **`rollcode` may not move, ever.** It holds the rolling codes of motors in
+#    daily use, and a lost code costs a physical re-pairing at each shade. Its
+#    address has been 0x200000 since the region existed, so every already
+#    provisioned board has its codes there. `wificfg` and `shades` are pinned
+#    beside it for the weaker reason that moving them costs a re-provision.
+# 4. **`otadata` must be exactly 0x2000 bytes of `data, ota`.** Two sectors, one
+#    `esp_ota_select_entry_t` copy each, so a torn write cannot lose both.
+#    `esp_bootloader_esp_idf::ota::Ota::new` refuses any other size outright.
+#
+# Rules 1–3 fix the first app slot completely: it starts at 0x10000 and ends
+# where `rollcode` begins, so it is **0x1F0000 = 2,031,616 bytes and cannot be
+# any larger without moving the rolling codes**. A/B slots must be the same size
+# — an image that fits the larger slot and not the smaller one is a brick on the
+# following update — so 0x1F0000 is the size of both.
+#
+# The second slot then follows by rule 2: the data regions plus `otadata` run to
+# 0x208000, and the next 64 KB boundary is 0x210000. 0x210000 + 0x1F0000 lands
+# on 0x400000 exactly, so the table ends on a 4 MB boundary and still fits a 4 MB
+# board — which the single-app table it replaces also did, and which is worth
+# keeping since only the ESP32-S3 board here is known to carry 8 MB.
+#
+# ## Is 0x1F0000 enough?
+#
+# Measured with `espflash save-image` on 2026-08-17, against the 2,031,616-byte
+# slot:
+#
+#     ESP32     632,640 bytes   31.1%   1,398,976 free
+#     ESP32-S3  585,376 bytes   28.8%   1,446,240 free
+#     ESP32-C3  581,040 bytes   28.6%   1,450,576 free
+#
+# The slot has to hold firmware **and** the web UI, because there is no
+# filesystem: spec §6 puts the UI in the image with `include_bytes!` so that one
+# image is firmware and UI together and an OTA is atomic. Against the worst chip
+# there is 1.33 MiB spare, and spec §8 budgets the whole UI at ≤200 KB gzipped.
+# What else is still to come — TLS, an HTTP server, the real config store, mDNS
+# and SNTP — is the part with no measurement behind it yet; mbedTLS is the large
+# one and is the figure to re-check when it lands.
+#
+# ## What is deliberately not allocated
+#
+# 0x208000–0x210000, 32 KB, eight erase sectors. It is the space between the
+# last data region and the 64 KB boundary `ota_1` has to start on, so it costs
+# neither app slot anything, and it is the only room a future data region can
+# have without shrinking a slot or pushing the table past 4 MB. Plan 6's real
+# config store is the likely claimant.
+#
+# On an 8 MB board 0x400000–0x800000 is unallocated too. Spending it would mean
+# either slots larger than 0x1F0000 — impossible while `rollcode` stays put —
+# or a data region no 4 MB board could carry.
+#
+# ## The data regions
+#
+# `rollcode` is 8 KB: two 4 KB erase sectors, which is the minimum the ring
+# needs to guarantee that erasing one sector can never take the newest record
+# with it.
+#
+# `wificfg` is the second region with the same shape and the same reasons. It is
+# a separate partition rather than more slots in `rollcode` because the two have
+# different write rates and very different consequences on loss, and one erase
+# must never touch both.
 #
 # `shades` is the third, and it is a third region rather than more fields in
 # `wificfg` because the shades do not fit there: a config record is 512 bytes
@@ -32,14 +91,51 @@
 # guarantee as the other two. **The firmware only ever reads it**; the host-side
 # `provision_shades` example writes it.
 #
-# Note `rollcode` and `wificfg` keep their offsets. A board reflashed with this
-# table keeps its rolling codes and its credentials; only the new region beyond
-# them is added.
+# ## What a board already in service keeps
+#
+# `rollcode`, `wificfg` and `shades` keep their offsets, their sizes and their
+# contents. A provisioned board reflashed with this table keeps its rolling
+# codes, its credentials and its shade table; `factory` becomes `ota_0` at the
+# same offset and the same size, so even the app image lands where it already
+# was. `otadata` is new and blank, and a blank `otadata` with no `factory`
+# partition present is exactly what the bootloader reads as "boot `ota_0`".
+#
+# The one thing an operator must do is erase `otadata` when *reverting* to this
+# table from a state where the device had already booted `ota_1` — see
+# `docs/hardware-checklist.md`.
+#
+# ## There is no `factory` partition, and that has a consequence for Plan 6 Task 4
+#
+# Omitting `factory` is required: the bootloader prefers it over both slots
+# whenever `otadata` is blank, which is what every freshly flashed board has, so
+# a table carrying one would boot the factory image forever and an update
+# written to a slot would simply never run. `build.rs` refuses a table that
+# reintroduces it.
+#
+# What it costs is a trap in `esp_bootloader_esp_idf` 0.5.0 that whoever writes
+# the update path should know about **before** they meet it. `Ota::
+# current_app_partition` reports `AppPartitionSubType::Factory` when both
+# `otadata` sequence numbers read 0xFFFFFFFF — a blank region — and it does so
+# whether or not a factory partition exists. `OtaUpdater::next_ota_part` then
+# maps `Factory` to `Ota0`, notices that `Ota0` is also the booted partition,
+# and recovers by computing `(current.ota_app_number() + 2) % ota_count`. For
+# `Factory` that inner call is `0u8 - 0x10`: it panics under the dev profile's
+# overflow checks and wraps to 240 under release, and `(240 + 2) % 2` is 0 —
+# `Ota0` again, the slot that is running. So on a board's **first** update the
+# convenience wrapper hands back the partition it is executing from.
+#
+# The layout is not what is wrong here and a factory partition would not fix it,
+# it would only hide it behind a worse failure. Task 4's options are to write
+# `otadata` once at first boot so it is no longer blank, or to pick the slot from
+# `PartitionTable::booted_partition` and drive the lower-level `ota::Ota` API
+# directly. Either is a few lines; discovering it against a running image is not.
 #
 # Name,     Type, SubType,   Offset,   Size,     Flags
 nvs,        data, nvs,       0x9000,   0x6000,
 phy_init,   data, phy,       0xf000,   0x1000,
-factory,    app,  factory,   0x10000,  0x1F0000,
+ota_0,      app,  ota_0,     0x10000,  0x1F0000,
 rollcode,   data, undefined, 0x200000, 0x2000,
 wificfg,    data, undefined, 0x202000, 0x2000,
 shades,     data, undefined, 0x204000, 0x2000,
+otadata,    data, ota,       0x206000, 0x2000,
+ota_1,      app,  ota_1,     0x210000, 0x1F0000,
