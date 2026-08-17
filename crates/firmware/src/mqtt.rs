@@ -12,12 +12,15 @@
 //! the one that talks to something outside the house:
 //!
 //! 1. **No shared state.** Its arguments are a [`Stack`], the broker's own
-//!    settings, a [`Broker`] (topic configuration and a snapshot of the shades
-//!    to announce), a command *sender* and a delta *subscriber*. It holds no
-//!    flash, no radio, no transmit queue, and no reference to the registry —
-//!    the shades are a copy taken before the state task owned it. Giving this
-//!    task any of those would be a change to its type, not an oversight in its
-//!    body.
+//!    settings, a [`Broker`] (topic configuration, a snapshot of the shades to
+//!    announce, and a snapshot of what the rolling-code region held at boot), a
+//!    command *sender* and a delta *subscriber*. It holds no flash, no radio, no
+//!    transmit queue, and no reference to the registry — the shades and the
+//!    survey are both **copies taken before the state task owned anything**.
+//!    Giving this task any of those would be a change to its type, not an
+//!    oversight in its body. That is also why the rolling-code diagnostic is a
+//!    boot figure rather than a live one: reporting it live would mean holding
+//!    the store, which is the one thing this task must not do.
 //! 2. **It is spawned after the radio tasks, and after the yield that polls
 //!    them.** `main` spawns radio and state, yields — which is what actually
 //!    runs them and arms the receiver — and only then starts the network.
@@ -58,14 +61,24 @@
 //! see [`crate::heap`] — so `main::check_stack_headroom` is what stands between
 //! these sizes and a board that will not boot. Their sizes are argued at each
 //! constant.
+//!
+//! ## R7's entity set, and the one rule that shapes it
+//!
+//! `somfy-mqtt` decides *which* entities exist; this module supplies the values,
+//! and [`Diagnostics`] is the table of where each one comes from. The rule is
+//! that **an entity backed by nothing is worse than an absent one** — it reads
+//! as a device fault rather than as an unimplemented feature — so a reading with
+//! no honest source publishes nothing at all rather than a placeholder, exactly
+//! as an unreported shade's position does.
 
+use core::fmt::Write as _;
 use core::net::SocketAddrV4;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_sync::pubsub::WaitResult;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use heapless::{String, Vec};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Publication, QoS, RetainHandling, Session,
@@ -74,13 +87,14 @@ use minimq::{
 use somfy_config::{MqttSettings, Namespaces};
 use somfy_domain::{Direction, Pos, ShadeCommand, ShadeId, StateDelta, MAX_SHADES};
 use somfy_mqtt::{
-    reconfigure, Component, ConfigError, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, Payload,
-    PublishedTopic, Retention, ShadeTopic, StateRoot, Step, PAYLOAD_CAPACITY,
+    reconfigure, Component, ConfigError, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig,
+    NodeId, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, PAYLOAD_CAPACITY,
 };
 use somfy_tasks::{Backoff, ControlCommand};
 
 use crate::config::MAX_SUPERSEDED;
 use crate::inventory::Inventory;
+use crate::store::Survey;
 use crate::tasks::{CommandSender, DeltaSubscriber};
 
 /// Inbound MQTT packet buffer.
@@ -97,11 +111,17 @@ const MQTT_RX_BYTES: usize = 512;
 /// flight.
 ///
 /// The largest packet this device sends is a retained discovery config: a
-/// topic under 80 bytes, a payload bounded by
-/// [`somfy_mqtt::PAYLOAD_CAPACITY`] at 1024, and a fixed header. 1536 covers
-/// that with room for a subscribe waiting to be acknowledged, and every byte
-/// here is a byte of the DRAM the main stack is carved from.
-const MQTT_TX_BYTES: usize = 1536;
+/// topic bounded by `somfy-mqtt`'s own capacity proof at 143 bytes, a payload
+/// bounded by [`somfy_mqtt::PAYLOAD_CAPACITY`] at 1152, and a fixed header —
+/// about 1,310 bytes at the widest configuration `somfy-mqtt` will accept, and
+/// under 600 at the one this firmware actually builds.
+///
+/// **One packet, not several.** [`perform`] settles after every operation, so
+/// exactly one is ever in flight and the arena never has to hold two at once.
+/// Without that, two of the widest configs would already overrun this figure —
+/// which is the tighter of the two ceilings the settle discipline removes, and
+/// the reason it is a bound rather than a budget to watch.
+const MQTT_TX_BYTES: usize = 1664;
 
 /// TCP receive window. Commands are tiny and arrive one at a time.
 const TCP_RX_BYTES: usize = 768;
@@ -154,6 +174,30 @@ const SOCKET_TIMEOUT_S: u64 = 20;
 /// common default and well inside the socket timeout above.
 const KEEPALIVE_S: u16 = 60;
 
+/// How often the controller's own diagnostics are republished.
+///
+/// They are what an operator watches over hours rather than seconds — a heap
+/// that is creeping, a signal that is falling — so the interval is chosen
+/// against the cost rather than against any need for immediacy. Each tick is
+/// [`DeviceEntity::ALL`] publishes and one round trip each; at a minute that is
+/// five packets a minute against a shade in motion's twenty a second.
+///
+/// It is also what makes uptime mean anything: published only on announcement,
+/// the figure would freeze at whatever it was when the session came up.
+///
+/// It equals [`KEEPALIVE_S`], and the coincidence is harmless in the useful
+/// direction: a tick is five publishes each settled with a `poll`, so the
+/// session is driven by real traffic within every keepalive window and PINGREQ
+/// becomes rare rather than starved. Real traffic is the better liveness proof
+/// of the two.
+const DIAGNOSTIC_INTERVAL_S: u64 = 60;
+
+/// Bytes a rendered diagnostic reading may occupy.
+///
+/// The widest is `u64::MAX` at 20 digits; a negative signal strength is 11 at
+/// most. 24 covers both and is the size of a pointer pair.
+const READING_CAPACITY: usize = 24;
+
 /// Whether this firmware advertises a tilt axis. **It does not, deliberately.**
 ///
 /// `somfy-domain` carries tilt modes without implementing them — no command
@@ -185,6 +229,8 @@ pub struct Broker {
     /// The last state observed for each shade, so a fresh broker session can be
     /// given it without waiting for the next change.
     known: Known,
+    /// What the controller reports about itself. See [`Diagnostics`].
+    diagnostics: Diagnostics,
     /// The one discovery-payload buffer. One, because only one config is
     /// rendered at a time and a kilobyte is not free on the tightest chip here.
     payload: String<PAYLOAD_CAPACITY>,
@@ -207,6 +253,7 @@ impl Broker {
         config: MqttConfig,
         stale: Vec<MqttConfig, MAX_SUPERSEDED>,
         inventory: Inventory,
+        survey: Survey,
     ) -> Broker {
         let known = Known::new(&inventory);
         Broker {
@@ -214,6 +261,9 @@ impl Broker {
             stale,
             inventory,
             known,
+            diagnostics: Diagnostics {
+                rollcode_damaged: survey.damaged,
+            },
             payload: String::new(),
             version_logged: false,
             rare: Rare::default(),
@@ -221,17 +271,103 @@ impl Broker {
     }
 }
 
+/// What the controller reports about **itself**, and where each figure comes
+/// from.
+///
+/// | entity | source |
+/// |---|---|
+/// | uptime | [`Instant::now`], which counts from the time driver starting at boot |
+/// | Wi-Fi signal | [`crate::net::signal_dbm`], sampled by the link task |
+/// | free heap | [`crate::heap::free_bytes`] |
+/// | peak heap use | [`crate::heap::peak_bytes`] |
+/// | damaged rolling-code slots | the boot survey, carried here |
+///
+/// Everything but the last is read at the moment it is published, so nothing
+/// here has to be kept up to date. The rolling-code figure is the exception and
+/// is a **snapshot of the region as it was at boot**: the store belongs to the
+/// state task from the moment it is handed over, and re-surveying it would mean
+/// reaching across the boundary that keeps a broker from being able to affect
+/// radio control. A slot damaged after boot is therefore reported at the next
+/// one — which is the same latency an operator reading the serial line has, and
+/// `docs/provenance.md` records the condition for improving it.
+struct Diagnostics {
+    /// Slots in the rolling-code region that were neither valid nor blank at
+    /// boot.
+    rollcode_damaged: usize,
+}
+
+impl Diagnostics {
+    /// The current reading for one entity, or `None` when there is nothing
+    /// honest to report.
+    ///
+    /// `None` is not a failure and it is not rendered as one: the caller
+    /// publishes nothing. The value would go out **retained**, so a placeholder
+    /// would outlive the boot that produced it and be handed to every later
+    /// subscriber — the confidently-wrong retained value this whole integration
+    /// is written around. Home Assistant shows an entity with no state as
+    /// unknown, which is what it is.
+    fn reading(&self, entity: DeviceEntity) -> Option<String<READING_CAPACITY>> {
+        let mut out: String<READING_CAPACITY> = String::new();
+        let written = match entity {
+            DeviceEntity::Uptime => write!(&mut out, "{}", Instant::now().as_secs()),
+            // The only one that can be absent: the link has not come up yet, or
+            // the driver could not answer. See `net::SIGNAL_DBM`.
+            DeviceEntity::WifiSignal => write!(&mut out, "{}", crate::net::signal_dbm()?),
+            DeviceEntity::HeapFree => write!(&mut out, "{}", crate::heap::free_bytes()),
+            DeviceEntity::HeapPeak => write!(&mut out, "{}", crate::heap::peak_bytes()),
+            DeviceEntity::RollcodeDamaged => write!(&mut out, "{}", self.rollcode_damaged),
+        };
+        // Unreachable — `READING_CAPACITY` holds every one of these — and
+        // treated as "nothing to report" rather than published half-written,
+        // because a truncated number is a plausible wrong number.
+        written.ok().map(|()| out)
+    }
+}
+
+/// Everything one operation needs beyond the connection and the step itself.
+///
+/// A struct rather than five arguments because [`perform`] is the **only**
+/// function in this module that puts anything on the wire, so every path
+/// reaches it and every one of them would otherwise repeat the list. Its fields
+/// are disjoint borrows of [`Broker`], which is what lets a plan that reads
+/// `config` and `inventory` be walked while `payload` and `rare` are written.
+struct Wire<'a> {
+    config: &'a MqttConfig,
+    inventory: &'a Inventory,
+    commands: &'a CommandSender,
+    payload: &'a mut String<PAYLOAD_CAPACITY>,
+    rare: &'a mut Rare,
+}
+
+/// What ended a wait in the session loop.
+///
+/// An enum rather than three branches doing their work in place, because two of
+/// them publish and an inbound message holds the connection borrowed while it is
+/// read. Deciding first and acting after is what gives the borrow back.
+enum Woken {
+    /// The state task reported a shade.
+    Delta(StateDelta),
+    /// The diagnostic interval elapsed.
+    Diagnostics,
+}
+
 /// Bring up the broker session.
 ///
 /// Returns a `SpawnError` and nothing else; the caller reports it and carries
 /// on without MQTT, exactly as it does for Wi-Fi. There is no failure here that
 /// stops the controller.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every one is a distinct thing boot found, and a struct for them \
+    would be a type constructed at one call site and destructured at the next"
+)]
 pub fn start(
     spawner: embassy_executor::Spawner,
     stack: Stack<'static>,
     settings: MqttSettings,
     superseded: Vec<Namespaces, MAX_SUPERSEDED>,
     inventory: Inventory,
+    survey: Survey,
     commands: CommandSender,
     deltas: DeltaSubscriber,
 ) -> Result<(), embassy_executor::SpawnError> {
@@ -276,7 +412,7 @@ pub fn start(
         }
     }
 
-    let broker = Broker::new(config, stale, inventory);
+    let broker = Broker::new(config, stale, inventory, survey);
     spawner.spawn(session(stack, settings, broker, commands, deltas)?);
     Ok(())
 }
@@ -491,105 +627,198 @@ impl Broker {
             // scratch. That also makes a broker restart indistinguishable from
             // a first connect, which is exactly why the whole announcement runs
             // here and not on every reconnect.
-            ConnectEvent::Connected => {
-                self.announce(&mut connection, commands).await?;
-                // R9's "republish retained state on reconnect". The broker may
-                // have lost its retained store, so the values this device last
-                // observed go out again rather than waiting for the next change
-                // — which, for a shade nobody touches, may be days.
-                //
-                // One shade at a time, and settled after each: see [`settle`]
-                // for why an unsettled burst cannot exceed eight operations.
-                for id in self.known.ids() {
-                    for state in self.known.of(id) {
-                        send_state(&mut connection, &self.config, &state).await?;
-                        settle(
-                            &mut connection,
-                            &self.config,
-                            &self.inventory,
-                            commands,
-                            &mut self.rare,
-                        )
-                        .await?;
-                    }
-                }
-            }
+            ConnectEvent::Connected => self.resync(&mut connection, commands).await?,
             // A resumed session: subscriptions and in-flight QoS state survived,
             // so re-announcing the entities would be a broker's worth of
             // retained publishes for no change. Availability still goes out,
             // because the will may have fired while this device was away and
             // left `offline` retained.
+            // **The retirement is not conditional on the event.** A superseded
+            // namespace still has orphans under it whether or not the broker
+            // resumed the session, and R5's obligation is about what is
+            // retained on the broker rather than about what this client's
+            // session remembers. Skipping it here would make the rule depend on
+            // a CONNACK flag — which, with `session_expiry_interval(0)`, is a
+            // branch nothing takes today and would silently turn the rule off
+            // for whoever raises it.
+            ConnectEvent::Reconnected if !self.stale.is_empty() => {
+                // **`resync`, not `announce`.** A superseded configuration that
+                // shares the state root has its state topics tombstoned by the
+                // retirement, and those are the topics the current
+                // configuration publishes to. Announcing without republishing
+                // would leave every position and every reading cleared on the
+                // broker until the next change — which, for a shade nobody
+                // touches, may be days. That the two cannot be asked for
+                // separately is the point of `resync` existing.
+                //
+                // `online` is not published separately on this path: it is the
+                // first step of the plan `resync` walks, and publishing it here
+                // as well would buy nothing for an extra settled round trip.
+                self.resync(&mut connection, commands).await?;
+            }
             ConnectEvent::Reconnected => {
-                let online = self.config.online();
-                send(&mut connection, &online).await?;
-                // **The retirement is not conditional on the event.** A
-                // superseded namespace still has orphans under it whether or
-                // not the broker resumed the session, and R5's obligation is
-                // about what is retained on the broker rather than about what
-                // this client's session remembers. Skipping it here would make
-                // the rule depend on a CONNACK flag — which, with
-                // `session_expiry_interval(0)`, is a branch nothing takes today
-                // and would silently turn the rule off for whoever raises it.
-                if !self.stale.is_empty() {
-                    self.announce(&mut connection, commands).await?;
-                }
+                let online = Step::Send(self.config.online());
+                self.perform_one(&mut connection, &online, commands).await?;
             }
         }
 
+        // Created once, outside the loop, so the interval is a schedule rather
+        // than a delay restarted by every delta and every inbound command. A
+        // `Timer` inside the loop would push the next diagnostic publish out by
+        // a full interval each time a shade moved.
+        let mut diagnostics = Ticker::every(Duration::from_secs(DIAGNOSTIC_INTERVAL_S));
+
         loop {
-            // Both halves in one wait. The delta subscriber's future is
-            // cancel-safe (it advances its cursor only on `Poll::Ready`) and
-            // `minimq`'s `recv` is documented as cancel-safe, so whichever loses
-            // is simply dropped.
+            // Three inputs in one wait. All three futures are cancel-safe: the
+            // delta subscriber advances its cursor only on `Poll::Ready`,
+            // `minimq`'s `recv` is documented as cancel-safe, and
+            // `Ticker::next` keeps its deadline in the ticker rather than in
+            // the future — so whichever loses is simply dropped.
             //
             // The inbound branch is handled *inside* the match and yields
             // nothing borrowed: an `InboundPublish` borrows the connection
-            // mutably, and the publish below needs that borrow back.
-            let delta = match select(connection.recv(), deltas.next_message()).await {
-                Either::First(inbound) => {
+            // mutably, and the publishes below need that borrow back.
+            let woken = match select3(connection.recv(), deltas.next_message(), diagnostics.next())
+                .await
+            {
+                Either3::First(inbound) => {
                     let inbound = inbound.map_err(SessionEnd::mqtt)?;
                     dispatch(
-                        &self.config,
-                        &self.inventory,
-                        commands,
-                        &mut self.rare,
+                        &mut Wire {
+                            config: &self.config,
+                            inventory: &self.inventory,
+                            commands,
+                            payload: &mut self.payload,
+                            rare: &mut self.rare,
+                        },
                         inbound.topic(),
                         inbound.payload(),
                     );
                     None
                 }
-                Either::Second(WaitResult::Message(delta)) => Some(delta),
+                Either3::Second(WaitResult::Message(delta)) => Some(Woken::Delta(delta)),
                 // The subscriber fell behind and the channel dropped deltas for
                 // it. Worth one line: it means this task was blocked long enough
                 // for the state task to publish `DELTA_QUEUE_DEPTH` updates, so
                 // the position now on the broker is behind the shade.
-                Either::Second(WaitResult::Lagged(missed)) => {
+                Either3::Second(WaitResult::Lagged(missed)) => {
                     esp_println::println!("mqtt: fell behind, {} state updates dropped", missed);
                     None
                 }
+                Either3::Third(()) => Some(Woken::Diagnostics),
             };
 
-            if let Some(delta) = delta {
-                self.known.record(&delta);
-                for state in self.known.of(delta.id) {
-                    send_state(&mut connection, &self.config, &state).await?;
+            match woken {
+                Some(Woken::Delta(delta)) => {
+                    self.known.record(&delta);
+                    for state in self.known.of(delta.id) {
+                        let publish = Step::Send(self.config.state(
+                            state.id,
+                            state.topic,
+                            state.value.as_bytes(),
+                        ));
+                        self.perform_one(&mut connection, &publish, commands)
+                            .await?;
+                    }
                 }
-                // A moving shade produces a delta every 100 ms, two publishes
-                // each. `recv` above does consume acknowledgements while it
-                // waits, but only when it is reached — and it is not reached
-                // while the subscriber has a backlog. Settling here bounds
-                // in-flight state at every loop boundary instead of relying on
-                // that. See [`settle`].
-                settle(
-                    &mut connection,
-                    &self.config,
-                    &self.inventory,
-                    commands,
-                    &mut self.rare,
-                )
-                .await?;
+                Some(Woken::Diagnostics) => {
+                    self.publish_diagnostics(&mut connection, commands).await?;
+                }
+                None => {}
             }
         }
+    }
+
+    /// Everything this device says when it takes ownership of its topics:
+    /// clear what a superseded configuration left, announce the current one,
+    /// then republish every retained value the announcement did not carry.
+    ///
+    /// **The three are one method because the third depends on the first.** A
+    /// superseded configuration that shares the state root has its state topics
+    /// tombstoned by the retirement — and those are the very topics the current
+    /// configuration publishes to, so an announcement without a republish
+    /// leaves them cleared on the broker until something changes. For a shade
+    /// nobody touches that is days. Offering the halves separately is what would
+    /// let a caller take one and not the other.
+    ///
+    /// It is also R9's "republish retained state on reconnect" in its own
+    /// right: a fresh broker session may have lost its retained store entirely.
+    async fn resync<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        self.announce(connection, commands).await?;
+        self.publish_shade_state(connection, commands).await?;
+        // A diagnostic whose first publish waited for the next tick would show
+        // as unknown in Home Assistant for up to `DIAGNOSTIC_INTERVAL_S` after
+        // every reconnect.
+        self.publish_diagnostics(connection, commands).await
+    }
+
+    /// Every shade's last observed state, republished retained.
+    async fn publish_shade_state<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        // Collected first because `known.ids()` borrows `self` and the publish
+        // below needs it back. `MAX_SHADES` ids is 32 bytes.
+        let ids: Vec<ShadeId, MAX_SHADES> = self.known.ids().collect();
+        for id in ids {
+            for state in self.known.of(id) {
+                let publish = Step::Send(self.config.state(
+                    state.id,
+                    state.topic,
+                    state.value.as_bytes(),
+                ));
+                self.perform_one(connection, &publish, commands).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The controller's own readings, retained, one per [`DeviceEntity`].
+    ///
+    /// An entity with nothing to report publishes **nothing** rather than a
+    /// placeholder — see [`Diagnostics::reading`]. Home Assistant shows it as
+    /// unknown, which is what it is, and the next tick fills it in as soon as
+    /// there is something to say.
+    async fn publish_diagnostics<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        for entity in DeviceEntity::ALL {
+            let Some(reading) = self.diagnostics.reading(entity) else {
+                continue;
+            };
+            let publish = Step::Send(self.config.device_state(entity, reading.as_bytes()));
+            self.perform_one(connection, &publish, commands).await?;
+        }
+        Ok(())
+    }
+
+    /// One step, settled — the shape every caller that is not walking a plan
+    /// uses. See [`perform`] for why settling is not optional.
+    async fn perform_one<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        step: &Step<'_>,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        perform(
+            connection,
+            step,
+            &mut Wire {
+                config: &self.config,
+                inventory: &self.inventory,
+                commands,
+                payload: &mut self.payload,
+                rare: &mut self.rare,
+            },
+        )
+        .await
     }
 
     /// Clear whatever a superseded configuration left behind, then publish the
@@ -614,25 +843,20 @@ impl Broker {
         // announcement. Looping here instead would announce the current
         // configuration once per superseded one, which is a broker's worth of
         // retained publishes repeated for no change.
-        for step in reconfigure(&self.stale, &self.config, self.inventory.ids(), HAS_TILT) {
-            execute(
-                connection,
-                &step,
-                &self.config,
-                &self.inventory,
-                &mut self.payload,
-            )
-            .await?;
-            // **After every operation, not at the end.** See [`settle`]: an
-            // announcement is `1 + 5N` operations and `minimq` holds eight.
-            settle(
-                connection,
-                &self.config,
-                &self.inventory,
+        // Every step through `perform`, which settles. See it for why that is
+        // not optional: an announcement now costs `1 + 3N + k` operations for
+        // `N` shades and `k` device entities, and `minimq` holds eight.
+        {
+            let mut wire = Wire {
+                config: &self.config,
+                inventory: &self.inventory,
                 commands,
-                &mut self.rare,
-            )
-            .await?;
+                payload: &mut self.payload,
+                rare: &mut self.rare,
+            };
+            for step in reconfigure(&self.stale, &self.config, self.inventory.ids(), HAS_TILT) {
+                perform(connection, &step, &mut wire).await?;
+            }
         }
 
         // The shade's own name, which no plan can carry because `somfy-mqtt`
@@ -640,22 +864,40 @@ impl Broker {
         // retirement clears it, so leaving it unpublished would be exactly the
         // publisher/model drift `ShadeTopic` exists to prevent — the retirement
         // would tombstone an address nothing had ever written.
-        for shade in self.inventory.ids().iter().copied() {
-            let Some(name) = self.inventory.name(shade) else {
+        for index in 0..self.inventory.len() {
+            // By index rather than over `inventory.ids()`, because the name is
+            // borrowed from the inventory and `perform_one` takes `&mut self`.
+            // Copied into a local for the same reason; a name is 32 bytes.
+            let Some(shade) = self.inventory.ids().get(index).copied() else {
+                break;
+            };
+            let Some(held) = self.inventory.name(shade) else {
                 continue;
             };
+            let mut name: String<{ somfy_mqtt::MAX_NAME_LEN }> = String::new();
+            if name.push_str(held).is_err() {
+                // **Reported and skipped, not published.** `heapless`'
+                // `push_str` is all-or-nothing, so a failure here would leave
+                // `name` empty — and an empty payload on a retained publish is
+                // a *tombstone*, the exact bytes `somfy_mqtt::tombstone` uses
+                // to remove a topic. Publishing it would delete the shade's
+                // name rather than leave the old one, which is a silent
+                // deletion dressed as a truncation.
+                //
+                // Unreachable while `somfy_mqtt::MAX_NAME_LEN` and
+                // `Inventory`'s own capacity are the same figure, which they
+                // are; nothing ties them together, so the branch is here.
+                esp_println::println!(
+                    "mqtt: shade {}'s name does not fit its buffer — \
+                     leaving whatever the broker holds rather than clearing it",
+                    shade.0,
+                );
+                continue;
+            }
             let published =
                 PublishedTopic::of(ShadeTopic::Name).expect("a shade's name is published");
-            let publish = self.config.state(shade, published, name.as_bytes());
-            send(connection, &publish).await?;
-            settle(
-                connection,
-                &self.config,
-                &self.inventory,
-                commands,
-                &mut self.rare,
-            )
-            .await?;
+            let publish = Step::Send(self.config.state(shade, published, name.as_bytes()));
+            self.perform_one(connection, &publish, commands).await?;
         }
 
         // Cleared only once every tombstone has been acknowledged. Without
@@ -672,10 +914,15 @@ impl Broker {
     }
 }
 
-/// Read the inbound direction until the broker has acknowledged everything
-/// outstanding.
+/// Carry out one [`Step`] and wait for the broker to acknowledge it.
 ///
-/// # Why this is not an optimisation
+/// **This is the only function in this module that puts anything on the wire,
+/// and it always settles.** That is the whole point of its existing: the
+/// settling rule below is not one a call site can be trusted to remember, and
+/// Task 4's larger entity set made forgetting it cheaper to do and more
+/// expensive to suffer.
+///
+/// # Why settling is not an optimisation
 ///
 /// `minimq` keeps a QoS 1 publish or a subscribe in its retained slots — there
 /// are **eight** — until the broker's acknowledgement is *read*, and reading
@@ -685,39 +932,51 @@ impl Broker {
 /// operation with `InflightExhausted`, and then does the same on every
 /// reconnect, at the backoff ceiling, forever.
 ///
-/// An announcement costs `1 + 5N` operations for `N` shades — `online`, then
-/// per shade one discovery config, two subscriptions and two state publishes —
-/// so **it exceeds eight at two shades**, and at one shade plus one superseded
-/// namespace. The retained packets also occupy [`MQTT_TX_BYTES`] until they are
-/// acknowledged, and three unacknowledged discovery configs fill it, which is
-/// the tighter of the two ceilings.
+/// An announcement costs `1 + 3N + k` operations for `N` shades and the `k = 5`
+/// entries of `DeviceEntity::ALL` — `online`, then per shade one discovery
+/// config and two subscriptions, then one discovery config per device entity.
+/// The firmware follows it with `N` names, `2N` state publishes and `k`
+/// readings, so a fresh session costs `1 + 6N + 2k` in all. **That is eleven
+/// with no shades provisioned at all** — the ordinary state of a freshly
+/// flashed board — where in Task 3 the same burst was `1 + 6N` and needed two
+/// shades to exceed eight. The plan alone crosses eight at one shade.
+/// `somfy-mqtt/tests/lifecycle.rs::walking_a_plan_without_settling_runs_out_of_slots_partway`
+/// is that failure, executed on the host against a model of the client, and
+/// `an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots`
+/// pins the arithmetic so it cannot quietly fall back under the limit.
+///
+/// The retained packets also occupy [`MQTT_TX_BYTES`] until they are
+/// acknowledged, and **two** unacknowledged discovery configs at the widest
+/// configuration already overrun it, which is the tighter of the two ceilings.
 ///
 /// Settling after each operation holds in-flight state at one, which makes both
 /// ceilings unreachable rather than merely distant. The cost is one round trip
-/// per operation, paid once per session.
+/// per operation, paid once per session and once per diagnostic interval.
+async fn perform<'buf, IO: minimq::Io>(
+    connection: &mut minimq::Connection<'_, 'buf, IO>,
+    step: &Step<'_>,
+    wire: &mut Wire<'_>,
+) -> Result<(), SessionEnd> {
+    execute(connection, step, wire).await?;
+    settle(connection, wire).await
+}
+
+/// Read the inbound direction until the broker has acknowledged everything
+/// outstanding. See [`perform`], which is the only caller and the only reason
+/// this is separate from it.
 ///
 /// An inbound message that arrives while settling is a real command, so it is
 /// acted on here rather than dropped: the subscriptions go out during the
 /// announcement, and a person pressing a button does not wait for it to finish.
 async fn settle<'buf, IO: minimq::Io>(
     connection: &mut minimq::Connection<'_, 'buf, IO>,
-    config: &MqttConfig,
-    inventory: &Inventory,
-    commands: &CommandSender,
-    rare: &mut Rare,
+    wire: &mut Wire<'_>,
 ) -> Result<(), SessionEnd> {
     while !connection.session().is_publish_quiescent() {
         // `poll` returns on any session progress, an acknowledgement included,
         // and it is the only thing that frees a retained slot.
         if let Some(inbound) = connection.poll().await.map_err(SessionEnd::mqtt)? {
-            dispatch(
-                config,
-                inventory,
-                commands,
-                rare,
-                inbound.topic(),
-                inbound.payload(),
-            );
+            dispatch(wire, inbound.topic(), inbound.payload());
         }
     }
     Ok(())
@@ -727,14 +986,9 @@ async fn settle<'buf, IO: minimq::Io>(
 ///
 /// Shared by the session loop and by [`settle`] so that a command arriving
 /// during an announcement is treated exactly like one arriving afterwards.
-fn dispatch(
-    config: &MqttConfig,
-    inventory: &Inventory,
-    commands: &CommandSender,
-    rare: &mut Rare,
-    topic: &str,
-    payload: &[u8],
-) {
+fn dispatch(wire: &mut Wire<'_>, topic: &str, payload: &[u8]) {
+    let (config, inventory, commands, rare) =
+        (wire.config, wire.inventory, wire.commands, &mut *wire.rare);
     match decode_command(config, inventory, topic, payload) {
         // `try_send`, never `send`: see this module's docs.
         Some(command) => {
@@ -807,10 +1061,11 @@ fn report_rare(counter: &mut u32, message: &str) {
 async fn execute<'buf, IO: minimq::Io>(
     connection: &mut minimq::Connection<'_, 'buf, IO>,
     step: &Step<'_>,
-    config: &MqttConfig,
-    inventory: &Inventory,
-    payload: &mut String<PAYLOAD_CAPACITY>,
+    wire: &mut Wire<'_>,
 ) -> Result<(), SessionEnd> {
+    let config = wire.config;
+    let inventory = wire.inventory;
+    let payload = &mut *wire.payload;
     match step {
         Step::Send(publish) => match publish.payload() {
             Payload::Discovery { shade, component } => {
@@ -845,8 +1100,9 @@ async fn execute<'buf, IO: minimq::Io>(
                             return Ok(());
                         }
                     }
-                    // Task 4 adds the rest of R7's entity set. Reported loudly
-                    // rather than skipped in silence: an entity the plan
+                    // A shade owns exactly one entity — `SHADE_COMPONENTS` is
+                    // `[Cover]` — so this is unreachable, and it is reported
+                    // loudly rather than skipped in silence: an entity the plan
                     // announces and nothing publishes is exactly the
                     // half-configured state this integration exists to prevent.
                     other => {
@@ -858,6 +1114,26 @@ async fn execute<'buf, IO: minimq::Io>(
                         );
                         return Ok(());
                     }
+                }
+                publish_bytes(
+                    connection,
+                    publish.topic().as_str(),
+                    payload.as_bytes(),
+                    publish.retention(),
+                )
+                .await
+            }
+            // R7's device-level entities. Rendered from the entity alone: what
+            // it *reports* is published separately, on the topic this config
+            // names.
+            Payload::DeviceDiscovery(entity) => {
+                if config.diagnostic_discovery(entity).render(payload).is_err() {
+                    esp_println::println!(
+                        "mqtt: the discovery config for '{}' does not fit its buffer — \
+                         the entity will not appear",
+                        entity.slug(),
+                    );
+                    return Ok(());
                 }
                 publish_bytes(
                     connection,
@@ -914,35 +1190,6 @@ async fn execute<'buf, IO: minimq::Io>(
     }
 }
 
-/// Send one already-decided [`somfy_mqtt::Publish`].
-async fn send<'buf, IO: minimq::Io>(
-    connection: &mut minimq::Connection<'_, 'buf, IO>,
-    publish: &somfy_mqtt::Publish<'_>,
-) -> Result<(), SessionEnd> {
-    let bytes = match publish.payload() {
-        Payload::Bytes(bytes) => bytes,
-        Payload::Nothing => &[],
-        // Unreachable: `send` is only used for publishes that carry their own
-        // bytes, because rendering needs the buffer only [`execute`] holds.
-        // Reported and skipped rather than ended, for the reason on `execute`.
-        Payload::Discovery { component, .. } => {
-            esp_println::println!(
-                "mqtt: a '{}' discovery config reached the buffer-free path and \
-                 was not published",
-                component.as_str(),
-            );
-            return Ok(());
-        }
-    };
-    publish_bytes(
-        connection,
-        publish.topic().as_str(),
-        bytes,
-        publish.retention(),
-    )
-    .await
-}
-
 /// The one place a packet is put on the wire, and the one place the retain flag
 /// is set.
 ///
@@ -963,22 +1210,66 @@ async fn publish_bytes<'buf, IO: minimq::Io>(
     };
     match connection.publish(publication).await {
         Ok(_) => Ok(()),
-        Err(minimq::PubError::Session(error)) => Err(SessionEnd::mqtt(error)),
-        // The payload did not fit the TX scratch space. That is a **local**
-        // limit, not a broker one, so it is reported and skipped rather than
-        // ending the session: reconnecting would meet it again, and one packet
-        // that cannot be encoded must not cost every other entity its config.
-        // Unreachable for anything within `somfy-mqtt`'s own bounds, which
-        // [`MQTT_TX_BYTES`] is sized for.
+        // **A packet that will not fit is not a reason to reconnect**, whichever
+        // half of it does not fit, and both halves have to be spelled out
+        // because `minimq` reports them through different variants.
+        //
+        // `PubError::Payload(())` is the payload overrunning the TX scratch
+        // space. `Error::Resource(_)` is the same condition reached from the
+        // header or the topic — and, more importantly, `PacketTooLarge`, which
+        // comes from the **broker's** advertised MQTT 5 `MaximumPacketSize`
+        // rather than from anything sized here: a broker configured with a
+        // limit below a discovery config would refuse every one of them,
+        // identically, on every reconnect, at the 60-second ceiling, forever.
+        // That is precisely the loop `execute`'s policy exists to forbid, and
+        // it is the one case the compile-time capacity proofs cannot rule out
+        // because the limit is not ours.
+        //
+        // Reported and skipped, so the entities that *do* fit still reach Home
+        // Assistant and the line names the size an operator has to change.
         Err(minimq::PubError::Payload(())) => {
-            esp_println::println!(
-                "mqtt: {} bytes do not fit the transmit buffer — '{}' not published",
-                bytes.len(),
+            report_oversize(topic, bytes.len(), "the transmit buffer");
+            Ok(())
+        }
+        Err(minimq::PubError::Session(minimq::Error::Resource(error))) => {
+            report_oversize(
                 topic,
+                bytes.len(),
+                match error {
+                    minimq::ResourceError::PacketTooLarge => {
+                        "the maximum packet size this broker advertised"
+                    }
+                    minimq::ResourceError::BufferTooSmall => "the transmit buffer",
+                    // Unreachable while `perform` settles every operation — the
+                    // slots cannot be exhausted when at most one is ever in use —
+                    // and still local, so still not a reason to reconnect.
+                    minimq::ResourceError::InflightExhausted => "the in-flight slots",
+                    // `ResourceError` is `#[non_exhaustive]`. Every variant it
+                    // has is a *local* limit, which is the whole reason this
+                    // arm exists, so a new one defaults to the same policy —
+                    // report and carry on — rather than to a reconnect loop.
+                    _ => "a local limit",
+                },
             );
             Ok(())
         }
+        Err(minimq::PubError::Session(error)) => Err(SessionEnd::mqtt(error)),
     }
+}
+
+/// One line for a packet that could not be sent because something was too
+/// small, naming *which* something.
+///
+/// Separate from the match above so the three causes read as one policy rather
+/// than as three arms that happen to agree.
+fn report_oversize(topic: &str, bytes: usize, limit: &str) {
+    esp_println::println!(
+        "mqtt: a {} byte payload for '{}' exceeds {} — not published, \
+         and the session is kept because reconnecting would meet it again",
+        bytes,
+        topic,
+        limit,
+    );
 }
 
 /// The will's bytes, which are always a literal.
@@ -1155,16 +1446,6 @@ impl StateValue {
             .expect("position and direction are topics the firmware publishes");
         StateValue { id, topic, value }
     }
-}
-
-/// Address a state value and send it, retained.
-async fn send_state<'buf, IO: minimq::Io>(
-    connection: &mut minimq::Connection<'_, 'buf, IO>,
-    config: &MqttConfig,
-    state: &StateValue,
-) -> Result<(), SessionEnd> {
-    let publish = config.state(state.id, state.topic, state.value.as_bytes());
-    send(connection, &publish).await
 }
 
 /// Why a session ended.

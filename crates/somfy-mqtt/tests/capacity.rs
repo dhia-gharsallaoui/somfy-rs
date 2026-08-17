@@ -9,9 +9,9 @@
 
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, ShadeTopic, StateRoot,
-    MAX_DEVICE_ID_LEN, MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN,
-    MAX_STATE_ROOT_LEN, MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
+    Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, ShadeTopic,
+    StateRoot, MAX_DEVICE_ID_LEN, MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN,
+    MAX_OBJECT_ID_LEN, MAX_STATE_ROOT_LEN, MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
 };
 
 /// The widest shade id, and therefore the most digits.
@@ -30,21 +30,46 @@ fn maximal_config() -> MqttConfig {
 #[test]
 fn the_widest_topics_fit_with_room_to_spare() {
     let cfg = maximal_config();
-    // The widest object id is the widest shade id: nothing else varies.
+    // Two shapes of object id, and the constant is deliberately wider than
+    // either: `DeviceEntity::MAX_SLUG_LEN` folds over a hand-maintained array,
+    // so sizing to it exactly would look proven and would not be. The actual
+    // widest is pinned, and the headroom is what is left over.
     let object = ObjectId::for_shade(WIDEST_SHADE);
     assert_eq!(object.as_str(), "shade_255");
-    assert_eq!(object.as_str().len(), MAX_OBJECT_ID_LEN);
+    let widest_object = DeviceEntity::ALL
+        .iter()
+        .map(|e| ObjectId::for_device(*e).as_str().len())
+        .chain(core::iter::once(object.as_str().len()))
+        .max()
+        .unwrap();
+    assert_eq!(
+        widest_object, 16,
+        "`rollcode_damaged` is the widest object id"
+    );
+    assert!(
+        widest_object < MAX_OBJECT_ID_LEN,
+        "the object-id budget has no headroom left",
+    );
 
     let mut widest = 0;
     for component in Component::ALL {
-        let topic = cfg.discovery_topic(component, &object);
-        widest = widest.max(topic.len());
+        for object in DeviceEntity::ALL
+            .iter()
+            .map(|e| ObjectId::for_device(*e))
+            .chain(core::iter::once(ObjectId::for_shade(WIDEST_SHADE)))
+        {
+            widest = widest.max(cfg.discovery_topic(component, &object).len());
+        }
     }
     for (_, topic) in cfg.shade_topics(WIDEST_SHADE, true) {
         widest = widest.max(topic.len());
     }
+    for (_, topic) in cfg.device_topics() {
+        widest = widest.max(topic.len());
+    }
     widest = widest.max(cfg.availability_topic().len());
     widest = widest.max(cfg.shade_base(WIDEST_SHADE).len());
+    widest = widest.max(cfg.device_base().len());
 
     // Pinned rather than merely bounded. `Topic` wraps a `String<TOPIC_CAPACITY>`,
     // so "it is under the capacity" is a type invariant that no test can
@@ -52,7 +77,7 @@ fn the_widest_topics_fit_with_room_to_spare() {
     // assertion runs. The number is the thing worth watching: if a change moves
     // it, the capacity budget deserves a fresh look rather than a silent slide.
     assert_eq!(
-        widest, 128,
+        widest, 135,
         "widest topic moved; re-check the budget against TOPIC_CAPACITY = {TOPIC_CAPACITY}",
     );
     assert!(widest < TOPIC_CAPACITY);
@@ -76,12 +101,36 @@ fn the_widest_payload_fits() {
     // that is exactly when the budget wants re-checking.
     assert_eq!(
         buf.len(),
-        692,
+        864,
         "widest payload moved; re-check the budget against PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
     );
     // It must still be valid JSON at the extreme, not merely short enough.
     let parsed: serde_json::Value = serde_json::from_str(&buf).expect("valid JSON");
     assert_eq!(parsed["name"].as_str(), Some(name.as_str()));
+}
+
+/// The same measurement for the entities R7 adds. Their payloads have no user
+/// text in them at all — every string is a firmware literal or a validated
+/// identifier — so the widest is reached at the widest *configuration* rather
+/// than at the widest input.
+#[test]
+fn the_widest_diagnostic_payload_fits() {
+    let cfg = maximal_config();
+    let mut widest = 0;
+    for entity in DeviceEntity::ALL {
+        let mut buf: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+        cfg.diagnostic_discovery(entity)
+            .render(&mut buf)
+            .expect("the widest diagnostic payload must fit");
+        let parsed: serde_json::Value = serde_json::from_str(&buf).expect("valid JSON");
+        assert_eq!(parsed["name"].as_str(), Some(entity.label()));
+        widest = widest.max(buf.len());
+    }
+    assert_eq!(
+        widest, 610,
+        "widest diagnostic payload moved; re-check the budget against \
+         PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
+    );
 }
 
 /// A name longer than the payload budget is refused, not truncated. A truncated
@@ -119,7 +168,16 @@ fn render_never_leaves_a_stale_or_partial_payload() {
         .render(&mut buf)
         .unwrap();
     assert!(buf.starts_with('{') && buf.ends_with('}'));
-    assert_eq!(buf.matches('{').count(), 1);
+    // One payload, not two concatenated. Compared against a freshly rendered
+    // one rather than by counting braces, because a payload legitimately
+    // contains a nested object — the `device` block — and a brace count would
+    // have to be updated every time the shape changes rather than checking
+    // the thing that matters.
+    let mut fresh: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    cfg.cover_discovery(ShadeId(2), "Kitchen", false)
+        .render(&mut fresh)
+        .unwrap();
+    assert_eq!(buf, fresh);
 
     // A failing render clears what the previous success left behind.
     let result = cfg

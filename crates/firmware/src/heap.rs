@@ -169,3 +169,33 @@ pub fn report(when: &str) {
         stats.max_usage,
     );
 }
+
+/// Bytes of heap not currently allocated.
+///
+/// Read from the same `esp-alloc` counters [`report`] prints, so a figure
+/// published over MQTT and a figure read off the serial line are the same
+/// measurement rather than two that might disagree.
+#[allow(
+    dead_code,
+    reason = "read only by the broker session, which the ESP32-S2 build omits"
+)]
+pub fn free_bytes() -> usize {
+    let stats = esp_alloc::HEAP.stats();
+    stats.size.saturating_sub(stats.current_usage)
+}
+
+/// The largest the heap has been since boot.
+///
+/// **This is the figure [`RADIO_HEAP_BYTES`] is chosen from, and the one Plan 5
+/// has been carrying forward unread under real traffic since Task 2** — the
+/// 46,660 bytes recorded there were measured with association *failing*, so
+/// they do not include the dynamic RX/TX buffers a working link fills. Publishing
+/// it makes the measurement something an operator can watch over days rather
+/// than something that has to be caught on a serial cable at the right moment.
+#[allow(
+    dead_code,
+    reason = "read only by the broker session, which the ESP32-S2 build omits"
+)]
+pub fn peak_bytes() -> usize {
+    esp_alloc::HEAP.stats().max_usage
+}

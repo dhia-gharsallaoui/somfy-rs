@@ -121,6 +121,22 @@
 //! plan at all: neither [`ObjectId`] nor [`UniqueId`] follows the name, so a
 //! rename is a payload change and the topic stays where it was.
 //!
+//! ## The entity set, and what decides its contents (R7)
+//!
+//! A cover per shade, and [`DeviceEntity::ALL`] for the controller itself —
+//! uptime, Wi-Fi signal, free heap, peak heap use, and the number of damaged
+//! slots in the rolling-code region. All five are marked
+//! `entity_category: diagnostic` so they do not clutter the device's main card,
+//! and all five carry the same `device` block the cover does, so Home Assistant
+//! groups every entity under one controller.
+//!
+//! The set is not chosen to reach a number. **An entity backed by nothing is
+//! worse than an absent one**, because it reads as a device fault rather than
+//! as an unimplemented feature — which is the failure the requirements spec's
+//! own acceptance criterion names. Every entity here is a value the firmware
+//! already holds; what it does not hold is absent rather than stubbed, and
+//! `docs/provenance.md` records each omission with the condition for adding it.
+//!
 //! ## What is deliberately not here
 //!
 //! - **Any network code.** A socket, a client, a reconnect schedule and a
@@ -129,8 +145,9 @@
 //! - **The state and command vocabularies.** [`CoverDiscovery::render`] emits
 //!   the topics and lets Home Assistant's defaults stand, because fixing a
 //!   vocabulary before anything publishes it would be guessing.
-//! - **Components other than `cover`.** [`Component`] carries the full set the
-//!   firmware will emit, but only the cover payload is built so far.
+//! - **Components other than `cover` and `sensor`.** [`Component`] carries the
+//!   full set the firmware could emit; a payload is built only for the two that
+//!   have something to report.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -144,12 +161,13 @@ mod validate;
 
 pub use config::MqttConfig;
 pub use entity::{
-    Component, CoverDiscovery, PayloadError, ShadeTopic, TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
+    Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, PayloadError, ShadeTopic,
+    TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
 };
 pub use error::{ConfigError, Field};
 pub use ident::{
-    DeviceId, NodeId, ObjectId, UniqueId, MAX_COMPONENT_HEADROOM, MAX_DEVICE_ID_LEN,
-    MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
+    DeviceId, NodeId, ObjectId, UniqueId, LONGEST_HA_COMPONENT_NAME, MAX_COMPONENT_HEADROOM,
+    MAX_DEVICE_ID_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
 };
 pub use lifecycle::{
     reconfigure, Listen, Payload, Publish, PublishedTopic, Retention, Step, SubscribedTopic,

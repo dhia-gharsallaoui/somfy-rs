@@ -279,6 +279,87 @@ Publish discovery for sensors, binary sensors and diagnostics alongside covers,
 so no custom component is required. Tilt topics only for tilt-capable shades
 (R8) — omit them rather than publishing dead topics.
 
+### Task 4 outcome — the set, and four things that constrain Task 5
+
+**Done, host-tested; nothing yet run against a real broker.** The set is **one
+cover per shade plus five device-level diagnostics**, and the number is not the
+target — `docs/provenance.md` carries the whole table, including every omission
+with its revisit condition.
+
+| entity | component | where its value comes from |
+|---|---|---|
+| the shade | `cover` | `StateDelta { pos, direction }`, as before |
+| Uptime | `sensor` | `embassy_time::Instant::now()` |
+| Wi-Fi signal | `sensor` | `WifiController::rssi`, sampled by the link task every 30 s |
+| Free heap | `sensor` | `esp-alloc`'s `internal-heap-stats` |
+| Peak heap use | `sensor` | the same counter's high-water mark |
+| Damaged rolling-code slots | `sensor` | the boot survey, carried to the session as a value |
+
+All five carry `entity_category: diagnostic`, and every payload — the cover's
+included — now carries a `device` block, so the whole set groups under one
+controller in Home Assistant.
+
+**Not published, each recorded with its condition:** sun/wind/dry-contact (the
+domain defers them post-1.0), a firmware-update entity (no OTA until Plan 6),
+the last received frame (`FrameChannel` has one consumer, and a second reader
+means changing the radio→state seam), a Wi-Fi "connected" binary sensor
+(tautological — it can only be published while the link is up, and availability
+already carries it correctly), and tilt (unchanged).
+
+The four things that change what Task 5 must do:
+
+1. **The settle discipline is now structural, and it had to become so.** An
+   announcement costs `1 + 3N + k` operations for `N` shades and `k = 5` device
+   entities, and the firmware follows it with `N` names, `2N` states and `k`
+   readings — `1 + 6N + 2k` for a fresh session, which is **eleven with no
+   shades provisioned at all**, the ordinary state of a freshly flashed board.
+   In Task 3 the same burst was `1 + 6N` and needed two shades to exceed eight;
+   the plan alone now crosses `minimq`'s eight slots at one shade. `settle` is no longer
+   called at call sites:
+   `mqtt::perform` is the only route to a publish or a subscribe and it settles
+   before returning. The failure and the fix are both executed on the host in
+   `somfy-mqtt/tests/lifecycle.rs` against a model of the client's slot table.
+2. **The heap high-water mark is now an entity.** Task 2 asked for it under real
+   traffic, Task 3 had no hardware, and Task 5 inherited the obligation. It is
+   now published every 60 seconds as `Peak heap use`, so reading it is a
+   dashboard rather than a serial cable at the right moment. **Read it, and put
+   the figure in `docs/provenance.md` beside the 46,660 measured with
+   association failing.**
+3. **The ESP32-S2 is unaffected and still builds without the session.** Task 4
+   cost 432 bytes of DRAM on the three chips that build it and 72 on the
+   ESP32-S2, which does not — that is the `SIGNAL_DBM` static in `net` alone.
+   The session's own task future is 14,816 against Task 3's 14,824: folding
+   `settle` into `perform` removed as much from it as five diagnostics added.
+   Per-chip stacks are in `docs/provenance.md`; every chip is well clear of
+   `REQUIRED_STACK_BYTES`.
+4. **A diagnostic with no reading publishes nothing.** Reachable today only for
+   Wi-Fi signal before the first association, which the announcement cannot
+   race — the link is up before a socket exists. If an entity is *unknown* in
+   Home Assistant during the integration run, that is a finding, not cosmetic.
+
+Two things worth knowing that no host test can settle, and that belong on Task
+5's checklist beside the existing items:
+
+- **`position_open: 0` / `position_closed: 100`** was already the one value in
+  `somfy-mqtt` a host test cannot establish. Four more join it, all of them
+  Home Assistant's vocabulary rather than this project's, and all confirmable
+  only by an entity that renders correctly: the `device` block, the
+  `entity_category`, each diagnostic's `device_class`/`unit_of_measurement`
+  pairing, and — the one review flagged — **the payload `object_id` becoming
+  the entity id**. That last is now emitted device-scoped
+  (`sensor.<device_id>_uptime`, not `sensor.uptime`) precisely because HA
+  documents it as generating the entity id; confirm that it does.
+  `has_entity_name` is deliberately *not* emitted, so `name` stays the friendly
+  name verbatim — right for a shade the user named, and the entity-id collision
+  it would otherwise have left is now closed by the `object_id` instead. Decide
+  whether to set it against a real instance rather than from the documentation.
+- **The Wi-Fi sampling loop drops and recreates an `esp-radio` event
+  subscription every 30 s.** The cancel-safety argument is read out of
+  `esp-radio` 0.18.0's source and is sound — a disconnect missed by the race
+  returns `WifiError::NotConnected` on the next call, which the caller already
+  treats as a lost link — but it has not been observed. Watch for a link that
+  drops and is reported late, or not at all.
+
 ## Task 5 — Integration against real Home Assistant
 
 Acceptance criterion 5, and the one that cannot be faked:

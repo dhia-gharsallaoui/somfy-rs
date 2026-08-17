@@ -177,7 +177,11 @@ proptest! {
         let quoted = format!("\"~\":\"{base}\"");
         prop_assert!(a.contains(&quoted), "{a}");
         prop_assert!(b.contains(&quoted), "{b}");
-        let object_field = format!("\"object_id\":\"{}\"", object.as_str());
+        // The payload's `object_id` carries the device id as well as the
+        // segment — it becomes the entity id, so it has to be unique across
+        // controllers where the topic segment only has to be unique within one.
+        // Neither half follows the name, which is what this asserts.
+        let object_field = format!("\"object_id\":\"a1b2c3d4_{}\"", object.as_str());
         prop_assert!(a.contains(&object_field), "{a}");
         prop_assert!(b.contains(&object_field), "{b}");
     }

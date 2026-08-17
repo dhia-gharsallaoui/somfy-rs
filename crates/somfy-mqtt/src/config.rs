@@ -18,7 +18,7 @@
 //! validated where it is built, but two individually valid roots can still name
 //! the same namespace — see [`crate::ConfigError::Overlap`].
 
-use crate::entity::{Component, CoverDiscovery, ShadeTopic};
+use crate::entity::{Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, ShadeTopic};
 use crate::error::{ConfigError, Field};
 use crate::ident::{
     DeviceId, NodeId, ObjectId, UniqueId, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS,
@@ -34,6 +34,15 @@ const CONFIG_SEGMENT: &str = "config";
 
 /// The segment that groups per-shade state under the state root.
 const SHADES_SEGMENT: &str = "shades";
+
+/// The segment that groups the controller's own diagnostics under the state
+/// root.
+///
+/// Distinct from [`SHADES_SEGMENT`] and from [`STATUS_SEGMENT`], so a device
+/// entity cannot address what a shade owns however either set grows —
+/// `tests/device_entities.rs` checks that against all 256 shade ids rather than
+/// leaving it as an observation about three string literals.
+const DEVICE_SEGMENT: &str = "device";
 
 /// The availability topic's segment under the state root.
 const STATUS_SEGMENT: &str = "status";
@@ -186,13 +195,39 @@ impl MqttConfig {
         ShadeTopic::for_shade(has_tilt).map(move |topic| (topic, self.shade_topic(shade, topic)))
     }
 
+    /// `{state_root}/device` — the base every diagnostic reading sits under,
+    /// and the diagnostic payloads' `~`.
+    pub fn device_base(&self) -> Topic {
+        self.state_root.topic().segment(DEVICE_SEGMENT).finish()
+    }
+
+    /// The absolute topic one device-level entity's reading is published to.
+    pub fn device_topic(&self, entity: DeviceEntity) -> Topic {
+        self.state_root
+            .topic()
+            .segment(DEVICE_SEGMENT)
+            .segment(entity.slug())
+            .finish()
+    }
+
+    /// Every device-level entity, paired with its absolute address.
+    ///
+    /// The device counterpart of [`MqttConfig::shade_topics`], and read by the
+    /// round-trip check for the same reason: the payload and the publisher must
+    /// come from one table or they will drift.
+    pub fn device_topics(&self) -> impl Iterator<Item = (DeviceEntity, Topic)> + '_ {
+        DeviceEntity::ALL
+            .into_iter()
+            .map(move |entity| (entity, self.device_topic(entity)))
+    }
+
     /// The `cover` discovery config for one shade.
     ///
     /// `has_tilt` decides whether the tilt topics are carried. It is the
     /// caller's judgement rather than a read of the stored tilt mode — see
     /// [`ShadeTopic::for_shade`] for why that distinction matters today.
     pub fn cover_discovery<'a>(
-        &self,
+        &'a self,
         shade: ShadeId,
         name: &'a str,
         has_tilt: bool,
@@ -203,7 +238,25 @@ impl MqttConfig {
             object_id: ObjectId::for_shade(shade),
             unique_id: UniqueId::for_shade(&self.device_id, Component::Cover, shade),
             name,
+            device_id: self.device_id.as_str(),
             has_tilt,
+        }
+    }
+
+    /// The discovery config for one device-level entity.
+    ///
+    /// Takes no value: what the entity *reports* is published separately, on
+    /// the topic this payload names, exactly as a shade's position is. That
+    /// split is what lets the announcement be built without the firmware's
+    /// readings being available to this crate.
+    pub fn diagnostic_discovery(&self, entity: DeviceEntity) -> DiagnosticDiscovery<'_> {
+        DiagnosticDiscovery {
+            base: self.device_base(),
+            availability: self.availability_topic(),
+            object_id: ObjectId::for_device(entity),
+            unique_id: UniqueId::for_device(&self.device_id, entity),
+            device_id: self.device_id.as_str(),
+            entity,
         }
     }
 }
@@ -238,6 +291,10 @@ const WORST_SHADE_TOPIC_LEN: usize = WORST_SHADE_BASE_LEN + ShadeTopic::MAX_RELA
 /// `{state_root}/status` at its widest.
 pub(crate) const WORST_AVAILABILITY_LEN: usize = MAX_STATE_ROOT_LEN + 1 + STATUS_SEGMENT.len();
 
+/// `{state_root}/device/{slug}` at its widest.
+const WORST_DEVICE_TOPIC_LEN: usize =
+    MAX_STATE_ROOT_LEN + 1 + DEVICE_SEGMENT.len() + 1 + DeviceEntity::MAX_SLUG_LEN;
+
 const _: () = assert!(
     TOPIC_CAPACITY >= WORST_DISCOVERY_TOPIC_LEN,
     "TOPIC_CAPACITY is too small for the longest discovery topic",
@@ -249,4 +306,8 @@ const _: () = assert!(
 const _: () = assert!(
     TOPIC_CAPACITY >= WORST_AVAILABILITY_LEN,
     "TOPIC_CAPACITY is too small for the availability topic",
+);
+const _: () = assert!(
+    TOPIC_CAPACITY >= WORST_DEVICE_TOPIC_LEN,
+    "TOPIC_CAPACITY is too small for the longest device topic",
 );

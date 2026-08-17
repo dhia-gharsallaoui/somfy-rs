@@ -21,9 +21,9 @@
 
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    reconfigure, Component, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, Payload,
-    PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic, OFFLINE, ONLINE,
-    SHADE_COMPONENTS,
+    reconfigure, Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId,
+    Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic, OFFLINE,
+    ONLINE, SHADE_COMPONENTS,
 };
 
 const NODE: &str = "somfyrs";
@@ -61,6 +61,7 @@ enum Flat {
 enum FlatPayload {
     Bytes(Vec<u8>),
     Discovery(u8, &'static str),
+    DeviceDiscovery(&'static str),
     Nothing,
 }
 
@@ -75,6 +76,7 @@ fn flatten<'a>(steps: impl Iterator<Item = Step<'a>>) -> Vec<Flat> {
                     Payload::Discovery { shade, component } => {
                         FlatPayload::Discovery(shade.0, component.as_str())
                     }
+                    Payload::DeviceDiscovery(entity) => FlatPayload::DeviceDiscovery(entity.slug()),
                     Payload::Nothing => FlatPayload::Nothing,
                 },
             },
@@ -161,8 +163,8 @@ fn every_discovery_config_is_published_retained() {
         .collect();
     assert_eq!(
         configs.len(),
-        2 * SHADE_COMPONENTS.len(),
-        "one config per shade per component: {steps:#?}",
+        2 * SHADE_COMPONENTS.len() + DeviceEntity::ALL.len(),
+        "one config per shade per component, plus one per device entity: {steps:#?}",
     );
     for step in configs {
         let Flat::Send {
@@ -173,7 +175,10 @@ fn every_discovery_config_is_published_retained() {
         };
         assert!(*retained, "a discovery config must be retained: {step:?}");
         assert!(
-            matches!(payload, FlatPayload::Discovery(..)),
+            matches!(
+                payload,
+                FlatPayload::Discovery(..) | FlatPayload::DeviceDiscovery(_)
+            ),
             "a discovery config carries a rendered payload: {step:?}",
         );
     }
@@ -270,9 +275,16 @@ fn the_tilt_topics_are_cleared_even_for_a_shade_that_never_had_tilt() {
     );
 }
 
-/// The structural version of the two tests above, and the one that survives
-/// Task 4 adding components: whatever an announcement retains, a retirement
-/// clears. A component added to `SHADE_COMPONENTS` joins both sides at once.
+/// The structural version of the two tests above, and the one that survives an
+/// entity set that grows: whatever an announcement retains, a retirement
+/// clears. A component added to `SHADE_COMPONENTS` and an entity added to
+/// `DeviceEntity::ALL` each join both sides at once, because both halves read
+/// the same array.
+///
+/// The device-level half is the one worth stating, because it is the one that
+/// could have been a second list somebody has to remember: the diagnostics are
+/// announced once for the whole controller rather than once per shade, so a
+/// retirement that only walked the shades would leave every one of them behind.
 #[test]
 fn retirement_clears_every_topic_an_announcement_retains() {
     let config = default_config();
@@ -298,6 +310,13 @@ fn retirement_clears_every_topic_an_announcement_retains() {
                     .as_str()
                     .to_string()
             })
+            .chain(DeviceEntity::ALL.into_iter().map(|entity| {
+                config
+                    .device_state(entity, b"0")
+                    .topic()
+                    .as_str()
+                    .to_string()
+            }))
             .collect();
 
         let cleared = published(&flatten(config.retire(&[ShadeId(5)])));
@@ -309,6 +328,308 @@ fn retirement_clears_every_topic_an_announcement_retains() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// R7 — the device-level entities, announced and retired by the same array
+// ---------------------------------------------------------------------------
+
+/// One discovery config per device entity, retained for the same reason a
+/// cover's is: a broker or Home Assistant restart must re-populate them without
+/// anybody touching the device.
+#[test]
+fn every_device_entity_is_announced_once_retained() {
+    let config = default_config();
+    let steps = flatten(config.announce(&[ShadeId(1), ShadeId(2)], false));
+
+    for entity in DeviceEntity::ALL {
+        let topic = config
+            .discovery_topic(entity.component(), &ObjectId::for_device(entity))
+            .as_str()
+            .to_string();
+        let matching: Vec<&Flat> = steps
+            .iter()
+            .filter(|step| matches!(step, Flat::Send { topic: t, .. } if *t == topic))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{entity:?} announced {} times, not once",
+            matching.len(),
+        );
+        assert_eq!(
+            matching[0],
+            &Flat::Send {
+                topic,
+                retained: true,
+                payload: FlatPayload::DeviceDiscovery(entity.slug()),
+            },
+        );
+    }
+}
+
+/// The diagnostics do not multiply with the shades. They describe the
+/// controller, so announcing one per shade would be both wrong (five entities
+/// per shade, all reporting the same number) and the thing that turns a long
+/// announcement into an unbounded one.
+#[test]
+fn the_device_entity_count_does_not_follow_the_shade_count() {
+    let config = default_config();
+    let count = |shades: &[ShadeId]| {
+        flatten(config.announce(shades, false))
+            .into_iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    Flat::Send {
+                        payload: FlatPayload::DeviceDiscovery(_),
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(count(&[ShadeId(1)]), DeviceEntity::ALL.len());
+    assert_eq!(
+        count(&[ShadeId(1), ShadeId(2), ShadeId(3)]),
+        DeviceEntity::ALL.len()
+    );
+    // Even with nothing provisioned. A controller with no shades still reports
+    // its own health, which is the case an operator most needs it in.
+    assert_eq!(count(&[]), DeviceEntity::ALL.len());
+}
+
+/// Nothing subscribes on a device topic, so nothing may be published as a
+/// command there either. Stated because `DeviceEntity` has no `role`: every
+/// variant is published, and adding a device-level *command* would need a
+/// subscription in the announcement that this asserts is not there today.
+#[test]
+fn the_device_namespace_carries_no_subscriptions() {
+    let config = default_config();
+    let steps = flatten(config.announce(&[ShadeId(1)], true));
+    let device_base = config.device_base().as_str().to_string();
+    for step in &steps {
+        if let Flat::Listen { topic, .. } = step {
+            assert!(
+                !topic.starts_with(&format!("{device_base}/")),
+                "{topic} is a device topic and nothing subscribes there",
+            );
+        }
+    }
+}
+
+/// A device entity's state is retained, exactly as a shade's is: a subscriber
+/// connecting later must see the current reading rather than wait up to a
+/// publish interval for the next one.
+#[test]
+fn device_state_is_published_retained() {
+    let config = default_config();
+    let publish = config.device_state(DeviceEntity::Uptime, b"3600");
+    assert_eq!(publish.topic().as_str(), "somfyrs/device/uptime");
+    assert_eq!(publish.retention(), Retention::Retained);
+    assert_eq!(publish.payload(), Payload::Bytes(b"3600"));
+}
+
+/// A retirement clears the diagnostics' configs *and* their retained readings.
+/// The evidence behind R5 is 49 retained topics deleted by hand and most of them
+/// were state topics; a diagnostic's reading outlives its entity in exactly the
+/// same way a shade's position does.
+#[test]
+fn retiring_the_device_clears_its_diagnostics_and_their_readings() {
+    let config = default_config();
+    let steps = flatten(config.retire(&[ShadeId(1)]));
+    let cleared = published(&steps);
+
+    for entity in DeviceEntity::ALL {
+        for topic in [
+            config
+                .discovery_topic(entity.component(), &ObjectId::for_device(entity))
+                .as_str()
+                .to_string(),
+            config.device_topic(entity).as_str().to_string(),
+        ] {
+            assert!(cleared.contains(&topic), "{topic} was never cleared");
+            let step = steps
+                .iter()
+                .find(|step| matches!(step, Flat::Send { topic: t, .. } if *t == topic))
+                .expect("just found above");
+            assert_eq!(
+                step,
+                &Flat::Send {
+                    topic,
+                    retained: true,
+                    payload: FlatPayload::Nothing,
+                },
+            );
+        }
+    }
+}
+
+/// A device with no shades at all still owns its diagnostics, so retiring one
+/// must clear them. This is the case a retirement written as "for each shade,
+/// clear its topics" gets silently wrong.
+#[test]
+fn a_retirement_with_no_shades_still_clears_the_device_entities() {
+    let config = default_config();
+    let cleared = published(&flatten(config.retire(&[])));
+    for entity in DeviceEntity::ALL {
+        assert!(
+            cleared.contains(&config.device_topic(entity).as_str().to_string()),
+            "{entity:?} survives a retirement of a device with no shades",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The client limit that makes a longer announcement a hard failure
+// ---------------------------------------------------------------------------
+
+/// Unacknowledged operations `minimq` 0.13 will hold at once.
+///
+/// `Connection::publish` and `Connection::subscribe` each take a slot in
+/// `outbound.retained`, whose capacity is `MAX_RETAINED = 8`, and a slot is
+/// freed only when the broker's acknowledgement is **read** — which happens in
+/// `recv`, `poll` or `drive` and never in a publish. So a plan walked without
+/// reading fails at the ninth operation and repeats identically on every
+/// reconnect, at the backoff ceiling, forever.
+///
+/// It is restated here rather than imported because this crate does not depend
+/// on a client, and the point of the tests below is that the *plans* this crate
+/// builds are already longer than that.
+const INFLIGHT_SLOTS: usize = 8;
+
+/// A stand-in for a client that holds [`INFLIGHT_SLOTS`] operations and frees
+/// them only when the caller reads.
+struct Inflight {
+    held: usize,
+    completed: usize,
+}
+
+impl Inflight {
+    fn new() -> Inflight {
+        Inflight {
+            held: 0,
+            completed: 0,
+        }
+    }
+
+    /// Issue one operation — a publish or a subscribe. Both cost a slot.
+    fn operation(&mut self) -> Result<(), usize> {
+        if self.held == INFLIGHT_SLOTS {
+            return Err(self.completed + 1);
+        }
+        self.held += 1;
+        self.completed += 1;
+        Ok(())
+    }
+
+    /// Read until everything outstanding has been acknowledged.
+    fn settle(&mut self) {
+        self.held = 0;
+    }
+}
+
+/// One operation per step, which is what the executor does.
+fn operations<'a>(steps: impl Iterator<Item = Step<'a>>) -> usize {
+    steps.count()
+}
+
+/// **The case that would have failed**, and the arithmetic behind it, pinned.
+///
+/// An announcement costs `1 + 3N + k` operations for `N` shades and the `k`
+/// device entities — `online`, then per shade one discovery config and two
+/// command subscriptions, then one discovery config per device entity. **A
+/// single provisioned shade already puts it past the client's eight slots**, so
+/// this is not a limit reached by an unusual estate; it is reached by the
+/// smallest configuration that does anything at all.
+///
+/// The figures are pinned rather than merely bounded because the bound is what
+/// the settle discipline exists for: if a change ever brought an announcement
+/// back under eight, the discipline would stop being load-bearing and every
+/// test that depends on it would keep passing while proving nothing.
+#[test]
+fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
+    let config = default_config();
+    let k = DeviceEntity::ALL.len();
+    for shades in 0u8..=3 {
+        let ids: Vec<ShadeId> = (1..=shades).map(ShadeId).collect();
+        assert_eq!(
+            operations(config.announce(&ids, false)),
+            1 + 3 * usize::from(shades) + k,
+            "the announcement's cost is 1 + 3N + k; N={shades}",
+        );
+    }
+
+    let cost = operations(config.announce(&[ShadeId(1)], false));
+    assert!(
+        cost > INFLIGHT_SLOTS,
+        "an announcement for one shade costs {cost} operations, which no longer \
+         exceeds the {INFLIGHT_SLOTS} a client holds",
+    );
+
+    // With no shades the plan alone fits — and the *session* still does not.
+    // The firmware follows the plan with one reading per device entity, so the
+    // burst on a freshly flashed board with a broker and nothing provisioned is
+    // `1 + 3N + k` plus `k` readings: eleven operations, and no shade in sight.
+    let bare = operations(config.announce(&[], false));
+    assert_eq!(bare, 1 + k);
+    assert!(
+        bare + k > INFLIGHT_SLOTS,
+        "a board with nothing provisioned still exceeds the slot count once its \
+         readings follow the plan: {bare} + {k}",
+    );
+}
+
+/// Walked without settling, the plan dies partway — and it dies at the ninth
+/// operation, not at the end, so most of the entity set never reaches the
+/// broker.
+#[test]
+fn walking_a_plan_without_settling_runs_out_of_slots_partway() {
+    let superseded = [config("oldprefix", "oldroot")];
+    let current = default_config();
+    let mut client = Inflight::new();
+
+    let failed_at = reconfigure(&superseded, &current, &[ShadeId(1), ShadeId(2)], false)
+        .map(|_| client.operation())
+        .find_map(Result::err)
+        .expect("a plan this long cannot be walked unsettled");
+
+    assert_eq!(
+        failed_at,
+        INFLIGHT_SLOTS + 1,
+        "the failure must land on the ninth operation",
+    );
+}
+
+/// And settling after **every** operation completes the same plan, however long
+/// it is. This is the discipline the firmware's `settle` implements, stated as
+/// a property rather than as a comment: in-flight state is held at one, so
+/// neither the slot count nor the transmit arena is reachable.
+#[test]
+fn settling_after_every_operation_completes_a_plan_of_any_length() {
+    let superseded = [
+        config("oldprefix", "oldroot"),
+        config("otherprefix", "otherroot"),
+    ];
+    let current = default_config();
+    let shades: Vec<ShadeId> = (1u8..=8).map(ShadeId).collect();
+
+    let mut client = Inflight::new();
+    let plan = reconfigure(&superseded, &current, &shades, true);
+    let mut length = 0;
+    for _ in plan {
+        client
+            .operation()
+            .expect("settling frees the slot each time");
+        client.settle();
+        length += 1;
+    }
+
+    assert!(
+        length > INFLIGHT_SLOTS * 4,
+        "this test wants a plan comfortably past the limit; got {length}",
+    );
+    assert_eq!(client.completed, length);
 }
 
 /// A device-wide retirement clears availability too. Without it the old

@@ -20,15 +20,31 @@
 //! the mess the requirements complain about — an estate accumulating retained
 //! entities that can only be deleted by hand.
 //!
-//! The requirements themselves note that `object_id` "does not influence the
-//! entity_id", so a stable, id-derived value costs nothing a user can see. The
-//! human-readable name still reaches Home Assistant, through the discovery
+//! The human-readable name still reaches Home Assistant, through the discovery
 //! payload's `name` field, which is where the display name actually comes from.
 //! Building the id from the shade's stable slot index instead makes a rename a
 //! payload change and nothing more, and it satisfies R2's character class more
 //! strongly than sanitising would: there is no user text to sanitise.
+//!
+//! ## `object_id` is two different things, and only one of them is inert
+//!
+//! The requirements note that `object_id` "does not influence the entity_id".
+//! **That is true of the topic segment and false of the payload key**, and the
+//! distinction is worth stating because [`ObjectId`] supplies both.
+//!
+//! - As the discovery topic's segment before `config`, Home Assistant accepts
+//!   it and ignores it. Nothing reads it; it earns its place by making a
+//!   device's own configs findable on a shared broker.
+//! - As the payload key, Home Assistant documents it as *"used instead of
+//!   `name` for automatic generation of `entity_id`"*. A bare slug there claims
+//!   `sensor.uptime` on the whole installation.
+//!
+//! So the payload key is emitted **device-scoped** —
+//! `entity::write_object_id` joins the device id to it — while the topic
+//! segment stays short and stable. Everything above about renames still holds:
+//! neither form follows the name.
 
-use crate::entity::Component;
+use crate::entity::{Component, DeviceEntity};
 use crate::error::{ConfigError, Field};
 use crate::validate::check_token;
 use core::fmt::Write as _;
@@ -51,42 +67,78 @@ pub const MAX_SHADE_ID_DIGITS: usize = 3;
 /// sensors, since it is a different segment of the discovery topic.
 const OBJECT_ID_PREFIX: &str = "shade_";
 
-/// Bytes an object id may occupy: the prefix and up to three digits of
-/// [`ShadeId`].
+/// Bytes an object id may occupy: enough for either of its two shapes, **with
+/// headroom**.
 ///
-/// Exact rather than padded, and safe to be exact because both terms are fixed
-/// at compile time — change the prefix and this constant moves with it. That is
-/// the difference from [`MAX_UNIQUE_ID_LEN`], whose bound depends on a
-/// hand-maintained array and therefore carries headroom.
-pub const MAX_OBJECT_ID_LEN: usize = OBJECT_ID_PREFIX.len() + MAX_SHADE_ID_DIGITS;
+/// A shade's is the prefix and up to three digits of [`ShadeId`]; a device
+/// entity's is its slug. Sizing this to `max(9, DeviceEntity::MAX_SLUG_LEN)`
+/// would look exact and would not be: `MAX_SLUG_LEN` is a fold over
+/// [`DeviceEntity::ALL`], which is hand-maintained, and nothing forces `ALL` to
+/// list every variant — the same defect [`MAX_UNIQUE_ID_LEN`] carries headroom
+/// for, reached through a different array. A variant left out of `ALL` with a
+/// longer slug would leave this constant stale, and `push_str` panics rather
+/// than truncating, which on the firmware means a reboot at announce time on
+/// every boot.
+///
+/// So the headroom is the point, and the two assertions below are what keep it
+/// meaningful rather than decorative.
+pub const MAX_OBJECT_ID_LEN: usize = 24;
+
+const _: () = assert!(
+    OBJECT_ID_PREFIX.len() + MAX_SHADE_ID_DIGITS <= MAX_OBJECT_ID_LEN,
+    "a shade's object id outgrew the object-id budget",
+);
+const _: () = assert!(
+    DeviceEntity::MAX_SLUG_LEN <= MAX_OBJECT_ID_LEN,
+    "a device entity's slug outgrew the object-id budget",
+);
+
+/// The widest thing that follows the component in a unique id.
+///
+/// Bounded by [`MAX_OBJECT_ID_LEN`] rather than by `MAX_SLUG_LEN`, so that the
+/// unique-id budget inherits the same headroom for the same reason.
+const MAX_UNIQUE_ID_SUFFIX_LEN: usize = MAX_OBJECT_ID_LEN;
 
 /// Bytes a unique id may occupy.
 ///
-/// A device id, a component name, up to three digits of [`ShadeId`], and two
-/// separators — with headroom, deliberately, rather than sized exactly to the
-/// components that exist today. [`Component::MAX_LEN`] is a fold over
-/// [`Component::ALL`], and nothing forces `ALL` to list every variant: the
-/// exhaustive `match` in [`Component::as_str`] forces a new variant to be named
-/// there, but a variant left out of `ALL` leaves `MAX_LEN` stale. Sizing this
-/// exactly would turn that omission into a truncated `unique_id` — and a
-/// truncated `unique_id` is not a visible fault, it is two entities silently
-/// sharing an identity.
+/// A device id, a component name, the suffix that identifies the entity within
+/// that component, and two separators — with headroom, deliberately, rather
+/// than sized exactly to the components that exist today.
+/// [`Component::MAX_LEN`] is a fold over [`Component::ALL`], and nothing forces
+/// `ALL` to list every variant: the exhaustive `match` in [`Component::as_str`]
+/// forces a new variant to be named there, but a variant left out of `ALL`
+/// leaves `MAX_LEN` stale. Sizing this exactly would turn that omission into a
+/// truncated `unique_id` — and a truncated `unique_id` is not a visible fault,
+/// it is two entities silently sharing an identity.
 ///
 /// The headroom absorbs any Home Assistant component name up to
 /// [`MAX_COMPONENT_HEADROOM`] bytes, which covers every name in HA's set; the
-/// assertion below pins that, and [`push_u8`] panics rather than truncating if
+/// assertions below pin that, and `push_str` panics rather than truncating if
 /// it is ever exceeded anyway.
-pub const MAX_UNIQUE_ID_LEN: usize = 64;
+pub const MAX_UNIQUE_ID_LEN: usize = 88;
 
 /// Bytes of component name [`MAX_UNIQUE_ID_LEN`] leaves room for.
+pub const MAX_COMPONENT_HEADROOM: usize =
+    MAX_UNIQUE_ID_LEN - MAX_DEVICE_ID_LEN - 1 - 1 - MAX_UNIQUE_ID_SUFFIX_LEN;
+
+/// The longest name in Home Assistant's own component set,
+/// `alarm_control_panel`.
 ///
-/// The longest name in Home Assistant's own component set is
-/// `alarm_control_panel` at 19 bytes; this is comfortably beyond it.
-pub const MAX_COMPONENT_HEADROOM: usize = MAX_UNIQUE_ID_LEN - MAX_DEVICE_ID_LEN - 1 - 1 - 3;
+/// Named so that the claim [`MAX_COMPONENT_HEADROOM`] makes is the claim an
+/// assertion checks. Asserting only `Component::MAX_LEN` would leave the
+/// documented guarantee — "absorbs any Home Assistant component name" — held up
+/// by nothing: a longer suffix could push the headroom below this figure with
+/// that assertion still green, because the components *this crate* names are
+/// short.
+pub const LONGEST_HA_COMPONENT_NAME: usize = 19;
 
 const _: () = assert!(
     Component::MAX_LEN <= MAX_COMPONENT_HEADROOM,
     "a component name outgrew the unique-id budget",
+);
+const _: () = assert!(
+    LONGEST_HA_COMPONENT_NAME <= MAX_COMPONENT_HEADROOM,
+    "the unique-id budget no longer absorbs every Home Assistant component name",
 );
 
 /// The optional device segment of a discovery topic.
@@ -175,6 +227,23 @@ impl ObjectId {
         ObjectId(out)
     }
 
+    /// The object id of a device-level entity: its slug, unchanged.
+    ///
+    /// Infallible and valid for the same reason [`ObjectId::for_shade`] is —
+    /// the only input is a firmware literal. It carries no `shade_` prefix, so
+    /// it cannot collide with a shade's however the two sets grow.
+    ///
+    /// ```
+    /// use somfy_mqtt::{DeviceEntity, ObjectId};
+    ///
+    /// assert_eq!(ObjectId::for_device(DeviceEntity::Uptime).as_str(), "uptime");
+    /// ```
+    pub fn for_device(entity: DeviceEntity) -> ObjectId {
+        let mut out: String<MAX_OBJECT_ID_LEN> = String::new();
+        push_str(&mut out, entity.slug());
+        ObjectId(out)
+    }
+
     /// The single topic segment this becomes.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -203,6 +272,23 @@ impl UniqueId {
         push_str(&mut out, component.as_str());
         push_str(&mut out, "_");
         push_u8(&mut out, id.0);
+        UniqueId(out)
+    }
+
+    /// Derive the unique id for one device-level entity.
+    ///
+    /// Built the same way and from the same pieces as a shade's, so the two
+    /// sets share one shape — and cannot collide, because a shade's suffix is
+    /// decimal digits and a device entity's is a slug that starts with a
+    /// letter. `tests/device_entities.rs` checks that against every shade id
+    /// and every component rather than leaving it as an argument.
+    pub fn for_device(device: &DeviceId, entity: DeviceEntity) -> UniqueId {
+        let mut out: String<MAX_UNIQUE_ID_LEN> = String::new();
+        push_str(&mut out, device.as_str());
+        push_str(&mut out, "_");
+        push_str(&mut out, entity.component().as_str());
+        push_str(&mut out, "_");
+        push_str(&mut out, entity.slug());
         UniqueId(out)
     }
 

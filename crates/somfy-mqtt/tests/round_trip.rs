@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ShadeTopic, StateRoot, TopicRole,
+    DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ShadeTopic, StateRoot, TopicRole,
     PAYLOAD_CAPACITY,
 };
 
@@ -130,6 +130,12 @@ fn round_trip(payload: &Value, firmware: &BTreeMap<String, TopicRole>) -> Result
 
 /// The payload key -> role mapping, read back out of the same table that
 /// produced the payload rather than restated here.
+///
+/// A diagnostic's `state_topic` resolves through [`ShadeTopic::State`], which
+/// carries the same key. That is the right answer and not a coincidence — the
+/// key names a direction, and a `state_topic` is read by Home Assistant
+/// whatever kind of entity carries it — but it is stated here because the two
+/// payloads are built by different renderers and nothing else says so.
 fn expected_role(key: &str) -> Option<TopicRole> {
     if key == "availability_topic" {
         return Some(TopicRole::Published);
@@ -279,6 +285,74 @@ fn hostile_names_still_render_parseable_json() {
         let firmware = firmware_topics(&cfg, ShadeId(2), true);
         round_trip(&payload, &firmware).unwrap_or_else(|e| panic!("name {name:?}: {e}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The same check for the entities R7 adds
+// ---------------------------------------------------------------------------
+
+/// The device-level half of acceptance criterion 3. A diagnostic's payload
+/// names two topics — its `~` and its `state_topic` — and both must resolve to
+/// somewhere the firmware actually publishes.
+///
+/// This is the check that would catch the R7 version of the field failure: five
+/// sensors whose configs are perfect and whose `state_topic` points one segment
+/// away from where the readings go, which appears in Home Assistant as five
+/// entities that are permanently unknown.
+#[test]
+fn every_diagnostic_payload_topic_is_a_firmware_topic() {
+    for root in ["somfyrs", "home/blinds", "a"] {
+        let cfg = config(root);
+        let firmware = device_topics(&cfg);
+        for entity in DeviceEntity::ALL {
+            let mut buf: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+            cfg.diagnostic_discovery(entity)
+                .render(&mut buf)
+                .expect("payload fits");
+            let payload: Value = serde_json::from_str(&buf).expect("valid JSON");
+
+            let checked = round_trip(&payload, &firmware)
+                .unwrap_or_else(|e| panic!("root {root:?} {entity:?}: {e}"));
+            // `~`, availability, and the state topic.
+            assert_eq!(checked, 3, "root {root:?} {entity:?}");
+        }
+    }
+}
+
+/// The absolute topics the firmware publishes for the device itself, derived
+/// from the same table the payloads are.
+fn device_topics(cfg: &MqttConfig) -> BTreeMap<String, TopicRole> {
+    let mut map = BTreeMap::new();
+    for (_, topic) in cfg.device_topics() {
+        map.insert(topic.as_str().to_owned(), TopicRole::Published);
+    }
+    map.insert(
+        cfg.availability_topic().as_str().to_owned(),
+        TopicRole::Published,
+    );
+    map
+}
+
+/// The same demonstration the cover half carries: a check that cannot fail
+/// proves nothing. Move a diagnostic's `state_topic` one segment and assert the
+/// round trip rejects it.
+#[test]
+fn the_diagnostic_check_actually_catches_a_reading_nobody_publishes() {
+    let cfg = config("somfyrs");
+    let firmware = device_topics(&cfg);
+    let mut buf: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    cfg.diagnostic_discovery(DeviceEntity::Uptime)
+        .render(&mut buf)
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&buf).unwrap();
+
+    payload["state_topic"] = Value::String("~/uptime_seconds".to_owned());
+
+    let err = round_trip(&payload, &firmware).expect_err("an unpublished reading must be rejected");
+    assert!(
+        err.contains("somfyrs/device/uptime_seconds"),
+        "unhelpful error: {err}"
+    );
 }
 
 /// R4: `unique_id` must be stable across reboots, config changes and firmware

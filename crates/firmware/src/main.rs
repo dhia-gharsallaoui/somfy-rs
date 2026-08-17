@@ -241,6 +241,15 @@ struct Pending {
     superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
     /// The shades to announce, copied before the state task owns the registry.
     inventory: Inventory,
+    /// What the rolling-code region held at boot.
+    ///
+    /// Carried to the broker session so that `damaged` — the single most
+    /// operationally important thing this device knows about itself — reaches
+    /// Home Assistant rather than only a serial cable. It is a snapshot, and it
+    /// has to be: the store belongs to the state task from the moment it is
+    /// handed over, and re-surveying it from the network path would cross the
+    /// boundary that keeps a broker from being able to affect radio control.
+    survey: store::Survey,
 }
 
 #[esp_rtos::main]
@@ -321,7 +330,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
     let mut store = FlashStore::mount(FlashStorage::new(flash)).map_err(StartError::Store)?;
-    report_store(&mut store)?;
+    let survey = report_store(&mut store)?;
 
     let bus = Spi::new(
         peripherals.SPI2,
@@ -424,6 +433,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         broker,
         superseded,
         inventory,
+        survey,
     })
 }
 
@@ -560,6 +570,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
         pending.broker,
         pending.superseded,
         pending.inventory,
+        pending.survey,
     );
 }
 
@@ -577,6 +588,7 @@ fn start_mqtt(
     broker: Option<MqttSettings>,
     superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
     inventory: Inventory,
+    survey: store::Survey,
 ) {
     let Some(settings) = broker else {
         esp_println::println!(
@@ -622,6 +634,7 @@ fn start_mqtt(
         settings,
         superseded,
         inventory,
+        survey,
         COMMANDS.sender(),
         deltas,
     ) {
@@ -645,6 +658,7 @@ fn start_mqtt(
     broker: Option<MqttSettings>,
     _superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
     _inventory: Inventory,
+    _survey: store::Survey,
 ) {
     esp_println::println!(
         "mqtt: not built into this image — this chip has no DRAM left for a \
@@ -662,7 +676,12 @@ fn start_mqtt(
 /// distinguishable, and no amount of "the store mounted OK" can tell you which
 /// one this is. `damaged` above zero on a device nobody power-cut deserves a
 /// look.
-fn report_store(store: &mut FlashStore<'_>) -> Result<(), StartError> {
+///
+/// The survey is returned as well as printed, because "deserves a look" is a
+/// weak guarantee when the only place to look is a serial console. The broker
+/// session publishes `damaged` as a diagnostic sensor, so the same fact reaches
+/// Home Assistant.
+fn report_store(store: &mut FlashStore<'_>) -> Result<store::Survey, StartError> {
     let (base, slots, slot_len) = store.geometry();
     esp_println::println!(
         "store: partition '{}' at {:#010X}, {} slots of {} bytes",
@@ -682,7 +701,7 @@ fn report_store(store: &mut FlashStore<'_>) -> Result<(), StartError> {
         survey.newest_seq,
         survey.addresses,
     );
-    Ok(())
+    Ok(survey)
 }
 
 /// Refuse to start if the main stack is smaller than the transmit path needs.

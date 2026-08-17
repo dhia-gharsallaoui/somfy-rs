@@ -39,19 +39,27 @@
 //!
 //! # The symmetry that prevents orphans
 //!
-//! [`SHADE_COMPONENTS`] is read by both halves: an announcement publishes a
-//! discovery config for each component in it, and a retirement clears one for
-//! each. A component added for Task 4's fuller entity set therefore joins both
-//! sides at once, and cannot be announced without also being removable.
+//! **Two arrays, and both are read by both halves.** [`SHADE_COMPONENTS`] is
+//! the per-shade set and [`DeviceEntity::ALL`] is the per-device one; an
+//! announcement publishes a discovery config for each member of each, and a
+//! retirement clears one. An entity added to either therefore joins both sides
+//! at once, and cannot be announced without also being removable.
 //! `tests/lifecycle.rs::retirement_clears_every_topic_an_announcement_retains`
-//! is that property, checked against the plans rather than against the array.
+//! is that property, checked against the plans rather than against the arrays.
+//!
+//! The device-level half is the one that could have been a second list somebody
+//! has to remember. It is not: [`MqttConfig::retire`] walks the same
+//! `DeviceEntity::ALL` the announcement does, and does so *outside* the loop
+//! over shades — so a controller with no shades at all still clears its own
+//! diagnostics, which is the case a retirement written as "for each shade,
+//! clear its topics" gets silently wrong.
 //!
 //! Retirement additionally does **not** ask whether a shade had tilt. Clearing
 //! a topic that was never published costs one packet; getting the answer wrong
 //! leaves `.../tilt` and `.../tilt/set` behind forever.
 
 use crate::config::MqttConfig;
-use crate::entity::{Component, ShadeTopic, TopicRole};
+use crate::entity::{Component, DeviceEntity, ShadeTopic, TopicRole};
 use crate::ident::ObjectId;
 use crate::topic::Topic;
 use somfy_domain::ShadeId;
@@ -67,9 +75,12 @@ pub const OFFLINE: &[u8] = b"offline";
 
 /// The components one shade owns an entity of.
 ///
-/// Read by both halves of the lifecycle — see this module's docs. Only `Cover`
-/// so far; R7's sensors, binary sensors and diagnostics belong to Task 4, and
-/// adding one here adds it to the announcement and to the retirement together.
+/// Read by both halves of the lifecycle — see this module's docs. Only `Cover`,
+/// and that is the honest answer rather than a placeholder: a shade reports a
+/// position and a direction, and `somfy-domain` reports nothing else about one.
+/// R7's fuller entity set is device-level, and [`DeviceEntity`] carries it.
+/// Adding a component here adds it to the announcement and to the retirement
+/// together.
 pub const SHADE_COMPONENTS: [Component; 1] = [Component::Cover];
 
 /// Whether the broker keeps a message after it has delivered it.
@@ -103,6 +114,14 @@ pub enum Payload<'a> {
         /// Which of the shade's entities it describes.
         component: Component,
     },
+    /// The discovery config for one device-level entity, to be rendered by the
+    /// executor.
+    ///
+    /// A separate variant rather than a `Discovery` with no shade: the two are
+    /// rendered by different functions from different data, and an `Option`
+    /// there would leave the executor with a combination — a shade and a
+    /// diagnostic — that means nothing.
+    DeviceDiscovery(DeviceEntity),
     /// No bytes at all.
     ///
     /// **This is the removal.** Paired with [`Retention::Retained`] — which is
@@ -299,25 +318,66 @@ impl MqttConfig {
         }
     }
 
+    /// A retained publish of one device-level entity's current reading.
+    ///
+    /// Retained for the same reason a shade's state is: a subscriber connecting
+    /// later must see the current figure rather than wait out a publish
+    /// interval for the next one.
+    ///
+    /// There is no `PublishedTopic` equivalent to guard this, because there is
+    /// nothing to guard against — [`DeviceEntity`] has no subscribed variant.
+    /// See its docs for what adding one would cost.
+    pub fn device_state<'a>(&self, entity: DeviceEntity, value: &'a [u8]) -> Publish<'a> {
+        Publish {
+            topic: self.device_topic(entity),
+            payload: Payload::Bytes(value),
+            retention: Retention::Retained,
+        }
+    }
+
     /// Everything to say on a broker session that has just been established.
     ///
     /// `online` first: the availability topic is what an operator watching the
     /// broker uses to tell "connected" from "connecting", and it should not
     /// wait behind a discovery config per shade.
     ///
+    /// Then the **shades**, and the device's own diagnostics after them. An
+    /// announcement can be cut short by the session ending, and the covers are
+    /// what the device is for; a diagnostic that arrives on the next attempt
+    /// costs nothing, a cover that does not is the integration not working.
+    ///
     /// State values are **not** here, because this crate does not know them.
-    /// The firmware republishes them from its registry after walking this plan;
-    /// that is the "republish retained state on reconnect" half of R9.
+    /// The firmware publishes them from its registry and its own counters after
+    /// walking this plan; that is the "republish retained state on reconnect"
+    /// half of R9.
     pub fn announce<'a>(
         &'a self,
         shades: &'a [ShadeId],
         has_tilt: bool,
     ) -> impl Iterator<Item = Step<'static>> + 'a {
-        core::iter::once(Step::Send(self.online())).chain(
-            shades
-                .iter()
-                .flat_map(move |shade| self.announce_shade(*shade, has_tilt)),
-        )
+        core::iter::once(Step::Send(self.online()))
+            .chain(
+                shades
+                    .iter()
+                    .flat_map(move |shade| self.announce_shade(*shade, has_tilt)),
+            )
+            .chain(self.announce_device())
+    }
+
+    /// The controller's own diagnostics: one retained discovery config each.
+    ///
+    /// Outside the loop over shades, because these describe the controller. A
+    /// device with no shades provisioned still reports its heap, its uptime and
+    /// the health of its rolling-code store — which is precisely the state an
+    /// operator most needs to see it in.
+    pub fn announce_device(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        DeviceEntity::ALL.into_iter().map(move |entity| {
+            Step::Send(Publish {
+                topic: self.discovery_topic(entity.component(), &ObjectId::for_device(entity)),
+                payload: Payload::DeviceDiscovery(entity),
+                retention: Retention::Retained,
+            })
+        })
     }
 
     /// One shade's discovery configs and command subscriptions.
@@ -365,11 +425,38 @@ impl MqttConfig {
             )
     }
 
+    /// Everything that removes the controller's own diagnostics — their
+    /// discovery configs and their retained readings.
+    ///
+    /// The mirror of [`MqttConfig::announce_device`], derived from the same
+    /// [`DeviceEntity::ALL`], plus the readings an announcement cannot emit
+    /// because it does not know them. A diagnostic's last reading outlives its
+    /// entity in exactly the way a shade's position does, and the evidence
+    /// behind R5 is 49 retained topics deleted by hand, most of them state.
+    pub fn retire_device(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        DeviceEntity::ALL
+            .into_iter()
+            .map(move |entity| {
+                Step::Send(tombstone(self.discovery_topic(
+                    entity.component(),
+                    &ObjectId::for_device(entity),
+                )))
+            })
+            .chain(
+                DeviceEntity::ALL
+                    .into_iter()
+                    .map(move |entity| Step::Send(tombstone(self.device_topic(entity)))),
+            )
+    }
+
     /// Everything that removes every entity and every retained topic this
     /// configuration owns, availability included.
     ///
     /// Run when the configuration itself is being abandoned — a changed
     /// `state_root` or `discovery_prefix`, or discovery being switched off.
+    ///
+    /// The device's own diagnostics are cleared **outside** the loop over
+    /// shades, so a controller with nothing provisioned still retires them.
     /// Availability is cleared last and only here: without it the old
     /// `{state_root}/status` keeps saying `online` forever, which is a worse
     /// orphan than a stale config because it is confidently wrong.
@@ -377,6 +464,7 @@ impl MqttConfig {
         shades
             .iter()
             .flat_map(move |shade| self.retire_shade(*shade))
+            .chain(self.retire_device())
             .chain(core::iter::once(Step::Send(tombstone(
                 self.availability_topic(),
             ))))
