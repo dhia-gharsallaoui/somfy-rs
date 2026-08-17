@@ -132,7 +132,12 @@ const TCP_TX_BYTES: usize = 1_024;
 /// The port. 80, because the UI's own `fetch` and `WebSocket` calls are
 /// same-origin and relative — there is no port to configure and nowhere to
 /// configure it.
-const PORT: u16 = 80;
+///
+/// `pub` because `crate::mdns` advertises it in an SRV record, and a second
+/// literal `80` there would be a number that could drift from the one the server
+/// actually binds — an advertisement pointing at a closed port, which is worse
+/// than no advertisement.
+pub const PORT: u16 = 80;
 
 /// How long a connection may sit after the handshake without sending a request.
 ///

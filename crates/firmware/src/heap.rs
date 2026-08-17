@@ -229,6 +229,40 @@ const REQUEST_CHAIN_BYTES: usize = 33_504;
 #[cfg(not(feature = "http"))]
 const REQUEST_CHAIN_BYTES: usize = 0;
 
+/// The deepest chain the two discovery-and-time services can run.
+///
+/// **A sum rather than a walk, and deliberately so.** Every other term here
+/// names one chain and adds its frames; this one adds *every* frame in
+/// `edge-mdns`, `domain`, `edge-nal`, `edge-nal-embassy`, `sntpc`,
+/// `crate::mdns`, `crate::sntp` and `crate::identity` — 41 functions, 4,240
+/// bytes — plus the `embassy-net` and `smoltcp` UDP and DNS frames beneath their
+/// socket calls — 15 functions, 1,072 bytes — plus the 144 above `poll`. No
+/// single path can exceed a sum over all of them, so 5,456 is an upper bound and
+/// not an estimate.
+///
+/// It is written that way because the honest alternative was worse. Walking
+/// these chains properly would mean following `domain`'s message builder through
+/// a `visit`/`FnMut` indirection, and a mis-walk there would produce a *number*
+/// rather than an obvious error. The two task frames that anchor them are small
+/// enough that the crude bound settles the question outright: measured
+/// 2026-08-17 on the ESP32-S3 with `mqtt` + `ui` + `mdns` + `sntp`,
+/// `TaskStorage<mdns::responder>::poll` is **512** bytes and
+/// `TaskStorage<sntp::client>::poll` is **880**, against [`BOOT_CHAIN_BYTES`]'s
+/// 53,008.
+///
+/// It is a term in [`REQUIRED_STACK_BYTES`] rather than a comment for the reason
+/// [`REQUEST_CHAIN_BYTES`] is: an mDNS record type added to `crate::mdns`'s
+/// `Service`, or a deeper path through `sntpc`, deepens this and nothing else,
+/// and the `max` below is what notices.
+///
+/// Zero when neither service is compiled in, which is not a rounding — there is
+/// no such task in that image.
+#[cfg(any(feature = "mdns", feature = "sntp"))]
+const SERVICE_CHAIN_BYTES: usize = 5_456;
+/// See the `mdns`/`sntp` definition above.
+#[cfg(not(any(feature = "mdns", feature = "sntp")))]
+const SERVICE_CHAIN_BYTES: usize = 0;
+
 /// What an interrupt costs on top of whatever chain it lands on.
 ///
 /// An interrupt lands on whatever stack was running, and on this firmware that
@@ -265,7 +299,9 @@ const INTERRUPT_FRAMES_BYTES: usize = 1_712;
 /// of being re-derived by hand.
 ///
 /// Today, on every configuration in the matrix, [`BOOT_CHAIN_BYTES`] wins:
-/// 53,008 + 1,712 = **54,720**.
+/// 53,008 + 1,712 = **54,720**. The runners-up are [`REQUEST_CHAIN_BYTES`] at
+/// 33,504, [`NETWORK_CHAIN_BYTES`] at 23,280 and [`SERVICE_CHAIN_BYTES`] at
+/// 5,456.
 ///
 /// Checked at run time by `crate::check_stack_headroom` rather than asserted at
 /// compile time, because the quantity it is checked *against* cannot be a
@@ -275,8 +311,11 @@ const INTERRUPT_FRAMES_BYTES: usize = 1_712;
 /// changes too. What *is* asserted at compile time is that this fits the
 /// division below.
 pub const REQUIRED_STACK_BYTES: usize = larger(
-    larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
-    REQUEST_CHAIN_BYTES,
+    larger(
+        larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
+        REQUEST_CHAIN_BYTES,
+    ),
+    SERVICE_CHAIN_BYTES,
 ) + INTERRUPT_FRAMES_BYTES;
 
 /// `usize::max`, which is not a `const fn`.
@@ -430,9 +469,18 @@ const _: () = assert!(
 ///
 /// | chip | features measured with | DRAM |
 /// |---|---|---|
-/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 125,116 |
-/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 159,908 |
-/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 146,672 |
+/// | ESP32 | `mqtt` — see [`crate::api`]; neither `http` nor `sntp` fits | 125,116 |
+/// | ESP32-S3 | `mqtt`, `ui` (and so `http`), `mdns`, `sntp` | 152,084 |
+/// | ESP32-C3 | `mqtt`, `ui` (and so `http`), `mdns`, `sntp` | 138,888 |
+///
+/// **Re-measured 2026-08-17 for Plan 6 Task 7**, which is what moved the last
+/// two rows. The discovery-and-time services cost the ESP32-S3 7,824 bytes
+/// (159,908 → 152,084) and the ESP32-C3 7,784 (146,672 → 138,888), and the
+/// ESP32 nothing, because it gets neither. Most of it is the mDNS responder's
+/// four buffers and the resolver's four `dns::DnsQuery` slots — `embassy-net`
+/// sizes the latter with a hard-coded `MAX_QUERIES = 4` that no feature reaches.
+/// The ESP32 figure was re-read as well, on a `--features chip-esp32,mqtt` image,
+/// and is unchanged to the byte.
 ///
 /// The web server costs about **69,000 bytes on the ESP32, 70,000 on the
 /// ESP32-S3 and 70,000 on the ESP32-C3** — three measurements of one thing, and the spread is
@@ -443,10 +491,10 @@ const _: () = assert!(
 const DRAM_FOR_STACK_AND_HEAP: usize = 125_116;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 159_908;
+const DRAM_FOR_STACK_AND_HEAP: usize = 152_084;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 146_672;
+const DRAM_FOR_STACK_AND_HEAP: usize = 138_888;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
@@ -474,6 +522,50 @@ compile_error!(
      See `heap::DRAM_FOR_STACK_AND_HEAP` for the measurement."
 );
 
+// **The ESP32 cannot carry the SNTP client either, and this refuses it for a
+// different reason from the one above.**
+//
+// It is not a link failure: the image builds, boots and runs. It is that the
+// heap left over is inside its own noise. Measured 2026-08-17, with
+// `--features chip-esp32,mqtt,sntp`:
+//
+// ```text
+// DRAM for stack and heap, with `sntp`                          122,220
+//   − STACK_BUDGET_BYTES                                         66,280
+//   = 55,940, rounded down to a whole KiB                        55,296   heap
+//   − the largest heap high-water yet measured                   54,424
+//   = what is left at the announcement burst                        872
+// ```
+//
+// 872 bytes against a **~4,216-byte boot-to-boot spread**, and against a peak
+// that was measured on an ESP32-S3 rather than on this chip. That is not a thin
+// margin, it is no margin: `esp-alloc` answers exhaustion with a null,
+// `handle_alloc_error` panics, and `main`'s handler resets — so the symptom
+// would be a board that reboots a few seconds into some boots and not others.
+// `warn_if_undersized` would not catch it, because the driver's *resting* set
+// still fits; it is the announcement burst that does not.
+//
+// **And the loss is nothing this chip can currently use.** A wall clock has two
+// consumers: log timestamps, and TLS certificate validity for the GitHub OTA
+// path. The ESP32 has no web server, so it has no manual-upload OTA either, and
+// Plan 6's own heap note says TLS may not fit on any chip. So this refusal costs
+// that board a number it would print and nothing else.
+//
+// Two-thirds of the cost is the resolver rather than the SNTP exchange —
+// `embassy-net` sizes its query storage with a hard-coded `MAX_QUERIES = 4` no
+// feature reaches — so **what would change this** is a resolver-free time
+// source: an NTP server address in the config record instead of a name, at which
+// point `sntp` without `embassy-net/dns` is worth re-measuring on this chip.
+#[cfg(all(feature = "chip-esp32", feature = "sntp"))]
+compile_error!(
+    "the ESP32 does not have the DRAM for the SNTP client and its resolver: with `sntp` \
+     enabled it has 55,296 bytes of heap against a 54,424-byte measured peak, which is 872 \
+     bytes of margin inside a ~4,216-byte boot-to-boot spread — the board would reboot on \
+     some boots and not others. Build it with `--no-default-features --features \
+     chip-esp32,mqtt`, or use an ESP32-S3 or ESP32-C3. See `heap::RADIO_HEAP_BYTES` for the \
+     arithmetic."
+);
+
 /// Bytes of heap installed for the Wi-Fi driver. **Per chip, from that chip's
 /// own DRAM.**
 ///
@@ -490,13 +582,22 @@ compile_error!(
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] |
 /// |---|---|---|---|---|
 /// | ESP32 | 125,116 | 57 KiB = 58,368 | 66,748 | 12,028 |
-/// | ESP32-S3 | 159,908 | 91 KiB = 93,184 | 66,724 | 12,004 |
-/// | ESP32-C3 | 146,672 | 78 KiB = 79,872 | 66,800 | 12,080 |
+/// | ESP32-S3 | 152,084 | 83 KiB = 84,992 | 67,092 | 12,372 |
+/// | ESP32-C3 | 138,888 | 70 KiB = 71,680 | 67,208 | 12,488 |
 ///
 /// Nothing in that table is chosen; it is what the rule returns. Every `stack
-/// left` column was read back out of the linked ELF on 2026-08-17 — they are the
-/// `.stack` section's own size, and the middle one is the 66,724 the boot loop
-/// printed.
+/// left` column was read back out of the linked ELF — they are the `.stack`
+/// section's own size.
+///
+/// **The last two rows moved on 2026-08-17 when the discovery-and-time services
+/// landed**, and the direction is the one to watch: their statics came out of
+/// [`DRAM_FOR_STACK_AND_HEAP`], so the heap fell by 8,192 bytes on the ESP32-S3
+/// and 8,192 on the ESP32-C3 while each chip's stack *rose* slightly — the
+/// rounding-down leaves the residue on the stack, which is the whole reason it
+/// rounds that way. Free at the 54,424-byte peak is now 30,568 on the ESP32-S3
+/// and 17,256 on the ESP32-C3. The ESP32 is unchanged because it carries
+/// neither service; see the `compile_error!` above for the arithmetic that
+/// refuses it.
 ///
 /// **The table used to read 233,700 for the ESP32-S3 and a 163 KiB heap, and
 /// that was a measurement of an image without the web server in it.** It went

@@ -83,25 +83,38 @@
 // at all, and `heap` explains what the heap is for.
 extern crate alloc;
 
-// The three transports, gated at their module declarations and nowhere else.
+// The network services, gated at their module declarations and nowhere else.
 // That restriction is the point rather than a tidiness rule: a `#[cfg]` that
 // had to appear inside `tasks`, `edits` or `somfy-domain` would mean transport
 // logic had leaked into the core, and turning these off is how that gets
 // noticed. `Cargo.toml` carries the argument in full.
+//
+// `mdns` and `sntp` join them at Plan 6 Task 7 and neither is a transport: one
+// answers a question about this device's name and the other asks one about the
+// date. Both are gated the same way anyway, because the rule is about where a
+// `#[cfg]` may appear rather than about what kind of thing is behind it — and
+// `sntp` earns it twice over, since with the feature off there is no wall clock
+// in the image at all.
 #[cfg(feature = "http")]
 mod api;
 mod chip;
 mod config;
 mod edits;
 mod heap;
+#[cfg(feature = "mdns")]
+mod identity;
 #[cfg(feature = "mqtt")]
 mod inventory;
+#[cfg(feature = "mdns")]
+mod mdns;
 #[cfg(feature = "mqtt")]
 mod mqtt;
 mod net;
 mod radio;
 mod rpc;
 mod shades;
+#[cfg(feature = "sntp")]
+mod sntp;
 mod store;
 mod tasks;
 
@@ -1087,15 +1100,42 @@ fn start_network(spawner: Spawner, pending: Pending) {
             error,
         );
     }
+    // **After the server and before the broker, and the order is the argument.**
+    // What mDNS advertises is the web server, so starting it first would put a
+    // name on the network for a port that is not yet listening; starting it
+    // after says the advertisement follows the thing advertised. It goes before
+    // the broker because it has nothing to do with one — a board with no broker
+    // provisioned still wants its UI findable, and that is the state in which a
+    // person is most likely to be looking for it.
+    #[cfg(feature = "mdns")]
+    if let Err(error) = mdns::start(spawner, stack) {
+        esp_println::println!(
+            "mdns: failed to start ({:?}) — the UI is still reachable by address, and the \
+             radio and the broker are unaffected",
+            error,
+        );
+    }
+    // Last, because nothing waits for it. A clock that never arrives changes
+    // nothing about what this device does; see `sntp`'s module docs for why that
+    // is structural rather than a promise.
+    #[cfg(feature = "sntp")]
+    if let Err(error) = sntp::start(spawner, stack) {
+        esp_println::println!(
+            "sntp: failed to start ({:?}) — running with no wall clock, which is the \
+             ordinary state of this device until a server answers",
+            error,
+        );
+    }
     #[cfg(feature = "mqtt")]
     start_mqtt(spawner, stack, pending.broker);
 
-    // A build with neither transport still brings the network up, and that is
-    // deliberate rather than an oversight: DHCP is what turns "associated" into
-    // "on the network", `net::address_watch` prints the address it was given,
-    // and an operator commissioning a radio-only board needs both. Nothing
-    // connects *through* the stack, so this is where that is said out loud.
-    #[cfg(not(any(feature = "http", feature = "mqtt")))]
+    // A build with no network service at all still brings the network up, and
+    // that is deliberate rather than an oversight: DHCP is what turns
+    // "associated" into "on the network", `net::address_watch` prints the
+    // address it was given, and an operator commissioning a radio-only board
+    // needs both. Nothing connects *through* the stack, so this is where that is
+    // said out loud.
+    #[cfg(not(any(feature = "http", feature = "mqtt", feature = "mdns", feature = "sntp")))]
     let _ = stack;
 }
 

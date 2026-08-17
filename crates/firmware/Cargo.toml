@@ -171,8 +171,16 @@ esp-radio = { version = "0.18", default-features = false, features = [
 # `src/heap.rs` carries the measurement and the argument that it is affordable.
 esp-alloc = { version = "0.10", features = ["internal-heap-stats"] }
 # The TCP/IP stack. `dhcpv4` for the address, `proto-ipv4` for the traffic;
-# no IPv6, and no DNS yet — Task 3's broker address is the first thing that
-# might want it, and an unused resolver is a static buffer for nothing.
+# no IPv6. `dns`, `udp` and `multicast` are **not** here: each has exactly one
+# consumer, so each is turned on by that consumer's feature below rather than
+# unconditionally. That matters for more than tidiness — `dns` makes
+# `embassy_net::new` add a socket to the set before any of this crate's code
+# runs, so a radio-only build would pay for a resolver nothing can call.
+#
+# The resolver, once `sntp` turns it on, is also what makes
+# `somfy_config::MqttSettings`'s broker able to become a hostname: that is a
+# field change and one call to `net::resolve`, rather than a feature flag and a
+# socket budget.
 # `embassy-net`'s `StackResources` has to outlive the stack that borrows it,
 # which means a `'static` it is handed exactly once. `StaticCell` is the
 # no_std idiom for that and it is by embassy's own author; the alternative is
@@ -219,6 +227,47 @@ embassy-net = { version = "0.9.1", features = [
     "proto-ipv4",
     "tcp",
 ] }
+# The mDNS responder. Chosen from a sweep of every `mdns`/`dns-sd` crate on
+# crates.io — see CLAUDE.md's evaluation table — and proved by building a
+# throwaway spike for `xtensa-esp32s3-none-elf` and `riscv32imc-unknown-none-elf`
+# against this crate's real dependency set before it was adopted. It is the only
+# `no_std` **no-alloc** responder there is, it carries **zero** `unsafe`, and it
+# never announces on a timer: its broadcast half waits on a `Signal` this crate
+# owns, so every multicast packet this device sends is one `crate::mdns` asked
+# for. `default-features = false` + `io` drops its `std` and `log`/`defmt`
+# defaults; this firmware logs through `esp-println`.
+edge-mdns = { version = "0.8", default-features = false, optional = true, features = [
+    "io",
+] }
+# `edge-mdns`'s socket abstraction, and its `embassy-net` implementation. The
+# feature list is spelled out rather than taking its `all` default, which would
+# turn on `embassy-net`'s `proto-ipv6`, `icmp`, `dns` and `dhcpv4-hostname` for
+# a responder that answers A records over IPv4.
+edge-nal = { version = "0.7", optional = true }
+edge-nal-embassy = { version = "0.9", default-features = false, optional = true, features = [
+    "medium-ethernet",
+    "multicast",
+    "proto-ipv4",
+    "udp",
+] }
+# `edge-mdns` takes an `rng` for the RFC 6762 §6 response jitter. This is the
+# trait crate only; the implementation over `esp_hal::rng::Rng` is four lines in
+# `crate::mdns`, because there is no chip RNG adapter for `rand_core` 0.10 in
+# the esp-rs stack and a `TryRng` impl is smaller than any crate that would
+# carry one.
+rand_core = { version = "0.10", default-features = false, optional = true }
+# The SNTP client, and its `embassy-net` socket adapter. Also chosen from a full
+# crates.io sweep and proved by the same spike. Alloc-free, `unsafe`-free, and
+# the adapter speaks to `embassy_net::udp::UdpSocket` directly rather than
+# through `embedded-nal-async` — so the trait-version mismatch that eliminated
+# two MQTT candidates has no surface here at all.
+#
+# **Not** `sntpc-time-embassy`, its sibling: see CLAUDE.md. `crate::sntp` supplies
+# the `NtpTimestampGenerator` itself, because that trait's `timestamp_sec` is the
+# *pivot* `sntpc` reconstructs the NTP era from, and the sibling hardcodes a
+# monotonic one with no way to hand it the device's own wall clock.
+sntpc = { version = "0.11", default-features = false, optional = true }
+sntpc-net-embassy = { version = "0.11", optional = true }
 
 # No [dev-dependencies]: crates like `embedded-hal-mock` assume `std` (they
 # don't declare `#![no_std]`), so no feature selection lets them compile for
@@ -228,7 +277,7 @@ embassy-net = { version = "0.9.1", features = [
 [features]
 # The ordinary build is the full one. A chip feature still has to be named on
 # top of these — there is no default chip, and there should not be.
-default = ["mqtt", "ui"]
+default = ["mqtt", "ui", "mdns", "sntp"]
 
 # The three transports, and **the reason they are features is not size.**
 #
@@ -261,6 +310,46 @@ http = ["dep:picoserve", "dep:serde", "dep:serde-json-core"]
 # `curl`-driven test rig needs and what keeps 100 KB of assets out of an image
 # that will never serve them.
 ui = ["http"]
+
+# **`mdns` implies `http`, for the same reason `ui` does.** The only thing this
+# device offers over `<hostname>.local` is the web server: the broker session
+# dials *out*, and there is no other listener in the image. So `mdns` without
+# `http` would advertise `_http._tcp` on port 80 to a port nothing is bound to —
+# a name that resolves to a connection refused, which is worse than no name at
+# all because it looks like a device that has broken rather than one that was
+# never there.
+#
+# The consequence is that the **ESP32 never has mDNS**, because it never has
+# `http` (see the `compile_error!` in `src/heap.rs`). That is the right answer
+# rather than a casualty: on that chip the image has no inbound service to find.
+#
+# The reverse — `http` without `mdns` — is a real build and stays one. It is what
+# an integration test rig wants when it already knows the address, and it is the
+# configuration the ESP32-C3 row in CI uses to prove the two are separable.
+mdns = [
+    "http",
+    "dep:edge-mdns",
+    "dep:edge-nal",
+    "dep:edge-nal-embassy",
+    "dep:rand_core",
+    "embassy-net/multicast",
+    "embassy-net/udp",
+]
+
+# **`sntp` implies nothing, and that is the point.** Wall-clock time is not a
+# transport: no shade command, no position estimate and no rolling code depends
+# on it, and `crate::sntp` is the only module in the image that knows what a date
+# is. A build with it off has no wall clock at all — which is a stronger
+# statement than "nothing reads it", because there is nothing to read.
+#
+# It is the one feature here the ESP32 keeps, for the same reason: an SNTP client
+# is one 48-byte datagram an hour and two small buffers.
+sntp = [
+    "dep:sntpc",
+    "dep:sntpc-net-embassy",
+    "embassy-net/dns",
+    "embassy-net/udp",
+]
 
 # Three chips, two architectures, one configuration each. There is no feature
 # here that turns a part of the firmware off: every supported chip builds the
