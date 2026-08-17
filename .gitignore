@@ -9,3 +9,6 @@
 # Real device backups carry radio addresses + rolling codes — never commit them.
 # The fixtures README stays tracked; the exported capture does not.
 crates/somfy-migrate/tests/fixtures/*.backup
+
+# Agent worktrees created by EnterWorktree/isolation, never part of the project.
+.claude/
