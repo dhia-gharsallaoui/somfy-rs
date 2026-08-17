@@ -45,6 +45,29 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
         run: cargo doc --workspace --no-deps
 
+  # The UI half of the wire contract. The `host` job proves the committed
+  # bindings match the Rust DTOs; this job proves the UI and its mock still
+  # compile against those bindings. Without it, a DTO change could regenerate
+  # cleanly, pass the diff gate, and still leave the mock describing a device
+  # the firmware no longer is.
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: typecheck (the drift gate — the mock is typed by the generated DTOs)
+        run: bun run typecheck
+      - run: bun run lint
+      - run: bun run build
+      - name: bundle size against the 200 KB gzipped budget (design spec §8)
+        run: bun run size
+
   firmware:
     runs-on: ubuntu-latest
     strategy:

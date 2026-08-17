@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <!--
+      Inline data URI rather than a file: the firmware serves this app from
+      flash with no filesystem, and every separate asset is another
+      `include_bytes!` and another route. A browser that requests /favicon.ico
+      and gets a 404 from the device is a needless log line on a device whose
+      logs matter.
+    -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23b4581f'/%3E%3Cg fill='%23fff'%3E%3Crect x='3' y='3' width='10' height='2'/%3E%3Crect x='3' y='6.5' width='10' height='2'/%3E%3Crect x='3' y='10' width='10' height='2'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <title>somfy-rs</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

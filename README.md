@@ -155,7 +155,35 @@ TypeScript generation.
 ² `firmware` is excluded from the root workspace: it builds only for ESP
 targets, one chip per build (`chip-esp32`/`chip-s3`/`chip-c3`).
 
-The `ui/` app arrives in a later plan.
+### The web UI
+
+[`ui/`](ui) is the Preact + Vite + TypeScript app the firmware serves from
+flash. It is **mock-driven**: `bun run dev` starts a Vite plugin that serves a
+fake `/api/v1/` REST + WebSocket device, so every screen can be built and
+exercised with no hardware and no firmware running.
+
+The mock is not a hand-written imitation of the API — it is *typed by* the
+generated bindings in `ui/src/api/generated/`, down to an exhaustive `switch`
+over `CommandDto` and a total map over the `WsEvent` tags. A DTO change in
+`somfy-api` therefore lands as a TypeScript error rather than as a mock that
+quietly describes a device the firmware is not.
+
+```sh
+cd ui
+bun install
+bun run dev      # dashboard against the mock device
+bun run check    # typecheck + lint + build + bundle-size budget
+```
+
+Positions on the wire are Somfy's — 0 fully open, 100 fully closed. The UI
+presents *openness* (100 = open, as Home Assistant and every consumer blind app
+do), and the conversion between the two lives in exactly one file,
+[`ui/src/api/position.ts`](ui/src/api/position.ts).
+
+Built and shipping today: the dashboard (rooms → groups → shade tiles, with
+up/my/down and a position slider), shade detail, and English + French. The
+pairing assistant, settings, backup/restore, diagnostics and captive-portal
+onboarding are routed stubs.
 
 ## Build & test
 
