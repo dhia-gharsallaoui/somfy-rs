@@ -87,7 +87,7 @@ jobs:
   # What is deliberately not covered, and why:
   #
   # - **The ESP32 with `http` or `ui`.** It cannot be built at all: the chip has
-  #   57,236 bytes of DRAM for a 66,280-byte stack budget once the server is in,
+  #   56,172 bytes of DRAM for a 66,280-byte stack budget once the server is in,
   #   and `heap.rs` refuses it with a `compile_error!` naming the measurement.
   #   The refusal was proved by hand rather than by a job, because a CI step
   #   whose success is a compilation *failure* inverts every other row here.
@@ -141,7 +141,10 @@ jobs:
       #
       # Run for every row rather than only the `ui` ones: it is a few seconds,
       # and a conditional here would be one more configuration-dependent thing
-      # to get wrong.
+      # to get wrong. `build.rs` skips the embedding entirely when `ui` is off
+      # (it checks `CARGO_FEATURE_UI`), so the rows that do not need this are
+      # not made to wait for it either — the cost is the bun install, not a
+      # dependency.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest

@@ -134,6 +134,17 @@ fn main() {
 /// under 80 KB against the megabyte and a third the app slot has spare (the
 /// measurement is in `partitions.csv`).
 fn embed_web_ui() {
+    // Nothing to embed without the feature that serves it, and this is not
+    // merely an optimisation: a build script runs once per *crate*, so without
+    // this check `tx-check` — a bring-up harness with no network in it at all —
+    // would refuse to build until somebody had run `bun run build`. The `ui`
+    // feature is supposed to mean "no UI in this image", and that has to
+    // include not needing one to exist.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UI");
+    if std::env::var_os("CARGO_FEATURE_UI").is_none() {
+        return;
+    }
+
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR"));
     let dist = Path::new(UI_DIST);
 
