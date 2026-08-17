@@ -20,19 +20,23 @@
 //!
 //! # How one request at a time is enough
 //!
-//! [`GATE`] is an async mutex, so a second caller waits rather than racing. That
-//! is not a throughput compromise worth optimising: every reply here is
+//! [`Rpc::gate`] is an async mutex, so a second caller waits rather than racing.
+//! That is not a throughput compromise worth optimising: every reply here is
 //! assembled in microseconds from memory the state task already owns, and the
 //! alternative — several requests in flight against one registry — would need
 //! per-request correlation for no gain. It also bounds the seam's cost, which
 //! matters more: however many HTTP connections exist, the state task sees one
 //! extra wake-up at a time.
 //!
-//! Serialising is also what makes the buffer safe to share. Between
-//! [`Rpc::call`] signalling and waiting, the caller holds the gate and is
-//! parked; the state task is the only thing touching the slot. No borrow is
-//! ever held across an await, so there is no `RefCell` to panic and no `unsafe`
-//! to justify.
+//! Serialising is also what makes the two signals a *rendezvous* rather than a
+//! race. `Signal` holds one value and overwrites, so with several callers in
+//! flight one request could replace another's before the state task read it.
+//! With the gate there is at most one outstanding exchange, and the ordering
+//! that makes it safe is written out at [`Rpc::call`]: clear the reply, then
+//! signal the request, then wait — so an answer left behind by a caller whose
+//! future was dropped cannot be mistaken for this one's. No borrow is held
+//! across an await, so there is no `RefCell` to panic and no `unsafe` to
+//! justify.
 //!
 //! # Lists are walked, not snapshotted
 //!
