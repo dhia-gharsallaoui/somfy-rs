@@ -14,8 +14,35 @@
 //!   deployed firmware and with migrated backups.
 //! - **No tilt *commands* exist this generation.** Tilt is config-carriage only
 //!   (see [`somfy_domain::ShadeConfig`]); [`CommandDto`] carries no tilt action.
-//! - **[`CommandDto`] is deserialize-only** — it is the inbound REST command the
-//!   firmware receives, never one it emits.
+//! - **[`CommandDto`] and [`CreateShadeDto`] are deserialize-only** — they are
+//!   inbound REST payloads the firmware receives, never ones it emits.
+//! - **Rejections are typed** ([`ApiErrorCode`]), not English sentences: the UI
+//!   ships two languages and the device ships none.
+//!
+//! ## Shade lifecycle
+//!
+//! Three routes beyond the command surface, and the shapes of their answers are
+//! the contract:
+//!
+//! | Route | Body | Success |
+//! |---|---|---|
+//! | `POST /api/v1/shades` | [`CreateShadeDto`] | `201` + [`ShadeDto`] |
+//! | `PATCH /api/v1/shades/{id}` | [`PatchShadeDto`] | `200` + [`ShadeDto`] |
+//! | `DELETE /api/v1/shades/{id}` | — | `204` |
+//! | `POST /api/v1/shades/{id}/pair` | — | `202` |
+//!
+//! `PATCH` exists because travel times were otherwise settable only at
+//! creation, and correcting one meant deleting the shade — which loses its
+//! address and costs a fresh pairing at the window. See [`PatchShadeDto`].
+//!
+//! **Pairing answers `202 Accepted` and can never answer `200 OK`.** RTS is
+//! one-way: the device queues a `Prog` burst and never learns whether the motor
+//! took it. `202` is the honest code for "this has been accepted for
+//! processing" with no claim about the outcome, and the outcome genuinely lives
+//! outside the system — it is a person watching the shade jog.
+//!
+//! It is also **not** a [`CommandDto`] action, and that is deliberate rather
+//! than an omission; [`CommandDto`]'s own documentation carries the argument.
 //!
 //! ## Manual tagged (de)serialization
 //!
@@ -37,8 +64,15 @@
 
 mod commands;
 mod entities;
+mod errors;
 mod events;
+mod shades;
 
 pub use commands::CommandDto;
-pub use entities::{GroupDto, RoomDto, ShadeDto};
+pub use entities::{
+    AddressOrigin, CalibrationSource, GroupDto, RoomDto, ShadeDto, FACTORY_DOWN_TIME_MS,
+    FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS,
+};
+pub use errors::{ApiErrorCode, ApiErrorDto};
 pub use events::{ShadeStateEvent, WsEvent};
+pub use shades::{CreateShadeDto, PatchShadeDto, NAME_MAX_BYTES};

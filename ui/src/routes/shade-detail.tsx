@@ -14,14 +14,29 @@
  * What *is* live here is the same control surface as the dashboard tile, so a
  * shade can be driven while its settings are read.
  */
+import type { AddressOrigin } from '../api/generated/AddressOrigin';
 import type { ShadeDto } from '../api/generated/ShadeDto';
 import { openPercent } from '../api/position';
-import { kindKey } from '../components/kind';
+import { DeleteShade } from '../components/delete-shade';
+import { formatAddress } from '../components/format';
+import { kindKey, TILT_NONE } from '../components/kind';
 import { ShadeTile } from '../components/shade-tile';
+import { TravelTimes } from '../components/travel-times';
 import { useT, type Translate } from '../i18n';
+import type { MessageKey } from '../i18n/en';
 import type { DeviceState } from '../state/device';
 
-const TILT_NONE = 0x00;
+/**
+ * Total over the generated {@link AddressOrigin}, so a third origin added in
+ * Rust fails `tsc` here rather than rendering a blank line. The `note` is the
+ * consequence the user actually needs — for an imported address it is the
+ * reason pairing is not offered, which would otherwise look like a missing
+ * button.
+ */
+const ORIGIN_TEXT: Record<AddressOrigin, { label: MessageKey; note: MessageKey }> = {
+  allocated: { label: 'detail.originAllocated', note: 'detail.originAllocatedNote' },
+  imported: { label: 'detail.originImported', note: 'detail.originImportedNote' },
+};
 
 export function ShadeDetail({ device, id }: { device: DeviceState; id: number }) {
   const t = useT();
@@ -59,27 +74,32 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
         <p>{favouriteLabel(shade, t)}</p>
       </section>
 
+      {/*
+        Origin, and the pairing entry point it gates. Pairing is offered here
+        rather than standing on the dashboard because it is a step inside adding
+        a shade, not a control for one that already works — and it is offered
+        *only* for an address this controller allocated, because pairing a motor
+        to another controller's address accomplishes nothing.
+      */}
       <section class="panel">
-        <h3>{t('detail.travelTimes')}</h3>
-        <dl class="facts">
-          <dt>{t('detail.upTime')}</dt>
-          <dd>{t('detail.seconds', { seconds: seconds(shade.upTimeMs) })}</dd>
-          <dt>{t('detail.downTime')}</dt>
-          <dd>{t('detail.seconds', { seconds: seconds(shade.downTimeMs) })}</dd>
-          {shade.tiltMode !== TILT_NONE && (
-            <>
-              <dt>{t('detail.tiltTime')}</dt>
-              <dd>{t('detail.seconds', { seconds: seconds(shade.tiltTimeMs) })}</dd>
-            </>
-          )}
-        </dl>
+        <h3>{t('detail.origin')}</h3>
+        <p>
+          <strong>{t(ORIGIN_TEXT[shade.addressOrigin].label)}</strong>
+        </p>
+        <p class="prose">{t(ORIGIN_TEXT[shade.addressOrigin].note)}</p>
+        {shade.addressOrigin === 'allocated' && (
+          <a class="btn" href={`/shades/${shade.id}/pair`}>
+            {t('detail.pair')}
+          </a>
+        )}
       </section>
 
-      {/* R2 lands here. */}
-      <section class="panel panel--pending">
-        <h3>{t('detail.calibration')}</h3>
-        <p>{t('detail.calibrationPending')}</p>
-      </section>
+      {/*
+        Editable, and marked per value with where that value came from. This
+        was a read-only list until a shade carrying the reference firmware's
+        untouched defaults moved 1% for a 25% command — see `TravelTimes`.
+      */}
+      <TravelTimes shade={shade} onSaved={device.reload} />
 
       <section class="panel">
         <h3>{t('detail.tilt')}</h3>
@@ -94,15 +114,11 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
         <h3>{t('detail.linkedRemotes')}</h3>
         <p>{t('detail.linkedRemotesPending')}</p>
       </section>
+
+      <DeleteShade shade={shade} onDeleted={device.reload} />
     </div>
   );
 }
-
-const seconds = (ms: number): string => (ms / 1000).toFixed(1);
-
-/** 24-bit remote address, shown the way every other tool in this project does. */
-const formatAddress = (address: number): string =>
-  `0x${address.toString(16).toUpperCase().padStart(6, '0')}`;
 
 function favouriteLabel(shade: ShadeDto, t: Translate): string {
   return shade.myPosition === null

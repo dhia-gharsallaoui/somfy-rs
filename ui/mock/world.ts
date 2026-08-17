@@ -24,12 +24,17 @@
  * — and it would be a good way to test how the UI reports an overshoot — it
  * belongs behind an explicit switch.
  */
+import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
+import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
 import type { GroupDto } from '../src/api/generated/GroupDto.ts';
+import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
 import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
 import type { WsEvent } from '../src/api/generated/WsEvent.ts';
-import { GROUPS, ROOMS, SHADES } from './fixtures.ts';
+import { originOf, toDto, type StoredShade } from './derive.ts';
+import { GROUPS, MAX_SHADES, MOCK_BASE, ROOMS, SHADES } from './fixtures.ts';
+import { validateCreateShade, validatePatchShade } from './validate.ts';
 
 /** `Pos::FULL` — full travel in hundredths of a percent (`somfy-domain`). */
 const FULL_RAW = 10_000;
@@ -60,10 +65,41 @@ const rawToPercent = (raw: number): number => Math.round(raw / 100);
 
 export type Listener = (event: WsEvent) => void;
 
+/**
+ * What `POST /api/v1/shades` produced: the created shade, or the code the
+ * device would have refused it with. A discriminated result rather than a
+ * thrown error, so the caller has to look.
+ */
+export type CreateResult = { ok: ShadeDto } | { error: ApiErrorCode };
+
+/**
+ * What `POST /api/v1/shades/{id}/pair` produced.
+ *
+ * `accepted` is deliberately not called `sent`, and there is no `succeeded`:
+ * RTS is one-way, so the furthest any layer here can honestly go is "the
+ * request was taken". Whether the motor heard it is settled by a person
+ * watching the shade.
+ */
+export type PairResult = 'accepted' | { error: ApiErrorCode };
+
 export class World {
-  private readonly shades = new Map<number, ShadeDto>();
+  /**
+   * Stored fields only. `addressOrigin` and the three calibration sources are
+   * computed by {@link toDto} on the way out, exactly as `ShadeDto::from_shade`
+   * computes them — so nothing in here can hold a stale copy of a fact that is
+   * really a function of another field.
+   */
+  private readonly shades = new Map<number, StoredShade>();
   private readonly motion = new Map<number, Motion>();
   private readonly listeners = new Set<Listener>();
+  /**
+   * Rooms and groups are copied, not aliased, because deleting a shade now
+   * mutates them — `Registry::remove_shade` drops the id from every group and
+   * room it belonged to, and a mock that left the id behind would report a
+   * group of three that only ever moves two.
+   */
+  private readonly rooms: RoomDto[];
+  private readonly groups: GroupDto[];
   private timer: ReturnType<typeof setInterval> | undefined;
   private lastTickMs = Date.now();
 
@@ -77,6 +113,8 @@ export class World {
         direction: IDLE,
       });
     }
+    this.rooms = ROOMS.map((room) => ({ ...room, shadeIds: [...room.shadeIds] }));
+    this.groups = GROUPS.map((group) => ({ ...group, shadeIds: [...group.shadeIds] }));
   }
 
   /**
@@ -87,20 +125,151 @@ export class World {
    */
   listShades(): ShadeDto[] {
     this.tick();
-    return [...this.shades.values()];
+    return [...this.shades.values()].map(toDto);
   }
 
   getShade(id: number): ShadeDto | undefined {
     this.tick();
-    return this.shades.get(id);
+    const shade = this.shades.get(id);
+    return shade && toDto(shade);
   }
 
   listRooms(): RoomDto[] {
-    return ROOMS;
+    return this.rooms;
   }
 
   listGroups(): GroupDto[] {
-    return GROUPS;
+    return this.groups;
+  }
+
+  // -------------------------------------------------------------- lifecycle
+
+  /**
+   * `POST /api/v1/shades`. Validates as the firmware does, then assigns the id
+   * and allocates the address — the two things a client may never choose.
+   *
+   * A created shade is **not** placed in a room or a group: the device has no
+   * way to guess which, and the dashboard already collects room-less shades
+   * under "Not in a room" rather than dropping them.
+   */
+  createShade(body: CreateShadeDto): CreateResult {
+    const error = validateCreateShade(body, this.shades.size);
+    if (error) return { error };
+
+    const id = this.nextId();
+    if (id === undefined) return { error: 'registryFull' };
+
+    const address = this.allocateAddress(id);
+    const shade: StoredShade = {
+      id,
+      name: body.name,
+      address,
+      kind: body.kind,
+      tiltMode: body.tiltMode,
+      // A shade nobody has moved and nobody has overheard is at the position
+      // `Shade::new` starts it at. The first Open or Close corrects it against
+      // a physical limit.
+      position: 0,
+      target: 0,
+      tiltPosition: 0,
+      myPosition: null,
+      direction: IDLE,
+      upTimeMs: body.upTimeMs,
+      downTimeMs: body.downTimeMs,
+      tiltTimeMs: body.tiltTimeMs,
+    };
+
+    this.shades.set(id, shade);
+    this.motion.set(id, { raw: 0, targetRaw: 0, direction: IDLE });
+    return { ok: toDto(shade) };
+  }
+
+  /**
+   * `PATCH /api/v1/shades/{id}` — the port of `PatchShadeDto::apply`.
+   *
+   * Validates against the **result** rather than the body, and writes nothing
+   * unless the whole patch is acceptable: a shade left renamed but still
+   * holding a rejected travel time would be worse than one that changed
+   * nothing at all.
+   *
+   * The travel times take effect immediately, including mid-travel — `tick`
+   * reads them every interval, which is the same thing a real shade does when
+   * its configuration changes under a moving estimate.
+   */
+  patchShade(id: number, body: PatchShadeDto): CreateResult {
+    const current = this.shades.get(id);
+    if (!current) return { error: 'notFound' };
+
+    const dto = toDto(current);
+    const error = validatePatchShade(body, dto);
+    if (error) return { error };
+
+    const next: StoredShade = {
+      ...current,
+      ...(body.name !== undefined && { name: body.name }),
+      ...(body.kind !== undefined && { kind: body.kind }),
+      ...(body.tiltMode !== undefined && { tiltMode: body.tiltMode }),
+      ...(body.upTimeMs !== undefined && { upTimeMs: body.upTimeMs }),
+      ...(body.downTimeMs !== undefined && { downTimeMs: body.downTimeMs }),
+      ...(body.tiltTimeMs !== undefined && { tiltTimeMs: body.tiltTimeMs }),
+    };
+
+    this.shades.set(id, next);
+    return { ok: toDto(next) };
+  }
+
+  /**
+   * `DELETE /api/v1/shades/{id}`, including the part that is easy to forget:
+   * `Registry::remove_shade` also drops the id from every group and room.
+   */
+  deleteShade(id: number): boolean {
+    if (!this.shades.delete(id)) return false;
+    this.motion.delete(id);
+    for (const room of this.rooms) room.shadeIds = room.shadeIds.filter((m) => m !== id);
+    for (const group of this.groups) group.shadeIds = group.shadeIds.filter((m) => m !== id);
+    return true;
+  }
+
+  /**
+   * `POST /api/v1/shades/{id}/pair`.
+   *
+   * Changes **nothing**, and that is the accurate model rather than a stub. A
+   * real device queues a `Prog` burst at the shade's address; it learns no more
+   * about the motor afterwards than it knew before, so there is no state for
+   * either side to update. What it can refuse is pairing an address that came
+   * from another controller, where the burst would go out perfectly and
+   * accomplish nothing.
+   */
+  pairShade(id: number): PairResult {
+    const shade = this.shades.get(id);
+    if (!shade) return { error: 'notFound' };
+    if (originOf(shade.address) !== 'allocated') return { error: 'addressNotAllocated' };
+    return 'accepted';
+  }
+
+  /** Lowest free registry slot, as `Registry::add_shade` picks it. */
+  private nextId(): number | undefined {
+    for (let id = 0; id < MAX_SHADES; id++) {
+      if (!this.shades.has(id)) return id;
+    }
+    return undefined;
+  }
+
+  /**
+   * `RemoteIdentity::address_for`: the base plus the shade's id, walking upward
+   * past anything the table already holds. The probe is not decorative — an
+   * imported table carries a foreign controller's addresses, and allocating
+   * over one of them is the exact clash the reserved bit exists to prevent.
+   */
+  private allocateAddress(id: number): number {
+    const taken = new Set([...this.shades.values()].map((shade) => shade.address));
+    for (let probe = 0; probe <= MAX_SHADES; probe++) {
+      const address = MOCK_BASE + id + probe;
+      if (!taken.has(address)) return address;
+    }
+    // Unreachable for the same reason it is in Rust: at most MAX_SHADES
+    // addresses are held and MAX_SHADES + 1 distinct candidates are probed.
+    throw new Error('no free address');
   }
 
   /** Current state of every shade, for a client that has just connected. */
@@ -170,7 +339,7 @@ export class World {
 
   /** Fan a command out to a group's members, as the device does in v1.0. */
   commandGroup(id: number, command: CommandDto): boolean {
-    const group = GROUPS.find((candidate) => candidate.id === id);
+    const group = this.groups.find((candidate) => candidate.id === id);
     if (!group) return false;
     for (const shadeId of group.shadeIds) this.command(shadeId, command);
     return true;
@@ -189,7 +358,7 @@ export class World {
   }
 
   /** `Shade::step_target`: `FULL_RAW * STEP_TRAVEL_MS / travel_ms`, clamped. */
-  private step(shade: ShadeDto, motion: Motion, direction: number): void {
+  private step(shade: StoredShade, motion: Motion, direction: number): void {
     const travelMs = direction === UP ? shade.upTimeMs : shade.downTimeMs;
     if (travelMs === 0) return;
     const stepRaw = Math.min(FULL_RAW, Math.floor((FULL_RAW * STEP_TRAVEL_MS) / travelMs));
@@ -243,7 +412,7 @@ export class World {
   }
 
   /** Mirror the motion state onto the DTO and push it to subscribers. */
-  private publish(shade: ShadeDto, motion: Motion): void {
+  private publish(shade: StoredShade, motion: Motion): void {
     shade.position = rawToPercent(motion.raw);
     shade.target = rawToPercent(motion.targetRaw);
     shade.direction = motion.direction;
@@ -251,7 +420,7 @@ export class World {
     for (const listener of this.listeners) listener(event);
   }
 
-  private eventFor(shade: ShadeDto): WsEvent {
+  private eventFor(shade: StoredShade): WsEvent {
     return {
       ev: 'shadeState',
       id: shade.id,

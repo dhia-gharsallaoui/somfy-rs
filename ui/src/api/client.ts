@@ -11,24 +11,15 @@
  * mode" branch anywhere in the app.
  */
 
+import { ApiError } from './errors';
 import type { CommandDto } from './generated/CommandDto';
+import type { CreateShadeDto } from './generated/CreateShadeDto';
 import type { GroupDto } from './generated/GroupDto';
+import type { PatchShadeDto } from './generated/PatchShadeDto';
 import type { RoomDto } from './generated/RoomDto';
 import type { ShadeDto } from './generated/ShadeDto';
 
 export const API_BASE = '/api/v1';
-
-/** A non-2xx response, carrying whatever the device said about it. */
-export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly path: string,
-    detail: string,
-  ) {
-    super(`${path} failed (${status}): ${detail}`);
-    this.name = 'ApiError';
-  }
-}
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(`${API_BASE}${path}`, init);
@@ -41,6 +32,17 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
 async function getJson<T>(path: string): Promise<T> {
   return (await request(path)).json() as Promise<T>;
 }
+
+async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
+  const response = await request(path, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return response.json() as Promise<T>;
+}
+
+const postJson = <T>(path: string, body: unknown): Promise<T> => sendJson('POST', path, body);
 
 async function postCommand(path: string, command: CommandDto): Promise<void> {
   await request(path, {
@@ -66,6 +68,59 @@ export const commandShade = (id: number, command: CommandDto): Promise<void> =>
  */
 export const commandGroup = (id: number, command: CommandDto): Promise<void> =>
   postCommand(`/groups/${id}/command`, command);
+
+/**
+ * Add a shade. The device assigns the id and allocates the remote address, so
+ * the answer — a full {@link ShadeDto} — carries information the request did
+ * not, and the caller needs it: the address it just invented is one no motor
+ * knows yet.
+ */
+export const createShade = (body: CreateShadeDto): Promise<ShadeDto> =>
+  postJson('/shades', body);
+
+/**
+ * Edit a shade that already exists. Fields left out are left unchanged.
+ *
+ * This is how a measured travel time gets in without an automatic sweep, which
+ * the position-accuracy requirements make a MUST (R9): a sweep runs the shade
+ * end to end twice per direction, which is not always acceptable, and an
+ * operator who already has a stopwatch reading should not have to wait for one.
+ * Deleting and re-adding is not an alternative — a re-added shade gets a new
+ * address and has to be paired again at the window.
+ *
+ * Answers with the whole shade, because the calibration sources are recomputed
+ * from the values and the caller needs the new ones.
+ */
+export const patchShade = (id: number, body: PatchShadeDto): Promise<ShadeDto> =>
+  sendJson('PATCH', `/shades/${id}`, body);
+
+/**
+ * Remove a shade from this controller.
+ *
+ * **The motor is not told, and cannot be.** RTS has no "forget this remote"
+ * that a controller may send safely — on a physical remote it is a *held* PROG
+ * press, and the length of the burst is the only thing distinguishing it from a
+ * pairing tap, so getting it wrong unpairs a working shade and costs a walk to
+ * the window. The firmware therefore offers no unpair command at all
+ * (`somfy_domain::PAIR_REPEATS` pins the burst to a tap), and neither does
+ * this. Deleting here removes the controller's knowledge of the shade; the
+ * motor keeps obeying every remote it has already learned.
+ */
+export const deleteShade = (id: number): Promise<void> =>
+  request(`/shades/${id}`, { method: 'DELETE' }).then(() => undefined);
+
+/**
+ * Ask the device to transmit a pairing frame at this shade's address.
+ *
+ * Resolving means **202 Accepted** — the request was taken — and nothing more.
+ * It is not a report that the motor was paired, because no such report exists:
+ * RTS is one-way and the controller never hears back. The only acknowledgement
+ * is the motor jogging, and the only observer is a person standing at it. A UI
+ * that renders this promise's resolution as success is lying, so the pairing
+ * assistant asks the user what happened instead.
+ */
+export const pairShade = (id: number): Promise<void> =>
+  request(`/shades/${id}/pair`, { method: 'POST' }).then(() => undefined);
 
 /** Everything the dashboard needs, fetched in parallel. */
 export interface Snapshot {
