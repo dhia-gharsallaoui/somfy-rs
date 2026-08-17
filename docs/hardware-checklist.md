@@ -1268,3 +1268,111 @@ Four ways, in descending order of what they cost.
   stays blank and a blank record with no `factory` partition present means "boot
   `ota_0`". It becomes reachable the moment Plan 6 Task 4 lands, which is why it
   is written down now rather than then.
+
+---
+
+## Name and time
+
+The two services Plan 6 Task 7 added. **This procedure touches the network
+only** — nothing goes on the 433 MHz band, and nothing here can affect what
+does. Both services are supposed to be invisible when they fail, so the whole
+point of this section is to make their *absence* legible.
+
+It needs a second machine on the same subnet. mDNS is link-local by design: a
+device on the guest VLAN, on Wi-Fi client isolation, or across a router will
+never see the announcement, and that is the correct behaviour rather than a
+fault to chase.
+
+### 1. What the boot line should say
+
+Two new lines, in this order, after `net: address …`:
+
+```
+mdns: answering for 'somfy-<12 hex>.local' — the UI is at http://somfy-<12 hex>.local
+sntp: asking pool.ntp.org for the time, then every 3600 s. Nothing here affects the radio.
+```
+
+**The twelve hex characters are the factory MAC and must equal the MQTT
+`device_id`** on the same boot. If they differ, something has grown a second
+identity scheme and the two should be reconciled before anything else here
+matters.
+
+A third line follows once a server answers, usually within a second or two of
+the address:
+
+```
+sntp: wall clock set — 1787... seconds since the UNIX epoch. Monotonic uptime is unaffected...
+```
+
+It is printed **only for the first sync of a boot**. An hourly line would be one
+message an hour saying the clock is still the clock, and `crates/firmware/src/net.rs`
+carries the argument about what a log line costs a cooperative executor.
+
+### 2. Prove the name resolves, from the other machine
+
+```bash
+# Linux with avahi, or macOS
+ping -c 3 somfy-<12 hex>.local
+avahi-resolve -4 -n somfy-<12 hex>.local      # Linux only
+dns-sd -B _http._tcp local.                   # macOS only
+avahi-browse -rt _http._tcp                   # Linux only
+```
+
+The service browse is the stronger check: it proves the SRV and TXT records
+compose, not just the A record. Expect the instance name to match the hostname,
+the port to be **80**, and a `path=/` TXT key.
+
+Then the thing it exists for:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://somfy-<12 hex>.local/
+```
+
+**A `200` here is the acceptance criterion for mDNS.** Anything that stops at
+name resolution has proved half of it.
+
+### 3. Confirm it is not chattering
+
+This is the check worth doing once, because a badly behaved mDNS responder is
+invisible to its owner and obvious to everyone else on the network.
+
+```bash
+sudo tcpdump -ni <iface> -c 200 'udp port 5353 and host <the board's IP>'
+```
+
+Expect **three packets in the first ~3 seconds** after the address arrives, and
+then **nothing at all** unless something queries. Leave it running for a few
+minutes: a device that transmits on a timer is a defect, not a tuning question,
+and `crates/firmware/src/mdns.rs` explains why the design cannot do it.
+
+### 4. What a failure looks like, and what it must not affect
+
+| Symptom | Meaning |
+|---|---|
+| Neither new line at boot | The features are compiled out, or `start_network` returned early. Check the `wifi:`/`net:` lines above them. |
+| `mdns: failed to start (…)` | A spawn failure. The UI is still at the IP address printed by `net: address …`. |
+| `mdns: the responder stopped (…) — retrying in 5000 ms` | The responder hit a fatal error and is restarting. If it repeats, the likely cause is a response that did not fit `RESPONSE_BYTES`; the module documents the arithmetic. |
+| Name never resolves, no errors | Almost always the network rather than the board — client isolation, a guest VLAN, or an mDNS-unaware resolver. Confirm with `tcpdump` on the board's IP before touching firmware. |
+| `sntp: no time this round (…)` repeating | Expected on a network with no internet or a blocked port 123. The retry stretches to an hour and stops there. |
+| No `sntp: wall clock set` line, ever | The device has no wall clock. **Nothing in this firmware depends on one**, so shades, positions and rolling codes are unaffected — that is the design, not a consolation. |
+
+**The check that matters more than any of the above:** with mDNS and SNTP both
+failing, run the transmit and receive procedures earlier in this document and
+confirm they are unchanged. A network service that degrades quietly is the
+requirement; a network service that degrades quietly *and takes the radio with
+it* is the failure both modules are arranged against.
+
+### What this procedure does not establish
+
+- **That the name survives a DHCP lease change.** The responder rebuilds and
+  re-announces when the address moves, and that path has never been exercised —
+  it needs a router that will hand out a different address, or a lease short
+  enough to force one.
+- **That the clock is *right*.** `sntp: wall clock set` proves a server answered
+  and the answer passed `sntpc`'s checks. Compare the printed epoch seconds
+  against `date +%s` on the other machine; they should agree within a second or
+  two, and a large disagreement means a captive portal answered port 123 rather
+  than a time server.
+- **Anything about a second board.** The hostname is derived from the MAC, so a
+  collision needs two boards with one MAC. That is the argument for not probing
+  (RFC 6762 §8.1), and it is untested because it is untestable here.
