@@ -12,6 +12,8 @@ import { LocationProvider, Route, Router, useLocation, useRoute } from 'preact-i
 import { useI18n, LOCALES, LOCALE_NAMES, type Locale } from './i18n';
 import { Dashboard } from './routes/dashboard';
 import { ShadeDetail } from './routes/shade-detail';
+import { ShadeNew } from './routes/shade-new';
+import { ShadePair } from './routes/shade-pair';
 import { Stub } from './routes/stub';
 import { useDevice, type DeviceState } from './state/device';
 
@@ -48,8 +50,14 @@ function Shell() {
       <main class="main">
         <Router>
           <Route path="/" component={Dashboard} device={device} />
+          {/*
+            `preact-iso`'s Router takes the *first* matching child, so the
+            literal segment must precede the parameter or `/shades/new` would
+            be read as a shade with the id "new".
+          */}
+          <Route path="/shades/new" component={ShadeNew} device={device} />
+          <Route path="/shades/:id/pair" component={ShadePairRoute} device={device} />
           <Route path="/shades/:id" component={ShadeRoute} device={device} />
-          <Route path="/pairing" component={Stub} screen="stub.pairing" />
           <Route path="/settings" component={Stub} screen="stub.settings" />
           <Route path="/backup" component={Stub} screen="stub.backup" />
           <Route path="/diagnostics" component={Stub} screen="stub.diagnostics" />
@@ -65,6 +73,12 @@ function Shell() {
 function ShadeRoute({ device }: { device: DeviceState }) {
   const { params } = useRoute();
   return <ShadeDetail device={device} id={Number(params['id'])} />;
+}
+
+/** The same, for the pairing assistant. */
+function ShadePairRoute({ device }: { device: DeviceState }) {
+  const { params } = useRoute();
+  return <ShadePair device={device} id={Number(params['id'])} />;
 }
 
 function NotFound() {

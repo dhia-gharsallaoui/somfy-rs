@@ -9,7 +9,8 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 
-import { ApiError, loadSnapshot, type Snapshot } from '../api/client';
+import { loadSnapshot, type Snapshot } from '../api/client';
+import { ApiError } from '../api/errors';
 import { connectEvents, type ConnectionState } from '../api/events';
 import type { ShadeDto } from '../api/generated/ShadeDto';
 

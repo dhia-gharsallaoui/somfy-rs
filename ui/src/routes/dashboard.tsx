@@ -36,14 +36,26 @@ export function Dashboard({ device }: { device: DeviceState }) {
   }
 
   if (device.snapshot.shades.length === 0) {
-    return <p class="panel">{t('dashboard.empty')}</p>;
+    return (
+      <section class="panel">
+        <p>{t('dashboard.empty')}</p>
+        <a class="btn btn--primary" href="/shades/new">
+          {t('dashboard.add')}
+        </a>
+      </section>
+    );
   }
 
   const layout = buildLayout(device.snapshot, t('dashboard.unassigned'));
 
   return (
     <div class="dashboard">
-      <h2 class="visually-hidden">{t('dashboard.title')}</h2>
+      <div class="dashboard__head">
+        <h2 class="visually-hidden">{t('dashboard.title')}</h2>
+        <a class="btn" href="/shades/new">
+          + {t('dashboard.add')}
+        </a>
+      </div>
 
       {layout.crossRoomGroups.length > 0 && (
         <section class="section">

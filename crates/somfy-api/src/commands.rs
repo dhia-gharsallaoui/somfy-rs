@@ -26,13 +26,26 @@ use somfy_domain::{Pos, ShadeCommand};
 /// surface a tilt command until the domain ports tilt behavior.
 ///
 /// [`ShadeCommand::Pair`] is absent **deliberately**, and this is the note that
-/// says so rather than leaving it looking forgotten. Pairing transmits a frame
-/// that teaches a motor a new remote, and it only works while somebody standing
-/// at the shade has just put the motor into programming mode — so it is a step
-/// in a procedure with a human in it, not an action a REST client should be able
-/// to fire at an unattended shade. The controller exposes it as a Home Assistant
-/// `button` per shade instead (`somfy-mqtt`), which is reached from the same
-/// room the motor is in. `docs/hardware-checklist.md` carries the sequence.
+/// says so rather than leaving it looking forgotten. Pairing is not a way to
+/// move a shade; it is one step inside *adding* one, and it only does anything
+/// while somebody standing at the motor has just put it into programming mode
+/// with a remote this controller does not have. Everything else in this enum is
+/// a movement that can be watched and undone from anywhere in the house.
+///
+/// So it lives on its own route — `POST /api/v1/shades/{id}/pair`, answering
+/// `202 Accepted` — which differs from a command in three ways that matter:
+///
+/// - it is refused outright on a shade whose address came from another
+///   controller ([`ApiErrorCode::AddressNotAllocated`]), where a `Prog` burst
+///   would teach the motor nothing;
+/// - it cannot be aimed at a group, which the domain also refuses
+///   ([`somfy_domain::DomainError::NotAGroupCommand`]) — fanned across a group
+///   it becomes a `Prog` at every shade in the house with nobody at any of them;
+/// - it never reports success, because there is none to report.
+///
+/// `docs/hardware-checklist.md` carries the full sequence and its hazards.
+///
+/// [`ApiErrorCode::AddressNotAllocated`]: crate::ApiErrorCode::AddressNotAllocated
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 // The wire form is a flat, internally-tagged object (`{"action":"up"}`,

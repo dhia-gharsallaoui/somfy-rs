@@ -1,18 +1,50 @@
 /**
  * Seed data for the mock device.
  *
- * **Everything here is invented.** The remote addresses are a deliberately
- * absurd `0xFACE__` run so that no value in this repository can be mistaken for
- * a real shade's radio address — real ones are private and cost a physical
- * re-pairing to leak.
+ * **Everything here is invented.** The remote addresses are deliberately absurd
+ * `…ACE__` runs so that no value in this repository can be mistaken for a real
+ * shade's radio address — real ones are private and cost a physical re-pairing
+ * to leak.
  *
  * The types are the generated ones. A field renamed, added or removed in
  * `somfy-api` and regenerated makes this file stop compiling, which is the
  * point: the mock cannot describe a device the firmware would not.
+ *
+ * ## Two address runs, because the difference is the whole feature
+ *
+ * `addressOrigin` is read off bit 23 of the address ({@link OUR_SPACE}), so a
+ * fixture set living entirely on one side of that bit could not exercise the
+ * screens that branch on it. Half of these shades therefore sit in each:
+ *
+ * - **`0x8ACE__` — allocated.** The shape `RemoteIdentity::address_for`
+ *   produces: the reserved bit, then a device-derived base, then the shade's
+ *   id. Pairing is offered on these.
+ * - **`0x7ACE__` — imported.** Bit 23 clear, so it could not have come from
+ *   this controller's allocator. These stand in for a table carried over from
+ *   the controller being replaced, which is the case the owner objected to
+ *   seeing a pairing button on: pairing them teaches a motor an address a
+ *   *different* controller is still counting on.
  */
 import type { GroupDto } from '../src/api/generated/GroupDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
 import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
+
+/**
+ * `RemoteIdentity::SPACE_START` — bit 23, set on every address this
+ * controller's allocator produces and on no address it imports.
+ */
+export const OUR_SPACE = 0x80_0000;
+
+/**
+ * The mock controller's allocation base, standing in for
+ * `RemoteIdentity::from_mac(...).base()`. A shade allocated at id `n` takes
+ * `MOCK_BASE + n`, probing upward past anything already taken — the same walk
+ * `RemoteIdentity::address_for` does.
+ */
+export const MOCK_BASE = OUR_SPACE | 0x0a_ce00;
+
+/** `MAX_SHADES` from `somfy-domain`'s registry. */
+export const MAX_SHADES = 32;
 
 /**
  * `ShadeKind` discriminants from `somfy-domain` (`types.rs`): Roller 0x00,
@@ -46,12 +78,20 @@ export const TILT = {
  * closed (see `src/api/position.ts`). Travel times are deliberately asymmetric
  * on a couple of them — a roller descends faster than it rises, and the domain
  * has carried per-direction times all along.
+ *
+ * Ids start at **0**, because a shade's id is its registry slot and
+ * `Registry::add_shade` fills the lowest free one. Numbering these from 1 would
+ * make the first shade added through the UI take id 0 and sort itself in front
+ * of the seed data, which looks like a bug and is not one.
+ *
+ * Three carry allocated addresses and three imported ones; see the module note.
  */
 export const SHADES: ShadeDto[] = [
   {
-    id: 1,
+    id: 0,
     name: 'Living room left',
-    address: 0xface01,
+    address: MOCK_BASE + 0,
+    addressOrigin: 'allocated',
     kind: KIND.roller,
     tiltMode: TILT.none,
     position: 0,
@@ -64,9 +104,10 @@ export const SHADES: ShadeDto[] = [
     tiltTimeMs: 0,
   },
   {
-    id: 2,
+    id: 1,
     name: 'Living room right',
-    address: 0xface02,
+    address: MOCK_BASE + 1,
+    addressOrigin: 'allocated',
     kind: KIND.roller,
     tiltMode: TILT.none,
     position: 100,
@@ -79,9 +120,10 @@ export const SHADES: ShadeDto[] = [
     tiltTimeMs: 0,
   },
   {
-    id: 3,
+    id: 2,
     name: 'Living room terrace',
-    address: 0xface03,
+    address: 0x7a_ce02,
+    addressOrigin: 'imported',
     kind: KIND.awning,
     tiltMode: TILT.none,
     position: 60,
@@ -94,9 +136,10 @@ export const SHADES: ShadeDto[] = [
     tiltTimeMs: 0,
   },
   {
-    id: 4,
+    id: 3,
     name: 'Kitchen',
-    address: 0xface04,
+    address: MOCK_BASE + 3,
+    addressOrigin: 'allocated',
     kind: KIND.blind,
     tiltMode: TILT.integrated,
     position: 40,
@@ -109,9 +152,10 @@ export const SHADES: ShadeDto[] = [
     tiltTimeMs: 1_500,
   },
   {
-    id: 5,
+    id: 4,
     name: 'Bedroom window',
-    address: 0xface05,
+    address: 0x7a_ce04,
+    addressOrigin: 'imported',
     kind: KIND.shutter,
     tiltMode: TILT.none,
     position: 100,
@@ -124,9 +168,10 @@ export const SHADES: ShadeDto[] = [
     tiltTimeMs: 0,
   },
   {
-    id: 6,
+    id: 5,
     name: 'Bedroom door',
-    address: 0xface06,
+    address: 0x7a_ce05,
+    addressOrigin: 'imported',
     kind: KIND.draperyCenter,
     tiltMode: TILT.none,
     position: 0,
@@ -141,16 +186,16 @@ export const SHADES: ShadeDto[] = [
 ];
 
 export const ROOMS: RoomDto[] = [
-  { id: 1, name: 'Living room', shadeIds: [1, 2, 3] },
-  { id: 2, name: 'Kitchen', shadeIds: [4] },
-  { id: 3, name: 'Bedroom', shadeIds: [5, 6] },
+  { id: 1, name: 'Living room', shadeIds: [0, 1, 2] },
+  { id: 2, name: 'Kitchen', shadeIds: [3] },
+  { id: 3, name: 'Bedroom', shadeIds: [4, 5] },
 ];
 
 export const GROUPS: GroupDto[] = [
   // Fully inside one room — the dashboard nests these under it.
-  { id: 1, name: 'Living room windows', shadeIds: [1, 2] },
-  { id: 2, name: 'Bedroom', shadeIds: [5, 6] },
+  { id: 1, name: 'Living room windows', shadeIds: [0, 1] },
+  { id: 2, name: 'Bedroom', shadeIds: [4, 5] },
   // Deliberately spans two rooms, so the dashboard's "groups that do not fit a
   // single room" path is exercised by the fixtures rather than only in theory.
-  { id: 3, name: 'Street side', shadeIds: [1, 4] },
+  { id: 3, name: 'Street side', shadeIds: [0, 3] },
 ];

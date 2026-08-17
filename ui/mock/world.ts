@@ -24,12 +24,15 @@
  * — and it would be a good way to test how the UI reports an overshoot — it
  * belongs behind an explicit switch.
  */
+import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
+import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
 import type { GroupDto } from '../src/api/generated/GroupDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
 import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
 import type { WsEvent } from '../src/api/generated/WsEvent.ts';
-import { GROUPS, ROOMS, SHADES } from './fixtures.ts';
+import { GROUPS, MAX_SHADES, MOCK_BASE, OUR_SPACE, ROOMS, SHADES } from './fixtures.ts';
+import { validateCreateShade } from './validate.ts';
 
 /** `Pos::FULL` — full travel in hundredths of a percent (`somfy-domain`). */
 const FULL_RAW = 10_000;
@@ -53,6 +56,15 @@ interface Motion {
   direction: number;
 }
 
+/**
+ * The port of `AddressOrigin::of`: bit 23 is `RemoteIdentity::SPACE_START`, set
+ * on every address this controller's allocator produces and on nothing it
+ * imports. Derived rather than stored on both sides — it is a fact about the
+ * address, and a stored copy is a copy that can be wrong.
+ */
+const originOf = (address: number): ShadeDto['addressOrigin'] =>
+  (address & OUR_SPACE) !== 0 ? 'allocated' : 'imported';
+
 const percentToRaw = (percent: number): number =>
   Math.min(100, Math.max(0, Math.round(percent))) * 100;
 
@@ -60,10 +72,35 @@ const rawToPercent = (raw: number): number => Math.round(raw / 100);
 
 export type Listener = (event: WsEvent) => void;
 
+/**
+ * What `POST /api/v1/shades` produced: the created shade, or the code the
+ * device would have refused it with. A discriminated result rather than a
+ * thrown error, so the caller has to look.
+ */
+export type CreateResult = { ok: ShadeDto } | { error: ApiErrorCode };
+
+/**
+ * What `POST /api/v1/shades/{id}/pair` produced.
+ *
+ * `accepted` is deliberately not called `sent`, and there is no `succeeded`:
+ * RTS is one-way, so the furthest any layer here can honestly go is "the
+ * request was taken". Whether the motor heard it is settled by a person
+ * watching the shade.
+ */
+export type PairResult = 'accepted' | { error: ApiErrorCode };
+
 export class World {
   private readonly shades = new Map<number, ShadeDto>();
   private readonly motion = new Map<number, Motion>();
   private readonly listeners = new Set<Listener>();
+  /**
+   * Rooms and groups are copied, not aliased, because deleting a shade now
+   * mutates them — `Registry::remove_shade` drops the id from every group and
+   * room it belonged to, and a mock that left the id behind would report a
+   * group of three that only ever moves two.
+   */
+  private readonly rooms: RoomDto[];
+  private readonly groups: GroupDto[];
   private timer: ReturnType<typeof setInterval> | undefined;
   private lastTickMs = Date.now();
 
@@ -77,6 +114,8 @@ export class World {
         direction: IDLE,
       });
     }
+    this.rooms = ROOMS.map((room) => ({ ...room, shadeIds: [...room.shadeIds] }));
+    this.groups = GROUPS.map((group) => ({ ...group, shadeIds: [...group.shadeIds] }));
   }
 
   /**
@@ -96,11 +135,111 @@ export class World {
   }
 
   listRooms(): RoomDto[] {
-    return ROOMS;
+    return this.rooms;
   }
 
   listGroups(): GroupDto[] {
-    return GROUPS;
+    return this.groups;
+  }
+
+  // -------------------------------------------------------------- lifecycle
+
+  /**
+   * `POST /api/v1/shades`. Validates as the firmware does, then assigns the id
+   * and allocates the address — the two things a client may never choose.
+   *
+   * A created shade is **not** placed in a room or a group: the device has no
+   * way to guess which, and the dashboard already collects room-less shades
+   * under "Not in a room" rather than dropping them.
+   */
+  createShade(body: CreateShadeDto): CreateResult {
+    const error = validateCreateShade(body, this.shades.size);
+    if (error) return { error };
+
+    const id = this.nextId();
+    if (id === undefined) return { error: 'registryFull' };
+
+    const address = this.allocateAddress(id);
+    const shade: ShadeDto = {
+      id,
+      name: body.name,
+      address,
+      // Derived, not asserted. It comes out `allocated` because the address
+      // came from our own space, but running it through the same classifier
+      // the firmware uses is what makes that a consequence rather than a claim.
+      addressOrigin: originOf(address),
+      kind: body.kind,
+      tiltMode: body.tiltMode,
+      // A shade nobody has moved and nobody has overheard is at the position
+      // `Shade::new` starts it at. The first Open or Close corrects it against
+      // a physical limit.
+      position: 0,
+      target: 0,
+      tiltPosition: 0,
+      myPosition: null,
+      direction: IDLE,
+      upTimeMs: body.upTimeMs,
+      downTimeMs: body.downTimeMs,
+      tiltTimeMs: body.tiltTimeMs,
+    };
+
+    this.shades.set(id, shade);
+    this.motion.set(id, { raw: 0, targetRaw: 0, direction: IDLE });
+    return { ok: shade };
+  }
+
+  /**
+   * `DELETE /api/v1/shades/{id}`, including the part that is easy to forget:
+   * `Registry::remove_shade` also drops the id from every group and room.
+   */
+  deleteShade(id: number): boolean {
+    if (!this.shades.delete(id)) return false;
+    this.motion.delete(id);
+    for (const room of this.rooms) room.shadeIds = room.shadeIds.filter((m) => m !== id);
+    for (const group of this.groups) group.shadeIds = group.shadeIds.filter((m) => m !== id);
+    return true;
+  }
+
+  /**
+   * `POST /api/v1/shades/{id}/pair`.
+   *
+   * Changes **nothing**, and that is the accurate model rather than a stub. A
+   * real device queues a `Prog` burst at the shade's address; it learns no more
+   * about the motor afterwards than it knew before, so there is no state for
+   * either side to update. What it can refuse is pairing an address that came
+   * from another controller, where the burst would go out perfectly and
+   * accomplish nothing.
+   */
+  pairShade(id: number): PairResult {
+    const shade = this.shades.get(id);
+    if (!shade) return { error: 'notFound' };
+    if (shade.addressOrigin !== 'allocated') return { error: 'addressNotAllocated' };
+    return 'accepted';
+  }
+
+  /** Lowest free registry slot, as `Registry::add_shade` picks it. */
+  private nextId(): number | undefined {
+    for (let id = 0; id < MAX_SHADES; id++) {
+      if (!this.shades.has(id)) return id;
+    }
+    return undefined;
+  }
+
+  /**
+   * `RemoteIdentity::address_for`: the base plus the shade's id, walking upward
+   * past anything the table already holds. The probe is not decorative — an
+   * imported table carries a foreign controller's addresses, and allocating
+   * over one of them is the exact clash the reserved bit exists to prevent.
+   */
+  private allocateAddress(id: number): number {
+    const taken = new Set([...this.shades.values()].map((shade) => shade.address));
+    for (let probe = 0; probe <= MAX_SHADES; probe++) {
+      const address = MOCK_BASE + id + probe;
+      if (!taken.has(address)) return address;
+    }
+    // Unreachable for the same reason it is in Rust: at most MAX_SHADES
+    // addresses are held and MAX_SHADES + 1 distinct candidates are probed.
+    throw new Error('no free address');
   }
 
   /** Current state of every shade, for a client that has just connected. */
@@ -170,7 +309,7 @@ export class World {
 
   /** Fan a command out to a group's members, as the device does in v1.0. */
   commandGroup(id: number, command: CommandDto): boolean {
-    const group = GROUPS.find((candidate) => candidate.id === id);
+    const group = this.groups.find((candidate) => candidate.id === id);
     if (!group) return false;
     for (const shadeId of group.shadeIds) this.command(shadeId, command);
     return true;

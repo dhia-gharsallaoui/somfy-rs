@@ -35,6 +35,21 @@ fn read(name: &str) -> String {
         .unwrap_or_else(|e| panic!("missing generated binding {}: {e}", path.display()))
 }
 
+/// The `export type ...` line only, with the doc comment ts-rs copies above it
+/// stripped off.
+///
+/// Needed for the *negative* assertions: a field must be absent from the
+/// **type**, and prose above it naturally discusses the fields it does not have
+/// — a whole-file substring search would fail on the explanation of why the
+/// field is missing, which is the wrong thing to be sensitive to.
+fn declaration(name: &str) -> String {
+    read(name)
+        .lines()
+        .filter(|line| line.starts_with("export type"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Regenerate every binding. `export_all` also writes transitive dependencies
 /// (e.g. `WsEvent` pulls in `ShadeStateEvent`). Idempotent: re-running produces
 /// byte-identical files, which is what the CI `git diff --exit-code` relies on.
@@ -52,7 +67,89 @@ fn regenerate() {
         somfy_api::RoomDto::export_all().expect("export RoomDto");
         somfy_api::CommandDto::export_all().expect("export CommandDto");
         somfy_api::WsEvent::export_all().expect("export WsEvent");
+        somfy_api::CreateShadeDto::export_all().expect("export CreateShadeDto");
+        somfy_api::ApiErrorDto::export_all().expect("export ApiErrorDto");
     });
+}
+
+#[test]
+fn address_origin_is_a_string_union_the_ui_can_switch_on() {
+    regenerate();
+    let origin = read("AddressOrigin.ts");
+
+    // A two-member string union, not a number: the UI branches on it to decide
+    // whether pairing is offered at all, and `0`/`1` would put the meaning in a
+    // lookup table nobody maintains.
+    assert!(
+        origin.contains(r#""allocated""#) && origin.contains(r#""imported""#),
+        "AddressOrigin must stay a camelCase string union:\n{origin}"
+    );
+
+    // And it must actually reach the shade payload, non-nullable — a UI that
+    // has to treat it as possibly-absent cannot use it as a gate.
+    let shade = read("ShadeDto.ts");
+    assert!(
+        shade.contains("addressOrigin: AddressOrigin"),
+        "ShadeDto must carry a required addressOrigin:\n{shade}"
+    );
+}
+
+#[test]
+fn create_shade_omits_everything_the_device_owns() {
+    regenerate();
+    let create = declaration("CreateShadeDto.ts");
+
+    for field in [
+        "name: string",
+        "kind: number",
+        "tiltMode: number",
+        "upTimeMs: number",
+        "downTimeMs: number",
+        "tiltTimeMs: number",
+    ] {
+        assert!(
+            create.contains(field),
+            "CreateShadeDto lost {field}:\n{create}"
+        );
+    }
+
+    // The device allocates the address and assigns the id, and derives the
+    // origin from the address. A client that could set any of the three could
+    // re-create the two-controllers-one-identity clash from a form field.
+    for forbidden in ["address", "id:", "position", "addressOrigin"] {
+        assert!(
+            !create.contains(forbidden),
+            "CreateShadeDto must not accept `{forbidden}` from a client:\n{create}"
+        );
+    }
+}
+
+#[test]
+fn api_error_is_a_code_the_ui_can_translate() {
+    regenerate();
+    let code = read("ApiErrorCode.ts");
+    let dto = read("ApiErrorDto.ts");
+
+    // Codes, not sentences: the device has no French. Every variant must reach
+    // the union, because `ui/src/api/errors.ts` maps it through a total Record
+    // and a missing member there is a `tsc` failure rather than a blank screen.
+    for variant in [
+        r#""nameEmpty""#,
+        r#""nameTooLong""#,
+        r#""invalidKind""#,
+        r#""invalidTiltMode""#,
+        r#""travelTimeZero""#,
+        r#""invalidAddress""#,
+        r#""registryFull""#,
+        r#""notFound""#,
+        r#""addressNotAllocated""#,
+    ] {
+        assert!(
+            code.contains(variant),
+            "ApiErrorCode lost {variant}:\n{code}"
+        );
+    }
+    assert!(dto.contains("code: ApiErrorCode"), "{dto}");
 }
 
 #[test]
