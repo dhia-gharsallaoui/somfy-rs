@@ -858,28 +858,45 @@ Checks 1 and 2 were run on the spare ESP32-S3 on 2026-08-16/17. **Checks 3, 4
 and 5 have not been run** — 3 needs a transmitter on the owner's network, and 4
 and 5 need the real broker.
 
-### The ESP32-S2 has no broker session
+### What the boot prints about the heap and the stack, and what to expect
 
-`chip-s2` builds without MQTT and says so at boot:
+**The ESP32-S2 was dropped on 2026-08-17** and the `mqtt` cargo feature went
+with it — it existed only to compile the broker session out for that one chip,
+which could not hold it. There is no build of this firmware without a broker
+session any more. `crates/firmware/Cargo.toml` keeps the arithmetic that
+justified it.
+
+Since then the heap is **per chip**, derived by subtracting a fixed stack
+budget from the DRAM each chip has to divide, so both numbers below move
+together and both are printed on every boot:
+
+| chip | heap | main stack | required |
+|---|---|---|---|
+| ESP32 | 60 KiB = 61,440 | 66,908 | 49,592 |
+| ESP32-S3 | 163 KiB = 166,912 | 66,788 | 49,592 |
+| ESP32-C3 | 150 KiB = 153,600 | 66,856 | 49,592 |
+
+Read on 2026-08-17 from the release ELFs; the ESP32-S3 row was confirmed on the
+spare board, which printed `stack: 66788 bytes available, 49592 required` —
+the ELF figure exactly. `crates/firmware/src/heap.rs` carries the derivation
+and the commands that regenerate the table.
+
+**The line worth reading is `heap: session announced`.** It is printed one line
+after the burst of retained discovery configs that produces the heap's peak;
+the two earlier `heap:` lines both run before that burst, so neither shows the
+figure the sizing is checked against. One clean ESP32-S3 boot at 163 KiB:
 
 ```
-mqtt: not built into this image — this chip has no DRAM left for a broker
- session alongside the Wi-Fi driver. See the `mqtt` feature.
+stack: 66788 bytes available, 49592 required
+heap: controller started — 46440 of 166912 bytes used, peak 46676
+heap: network up — 47364 of 166912 bytes used, peak 49068
+heap: session announced — 47464 of 166912 bytes used, peak 51212
 ```
 
-It is a measurement, not a preference: with the session compiled in, the
-ESP32-S2 image does not link at all — the statics overrun the end of its
-184 KB `dram_seg` by 5,260 bytes before any stack is carved, and
-`REQUIRED_STACK_BYTES` needs 8,192 more on top. `crates/firmware/Cargo.toml`
-carries the full arithmetic on the `mqtt` feature. Wi-Fi and the radio are
-unaffected there.
-
-| chip | main stack after Task 3 | broker session future |
-|---|---|---|
-| ESP32 | 71,524 | 14,824 |
-| ESP32-S2 | 14,716 | **not built** |
-| ESP32-S3 | 176,876 | 14,824 |
-| ESP32-C3 | 163,632 | 14,824 |
+If `heap:` ever reports a peak within a few kilobytes of the size, that is the
+thing to act on; `heap: … too little DRAM for the radio …` at boot means the
+heap has been squeezed below the driver's measured working set and association
+is expected to end in a panic.
 
 A fourth thing worth knowing rather than checking: **the controller reboots on
 a panic; the bring-up harnesses halt.** Wi-Fi brings in panics this firmware

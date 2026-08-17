@@ -114,19 +114,92 @@ const SPI_HZ: u32 = 4_000_000;
 
 /// Main stack this firmware refuses to start without.
 ///
-/// `RmtTx::transmit_frame` needs roughly 6.5 KB, nearly all of it in
-/// `somfy_rmt::build_symbols`'s two fixed 320-pulse buffers. Those are locals of
-/// a synchronous call, so they sit on the stack of whatever polls the radio
-/// task — and Embassy tasks have no stacks of their own, so that is the main
-/// stack. 8 KB is that figure plus room for the call frames above and below it.
+/// **This was 8,192, and it was wrong by a factor of six.** It was reasoned from
+/// `RmtTx::transmit_frame`, which needs about 6.5 KB and is the deepest thing on
+/// the *frame* path — but the frame path is nowhere near the deepest thing this
+/// firmware does. The boot path is, and it is nearly six times larger.
 ///
-/// Checked rather than asserted because it cannot be a constant: esp-hal's
-/// linker script gives the stack **whatever DRAM is left after the statics**,
-/// so the figure moves every time a static is added. On a device with plenty
-/// spare this check never fires; on one where a future Plan's buffers have
-/// eaten the margin, it fires at boot with a number rather than corrupting a
-/// pulse train.
-const REQUIRED_STACK_BYTES: usize = 8 * 1024;
+/// The old figure never fired, and that is the point rather than a defence: at
+/// the 56 KB heap every chip in the matrix had at least 71,004 bytes of stack,
+/// so a check set at 8,192 passed on all of them for a reason unrelated to
+/// whether it was right. It would have gone on passing until a heap change took
+/// the stack below the real requirement — which is exactly what
+/// [`heap::RADIO_HEAP_BYTES`] now does deliberately, and why this had to be
+/// derived before that could be.
+///
+/// ## Where the number comes from
+///
+/// Every frame below is read out of the linked ELF, from the `.stack_sizes`
+/// section `-Zemit-stack-sizes` emits, and they are summed along one call chain
+/// rather than guessed at. On Xtensa and RISC-V alike a frame is allocated whole
+/// in the prologue, so a chain's cost is the sum of its frames.
+///
+/// The deepest chain is the boot path, and it is one straight line — no branch,
+/// no recursion, nothing conditional:
+///
+/// | | ESP32 | ESP32-S3 | ESP32-C3 |
+/// |---|---|---|---|
+/// | executor poll above the main task | 152 | 152 | 152 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 12,272 | 12,272 | 16 |
+/// | [`start`] | 13,952 | 13,744 | *inlined* |
+/// | `entry`'s body, where `start` inlined into it | — | — | 16,688 |
+/// | [`tasks::state`], building the task token | 7,184 | 7,184 | 7,168 |
+/// | `UninitCell::write`, moving the future into its static | 14,320 | 14,320 | 14,320 |
+/// | **total** | **47,880** | **47,672** | **38,344** |
+///
+/// The last row is the state task's 14 KB future being materialised on the stack
+/// and then copied into the static `#[embassy_executor::task]` declares for it.
+/// It is the largest frame in two of the three images, it is unavoidable at this
+/// Embassy version, and it lands *below* `start`'s own 13.7 KB frame rather than
+/// after it has been given back.
+///
+/// **The ESP32-S3 column was checked against the silicon.** A throwaway build
+/// (not committed, like the `rx_raw` diagnostics before it) painted the free
+/// stack with a known word at the top of `entry` and read back how far down the
+/// pattern had been destroyed, on a board associating with a real access point
+/// and announcing to a real broker: **47,672 bytes**, against the 47,672 the
+/// table computes. Not close — equal. The mark is reached during boot and never
+/// moves again, which is what makes the boot path, and not the frame path, the
+/// thing this constant has to cover. The other two columns are computed and not
+/// measured.
+///
+/// ## What is added on top of it
+///
+/// **1,712 bytes of interrupt frames.** An interrupt lands on whatever stack was
+/// running, and here that is this one. `xtensa-lx-rt` allocates `XT_STK_FRMSZ` =
+/// 256 bytes per entry (`xtensa-lx-rt-0.22.0/src/exception/asm.rs:81`) and then
+/// calls a handler with its own frame; the five entries that can nest —
+/// `__user_exception`, `__level_1`, `__level_2`, `__level_3` and
+/// `__default_double_exception` — cost 5 × 256 plus 432 of handler frames on the
+/// worst chip. All five stacked at once is not a scenario anyone has seen; it is
+/// the bound.
+///
+/// So **47,880 + 1,712 = 49,592**, and that is this constant. It is the worst
+/// chip's figure rather than a per-chip one, because a boot check that differs
+/// per chip is three numbers to keep true instead of one — and the worst chip is
+/// the ESP32, which is also the one whose interrupt frames are counted above.
+/// The ESP32-C3 is RISC-V and enters interrupts differently, but it arrives with
+/// 9,536 bytes of slack against the ESP32's boot path, which is more than the
+/// whole Xtensa allowance.
+///
+/// ## What it does *not* cover, said plainly
+///
+/// The bodies interrupt handlers dispatch into. `esp_radio`'s `Handler::dispatch`
+/// calls straight into the closed Wi-Fi driver from interrupt context
+/// (`esp-radio-0.18.0/src/interrupt_dispatch.rs:24`), so those frames land here,
+/// and neither that blob nor masked ROM carries stack-size metadata — no sum
+/// over them is available. The hardware measurement above is what stands in for
+/// it, since it was taken with the driver's interrupts live, and
+/// [`heap::STACK_BUDGET_BYTES`] carries the margin that covers being wrong about
+/// it.
+///
+/// Checked at run time rather than asserted at compile time because it cannot be
+/// a constant: esp-hal's linker script gives the stack **whatever DRAM is left
+/// after the statics**, so the figure moves every time a static is added — and
+/// now that [`heap::RADIO_HEAP_BYTES`] is the largest static in the image, it
+/// moves every time that changes too. When it fires it names both numbers, which
+/// is worth more than a corrupted pulse train.
+const REQUIRED_STACK_BYTES: usize = 49_592;
 
 /// How long the panic handler waits for the serial line to drain before it
 /// resets the board. See the handler for why this is not optional.
@@ -259,7 +332,6 @@ struct Pending {
 
 #[esp_rtos::main]
 async fn entry(spawner: Spawner) {
-
     let pending = match start(spawner) {
         Ok(pending) => pending,
         Err(error) => {
@@ -306,6 +378,11 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // from — it is a static, so it comes out of the same DRAM as the stack
     // `check_stack_headroom` measures below.
     heap::install_for_radio();
+    // After the heap is installed and before the stack check below: a chip
+    // can pass the stack check and still have too little heap left for the
+    // radio, and those are two different failures with two different
+    // symptoms. See `heap::warn_if_undersized`.
+    heap::warn_if_undersized();
 
     // The scheduler behind the executor needs a timer and a software interrupt.
     //

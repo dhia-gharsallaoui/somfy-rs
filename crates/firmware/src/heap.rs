@@ -66,201 +66,229 @@
 //! mechanism that turns heap exhaustion back into a recoverable event, and it
 //! is why the margin below is watched on every boot rather than assumed.
 //!
-//! ## It is taken out of the same DRAM as the main stack
+//! ## It is taken out of the same DRAM as the main stack, and it is per chip
 //!
 //! `esp_alloc::heap_allocator!` declares a static array, and esp-hal's linker
 //! script gives the main stack whatever DRAM is left once the statics are
 //! placed. So every byte here is a byte `main::check_stack_headroom` no longer
 //! has — and that check is what turns an over-large heap into a refusal to
 //! boot carrying a number, instead of into a corrupted pulse train.
+//!
+//! That trade is settled once, in one direction: [`STACK_BUDGET_BYTES`] fixes
+//! what the stack keeps and [`RADIO_HEAP_BYTES`] takes the rest of whatever DRAM
+//! the chip being built happens to have. **It is one rule over three inputs
+//! rather than one number**, and the reason is that the chips are not the same
+//! size: a single shared figure has to fit the smallest of them, which is how an
+//! ESP32-S3 with 233,700 bytes to divide came to run its heap at 96% full next
+//! to 176,356 bytes of stack it had no use for.
+//!
+//! The objection to per-chip figures is that it makes the chip nobody can test
+//! the one running a configuration nobody has measured. That is true, and it was
+//! equally true of the shared constant — no ESP32 and no ESP32-C3 had ever run
+//! that either. What changes it is that the rule is now identical on every chip
+//! and only its input differs, and that both quantities it is built from are
+//! measurements rather than arguments: `main::REQUIRED_STACK_BYTES` against a
+//! painted stack, and [`WIFI_WORKING_SET_BYTES`] against a live broker.
 
-/// Bytes of heap installed for the Wi-Fi driver.
+/// The main stack every chip is left, before the heap takes the rest.
 ///
-/// **Two measurements bracket this number, and neither of them is a
-/// derivation.** `docs/provenance.md` records both.
+/// **This is the design's one free variable, and everything else follows from
+/// it.** `esp_alloc::heap_allocator!` declares a static array and esp-hal's
+/// linker script gives the main stack whatever DRAM is left once the statics
+/// are placed, so the heap and the stack are two shares of one fixed quantity —
+/// measurably so, and checked rather than assumed: the heap moved by +4,096 on
+/// the ESP32, +109,568 on the ESP32-S3 and +96,256 on the ESP32-C3 when this
+/// constant was introduced, and each chip's stack fell by exactly that, to the
+/// byte, in the relinked ELF. There is no third option and no slack between
+/// them; choosing one chooses the other.
 ///
-/// ### The floor: what the driver actually uses
+/// So this crate chooses the *stack*, once, for all chips, and
+/// [`RADIO_HEAP_BYTES`] is the arithmetic that follows. The other order — pick a
+/// heap and hope the stack survives — is what produced a 56 KB heap sized by the
+/// smallest chip that was then in the matrix, and an ESP32-S3 running that heap
+/// 96% full with 2,724 bytes to spare at the announcement peak.
 ///
-/// **55,040 bytes**, the worst high-water mark seen across fourteen boots of an
-/// ESP32-S3 on a real access point with a real broker (2026-08-17). Not a
-/// figure reasoned to — a figure read off the serial line.
+/// ### The two terms
 ///
-/// It replaces the 46,660 bytes this note carried from 2026-08-16, which were
-/// taken with association *failing* and which the note itself flagged as owing
-/// a re-measurement under real MQTT traffic. **That obligation is discharged,
-/// and the answer is that the old figure understated the peak by 8,380 bytes.**
-/// What the traffic actually looks like:
+/// **49,592 bytes are required.** `main::REQUIRED_STACK_BYTES` derives that
+/// frame by frame from the linked ELF and checks it on the ESP32-S3 against a
+/// painted stack on real hardware, where the computed figure and the measured
+/// one agree exactly. It is the boot path, not the frame path: the deepest thing
+/// this firmware does is move the state task's 14 KB future into place,
+/// underneath `start`'s own 13.7 KB frame, and `RmtTx::transmit_frame`'s
+/// celebrated 6.5 KB never comes close.
 ///
-/// | | bytes |
-/// |---|---|
-/// | steady use, held for as long as the boot lasts | 47,464 |
-/// | free at rest | 9,880 |
-/// | worst peak in fourteen boots | 55,040 |
-/// | free at that peak | 2,304 |
+/// **16,688 bytes are the margin, and it is measured rather than rounded.** What
+/// the derivation cannot see is what an interrupt handler *calls*: those paths
+/// run into `esp-radio`'s closed driver and into masked ROM, and neither carries
+/// stack-size metadata, so no sum over them exists to be taken. The margin has
+/// to cover being wrong about that, so it is set to **the largest single stack
+/// frame emitted anywhere in any of the three images** — one more frame of the
+/// worst size this compiler has actually produced here is the smallest unit in
+/// which this call graph can grow.
 ///
-/// Three things about that table are worth more than the numbers.
-///
-/// **The steady figure does not move within a boot.** Sampled every five
-/// seconds over runs of seven minutes: 47,464 at every one of them, unchanged
-/// across association cycles and across the diagnostics tick. It settles on a
-/// slightly different value from boot to boot — 47,416 on one run in seven —
-/// and then holds it. So "the heap is stable" is a claim about a running
-/// device, not about a constant.
-///
-/// **There is no leak, and that is checked rather than assumed.** With
-/// `internal-heap-stats`' running totals printed alongside the usage,
-/// `total_allocated - total_freed` equalled `current_usage` **exactly**, at
-/// every sample, through 6.4 MB of allocation. A leak of one byte a minute
-/// would show in that subtraction; nothing does.
-///
-/// **The peak is transient and it is the session announcement.** It is reached
-/// within a second of the broker's CONNACK — the burst of retained discovery
-/// configs — and never again: [`report`] at "network up", a moment before,
-/// reads about 49,000. So the honest picture is 9,880 bytes free at rest with a
-/// momentary trough of 2,304, not a heap that sits 96% full.
-///
-/// The peak is also **noisy**, which the single measurement it replaces could
-/// not have shown. Fourteen boots of one unchanged image spanned 50,824 to
-/// 55,040 — a 4,216-byte spread — depending on nothing more than how many of
-/// the driver's dynamic RX and TX buffers happened to be in flight at once. Any
-/// future comparison of two heap configurations has to survive that spread
-/// before it means anything; see the AMPDU note below, which did not.
-///
-/// Reasoning to one was tried and abandoned as fiction. `esp-radio`'s
-/// documented budget at `ControllerConfig::default()` is 10 static RX buffers
-/// of about 1.6 KB each — 16 KB, held from Wi-Fi init to deinit — plus *up to*
-/// 32 dynamic RX and 32 dynamic TX buffers sized by the frame and freed once
-/// the stack has taken them, plus the driver's task stacks. Only the 16 KB is
-/// a working set; the rest is a cap, and taking the cap literally gives about
-/// 120 KB, which is more DRAM than the smaller chips in this matrix have at
-/// all.
-///
-/// ### The ceiling: what the tightest chip can give
-///
-/// **The ESP32-S2 sets it.** Its usable `dram_seg` is 184 KB against the
-/// ESP32-S3's, and `esp-radio`'s statics take most of that, so linking the
-/// controller leaves these main stacks. **How to re-read them**, because every
-/// figure below has already drifted once: build the binary for each target and
-/// subtract two linker symbols out of the ELF —
+/// That worst frame is **not** the same one on every chip, and getting this
+/// wrong is easy: on the ESP32 and the ESP32-S3 the largest frame is
+/// `UninitCell::write` at 14,320 bytes, but on the ESP32-C3 it is `entry`'s own
+/// body — where `start` is inlined into it — at **16,688**. A margin of 14,320
+/// would therefore have been smaller than one worst-case frame on one of the
+/// three chips actually shipped, which is exactly the property the margin exists
+/// to buy. The maximum is taken across all three:
 ///
 /// ```text
-/// cargo build --release --features chip-s2 --target xtensa-esp32s2-none-elf --bin firmware
-/// nm target/xtensa-esp32s2-none-elf/release/firmware | grep _stack_.*_cpu0
+/// RUSTFLAGS="-Zemit-stack-sizes -C link-arg=-Tlinkall.x" \
+///   cargo build --release --features chip-c3 --target riscv32imc-unknown-none-elf --bin firmware
+/// readelf -x .stack_sizes target/riscv32imc-unknown-none-elf/release/firmware
 /// ```
 ///
-/// — and the stack is `_stack_start_cpu0 - _stack_end_cpu0`. It is the same
-/// subtraction `main::check_stack_headroom` does at boot, so the ESP32-S3 row
-/// can be checked against the `stack:` line on the serial console; on
-/// 2026-08-17 both said 176,388.
+/// — each entry in that section is a 4-byte address followed by a ULEB128 frame
+/// size, and the largest of them is this figure. Read on 2026-08-17: ESP32
+/// 14,320; ESP32-S3 14,320; ESP32-C3 16,688.
 ///
-/// | chip | stack at this crate's 56 KB heap | at a 32 KB heap |
+/// 49,592 + 16,688 = **66,280**, and the boot check fires at 49,592 — so the
+/// margin is the distance between "this still works" and "this stops booting and
+/// says why", rather than a number nobody would notice being spent.
+pub const STACK_BUDGET_BYTES: usize = 49_592 + 16_688;
+
+/// DRAM this chip has to divide between the main stack and the heap.
+///
+/// Measured, not looked up: build the chip, subtract the two linker symbols that
+/// bound the stack, and add back whatever heap that build carried.
+///
+/// ```text
+/// cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf --bin firmware
+/// nm target/xtensa-esp32s3-none-elf/release/firmware | grep _stack_.*_cpu0
+/// ```
+///
+/// `_stack_start_cpu0 - _stack_end_cpu0` is the stack, and it is the same
+/// subtraction `main::check_stack_headroom` prints at boot, so these can be
+/// cross-checked against a serial console rather than trusted. Read on
+/// 2026-08-17 from release ELFs carrying a 57,344-byte heap, whose stacks were
+/// ESP32 71,004, ESP32-S3 176,356 and ESP32-C3 163,112.
+///
+/// **This is the row that goes stale.** It moves every time a static is added
+/// anywhere in the image, silently and in the direction that costs stack, which
+/// is why the command that regenerates it sits next to it.
+#[cfg(feature = "chip-esp32")]
+const DRAM_FOR_STACK_AND_HEAP: usize = 128_348;
+/// See the `chip-esp32` definition above.
+#[cfg(feature = "chip-s3")]
+const DRAM_FOR_STACK_AND_HEAP: usize = 233_700;
+/// See the `chip-esp32` definition above.
+#[cfg(feature = "chip-c3")]
+const DRAM_FOR_STACK_AND_HEAP: usize = 220_456;
+
+/// Bytes of heap installed for the Wi-Fi driver. **Per chip, from that chip's
+/// own DRAM.**
+///
+/// One rule produces all three, and it is written here as arithmetic rather than
+/// as three hand-computed constants so that it cannot drift from the prose:
+///
+/// > heap = [`DRAM_FOR_STACK_AND_HEAP`] − [`STACK_BUDGET_BYTES`], rounded
+/// > **down** to a whole KiB.
+///
+/// The rounding goes down so the residue lands on the stack, which is the side
+/// that fails silently — a heap that is a kilobyte small panics and says so,
+/// while a stack that is a kilobyte small corrupts whatever it grows into.
+///
+/// | chip | DRAM to divide | heap | stack left | was, at 56 KB |
+/// |---|---|---|---|---|
+/// | ESP32 | 128,348 | 60 KiB = 61,440 | 66,908 | 57,344 heap / 71,004 stack |
+/// | ESP32-S3 | 233,700 | **163 KiB = 166,912** | 66,788 | 57,344 / 176,356 |
+/// | ESP32-C3 | 220,456 | 150 KiB = 153,600 | 66,856 | 57,344 / 163,112 |
+///
+/// Nothing in that table is chosen; it is what the rule returns.
+///
+/// ### What the ESP32-S3 gained, measured rather than asserted
+///
+/// The figure read off `heap: session announced`, which `crate::mqtt` prints one
+/// line after the burst of retained discovery configs that *is* the peak — the
+/// two older `report` call sites both run before that burst, so neither ever
+/// showed the number this constant is chosen from:
+///
+/// | | 56 KB heap | 163 KiB heap |
 /// |---|---|---|
-/// | ESP32 | 71,036 | 95,612 |
-/// | ESP32-S2 | **14,588** | 39,164 |
-/// | ESP32-S3 | 176,388 | 200,964 |
-/// | ESP32-C3 | 163,144 | 187,720 |
+/// | heap total | 57,344 | 166,912 |
+/// | steady use | 47,464 – 47,608 | 47,464 – 47,608 |
+/// | worst peak seen | 54,620 | 54,424 |
+/// | **free at that peak** | **2,724** | **112,488** |
 ///
-/// Measured 2026-08-17. The 32 KB column this replaces was measured on
-/// 2026-08-16 and read ESP32 113,340, ESP32-S2 41,028, ESP32-S3 218,692,
-/// ESP32-C3 205,440 — stale by 17,728 bytes on the three chips that build the
-/// broker session and by 1,864 on the ESP32-S2, which does not. The difference
-/// is Task 3 onward: a table of figures like this goes wrong silently every
-/// time a static is added, so it carries the command to regenerate it rather
-/// than only the result.
+/// The steady figure does not move, which is the point: the driver's resting
+/// working set was never the problem. The old margin was 2,724 bytes against a
+/// peak that itself varied by about 2,000 bytes between boots of one unchanged
+/// image — a margin inside its own noise, which is a coincidence with a good
+/// track record rather than a design.
 ///
-/// Every byte added here comes off those figures one for one. A 96 KB heap —
-/// which is what `esp-radio`'s own example implies, and what this was first
-/// written as — does not link for the ESP32-S2 at all: the linker reports
-/// `cannot move location counter backwards`, the statics having overrun the
-/// segment by 28,980 bytes.
+/// ### Three questions this retires
 ///
-/// ### The choice
+/// All three were open against the 56 KB heap and none survives the arithmetic,
+/// which is the point of the exercise rather than a side effect:
 ///
-/// 56 KB is the largest single figure that leaves the ESP32-S2 **14,588
-/// bytes** of main stack — 1.78 times `main::REQUIRED_STACK_BYTES`, and well
-/// clear of the ~6.5 KB `RmtTx::transmit_frame` needs — while staying 2,304
-/// bytes above the worst peak measured under real traffic. One constant rather
-/// than four, because a per-chip heap would mean the chip nobody can test is
-/// the one running a configuration nobody has measured.
-///
-/// **That margin is 4%, not the 23% this note used to claim**, and the change
-/// is entirely in the measurement rather than in the constant: the old figure
-/// compared 56 KB against a mark taken with association failing. Both halves
-/// have since moved against each other — the peak up by 8,380 bytes and the
-/// ESP32-S2's stack down by 1,736 — so the arithmetic is worth re-doing rather
-/// than trusting, and the two commands above are what re-does it.
-///
-/// **What that costs, said plainly.** 2,304 bytes of headroom against a peak
-/// that varies by 4,216 bytes between boots is not a comfortable margin: it
-/// says a session announcement roughly twice as expensive as the worst one
-/// observed would exhaust this heap. The consequence is bounded rather than
-/// catastrophic — an exhausted heap is a panic, and `main`'s handler resets
-/// rather than halting, so the device reboots and rejoins (see "Heap exhaustion
-/// mid-frame" above) — but "bounded" means a reboot loop at the moment the
-/// broker is announced, which is a plausible way for this device to become
-/// useless while looking merely flaky.
-///
-/// Growing the heap is **not** the answer and the ESP32-S2 is why: every byte
-/// added comes off its 14,588, and it boots into `StackTooSmall` below 8,192.
-/// The margin is what it is. Two things follow. The peak is published over MQTT
-/// precisely so it can be watched across many more than fourteen boots, and the
-/// announcement burst — not the steady link — is where to look first if it is
-/// ever seen to climb.
-///
-/// ### What frame aggregation is worth here, since it was measured
-///
-/// `esp-radio`'s `ControllerConfig::default()` enables AMPDU in both directions
-/// with a six-frame Block-Ack window, and Block-Ack reorder state was the
-/// leading suspect for the transient peak above. **It is not.** Fourteen boots
-/// with aggregation on against seventeen with it off, same image otherwise,
-/// same access point and broker (2026-08-17):
-///
-/// | | AMPDU on | AMPDU off |
-/// |---|---|---|
-/// | steady use | 47,464 | 47,148 |
-/// | worst peak | 55,040 | 54,676 |
-/// | best peak | 50,824 | 50,556 |
-/// | allocator churn | ~29,800 B/s | ~27,500 B/s |
-///
-/// Turning it off is worth **316 bytes of steady use** — a real and repeatable
-/// saving, visible on every boot — and **364 bytes of worst case**, which is
-/// inside the 4,216-byte boot-to-boot spread and therefore not a result at all.
-/// The transient peak survives with aggregation disabled, on most boots, which
-/// is what rules Block-Ack state out as its cause.
-///
-/// So aggregation stays on, and the reason is the *cost* of turning it off
-/// rather than the benefit: the `with_ampdu_*` setters are
-/// `#[builder_lite(unstable)]`, which the derive expands to
-/// `#[cfg(feature = "unstable")]`, so reaching them means enabling
-/// `esp-radio/unstable` — a wider API surface and, on `chip-esp32` only, an
-/// ADC2 claim in `esp_radio`'s `init` that panics if esp-hal holds it. That is
-/// not a trade worth 316 bytes. Recorded so it is not investigated a third
-/// time; `docs/provenance.md` carries the per-boot figures.
-///
-/// ### The ESP32-S2 answered the other half of that question
-///
-/// The note this replaces asked what to do if the working set did not fit the
-/// ESP32-S2. It does not, and the shortfall is not in the heap: it is in what
-/// is left of `dram_seg` after it. The broker session's task future is 14,816
-/// bytes, the boot check needs 8,192 of stack, and at 56 KB the ESP32-S2 has
-/// 14,588 bytes of DRAM after the statics — so the image does not link, by
-/// **5,748 bytes**, before any stack is carved at all (`cannot move location
-/// counter backwards (from 3ffdf674 to 3ffde000)`, 2026-08-17).
-///
-/// The answer taken is the one this note asked for: **say so.** `chip-s2`
-/// builds without the broker session and prints that at boot; every other chip
-/// is unaffected and the heap stays one constant. Shrinking it to fit would put
-/// the figure below the 55,040-byte peak above, which trades a link error for a
-/// heap-exhaustion panic under traffic that has now been measured rather than
-/// under traffic nobody had seen. `crates/firmware/Cargo.toml`'s `mqtt` feature
-/// carries the arithmetic.
+/// - **The announcement burst.** It is the peak, it costs about 7,000 bytes over
+///   the steady figure, and it now lands inside a heap with more than a hundred
+///   kilobytes spare.
+/// - **How many shades can be announced.** The burst scales with the shade count
+///   and the old headroom did not cover doubling it. This one does.
+/// - **Whether frame aggregation should be turned off.** It was measured at 316
+///   bytes of steady use — a real, repeatable saving that was never worth what
+///   reaching the setter costs (`esp-radio/unstable`, and on `chip-esp32` an ADC2
+///   claim in `esp_radio`'s `init` that panics if esp-hal holds it). At 163 KiB
+///   it is not worth discussing. Recorded so it is not investigated a fourth
+///   time; `docs/provenance.md` carries the per-boot figures.
 #[allow(
     dead_code,
     reason = "not used by `tx-check`, which includes this file by path and \
               installs only the scheduler's heap"
 )]
-pub const RADIO_HEAP_BYTES: usize = 56 * 1024;
+pub const RADIO_HEAP_BYTES: usize = (DRAM_FOR_STACK_AND_HEAP - STACK_BUDGET_BYTES) / 1024 * 1024;
 
+/// The Wi-Fi driver's measured resting working set, on an ESP32-S3.
+///
+/// Not a budget and not a peak — the figure `current_usage` settles on and then
+/// holds for the life of a boot, 47,464 bytes at the bottom of its range across
+/// sixteen boots against a real access point and a real broker (2026-08-17). It
+/// is here so that [`warn_if_undersized`] has something to compare against that
+/// was read off a serial line rather than argued for.
+///
+/// It is one chip's number used for all three, which is the honest limit of it:
+/// the ESP32-C3 has never been measured, and the ESP32's driver is a different
+/// blob again.
+#[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
+pub const WIFI_WORKING_SET_BYTES: usize = 47_464;
+
+/// Say at boot when this chip's heap cannot hold the driver's working set.
+///
+/// **No chip in the matrix trips this today**, and it is here anyway, because
+/// [`RADIO_HEAP_BYTES`] is now a *subtraction* rather than a number somebody
+/// chose. Every static added to this image comes out of
+/// [`DRAM_FOR_STACK_AND_HEAP`], and the day that constant is re-measured after a
+/// Plan's worth of new buffers, the heap shrinks by exactly as much — quietly,
+/// and with no diff to review, because the arithmetic is what changed rather
+/// than the literal.
+///
+/// A heap that cannot fit the Wi-Fi driver does not degrade: `esp-alloc` returns
+/// null, which reaches `handle_alloc_error`, which panics, and `main`'s handler
+/// resets rather than halting. The visible symptom is a board that reboots a few
+/// seconds into every boot, which is indistinguishable from a bad access point,
+/// a failing supply or a broker that hangs up. One line naming the two numbers
+/// turns a week of that into a sentence.
+///
+/// It is a run-time check rather than a `const` assertion so that a chip in this
+/// state still **builds** — a compile-time refusal would take it out of the lint
+/// and build matrix at the moment the matrix is what would catch the problem.
+#[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
+pub fn warn_if_undersized() {
+    if RADIO_HEAP_BYTES < WIFI_WORKING_SET_BYTES {
+        esp_println::println!(
+            "heap: {} bytes is below the {} the Wi-Fi driver was measured to \
+             hold at rest — this chip has too little DRAM for the radio and a \
+             bootable stack at once, and association is expected to end in a \
+             heap-exhaustion panic. See crates/firmware/src/heap.rs.",
+            RADIO_HEAP_BYTES,
+            WIFI_WORKING_SET_BYTES,
+        );
+    }
+}
 /// Bytes of heap for a binary that starts the scheduler and no radio.
 ///
 /// **The reason this constant used to give was false, and the constant is kept
@@ -335,9 +363,11 @@ pub fn install_scheduler_only() {
 
 /// Print the heap's size, its current use and its high-water mark.
 ///
-/// The high-water mark is the number [`RADIO_HEAP_BYTES`] is chosen from, so
-/// this is the measurement rather than decoration: a boot that prints it is a
-/// boot that can be quoted. Nowhere near the frame path.
+/// [`RADIO_HEAP_BYTES`] is derived from DRAM rather than from this figure, but
+/// this is what says the derivation left enough: the high-water mark against the
+/// size, on a running board. So it is the measurement rather than decoration — a
+/// boot that prints it is a boot that can be quoted. Nowhere near the frame
+/// path.
 #[allow(
     dead_code,
     reason = "not called by every binary that includes this file"
@@ -360,7 +390,7 @@ pub fn report(when: &str) {
 /// measurement rather than two that might disagree.
 #[allow(
     dead_code,
-    reason = "read only by the broker session, which the ESP32-S2 build omits"
+    reason = "not called by every binary that includes this file by path"
 )]
 pub fn free_bytes() -> usize {
     let stats = esp_alloc::HEAP.stats();
@@ -369,17 +399,18 @@ pub fn free_bytes() -> usize {
 
 /// The largest the heap has been since boot.
 ///
-/// **This is the figure [`RADIO_HEAP_BYTES`] is chosen from**, and it is worth
-/// publishing rather than only printing, for two reasons the measurement behind
-/// that constant established. It is reached within a second of the broker's
-/// CONNACK and never moves again, so catching it on a serial cable means
-/// catching one second of a boot; and it varies by four kilobytes from boot to
-/// boot, so one reading is a sample rather than the answer. Over MQTT it
-/// becomes something an operator watches across days and across reboots, which
-/// is the only shape in which this number means much.
+/// **This is the figure [`RADIO_HEAP_BYTES`] is checked against**, and it is
+/// worth publishing rather than only printing, for two reasons the measurement
+/// behind that constant established. It is reached within a second of the
+/// broker's CONNACK and never moves again, so catching it on a serial cable
+/// means catching one second of a boot; and it varies by about two kilobytes
+/// from boot to boot on one unchanged image, so one reading is a sample rather
+/// than the answer. Over MQTT it becomes something an operator watches across
+/// days and across reboots, which is the only shape in which this number means
+/// much.
 #[allow(
     dead_code,
-    reason = "read only by the broker session, which the ESP32-S2 build omits"
+    reason = "not called by every binary that includes this file by path"
 )]
 pub fn peak_bytes() -> usize {
     esp_alloc::HEAP.stats().max_usage

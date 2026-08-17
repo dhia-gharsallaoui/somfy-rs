@@ -125,7 +125,15 @@ Report the heap figure and the measured stack headroom.
 **Done, on hardware.** Full evidence in `docs/provenance.md`; the three facts
 that change what Task 3 can assume:
 
-1. **The heap is 56 KB, and the ESP32-S2 is why it is not larger.** Its usable
+1. **The heap is 56 KB, and the ESP32-S2 is why it is not larger.**
+   **Superseded 2026-08-17:** the ESP32-S2 was dropped, and with the constraint
+   that set this figure gone the heap became **per chip** — ESP32 60 KiB,
+   ESP32-S3 163 KiB, ESP32-C3 150 KiB — derived by subtracting a fixed stack
+   budget from the DRAM each chip has to divide. The obligation this item ends
+   with (read the mark again under real MQTT traffic) was discharged, and the
+   answer was that 46,660 understated the peak by about 8,000 bytes. See
+   `crates/firmware/src/heap.rs` and `docs/provenance.md`. The original
+   reasoning follows, as the record of what Task 3 was told. Its usable
    `dram_seg` is 184 KB and `esp-radio`'s statics take most of it — a 96 KB
    heap does not link for it at all. 56 KB leaves the ESP32-S2 16,324 bytes of
    main stack, just under twice what the firmware refuses to start without. The measured
@@ -203,6 +211,11 @@ is asserted in `crates/somfy-mqtt/tests/lifecycle.rs` without a socket. The
 four facts that change what comes next:
 
 1. **The ESP32-S2 no longer builds the broker session, and that is measured.**
+   **Superseded 2026-08-17:** the product decision this item asked for was
+   confirmed in the other direction — the ESP32-S2 was dropped outright rather
+   than kept as a chip that builds a different image, and the `mqtt` feature
+   that expressed the split went with it. The `dram2_seg` option below was
+   never tried and now never will be. The original reasoning follows.
    Its `dram_seg` is 184 KB; the session's task future is 14,824 bytes and the
    boot check needs 8,192 of stack, against the 16,324 that Task 2 left. With
    MQTT compiled in the image **does not link** — the statics overrun the
@@ -325,7 +338,9 @@ The four things that change what Task 5 must do:
    dashboard rather than a serial cable at the right moment. **Read it, and put
    the figure in `docs/provenance.md` beside the 46,660 measured with
    association failing.**
-3. **The ESP32-S2 is unaffected and still builds without the session.** Task 4
+3. **The ESP32-S2 is unaffected and still builds without the session.**
+   **Superseded 2026-08-17:** the chip was dropped; the matrix is three chips
+   and every one of them builds the session. Task 4
    cost 432 bytes of DRAM on the three chips that build it and 72 on the
    ESP32-S2, which does not — that is the `SIGNAL_DBM` static in `net` alone.
    The session's own task future is 14,816 against Task 3's 14,824: folding
