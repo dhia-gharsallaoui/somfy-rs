@@ -184,6 +184,15 @@ static CONFIG: Config = Config::new(Timeouts {
 // Checked rather than commented, because the failure it prevents is quiet: a
 // channel one slot short would refuse the *last* WebSocket, at random, only on
 // a board that also has a broker provisioned.
+// Every connection task can be inside `rpc::Rpc::call` at once, and the gate
+// queues waiters in a fixed-size FIFO. A pool larger than that queue would make
+// `acquire` able to fail, which is a request refused for a reason nobody asked
+// about.
+const _: () = assert!(
+    HTTP_TASKS <= crate::rpc::GATE_WAITERS,
+    "the request gate must be able to queue every connection task",
+);
+
 const _: () = assert!(
     somfy_tasks::DELTA_SUBSCRIBERS > WS_MAX,
     "the delta channel needs a subscriber slot per websocket plus one for the \

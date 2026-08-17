@@ -27,15 +27,29 @@
 //! settings screen with a full-page overlay whenever the socket was down, which
 //! is what turned a connection limit into a lockout.
 //!
-//! # Why the subscription *is* the permit
+//! # The permit, and why the subscription is not it
 //!
-//! The delta channel is a `PubSubChannel` with a fixed number of subscriber
-//! slots, and `subscriber()` refuses once they are gone. So the admission check
-//! and the resource are the same object: there is no counter to keep in step
-//! with reality, and no path that takes one without the other. It is released
-//! by `Drop`, which runs whether this returns normally, returns early through
-//! `?`, or has its future dropped when the socket dies — the three ways a
-//! hand-written release is missed.
+//! It very nearly was. The delta channel is a `PubSubChannel` with a fixed
+//! number of subscriber slots, `subscriber()` refuses once they are gone, and
+//! `Drop` gives one back — so "take a subscription, and refuse the client if
+//! you cannot" looked like an admission check and a resource that could not
+//! drift apart.
+//!
+//! **It was wrong, and the way it was wrong is worth keeping.** The slots are
+//! shared with the broker session, which takes one *only when a broker is
+//! provisioned* — and not at all in a build without the `mqtt` feature. So on
+//! the ordinary state of a freshly flashed device, an unprovisioned board, the
+//! effective cap was [`somfy_tasks::DELTA_SUBSCRIBERS`] rather than [`WS_MAX`]:
+//! four WebSockets against four connection tasks, every task consumed, and REST
+//! unreachable. That is precisely the lockout above, reached by four browser
+//! tabs.
+//!
+//! So the permit is its own counter, [`WS_HELD`], and [`Permit`] is the RAII
+//! guard that returns it. The subscription is still taken and still dropped
+//! with it; it is simply no longer pretending to be the bound. The counter is a
+//! `blocking_mutex` around a `Cell` rather than an atomic because the ESP32-C3
+//! is `riscv32imc` and has no atomic read-modify-write — the same reason
+//! `crate::net`'s signal-strength cell is one.
 //!
 //! # A dead tab does not hold a slot forever
 //!
@@ -56,6 +70,10 @@
 //! session already makes, and it is why this reads deltas rather than being
 //! handed them.
 
+use core::cell::Cell;
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use picoserve::io::{Read, Write};
 use picoserve::response::ws::{Message, SocketRx, SocketTx, WebSocketCallback};
 use somfy_api::{ShadeStateEvent, WsEvent};
@@ -86,22 +104,84 @@ pub const WS_MAX: usize = 2;
 /// header, and nothing larger can be delivered by a conforming client.
 const FRAME_BYTES: usize = 192;
 
+/// WebSockets currently held.
+///
+/// A `blocking_mutex` around a `Cell` rather than an atomic: the ESP32-C3 is
+/// `riscv32imc` and has no atomic read-modify-write instruction, so the natural
+/// `AtomicUsize` is not available across the matrix. A critical section costs a
+/// handful of instructions and is held for one load and one store.
+static WS_HELD: BlockingMutex<CriticalSectionRawMutex, Cell<usize>> =
+    BlockingMutex::new(Cell::new(0));
+
+/// One WebSocket's claim on a connection task, returned by `Drop`.
+///
+/// `Drop` rather than an explicit release because the three ways this ends —
+/// the callback returning, returning early through `?`, and the whole future
+/// being dropped when the socket dies — are exactly the three a hand-written
+/// release forgets. There is no path out of a `Permit` that does not run it.
+struct Permit;
+
+impl Permit {
+    /// Take a slot if there is one.
+    ///
+    /// The check and the increment are inside one critical section, so two
+    /// upgrades arriving in the same executor pass cannot both see the last
+    /// slot free.
+    fn take() -> Option<Permit> {
+        WS_HELD.lock(|held| {
+            let count = held.get();
+            if count >= WS_MAX {
+                return None;
+            }
+            held.set(count + 1);
+            Some(Permit)
+        })
+    }
+
+    /// How many are held, for the log line that refuses one.
+    fn held() -> usize {
+        WS_HELD.lock(Cell::get)
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        WS_HELD.lock(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
 /// One connected client.
 ///
-/// Holds the subscription for the life of the socket, which is what makes the
-/// permit and the resource the same thing — see this module's docs.
+/// Holds both halves for the life of the socket: the permit that bounds how
+/// many of these exist, and the subscription its deltas arrive on.
 pub struct Events {
+    /// Dropped last, and only ever here — see [`Permit`].
+    _permit: Permit,
     deltas: DeltaSubscriber,
 }
 
 impl Events {
     /// Take a slot, or report that they are all taken.
     ///
-    /// The caller turns `None` into `503`. It is fallible here rather than
+    /// `None` becomes `503` at the caller. It is fallible here rather than
     /// deeper because this is the last point at which there is still a response
     /// to send: after the upgrade there is no status code left to use.
-    pub fn admit(deltas: DeltaSubscriber) -> Events {
-        Events { deltas }
+    ///
+    /// **Both resources or neither.** The subscription is taken first and
+    /// dropped on the spot if there is no permit, so a refused client cannot
+    /// leave a slot held on a channel it never used.
+    pub fn admit() -> Option<Events> {
+        let deltas = crate::DELTAS.subscriber().ok()?;
+        let permit = Permit::take()?;
+        Some(Events {
+            _permit: permit,
+            deltas,
+        })
+    }
+
+    /// How many WebSockets are open, for the refusal's log line.
+    pub fn held() -> usize {
+        Permit::held()
     }
 }
 

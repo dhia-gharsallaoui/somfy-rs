@@ -78,21 +78,19 @@ use crate::rpc::{Reply, Request as Rpc, RPC};
 
 /// Longest JSON any one entity serialises to, in bytes.
 ///
-/// Derived rather than rounded, from the widest [`ShadeDto`]:
+/// **Not counted here — taken from [`somfy_api::SHADE_JSON_MAX_BYTES`]**, which
+/// lives beside the DTOs and is checked by `somfy-api`'s `tests/wire_width.rs`
+/// against the widest legal value of each type, from both sides: never over it,
+/// and never more than 128 bytes under it.
 ///
-/// - **~210 bytes of structure** — seventeen camelCase field names, their
-///   quotes, colons and commas, and the enclosing braces.
-/// - **192 bytes of name.** The field is a `heapless::String<32>`, and
-///   `serde-json-core` escapes a control character as `\u00XX`, six bytes for
-///   one. Nothing forbids a name of thirty-two of them, so the bound has to
-///   assume it even though no real name comes close.
-/// - **~70 bytes of values** — a 24-bit address, three `u32` travel times at up
-///   to ten digits each, four percentages, and the longest of the enum
-///   spellings (`"operatorSupplied"` at eighteen bytes, three times over).
-///
-/// 472 rounded to 512. [`GroupDto`] and [`RoomDto`] are smaller: the same name
-/// bound plus at most thirty-two two-digit ids.
-const ENTITY_JSON_BYTES: usize = 512;
+/// It was counted here once, at 512, and the count was wrong by 160 bytes. The
+/// widest shade is 540: a `heapless::String<32>` name of control characters
+/// escapes to `\u00XX` six bytes at a time, and nothing refuses such a name —
+/// `picoserve`'s inbound unescape buffer is exactly 32 bytes, which is enough to
+/// deliver thirty-two of them, and the result is written to flash. So one shade
+/// could have made `GET /api/v1/shades` answer with malformed JSON forever,
+/// including for the screen an operator would use to delete it.
+const ENTITY_JSON_BYTES: usize = somfy_api::SHADE_JSON_MAX_BYTES;
 
 /// How long a client is asked to wait when every WebSocket slot is taken.
 ///
@@ -176,13 +174,30 @@ impl<T: Serialize> Content for JsonBody<T> {
         // walks a handful of times per page, against the alternative of a
         // chunked response for a single object, which costs the client a
         // streaming parse for no gain.
+        //
+        // Both halves fall back to zero on an encoder that could not fit the
+        // value, so the header and the body agree and the connection is not
+        // desynchronised. That is damage control, not correctness: the client
+        // gets `200 OK` with an empty body. It is unreachable — see
+        // `ENTITY_JSON_BYTES` — and `write_content` says so out loud if it ever
+        // happens, which is the half a header cannot.
         let mut scratch = [0u8; ENTITY_JSON_BYTES];
         serde_json_core::to_slice(&self.0, &mut scratch).unwrap_or(0)
     }
 
     async fn write_content<W: Write>(self, mut writer: W) -> Result<(), W::Error> {
         let mut scratch = [0u8; ENTITY_JSON_BYTES];
-        let written = serde_json_core::to_slice(&self.0, &mut scratch).unwrap_or(0);
+        let written = match serde_json_core::to_slice(&self.0, &mut scratch) {
+            Ok(written) => written,
+            Err(_) => {
+                esp_println::println!(
+                    "api: an entity did not fit {} bytes and was answered as an empty body — \
+                     this is a bug in somfy_api::SHADE_JSON_MAX_BYTES, not in the request",
+                    ENTITY_JSON_BYTES,
+                );
+                0
+            }
+        };
         writer.write_all(&scratch[..written]).await
     }
 }
@@ -277,10 +292,20 @@ impl Chunks for Collection {
             let start = usize::from(!first);
             scratch[0] = b',';
 
-            let (written, next) = match self {
+            // **`Option`, not a length.** An encoder that could not fit the
+            // entity must not be read as "wrote nothing": that would emit the
+            // separator with no element after it and hand the client
+            // `[{…},,{…}]`, which is not JSON — and would do it on every
+            // request until somebody deleted the offending shade through the
+            // very list endpoint it had just broken.
+            //
+            // `somfy_api::SHADE_JSON_MAX_BYTES` is measured against the widest
+            // legal value of each type, so this cannot happen; it is handled
+            // rather than asserted because a panic here reboots the board.
+            let (encoded, next) = match self {
                 Collection::Shades => match RPC.call(Rpc::ShadeFrom(slot)).await {
                     Some(Reply::Shade(Some(shade))) => (
-                        serde_json_core::to_slice(&shade, &mut scratch[start..]).unwrap_or(0),
+                        serde_json_core::to_slice(&shade, &mut scratch[start..]).ok(),
                         shade.id.checked_add(1),
                     ),
                     // Either the walk is done, or the state task did not
@@ -291,22 +316,35 @@ impl Chunks for Collection {
                 },
                 Collection::Groups => match RPC.call(Rpc::GroupFrom(slot)).await {
                     Some(Reply::Group(Some(group))) => (
-                        serde_json_core::to_slice(&group, &mut scratch[start..]).unwrap_or(0),
+                        serde_json_core::to_slice(&group, &mut scratch[start..]).ok(),
                         group.id.checked_add(1),
                     ),
                     _ => break,
                 },
                 Collection::Rooms => match RPC.call(Rpc::RoomFrom(slot)).await {
                     Some(Reply::Room(Some(room))) => (
-                        serde_json_core::to_slice(&room, &mut scratch[start..]).unwrap_or(0),
+                        serde_json_core::to_slice(&room, &mut scratch[start..]).ok(),
                         room.id.checked_add(1),
                     ),
                     _ => break,
                 },
             };
 
-            writer.write_chunk(&scratch[..start + written]).await?;
-            first = false;
+            match encoded {
+                Some(written) => {
+                    writer.write_chunk(&scratch[..start + written]).await?;
+                    // Only once something has actually been written, so the
+                    // next element does not inherit a separator for an element
+                    // that was skipped.
+                    first = false;
+                }
+                None => esp_println::println!(
+                    "api: an entity did not fit {} bytes and was left out of the list — \
+                     this is a bug in somfy_api::SHADE_JSON_MAX_BYTES, not in the request",
+                    ENTITY_JSON_BYTES,
+                ),
+            }
+
             let Some(next) = next else { break };
             slot = next;
         }
@@ -464,16 +502,21 @@ async fn dispatch(
 
 /// Upgrade to a WebSocket, if there is a slot.
 ///
-/// The subscription **is** the slot — see [`crate::api::events`] — so this
-/// cannot admit a client it has no capacity to serve, and cannot leak capacity
-/// when one leaves.
+/// [`Events::admit`] takes both the permit that bounds how many exist and the
+/// subscription the deltas arrive on, or neither — see [`crate::api::events`]
+/// for why the subscription alone was not a sufficient bound, and for the
+/// lockout that oversight would have reproduced.
 async fn events(upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
-    match crate::DELTAS.subscriber() {
-        Ok(deltas) => Ok(upgrade.on_upgrade(Events::admit(deltas))),
-        Err(_) => {
+    match Events::admit() {
+        Some(events) => Ok(upgrade.on_upgrade(events)),
+        None => {
             esp_println::println!(
-                "api: refusing a websocket — all {} slots are in use. REST is unaffected.",
+                "api: refusing a websocket — {} of {} slots are in use. REST is unaffected: \
+                 {} of this device's {} connection tasks can never be taken by one.",
+                Events::held(),
                 crate::api::events::WS_MAX,
+                crate::api::REST_TASKS_RESERVED,
+                crate::api::HTTP_TASKS,
             );
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,

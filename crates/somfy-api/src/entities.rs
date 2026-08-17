@@ -183,6 +183,34 @@ impl CalibrationSource {
     }
 }
 
+/// The widest any one entity here serialises to as JSON, in bytes.
+///
+/// # Why this is a constant in this crate
+///
+/// A device serialises one of these into a **fixed buffer** — there is no
+/// allocator on that path — and a buffer one byte short is not an error it can
+/// usefully report: the encoder returns `Err` in the middle of writing a
+/// response whose status has already been sent. So the bound belongs beside the
+/// types it describes, where adding a field moves it, rather than in a server
+/// that would have to guess.
+///
+/// # Measured, not counted
+///
+/// `tests/wire_width.rs` constructs the widest legal value of each type and
+/// checks it against this figure from both sides: over it, and more than 128
+/// bytes under it. A hand-counted version of this number was wrong by 160
+/// bytes, and the buffer it sized would have let a single shade break the list
+/// endpoint permanently.
+///
+/// # What the worst case actually is
+///
+/// A name of thirty-two control characters. The field is a
+/// `heapless::String<32>` and JSON escapes a control character as `\u00XX`, six
+/// bytes for one, so the name alone reaches 192 — and nothing refuses such a
+/// name, so it is reachable rather than hypothetical. An ordinary shade is
+/// under half this.
+pub const SHADE_JSON_MAX_BYTES: usize = 640;
+
 /// Live snapshot of one shade for REST/WS payloads. Field names are
 /// camelCase on the wire; positions are whole percent (0-100);
 /// `kind`/`tiltMode` reuse the numeric discriminants deployed devices

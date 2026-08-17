@@ -311,9 +311,9 @@ impl Catalog {
     /// RTS can tell it the address moved, and nothing can ask it what it
     /// learned — so a shade whose address changed is a shade that stops
     /// responding, looks exactly like a dead motor, and is fixed only by
-    /// walking to it. The id is the registry slot and the Home Assistant
-    /// entity's identity, and moving it orphans every automation pointing at
-    /// it.
+    /// walking to it. `Shade::reconfigure` is where that is enforced. The id is
+    /// the registry slot and the Home Assistant entity's identity, and moving
+    /// it orphans every automation pointing at it.
     ///
     /// So the incoming `config` supplies the name, the kind, the tilt mode and
     /// the three travel times, and its `address` field is **overwritten** with
@@ -322,6 +322,14 @@ impl Catalog {
     /// current configuration, so the field it holds is already right, and
     /// refusing a request over a field the caller never meant to set would
     /// reject correct edits.
+    ///
+    /// # A shade that is moving is re-anchored, not re-interpreted
+    ///
+    /// `Shade::reconfigure` does that part, and it is the reason this delegates
+    /// rather than assigning: a travel time is read absolutely by the position
+    /// estimator, so changing one mid-move rewrites the travel that has already
+    /// happened. Its docs carry the failure that produces — and it is the
+    /// calibration workflow, not an edge case.
     ///
     /// # What this does not do
     ///
@@ -333,12 +341,13 @@ impl Catalog {
         &mut self,
         registry: &mut Registry,
         id: ShadeId,
-        mut config: ShadeConfig,
+        config: ShadeConfig,
         now_ms: u64,
     ) -> Result<(), CatalogError> {
-        let shade = registry.shade_mut(id).ok_or(DomainError::NotFound)?;
-        config.address = shade.config.address;
-        shade.config = config;
+        registry
+            .shade_mut(id)
+            .ok_or(DomainError::NotFound)?
+            .reconfigure(config, now_ms);
         self.touch(now_ms);
         Ok(())
     }

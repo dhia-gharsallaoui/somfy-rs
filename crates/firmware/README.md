@@ -161,9 +161,9 @@ builds exactly that per chip; `Cargo.toml` carries the argument.
 | radio only | `--no-default-features --features chip-s3` |
 
 **`http` and `ui` cannot be built for the ESP32.** With the server in, that chip
-has 56,172 bytes of DRAM for a 66,280-byte stack budget and the image does not
+has 54,556 bytes of DRAM for a 66,280-byte stack budget and the image does not
 link; `src/heap.rs` refuses it with a `compile_error!` naming the measurement.
-The ESP32-S3 and ESP32-C3 carry it with 40,808 and 27,496 bytes of Wi-Fi heap to
+The ESP32-S3 and ESP32-C3 carry it with 38,760 and 25,448 bytes of Wi-Fi heap to
 spare.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip

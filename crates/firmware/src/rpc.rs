@@ -20,13 +20,25 @@
 //!
 //! # How one request at a time is enough
 //!
-//! [`Rpc::gate`] is an async mutex, so a second caller waits rather than racing.
-//! That is not a throughput compromise worth optimising: every reply here is
-//! assembled in microseconds from memory the state task already owns, and the
-//! alternative — several requests in flight against one registry — would need
-//! per-request correlation for no gain. It also bounds the seam's cost, which
-//! matters more: however many HTTP connections exist, the state task sees one
-//! extra wake-up at a time.
+//! [`Rpc::gate`] admits one caller at a time, so a second waits rather than
+//! racing. That is not a throughput compromise worth optimising: every reply
+//! here is assembled in microseconds from memory the state task already owns,
+//! and the alternative — several requests in flight against one registry —
+//! would need per-request correlation for no gain. It also bounds the seam's
+//! cost, which matters more: however many HTTP connections exist, the state
+//! task sees one extra wake-up at a time.
+//!
+//! **A `FairSemaphore` and not an async `Mutex`**, and the difference is not
+//! stylistic. `embassy_sync::mutex::Mutex` holds a *single* `WakerRegistration`,
+//! and its own documentation says what two waiters do to it: they "wake each
+//! other in a loop fighting over this WakerRegistration", which wastes CPU
+//! until the holder releases. That is not a corner case here — the UI's
+//! dashboard opens with three parallel `GET`s, and each list walk takes the
+//! gate once per entity, so an ordinary page load is sustained three-way
+//! contention. A `FairSemaphore` keeps a FIFO queue instead, and its capacity
+//! is [`crate::api::HTTP_TASKS`] because that is exactly how many callers can
+//! exist — so the `WaitQueueFull` it can return is unreachable, and it is
+//! reported rather than ignored anyway.
 //!
 //! Serialising is also what makes the two signals a *rendezvous* rather than a
 //! race. `Signal` holds one value and overwrites, so with several callers in
@@ -53,7 +65,7 @@
 //! an untouched shade; the worst case is a list that reflects the table as of
 //! partway through, which is what any client polling a live device gets anyway.
 
-use embassy_sync::mutex::Mutex as AsyncMutex;
+use embassy_sync::semaphore::{FairSemaphore, Semaphore as _};
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration};
 use somfy_api::{GroupDto, RoomDto, ShadeDto};
@@ -155,13 +167,22 @@ pub enum Reply {
               requests and this is the seam it would answer them on"
 )]
 pub struct Rpc {
-    /// Serialises callers. Held across the whole exchange.
-    gate: AsyncMutex<Mutex, ()>,
+    /// Serialises callers, FIFO. Held across the whole exchange.
+    gate: FairSemaphore<Mutex, GATE_WAITERS>,
     /// Raised by a caller, awaited by the state task.
     request: Signal<Mutex, Request>,
     /// Raised by the state task, awaited by the caller.
     reply: Signal<Mutex, Reply>,
 }
+
+/// Callers the gate can queue.
+///
+/// One per thing that can be inside [`Rpc::call`] at once, which is one per
+/// connection task. Stated here rather than read from `crate::api::HTTP_TASKS`
+/// because this module is compiled whether or not there is a web server — the
+/// seam belongs to the state task, which offers it — and `crate::api` asserts
+/// that its own pool fits, so the two cannot drift without the build saying so.
+pub const GATE_WAITERS: usize = 8;
 
 /// The seam itself.
 pub static RPC: Rpc = Rpc::new();
@@ -169,7 +190,7 @@ pub static RPC: Rpc = Rpc::new();
 impl Rpc {
     const fn new() -> Rpc {
         Rpc {
-            gate: AsyncMutex::new(()),
+            gate: FairSemaphore::new(1),
             request: Signal::new(),
             reply: Signal::new(),
         }
@@ -183,8 +204,18 @@ impl Rpc {
     /// turns it into a `503`.
     pub async fn call(&'static self, request: Request) -> Option<Reply> {
         // Held for the whole exchange, which is what makes the signals below a
-        // rendezvous rather than a race.
-        let _held = self.gate.lock().await;
+        // rendezvous rather than a race. Released by `Drop` on every path,
+        // including the timeout below and a caller whose future is dropped.
+        let _held = match self.gate.acquire(1).await {
+            Ok(held) => held,
+            Err(_) => {
+                // Unreachable: the queue is as deep as the number of tasks that
+                // can ask. Reported rather than `expect`ed, because a panic
+                // here reboots the board over one request.
+                esp_println::println!("api: the request queue is full, which should be impossible");
+                return None;
+            }
+        };
         // **Before signalling, not after.** A previous caller whose future was
         // dropped between signalling and waiting — an HTTP task whose socket
         // died — leaves an answer nobody read. Clearing it here means this

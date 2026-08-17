@@ -87,7 +87,7 @@ jobs:
   # What is deliberately not covered, and why:
   #
   # - **The ESP32 with `http` or `ui`.** It cannot be built at all: the chip has
-  #   56,172 bytes of DRAM for a 66,280-byte stack budget once the server is in,
+  #   54,556 bytes of DRAM for a 66,280-byte stack budget once the server is in,
   #   and `heap.rs` refuses it with a `compile_error!` naming the measurement.
   #   The refusal was proved by hand rather than by a job, because a CI step
   #   whose success is a compilation *failure* inverts every other row here.

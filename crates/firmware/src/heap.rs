@@ -186,29 +186,29 @@ pub const STACK_BUDGET_BYTES: usize = 49_592 + 16_688;
 ///
 /// | chip | features measured with | DRAM |
 /// |---|---|---|
-/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 125,180 |
-/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 161,524 |
-/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 148,280 |
+/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 125,116 |
+/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 159,908 |
+/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 146,672 |
 ///
-/// The web server costs **69,008 bytes on the ESP32, 68,296 on the ESP32-S3 and
-/// 68,632 on the ESP32-C3** — three measurements of one thing, and the spread is
+/// The web server costs about **69,000 bytes on the ESP32, 70,000 on the
+/// ESP32-S3 and 70,000 on the ESP32-C3** — three measurements of one thing, and the spread is
 /// the per-architecture difference in what a generator lays out. Four connection
 /// tasks are 52,384 of it (`api::HTTP_TASKS` × a 13,096-byte future, which is
 /// `picoserve`'s router recursion) and their buffers are 14,336.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 125_180;
+const DRAM_FOR_STACK_AND_HEAP: usize = 125_116;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 161_524;
+const DRAM_FOR_STACK_AND_HEAP: usize = 159_908;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 148_280;
+const DRAM_FOR_STACK_AND_HEAP: usize = 146_672;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
 //
 // Measured 2026-08-17: with `http` enabled the DRAM left for the stack and the
-// heap falls to 56,172 bytes against a stack budget of 66,280 — the image does
+// heap falls to 54,556 bytes against a stack budget of 66,280 — the image does
 // not link at all, and what `ld` says about it is `stack.x:11 cannot move
 // location counter backwards`, which names neither the feature nor the chip.
 //
@@ -217,14 +217,14 @@ const DRAM_FOR_STACK_AND_HEAP: usize = 148_280;
 // Wi-Fi driver a heap of roughly 42 KB against a resting working set of 47,464
 // — so the board would link and then fail to associate.
 //
-// The ESP32-S3 and the ESP32-C3 both have the DRAM for it, with 40,808 and
-// 27,496 bytes of heap to spare over the worst peak yet measured — against the
+// The ESP32-S3 and the ESP32-C3 both have the DRAM for it, with 38,760 and
+// 25,448 bytes of heap to spare over the worst peak yet measured — against the
 // 3,944 the ESP32 has left with only a broker in it, which is itself inside
 // this heap's known ~4,216-byte boot-to-boot noise and is the figure to watch
 // on that chip.
 #[cfg(all(feature = "chip-esp32", feature = "http"))]
 compile_error!(
-    "the ESP32 does not have the DRAM for the web server: with `http` enabled it has 56,172 \
+    "the ESP32 does not have the DRAM for the web server: with `http` enabled it has 54,556 \
      bytes for a stack budget of 66,280, so the image cannot link. Build it with \
      `--no-default-features --features chip-esp32,mqtt`, or use an ESP32-S3 or ESP32-C3. \
      See `heap::DRAM_FOR_STACK_AND_HEAP` for the measurement."
