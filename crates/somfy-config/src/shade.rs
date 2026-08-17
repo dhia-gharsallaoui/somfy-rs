@@ -37,19 +37,29 @@
 //! different slot. An id stored here would now be a field the registry *can*
 //! honour.
 //!
-//! What has not changed is this format, deliberately, and the ordering is the
-//! reason. The firmware is the only thing that turns a record into registry
-//! entries, and it calls `add_shade`. Growing an id field here before the
-//! firmware reads it would give the provisioning tool an id column the device
-//! ignores — a reorder the tool accepts and the board silently undoes, which
-//! is worse than the honest limitation above. A reader that understands ids
-//! has to ship before a writer that emits them, and the reader is firmware.
+//! What has not changed is that **the row's position is still the shade's id**.
+//! The firmware fills an empty registry in record order, so row 0 is
+//! `ShadeId(0)`; nothing stores an id explicitly. That is what
+//! [`ShadeRecord::announced`] is indexed by, and it is why a reorder is still
+//! unsafe: it would move the announced bits off the shades they describe.
+//! Storing the id is a further `VERSION` bump, not a reinterpretation of the
+//! remaining padding byte in each entry — that byte is zero in every record
+//! ever written, so a reader that took it for an id would read every shade as
+//! `ShadeId(0)`. The version field exists precisely so a reader reports a
+//! record it does not understand instead of half-reading it.
 //!
-//! When that lands it is a `VERSION` bump, not a reinterpretation of the
-//! three padding bytes in each entry: those are zero in every record ever
-//! written, so a reader that took them for ids would read every shade as
-//! `ShadeId(0)`. The version field exists precisely so an older reader reports
-//! a record it does not understand instead of half-reading it.
+//! ## Versions, and the board in the field
+//!
+//! There are two, and both are read. Version 1 has a 12-byte header and no
+//! per-shade radio settings; version 2 adds the announced-shade bitmap to the
+//! header — which moves the entries down four bytes — and gives each entry a
+//! frame width and a radio protocol in bytes it already had as padding.
+//!
+//! Version 1 is not a historical curiosity: a provisioned board is carrying one
+//! right now, and refusing it would make its shades vanish at the next boot.
+//! [`Layout`] is the whole of the difference, and
+//! `tests/shade_v1.rs` decodes a byte-for-byte copy of a record the previous
+//! build wrote rather than one this build reconstructs.
 //!
 //! ## The seed is not a preference
 //!
@@ -60,7 +70,9 @@
 //! anything other than verbatim is a shade that stops responding.
 
 use heapless::Vec;
-use somfy_domain::{DomainError, ShadeConfig, ShadeKind, TiltMode, MAX_SHADES};
+use somfy_domain::{
+    DomainError, FrameWidth, RadioProtocol, ShadeConfig, ShadeId, ShadeKind, TiltMode, MAX_SHADES,
+};
 use somfy_rts::RollingCode;
 
 /// Shades one record carries: the registry's own capacity, so a table that
@@ -74,10 +86,11 @@ pub const SHADE_TABLE_CAPACITY: usize = MAX_SHADES;
 /// Bytes in one shade record, and therefore in one slot of the shade ring.
 ///
 /// 2048 is the smallest power of two that holds a full registry: 32 shades of
-/// 56 bytes plus the header and checksum is 1808. It is a whole
-/// number of 4-byte flash words and it divides a 4 KB erase sector exactly —
-/// two records per sector, four across the two-sector region — which are the
-/// two relationships the ring needs.
+/// 56 bytes, the 20-byte header and the checksum come to 1816, and the 232
+/// bytes left over are [`MAX_LINKS`] linked-remote words — so the record is
+/// full to the byte. It is a whole number of 4-byte flash words and it divides
+/// a 4 KB erase sector exactly — two records per sector, four across the
+/// two-sector region — which are the two relationships the ring needs.
 ///
 /// **Shades do not fit alongside the Wi-Fi and MQTT settings.** That record is
 /// 512 bytes with 228 free after its last field, or four shades' worth; a
@@ -86,9 +99,12 @@ pub const SHADE_TABLE_CAPACITY: usize = MAX_SHADES;
 /// host-side tooling and read by the same code path.
 pub const SHADE_RECORD_LEN: usize = 2048;
 
-/// `magic`, `version`, `count`, `seq`.
-const HEADER_LEN: usize = 12;
-/// One shade: see the offsets below.
+/// `magic`, `version`, `count`, `seq`, `announced`, `link_count`, padding.
+const HEADER_LEN: usize = 20;
+/// What [`VERSION_ANNOUNCED`] replaced: `magic`, `version`, `count`, `seq`.
+const HEADER_LEN_V1: usize = 12;
+/// One shade: see the offsets below. Unchanged across both versions — the two
+/// new fields went into padding bytes the entry already had.
 const ENTRY_LEN: usize = 56;
 const CRC_LEN: usize = 4;
 
@@ -98,10 +114,26 @@ const CRC_LEN: usize = 4;
 /// rather than half-read.
 const MAGIC: u32 = u32::from_le_bytes(*b"RTSS");
 
-/// Bumped when the layout below changes. A record carrying a different version
-/// is reported as such rather than as damage, so a later implementation can
-/// migrate instead of erasing shades it does not recognise.
-const VERSION: u16 = 1;
+/// The version this build writes.
+///
+/// Bumped when the layout below changes. A record carrying a version this build
+/// has no reader for is reported as such rather than as damage, so a later
+/// implementation can migrate instead of erasing shades it does not recognise —
+/// and [`VERSION_INITIAL`] is what that promise was written for.
+const VERSION: u16 = 2;
+
+/// The first layout, still readable: no `announced` word, entries at
+/// [`HEADER_LEN_V1`], and no frame width or protocol in an entry.
+///
+/// **A board in the field is carrying one of these right now.** Refusing it
+/// would make three real shades vanish at the next boot, so it is decoded, not
+/// rejected — see [`decode_entry`] for the two values substituted and why they
+/// are the only honest choices.
+const VERSION_INITIAL: u16 = 1;
+
+/// The version that added the announced-shade bitmap and the per-shade frame
+/// width and protocol.
+const VERSION_ANNOUNCED: u16 = 2;
 
 const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -110,11 +142,67 @@ const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 4;
 const OFF_COUNT: usize = 6;
 const OFF_SEQ: usize = 8;
+/// The announced-shade bitmap. New in [`VERSION_ANNOUNCED`], which is why the
+/// entries moved from [`HEADER_LEN_V1`] to [`HEADER_LEN`].
+const OFF_ANNOUNCED: usize = 12;
+/// How many words of the linked-remote pool are live. New in
+/// [`VERSION_ANNOUNCED`]. Bytes 18..20 are padding, so the entries start on a
+/// word boundary.
+const OFF_LINK_COUNT: usize = 16;
 const OFF_ENTRIES: usize = HEADER_LEN;
+/// The linked-remote pool: everything between the last entry and the checksum.
+const OFF_LINKS: usize = OFF_ENTRIES + SHADE_TABLE_CAPACITY * ENTRY_LEN;
 const OFF_CRC: usize = SHADE_RECORD_LEN - CRC_LEN;
 
+/// Bytes one pool word occupies.
+const LINK_LEN: usize = 4;
+
+/// Linked remotes one record can carry, **across every shade**.
+///
+/// # Why the bound is shared rather than per-shade
+///
+/// Because a per-shade bound of 7 does not fit and shrinking the shade table to
+/// make it fit would be the wrong trade. The arithmetic, since it is the whole
+/// argument: a slot is 2048 bytes, an entry is 56, and 32 entries with seven
+/// 4-byte addresses each would be `20 + 32 * (56 + 28) + 4 = 2712` bytes.
+///
+/// The three ways out, and why this one:
+///
+/// - **A bigger slot.** 4096 bytes would hold it, and the ring can be re-carved
+///   into two slots of that size. But a slot's bytes are read into a stack
+///   buffer, and on the tightest chip this builds for the whole main stack is
+///   14,588 bytes with an 8,016-byte state machine already standing in it. A
+///   4 KB buffer there is not affordable, and the existing 2 KB one is already
+///   the largest single thing on that stack.
+/// - **A smaller shade table.** `20 + 24 * 84 + 4 = 2040` fits, at 24 shades
+///   instead of 32 — and 32 is not a preference, it is
+///   [`somfy_domain::MAX_SHADES`], sized to what a deployed configuration can
+///   contain. A record that could no longer hold a full registry would break
+///   the property that a table fitting the controller fits the record.
+/// - **A shared pool**, which is this. Every shade keeps the domain's own bound
+///   of [`MAX_LINKED_REMOTES`]; what is bounded here is the total, and the bound
+///   is exactly the space left over — so the record is full to the byte and the
+///   figure cannot drift from the layout that produced it.
+///
+/// **This is a real limit, not a theoretical one:** 32 shades with two wall
+/// remotes each is 64 links and does not fit. It is refused at the push rather
+/// than dropped at the write, which is this crate's posture everywhere else.
+pub const MAX_LINKS: usize = (OFF_CRC - OFF_LINKS) / LINK_LEN;
+
+/// Linked remotes **one shade** may have — the domain's own bound, restated so
+/// a record cannot deliver a shade [`Shade::link_remote`](somfy_domain::Shade::link_remote) would then refuse.
+pub const MAX_LINKED_REMOTES: usize = somfy_domain::MAX_LINKED_REMOTES;
+
+/// Bits of a pool word the address occupies. An RTS address is 24 bits and
+/// [`ShadeConfig::new`] refuses anything at or above `0xFF_FFFF`, so the top
+/// byte is free to carry the row the link belongs to — which is what lets one
+/// word be one link.
+const LINK_ADDRESS_MASK: u32 = 0x00FF_FFFF;
+
 // Offsets within one entry. Spelled out rather than computed so the layout can
-// be read off the file and compared against a hex dump.
+// be read off the file and compared against a hex dump. **Every one of them is
+// the same in both versions**, which is what makes the migration a change of
+// starting offset rather than a second decoder.
 const ENTRY_ADDRESS: usize = 0;
 const ENTRY_CODE: usize = 4;
 const ENTRY_KIND: usize = 6;
@@ -123,7 +211,15 @@ const ENTRY_UP_MS: usize = 8;
 const ENTRY_DOWN_MS: usize = 12;
 const ENTRY_TILT_MS: usize = 16;
 const ENTRY_NAME_LEN: usize = 20;
-// 21..24 is padding, so the name starts on a word boundary and a hex dump lines
+/// New in [`VERSION_ANNOUNCED`], in a byte [`VERSION_INITIAL`] left zero — so a
+/// v1 record read with v2 entry rules would claim a zero-bit frame, which is
+/// exactly why the version gate decides which rules apply rather than the bytes.
+const ENTRY_WIDTH: usize = 21;
+/// New in [`VERSION_ANNOUNCED`], and a byte where zero happens to be the right
+/// answer ([`RadioProtocol::Rts`]) — which is a coincidence, not a licence to
+/// read it out of a v1 record.
+const ENTRY_PROTOCOL: usize = 22;
+// 23 is padding, so the name starts on a word boundary and a hex dump lines
 // up. It is zero-filled and covered by the checksum.
 const ENTRY_NAME: usize = 24;
 
@@ -146,6 +242,139 @@ const _: () = assert!(
     OFF_CRC + CRC_LEN == SHADE_RECORD_LEN,
     "the checksum must occupy the last four bytes of the record"
 );
+// The pool is defined as "whatever is left", so this is the statement that
+// nothing is left over and nothing overlaps the checksum.
+const _: () = assert!(
+    OFF_LINKS + MAX_LINKS * LINK_LEN == OFF_CRC,
+    "the linked-remote pool must fill the record exactly, up to the checksum"
+);
+// A pool word carries the row in its top byte, so the table cannot be wider
+// than a byte — and it is not, but the word says so rather than the reader
+// assuming it.
+const _: () = assert!(
+    SHADE_TABLE_CAPACITY <= u8::MAX as usize,
+    "a link word carries its shade's row index in one byte"
+);
+// The older layout still has to fit, because this build still reads it.
+const _: () = assert!(
+    HEADER_LEN_V1 + SHADE_TABLE_CAPACITY * ENTRY_LEN <= OFF_CRC,
+    "a full registry must fit inside a record of the first layout too"
+);
+// `Announced` is one bit per registry slot in a `u32`, so a registry wider than
+// 32 slots would silently stop recording the announcement of its last shades.
+const _: () = assert!(
+    SHADE_TABLE_CAPACITY <= u32::BITS as usize,
+    "the announced-shade bitmap has one bit per shade and no more"
+);
+
+/// Which shades this device has published Home Assistant entities for.
+///
+/// # Why the record has to hold this at all
+///
+/// A discovery config is published **retained**, so it outlives the device that
+/// published it. Remove a shade and the broker keeps its config forever, Home
+/// Assistant keeps showing an entity nothing is behind, and the only cure is an
+/// MQTT client and a person — the requirements behind this were written after
+/// deleting 49 retained topics by hand.
+///
+/// Removing it properly means publishing a zero-length retained payload to each
+/// of its topics, and **that needs the id of a shade that no longer exists**. A
+/// device that only ever records what exists cannot name what it has lost. So
+/// the announcement is recorded next to the table it was made from, and a boot
+/// that finds a bit set for a slot no shade occupies knows exactly which
+/// entities to clear.
+///
+/// # Why a bare `u32` and not a flag-set crate
+///
+/// [`bitflags`](https://crates.io/crates/bitflags) 2.13.1 is the obvious
+/// candidate and is about as well adopted as a Rust crate gets — 1,678,874,973
+/// downloads (374,002,223 recent), 1,152 stars, 96 contributors, last commit
+/// 2026-07-16, `no_std` without `alloc` by default, MIT OR Apache-2.0 and so
+/// compatible with this project's GPL-3.0-only. `enumset` 1.1.14 and
+/// `enumflags2` 0.7.12 are the same shape with less adoption.
+///
+/// **All three model a set of *named* flags, and these bits have no names.**
+/// Bit *n* means registry slot *n*: there is no `const READ = 1 << 0;` to write,
+/// because the thing being written would be thirty-two identical lines naming
+/// `SHADE_0` … `SHADE_31`, and the one operation that matters — "is the bit for
+/// *this* [`ShadeId`] set?" — is an index, which a flag-set type deliberately
+/// does not offer. What is left after removing the naming is `1 << n`, and the
+/// safety that matters is not the bit arithmetic but the **bound**: a
+/// [`ShadeId`] outside the registry must not shift past the word. That check is
+/// this type's whole content and no flag crate performs it, because a flag
+/// crate has no ids to bound.
+///
+/// Worth reopening if the announced set ever becomes per-shade and per-entity —
+/// [`somfy_mqtt::Component`](https://docs.rs/) *is* a named set, and `enumset`
+/// with `repr = "u32"` and the default `map = "lsb"` pins a flash-stable layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Announced(u32);
+
+impl Announced {
+    /// Nothing has been announced. What a freshly provisioned table holds.
+    pub const NONE: Announced = Announced(0);
+
+    /// Reconstruct from the stored word.
+    ///
+    /// Bits above the registry's capacity are **dropped**, not rejected: they
+    /// name slots this build has no shade for and no topic to clear, so
+    /// carrying them would only let a later `bits()` write back a claim this
+    /// build cannot act on.
+    pub const fn from_bits(bits: u32) -> Announced {
+        // `SHADE_TABLE_CAPACITY <= 32` is asserted above, and the shift is
+        // written so that a capacity of exactly 32 does not overflow.
+        Announced(bits & (u32::MAX >> (u32::BITS as usize - SHADE_TABLE_CAPACITY)))
+    }
+
+    /// The word as stored.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether `id`'s entities have been published.
+    ///
+    /// An id past the registry's capacity is always `false`: it names no slot,
+    /// so nothing could have announced it.
+    pub const fn contains(self, id: ShadeId) -> bool {
+        match Announced::mask(id) {
+            Some(mask) => self.0 & mask != 0,
+            None => false,
+        }
+    }
+
+    /// The same set with `id` recorded as announced. An out-of-range id is
+    /// ignored rather than shifted past the end of the word.
+    pub const fn with(self, id: ShadeId) -> Announced {
+        match Announced::mask(id) {
+            Some(mask) => Announced(self.0 | mask),
+            None => self,
+        }
+    }
+
+    /// The same set with `id` recorded as no longer announced.
+    pub const fn without(self, id: ShadeId) -> Announced {
+        match Announced::mask(id) {
+            Some(mask) => Announced(self.0 & !mask),
+            None => self,
+        }
+    }
+
+    /// Every id in the set, ascending.
+    pub fn ids(self) -> impl Iterator<Item = ShadeId> {
+        (0..SHADE_TABLE_CAPACITY as u8)
+            .map(ShadeId)
+            .filter(move |id| self.contains(*id))
+    }
+
+    /// The bit `id` occupies, or `None` if it names no registry slot.
+    const fn mask(id: ShadeId) -> Option<u32> {
+        if (id.0 as usize) < SHADE_TABLE_CAPACITY {
+            Some(1u32 << id.0)
+        } else {
+            None
+        }
+    }
+}
 
 /// Which travel time a [`ShadeError::TravelTimeZero`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +528,43 @@ pub enum ShadeRecordError {
         /// The byte the record carried.
         raw: u8,
     },
+    /// The header claims more linked remotes than the pool holds.
+    LinkCount(u16),
+    /// A pool word names a row the record does not have. Reported rather than
+    /// skipped: the link belongs to *some* shade, and guessing which would
+    /// attach a wall remote to the wrong motor's position estimate.
+    LinkShade {
+        /// Which pool word.
+        index: usize,
+        /// The row it named.
+        shade: u8,
+    },
+    /// A pool word the domain would refuse — a sentinel address, the shade's
+    /// own address, a duplicate, or more than [`MAX_LINKED_REMOTES`] for one
+    /// shade.
+    Link {
+        /// Which pool word.
+        index: usize,
+        /// Why it was refused, in the domain's own terms.
+        error: DomainError,
+    },
+    /// A frame-width byte that is neither of the protocol's two widths.
+    /// Reported rather than defaulted to 56 for the same reason a shade kind
+    /// is: a motor paired at the other width is deaf to every frame the
+    /// substituted value would produce, and nothing would say why.
+    Width {
+        /// Which entry.
+        index: usize,
+        /// The byte the record carried.
+        raw: u8,
+    },
+    /// A radio-protocol byte this version does not model.
+    Protocol {
+        /// Which entry.
+        index: usize,
+        /// The byte the record carried.
+        raw: u8,
+    },
     /// The entry decoded and the shade it describes would have been refused had
     /// it been entered by hand.
     Shade {
@@ -326,10 +592,40 @@ pub enum ShadeRecordError {
 pub struct ShadeRecord {
     /// Monotonic write counter, wrapping at [`u32::MAX`].
     pub seq: u32,
+    /// Which shades this device has published Home Assistant entities for.
+    ///
+    /// Deliberately **not** derived from `shades`: the whole value of the field
+    /// is the case where the two disagree, which is a shade that was announced
+    /// and has since been removed. See [`Announced`].
+    pub announced: Announced,
     /// Every provisioned shade, in the order their registry ids will follow.
     /// An empty table is a value an operator can mean, and is not the same fact
     /// as a blank region.
     pub shades: Vec<StoredShade, SHADE_TABLE_CAPACITY>,
+    /// Every wall remote that drives a shade's position estimate.
+    ///
+    /// A flat pool rather than a field on each shade, bounded by
+    /// [`MAX_LINKS`] — see that constant for the arithmetic and for the two
+    /// alternatives it rules out. The bound being on the vector rather than on
+    /// the encoder is what keeps [`ShadeRecord::encode`] infallible: a table
+    /// with more links than the record can hold is refused at the `push`, the
+    /// same way a thirty-third shade is.
+    pub links: Vec<LinkedRemote, MAX_LINKS>,
+}
+
+/// One wall remote, and the shade whose estimate its frames drive.
+///
+/// Stored as a single word: the address in the low 24 bits, the shade's row in
+/// the top 8. That is not packing for its own sake — an RTS address *is* 24
+/// bits, and [`ShadeConfig::new`] refuses anything at or above `0xFF_FFFF`, so
+/// the top byte was never going to carry address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedRemote {
+    /// The row in [`ShadeRecord::shades`] this remote belongs to — which is
+    /// also the [`ShadeId`] that row will take.
+    pub shade: ShadeId,
+    /// The remote's 24-bit address.
+    pub address: u32,
 }
 
 impl ShadeRecord {
@@ -345,6 +641,17 @@ impl ShadeRecord {
         // Bounded by the vector's own capacity, which is `SHADE_TABLE_CAPACITY`.
         bytes[OFF_COUNT..OFF_COUNT + 2].copy_from_slice(&(self.shades.len() as u16).to_le_bytes());
         bytes[OFF_SEQ..OFF_SEQ + 4].copy_from_slice(&self.seq.to_le_bytes());
+        bytes[OFF_ANNOUNCED..OFF_ANNOUNCED + 4]
+            .copy_from_slice(&self.announced.bits().to_le_bytes());
+        // Bounded by the vector's own capacity, which is `MAX_LINKS`.
+        bytes[OFF_LINK_COUNT..OFF_LINK_COUNT + 2]
+            .copy_from_slice(&(self.links.len() as u16).to_le_bytes());
+
+        for (index, link) in self.links.iter().enumerate() {
+            let at = OFF_LINKS + index * LINK_LEN;
+            let word = ((link.shade.0 as u32) << 24) | (link.address & LINK_ADDRESS_MASK);
+            bytes[at..at + LINK_LEN].copy_from_slice(&word.to_le_bytes());
+        }
 
         for (index, shade) in self.shades.iter().enumerate() {
             let at = OFF_ENTRIES + index * ENTRY_LEN;
@@ -354,6 +661,8 @@ impl ShadeRecord {
             entry[ENTRY_CODE..ENTRY_CODE + 2].copy_from_slice(&shade.initial_code.0.to_le_bytes());
             entry[ENTRY_KIND] = config.kind as u8;
             entry[ENTRY_TILT] = config.tilt_mode as u8;
+            entry[ENTRY_WIDTH] = config.frame_width as u8;
+            entry[ENTRY_PROTOCOL] = config.protocol as u8;
             for (offset, value) in [
                 (ENTRY_UP_MS, config.up_time_ms),
                 (ENTRY_DOWN_MS, config.down_time_ms),
@@ -393,18 +702,54 @@ impl ShadeRecord {
         }
 
         let version = u16::from_le_bytes([bytes[OFF_VERSION], bytes[OFF_VERSION + 1]]);
-        if version != VERSION {
-            return Err(ShadeRecordError::Version(version));
-        }
+        let layout = Layout::of(version).ok_or(ShadeRecordError::Version(version))?;
 
         let count = u16::from_le_bytes([bytes[OFF_COUNT], bytes[OFF_COUNT + 1]]);
         if count as usize > SHADE_TABLE_CAPACITY {
             return Err(ShadeRecordError::Count(count));
         }
+        let count = count as usize;
+
+        // A record written before the bitmap existed has to answer the question
+        // anyway, and the two candidate answers are not symmetric.
+        //
+        // "Nothing was announced" would let a shade that *had* been announced be
+        // removed on this boot and leave its retained config on the broker
+        // forever — the exact failure the field was added for, reintroduced by
+        // the migration.
+        //
+        // "Every shade in the table was announced" is wrong only for a board
+        // that never reached a broker, and being wrong that way costs a
+        // zero-length publish to a topic holding nothing: a no-op. So the older
+        // record is read as having announced what it holds.
+        let announced = match layout.announced {
+            Some(offset) => Announced::from_bits(u32::from_le_bytes(word(bytes, offset))),
+            None => (0..count).fold(Announced::NONE, |set, index| set.with(ShadeId(index as u8))),
+        };
+
+        // A record written before the pool existed has none. That is a real
+        // loss and it is stated where it is felt: such a shade drives its
+        // estimate from this controller's own transmissions only, and a wall
+        // remote moving it goes unheard until somebody links the remote again.
+        // Nothing here can invent an address.
+        let links = match layout.links {
+            None => 0,
+            Some(_) => {
+                let claimed =
+                    u16::from_le_bytes([bytes[OFF_LINK_COUNT], bytes[OFF_LINK_COUNT + 1]]);
+                if claimed as usize > MAX_LINKS {
+                    return Err(ShadeRecordError::LinkCount(claimed));
+                }
+                claimed as usize
+            }
+        };
 
         Ok(ShadeHeader {
             seq: u32::from_le_bytes(word(bytes, OFF_SEQ)),
-            count: count as usize,
+            count,
+            announced,
+            links,
+            layout,
         })
     }
 
@@ -433,7 +778,7 @@ impl ShadeRecord {
         // the shades themselves.
         let mut seen: [u32; SHADE_TABLE_CAPACITY] = [0; SHADE_TABLE_CAPACITY];
         for index in 0..header.count {
-            let shade = decode_entry(entry_at(bytes, index), index)?;
+            let shade = decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?;
             // A repeated address makes the table ambiguous, and the registry
             // would answer it by refusing the second shade — which is a
             // provisioned shade vanishing with only a log line to say so.
@@ -446,9 +791,44 @@ impl ShadeRecord {
             seen[index] = shade.config.address;
         }
 
+        // The links are checked here too, before anything is visited, so that
+        // the all-or-nothing rule covers the whole record rather than the
+        // entries alone. A caller that placed the shades and then found a bad
+        // link would have to unplace them.
+        check_links(bytes, &header, &seen)?;
+
         // Second pass, reached only once every entry above was accepted.
         for index in 0..header.count {
-            visit(index, decode_entry(entry_at(bytes, index), index)?);
+            visit(
+                index,
+                decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?,
+            );
+        }
+        Ok(header)
+    }
+
+    /// Hand every linked remote in `bytes` to `visit`, with the shade it
+    /// belongs to.
+    ///
+    /// Separate from [`ShadeRecord::for_each`] rather than folded into it,
+    /// because the two are used at different moments: a shade has to exist
+    /// before a remote can be linked to it, so the firmware places every shade
+    /// first and links afterwards. Both walks validate the whole record, so
+    /// either can be called alone and neither can visit half a table.
+    pub fn for_each_link(
+        bytes: &[u8; SHADE_RECORD_LEN],
+        mut visit: impl FnMut(LinkedRemote),
+    ) -> Result<ShadeHeader, ShadeRecordError> {
+        let header = ShadeRecord::header(bytes)?;
+        let mut seen: [u32; SHADE_TABLE_CAPACITY] = [0; SHADE_TABLE_CAPACITY];
+        for (index, address) in seen.iter_mut().enumerate().take(header.count) {
+            *address = decode_entry(entry_at(bytes, header.layout, index), header.layout, index)?
+                .config
+                .address;
+        }
+        check_links(bytes, &header, &seen)?;
+        for index in 0..header.links {
+            visit(decode_link(bytes, index));
         }
         Ok(header)
     }
@@ -466,10 +846,120 @@ impl ShadeRecord {
             // that is bounded by the capacity.
             let _ = shades.push(shade);
         })?;
+        let mut links: Vec<LinkedRemote, MAX_LINKS> = Vec::new();
+        // Infallible for the same reason: `header.links` is bounded by
+        // `MAX_LINKS`, which is this vector's capacity.
+        ShadeRecord::for_each_link(bytes, |link| {
+            let _ = links.push(link);
+        })?;
         Ok(ShadeRecord {
             seq: header.seq,
+            announced: header.announced,
             shades,
+            links,
         })
+    }
+}
+
+/// One pool word, as a link. Panic-free by construction: `index` is below a
+/// `links` count [`ShadeRecord::header`] has bounded by [`MAX_LINKS`], and the
+/// pool is that long (asserted at compile time above).
+fn decode_link(bytes: &[u8; SHADE_RECORD_LEN], index: usize) -> LinkedRemote {
+    let raw = u32::from_le_bytes(word(bytes, OFF_LINKS + index * LINK_LEN));
+    LinkedRemote {
+        shade: ShadeId((raw >> 24) as u8),
+        address: raw & LINK_ADDRESS_MASK,
+    }
+}
+
+/// Every rule a linked remote has to satisfy, checked against the shade
+/// addresses `addresses[..header.count]` already decoded.
+///
+/// The rules are the domain's — [`Shade::link_remote`](somfy_domain::Shade::link_remote)'s — restated here for
+/// the same reason every other rule in this file is: flash must not be able to
+/// deliver a link the registry would then refuse, because the refusal would
+/// arrive one shade at a time in a log line nobody reads.
+fn check_links(
+    bytes: &[u8; SHADE_RECORD_LEN],
+    header: &ShadeHeader,
+    addresses: &[u32; SHADE_TABLE_CAPACITY],
+) -> Result<(), ShadeRecordError> {
+    // One byte per row rather than a list per row: what has to be counted is
+    // how many links a shade already has, and 32 bytes says that for a full
+    // table.
+    let mut per_shade: [u8; SHADE_TABLE_CAPACITY] = [0; SHADE_TABLE_CAPACITY];
+    for index in 0..header.links {
+        let link = decode_link(bytes, index);
+        let row = link.shade.0 as usize;
+        if row >= header.count {
+            return Err(ShadeRecordError::LinkShade {
+                index,
+                shade: link.shade.0,
+            });
+        }
+        let refuse = |error| Err(ShadeRecordError::Link { index, error });
+        if link.address == 0 || link.address >= LINK_ADDRESS_MASK {
+            return refuse(DomainError::InvalidAddress);
+        }
+        // A shade's own address is not a link, and the domain refuses it as a
+        // duplicate. Storing it would make the same address arrive twice.
+        if link.address == addresses[row] {
+            return refuse(DomainError::DuplicateAddress);
+        }
+        // A duplicate *within* one shade. Checked against the pool rather than
+        // against a per-shade list, because the pool is what is in hand.
+        for earlier in 0..index {
+            let other = decode_link(bytes, earlier);
+            if other.shade == link.shade && other.address == link.address {
+                return refuse(DomainError::DuplicateAddress);
+            }
+        }
+        per_shade[row] += 1;
+        if per_shade[row] as usize > MAX_LINKED_REMOTES {
+            return refuse(DomainError::RegistryFull);
+        }
+    }
+    Ok(())
+}
+
+/// Where a record of a given version keeps things, and which fields it has.
+///
+/// Two versions, two rows — small enough to be a table rather than a second
+/// decoder, which is the point: the entry offsets are identical across both, so
+/// everything that differs is here and nothing that differs is anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Byte offset of the first entry.
+    entries: usize,
+    /// Byte offset of the announced-shade bitmap, or `None` in a version that
+    /// predates it.
+    announced: Option<usize>,
+    /// Byte offset of the linked-remote pool, or `None` in a version that
+    /// predates it.
+    links: Option<usize>,
+    /// Whether an entry carries its own frame width and radio protocol.
+    per_shade_radio: bool,
+}
+
+impl Layout {
+    /// The layout `version` describes, or `None` if this build has no reader
+    /// for it.
+    const fn of(version: u16) -> Option<Layout> {
+        match version {
+            VERSION_INITIAL => Some(Layout {
+                entries: HEADER_LEN_V1,
+                announced: None,
+                links: None,
+                per_shade_radio: false,
+            }),
+            VERSION_ANNOUNCED => Some(Layout {
+                entries: OFF_ENTRIES,
+                announced: Some(OFF_ANNOUNCED),
+                links: Some(OFF_LINKS),
+                per_shade_radio: true,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -481,18 +971,31 @@ pub struct ShadeHeader {
     pub seq: u32,
     /// Shades the record carries, already checked against the capacity.
     pub count: usize,
+    /// Which shades this device has published entities for — read from the
+    /// record, or reconstructed for a record written before the field existed.
+    /// See [`ShadeRecord::header`].
+    pub announced: Announced,
+    /// Linked remotes the record carries, already checked against
+    /// [`MAX_LINKS`]. Zero for a record written before the pool existed.
+    pub links: usize,
+    /// Which version's rules the rest of the record follows.
+    layout: Layout,
 }
 
 /// One entry's bytes. Panic-free by construction: `index` is always below a
 /// `count` [`ShadeRecord::header`] has bounded by [`SHADE_TABLE_CAPACITY`], and
-/// a full table fits (asserted at compile time above).
-fn entry_at(bytes: &[u8; SHADE_RECORD_LEN], index: usize) -> &[u8] {
-    let at = OFF_ENTRIES + index * ENTRY_LEN;
+/// a full table fits under either layout (both asserted at compile time above).
+fn entry_at(bytes: &[u8; SHADE_RECORD_LEN], layout: Layout, index: usize) -> &[u8] {
+    let at = layout.entries + index * ENTRY_LEN;
     &bytes[at..at + ENTRY_LEN]
 }
 
 /// One entry's bytes as a shade, or which field was wrong and in which entry.
-fn decode_entry(entry: &[u8], index: usize) -> Result<StoredShade, ShadeRecordError> {
+fn decode_entry(
+    entry: &[u8],
+    layout: Layout,
+    index: usize,
+) -> Result<StoredShade, ShadeRecordError> {
     let name_len = entry[ENTRY_NAME_LEN] as usize;
     if name_len > MAX_NAME_LEN {
         return Err(ShadeRecordError::NameLength {
@@ -532,6 +1035,24 @@ fn decode_entry(entry: &[u8], index: usize) -> Result<StoredShade, ShadeRecordEr
     config.down_time_ms = u32::from_le_bytes(entry_word(entry, ENTRY_DOWN_MS));
     config.tilt_time_ms = u32::from_le_bytes(entry_word(entry, ENTRY_TILT_MS));
 
+    // A record from before these bytes were fields left them zero, so reading
+    // them would give a zero-bit frame and refuse every shade on a board that
+    // is working today. `ShadeConfig::new`'s defaults are what such a shade
+    // has always been driven as — 56-bit RTS is the only thing this firmware
+    // has ever transmitted — so they are what it decodes as.
+    if layout.per_shade_radio {
+        config.frame_width =
+            FrameWidth::from_raw(entry[ENTRY_WIDTH]).ok_or(ShadeRecordError::Width {
+                index,
+                raw: entry[ENTRY_WIDTH],
+            })?;
+        config.protocol =
+            RadioProtocol::from_raw(entry[ENTRY_PROTOCOL]).ok_or(ShadeRecordError::Protocol {
+                index,
+                raw: entry[ENTRY_PROTOCOL],
+            })?;
+    }
+
     let initial_code = RollingCode(u16::from_le_bytes([
         entry[ENTRY_CODE],
         entry[ENTRY_CODE + 1],
@@ -564,7 +1085,19 @@ mod tests {
         let mut shades = Vec::new();
         shades.push(shade("Kitchen", 0x00_1001, 7)).expect("fits");
         shades.push(shade("Salon", 0x00_1002, 9)).expect("fits");
-        ShadeRecord { seq: 3, shades }
+        let mut links = Vec::new();
+        links
+            .push(LinkedRemote {
+                shade: ShadeId(1),
+                address: 0x00_2002,
+            })
+            .expect("fits");
+        ShadeRecord {
+            seq: 3,
+            announced: Announced::NONE.with(ShadeId(0)),
+            shades,
+            links,
+        }
     }
 
     /// Re-stamp a record's bytes and re-checksum, as a writer of some other
@@ -707,20 +1240,35 @@ mod tests {
     #[test]
     fn entry_padding_is_covered_by_the_checksum() {
         let mut bytes = record().encode();
-        bytes[field(0, ENTRY_NAME_LEN) + 1] = 0x01;
+        // The one byte of an entry that is still padding: 23, between the
+        // protocol and the name.
+        bytes[field(0, ENTRY_PROTOCOL) + 1] = 0x01;
+        assert_eq!(ShadeRecord::decode(&bytes), Err(ShadeRecordError::Checksum));
+    }
+
+    /// The unused tail of the linked-remote pool is checksummed too, so a later
+    /// format cannot put a field in it and have this version accept the record.
+    #[test]
+    fn the_unused_pool_is_covered_by_the_checksum() {
+        let mut bytes = record().encode();
+        bytes[OFF_LINKS + (MAX_LINKS - 1) * LINK_LEN] = 0x01;
         assert_eq!(ShadeRecord::decode(&bytes), Err(ShadeRecordError::Checksum));
     }
 
     /// The numbers the docs quote, pinned. That a full table *fits* is asserted
     /// at compile time above; what this adds is that the figures the module and
-    /// the partition table are documented with are the figures in force.
+    /// the partition table are documented with are the figures in force — and
+    /// that the record is full to the byte, which is what makes [`MAX_LINKS`]
+    /// "whatever is left" rather than a number somebody chose.
     #[test]
     fn a_full_table_is_the_size_the_docs_claim() {
         assert_eq!(ENTRY_LEN, 56);
         assert_eq!(SHADE_TABLE_CAPACITY, 32);
+        assert_eq!(HEADER_LEN, 20);
+        assert_eq!(MAX_LINKS, 58);
         assert_eq!(
-            HEADER_LEN + SHADE_TABLE_CAPACITY * ENTRY_LEN + CRC_LEN,
-            1808
+            HEADER_LEN + SHADE_TABLE_CAPACITY * ENTRY_LEN + MAX_LINKS * LINK_LEN + CRC_LEN,
+            SHADE_RECORD_LEN,
         );
     }
 }

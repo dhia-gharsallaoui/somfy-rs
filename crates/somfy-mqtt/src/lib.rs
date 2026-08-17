@@ -114,10 +114,13 @@
 //!   reconnect, which is a shade that closes itself each time the broker
 //!   restarts.
 //!
-//! Deleting a shade clears every retained topic it owns with a zero-length
-//! retained publish; [`MqttConfig::retire_shade`] is that plan, and it is
-//! derived from the same [`SHADE_COMPONENTS`] the announcement is, so an entity
-//! cannot be announced without also being removable. Renaming a shade needs no
+//! Deleting a shade clears every retained topic it *could* own with a
+//! zero-length retained publish; [`MqttConfig::retire_shade`] is that plan, and
+//! it is derived from the same [`SHADE_COMPONENTS`] the announcement filters,
+//! so an entity cannot be announced without also being removable. The
+//! announcement is the narrower of the two — a shade whose address this
+//! controller did not allocate gets no pairing button ([`Pairing`]) — and the
+//! retirement stays wide deliberately: see `lifecycle`'s docs. Renaming a shade needs no
 //! plan at all: neither [`ObjectId`] nor [`UniqueId`] follows the name, so a
 //! rename is a payload change and the topic stays where it was.
 //!
@@ -170,8 +173,8 @@ pub use ident::{
     MAX_DEVICE_ID_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
 };
 pub use lifecycle::{
-    reconfigure, Listen, Payload, Publish, PublishedTopic, Retention, Step, SubscribedTopic,
-    OFFLINE, ONLINE, SHADE_COMPONENTS,
+    reconfigure, Listen, Pairing, Payload, Publish, PublishedTopic, Retention, Step,
+    SubscribedTopic, OFFLINE, ONLINE, SHADE_COMPONENTS,
 };
 pub use topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,

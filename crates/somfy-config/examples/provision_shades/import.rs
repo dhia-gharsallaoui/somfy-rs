@@ -69,8 +69,12 @@
 //!   *plausible* rolling code that is not the right one, which is the failure
 //!   at the top of this file. The tool shows the table and demands confirmation.
 
-use somfy_config::{ShadeError, StoredShade, SHADE_TABLE_CAPACITY};
-use somfy_domain::{ShadeConfig, ShadeKind, TiltMode};
+use somfy_config::{
+    LinkedRemote, ShadeError, StoredShade, MAX_LINKED_REMOTES, MAX_LINKS, SHADE_TABLE_CAPACITY,
+};
+use somfy_domain::{
+    DomainError, FrameWidth, RadioProtocol, ShadeConfig, ShadeId, ShadeKind, TiltMode,
+};
 use somfy_migrate::{
     parse_backup, MigrateError, MigrationData, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
@@ -182,9 +186,14 @@ pub struct Import {
     pub rooms: usize,
     /// Groups the backup carried. None are written here.
     pub groups: usize,
-    /// Linked remotes the backup carried, summed over every shade. None are
-    /// written here, and their rolling codes are not in the file to begin with.
-    pub linked_remotes: usize,
+    /// Every linked remote the backup carried, ready for the record's pool.
+    ///
+    /// **Their rolling codes are not in the file** — the old controller kept
+    /// those outside the backup — and that is fine here, because a linked
+    /// remote is only ever *listened to*. Recognising a wall remote's frames
+    /// needs its address; transmitting as one would need its code, and this
+    /// controller never does that.
+    pub links: heapless::Vec<LinkedRemote, MAX_LINKS>,
     /// Shades whose "my" favourite was set on the old controller and could not
     /// be provisioned — see this module's docs, which is where the consequence
     /// is. Counted rather than warned per shade: a favourite is common enough
@@ -250,6 +259,30 @@ pub enum Refusal {
         /// The address they share.
         address: u32,
     },
+    /// More linked remotes than one record can carry. The per-shade bound is
+    /// the domain's seven and is not what runs out; the record's shared pool is
+    /// [`somfy_config::MAX_LINKS`] across the whole table, and a big enough
+    /// installation can exceed it. Refused rather than truncated: a dropped
+    /// link is a wall remote whose presses stop correcting the position
+    /// estimate, and nothing would say which one.
+    TooManyLinks {
+        /// Links the backup carried.
+        wanted: usize,
+        /// Links a record holds.
+        held: usize,
+    },
+    /// A linked remote the domain's own rules refuse — a sentinel address, a
+    /// duplicate, the shade's own address, or an eighth remote on one shade.
+    Link {
+        /// The shade's index in the imported table.
+        index: usize,
+        /// The shade's name.
+        name: String,
+        /// The remote's address.
+        address: u32,
+        /// Why it was refused.
+        error: DomainError,
+    },
 }
 
 impl core::fmt::Display for Refusal {
@@ -314,6 +347,22 @@ impl core::fmt::Display for Refusal {
                 "shade {index} {name:?} is at address {address} ({address:#08X}), which shade \
                  {first} already holds; the table would be refused on the device"
             ),
+            Refusal::TooManyLinks { wanted, held } => write!(
+                f,
+                "the backup links {wanted} remotes to its shades and a record holds {held} in \
+                 all; dropping the rest would silently stop those wall remotes correcting a \
+                 shade's position, so unlink some on the old controller and export again"
+            ),
+            Refusal::Link {
+                index,
+                name,
+                address,
+                error,
+            } => write!(
+                f,
+                "shade {index} {name:?} has a remote at address {address} ({address:#08X}) the \
+                 device would refuse ({error:?})"
+            ),
         }
     }
 }
@@ -337,8 +386,9 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
     }
 
     let mut shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY> = heapless::Vec::new();
+    let mut links: heapless::Vec<LinkedRemote, MAX_LINKS> = heapless::Vec::new();
+    let mut wanted_links = 0usize;
     let mut warnings: Vec<Warning> = Vec::new();
-    let mut linked_remotes = 0usize;
     let mut favourites = 0usize;
 
     for migrated in data.shades.iter() {
@@ -385,13 +435,36 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             TiltMode::None
         });
 
-        // And the two that are not substitutions: a width and a protocol there
-        // is no field for. Both mean a shade that is provisioned and inert.
-        if migrated.bit_length != TRANSMITTED_BIT_LENGTH {
-            note(Caveat::FrameWidth(migrated.bit_length));
+        // And the two that used to be neither substituted nor stored: a width
+        // and a protocol the record now carries. Both still mean a shade that
+        // is provisioned and inert — the transmit width is per-controller and
+        // only RTS is implemented — so both are still reported. What has
+        // changed is that the value survives to the device, which is what lets
+        // the device say which shade it cannot drive instead of being silent.
+        match FrameWidth::from_raw(migrated.bit_length) {
+            // The ordinary case: a width this controller transmits.
+            Some(width) if migrated.bit_length == TRANSMITTED_BIT_LENGTH => {
+                config.frame_width = width
+            }
+            // A real width this controller does not transmit. Stored
+            // faithfully, and reported because the shade will not move.
+            Some(width) => {
+                config.frame_width = width;
+                note(Caveat::FrameWidth(migrated.bit_length));
+            }
+            // Not a frame width at all. Left at the constructor's default and
+            // reported, for the same reason an unmodelled shade kind is.
+            None => note(Caveat::FrameWidth(migrated.bit_length)),
         }
-        if migrated.proto_raw != TRANSMITTED_PROTOCOL {
-            note(Caveat::Protocol(migrated.proto_raw));
+        match RadioProtocol::from_raw(migrated.proto_raw) {
+            Some(protocol) if migrated.proto_raw == TRANSMITTED_PROTOCOL => {
+                config.protocol = protocol
+            }
+            Some(protocol) => {
+                config.protocol = protocol;
+                note(Caveat::Protocol(migrated.proto_raw));
+            }
+            None => note(Caveat::Protocol(migrated.proto_raw)),
         }
 
         config.up_time_ms = migrated.up_time_ms;
@@ -415,9 +488,53 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
                 address: shade.config.address,
             });
         }
+        let address = shade.config.address;
         shades.push(shade).map_err(|_| Refusal::TooManyShades)?;
 
-        linked_remotes += migrated.linked_addresses.len();
+        // The wall remotes. **This is the only feedback path this controller
+        // has**: RTS is one-way, nothing asks a motor where it is, and a shade
+        // whose remotes are unknown decodes their frames, matches them against
+        // nothing, and lets its position estimate drift with nothing to say so.
+        // The backup carries the addresses, which is the half that matters —
+        // the rolling codes are not in the file and are not needed, because a
+        // linked remote is listened to and never transmitted as.
+        wanted_links += migrated.linked_addresses.len();
+        let mut linked_here = 0usize;
+        for remote in migrated.linked_addresses.iter().copied() {
+            let refuse_link = |error| Refusal::Link {
+                index,
+                name: name.to_string(),
+                address: remote,
+                error,
+            };
+            // The domain's own rules for `Shade::link_remote`, applied here so
+            // a table this tool writes is one the device loads whole. A linked
+            // remote is **not** a shade and never becomes one: it shares a
+            // motor, not an identity, so nothing below touches `shades`.
+            if remote == 0 || remote >= 0xFF_FFFF {
+                return Err(refuse_link(DomainError::InvalidAddress));
+            }
+            if remote == address
+                || links
+                    .iter()
+                    .any(|held| held.shade.0 as usize == index && held.address == remote)
+            {
+                return Err(refuse_link(DomainError::DuplicateAddress));
+            }
+            linked_here += 1;
+            if linked_here > MAX_LINKED_REMOTES {
+                return Err(refuse_link(DomainError::RegistryFull));
+            }
+            links
+                .push(LinkedRemote {
+                    shade: ShadeId(index as u8),
+                    address: remote,
+                })
+                .map_err(|_| Refusal::TooManyLinks {
+                    wanted: wanted_links,
+                    held: MAX_LINKS,
+                })?;
+        }
         // The backup's unset favourite is a negative sentinel, so any position
         // at or above zero is one the old controller was actually holding.
         if migrated.my_position_centi >= 0 {
@@ -432,7 +549,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         version: data.version,
         rooms: data.rooms.len(),
         groups: data.groups.len(),
-        linked_remotes,
+        links,
         favourites,
     })
 }

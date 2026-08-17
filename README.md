@@ -120,11 +120,17 @@ policy-free:
   reported per shade by name, and a nonzero `skipped_resyncs` prints the whole
   table and refuses to write without a typed `yes`. That covers the shades and
   their rolling codes — the values that cost a physical re-pairing to get wrong
-  — on the host, before anything is flashed. **What is still Plan 6's** is
-  everything else in (1) and (2): rooms, groups (including the v19–v22
-  fabricated codes and the linked remotes whose codes the file never carries),
-  MQTT settings, and applying any of it on the device rather than into a
-  provisioning image.
+  — on the host, before anything is flashed.
+
+  **A linked remote's *address* is discharged too, 2026-08-17.** The record
+  carries the wall remotes now (a shared pool of 58 across the table) and the
+  firmware loads them into `Shade::linked`, so overheard presses finally reach
+  the position estimate — which, RTS being one-way, is the only feedback path
+  this controller has. What the file never carried is their **rolling codes**,
+  and that turns out not to matter: a linked remote is listened to and never
+  transmitted as. **What is still Plan 6's** is the rest of (1) and (2): rooms,
+  groups (including the v19–v22 fabricated codes), MQTT settings, and applying
+  those on the device rather than into a provisioning image.
 - **Group commands stay per-shade fan-out in v1.0.** The domain executes a group
   command by fanning it out to each member shade (Plan 2 `Controller::command_group`),
   not by transmitting a single group virtual-remote frame. Even so, group

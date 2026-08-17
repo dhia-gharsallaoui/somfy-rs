@@ -76,11 +76,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+mod catalog;
 mod credentials;
 mod mqtt;
 mod record;
 mod shade;
 
+pub use catalog::{Catalog, CatalogError, Dropped, DEBOUNCE_MS, MAX_DEFER_MS};
 pub use credentials::{
     CredentialError, Field, WifiCredentials, MAX_PSK_LEN, MAX_SSID_LEN, MIN_PSK_LEN,
 };
@@ -90,6 +92,7 @@ pub use mqtt::{
 };
 pub use record::{ConfigRecord, RecordError, CONFIG_RECORD_LEN};
 pub use shade::{
-    ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError, StoredShade, TravelField,
-    SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
+    Announced, Layout, LinkedRemote, ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError,
+    StoredShade, TravelField, MAX_LINKED_REMOTES, MAX_LINKS, SHADE_RECORD_LEN,
+    SHADE_TABLE_CAPACITY,
 };

@@ -27,13 +27,18 @@
 //! an empty registry, no entity to command, and keys the transmitter never,
 //! which is the ordinary state of a freshly flashed device.
 //!
-//! Two things follow, and both are deliberate. A shade cannot be commanded
-//! before somebody has flashed a shade table with `provision_shades` — the
-//! firmware has no path that writes one. And a shade that *is* provisioned
-//! still cannot transmit until its rolling code exists in the store, which
-//! [`provision_shades`] does once, from the record, and never again: a code
-//! re-seeded at every boot would walk backwards and desync the motor. See
-//! `somfy_store::seed_if_absent`.
+//! A shade that is in the table still cannot transmit until its rolling code
+//! exists in the store, which [`provision_shades`] does once, from the record,
+//! and never again: a code re-seeded at every boot would walk backwards and
+//! desync the motor. See `somfy_store::seed_if_absent`.
+//!
+//! **What has changed is where the table comes from.** It used to be flashed by
+//! `provision_shades` and nothing else — the firmware had no path that wrote
+//! one — and now it does: `shades::ShadeStore::store`, driven by the state task
+//! on a debounce. `provision_shades` remains how an installation is imported
+//! from another controller, and it is still the only way to get a table onto a
+//! board that has never had one; adding, removing and linking are the device's
+//! own from here.
 //!
 //! ## What a boot proves
 //!
@@ -56,6 +61,7 @@ extern crate alloc;
 
 mod chip;
 mod config;
+mod edits;
 mod heap;
 mod inventory;
 mod mqtt;
@@ -87,14 +93,17 @@ use somfy_tasks::{
 };
 
 use config::ConfigStore;
+use edits::{AckChannel, EditChannel, EventChannel};
 use heapless::Vec;
 use inventory::Inventory;
 use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
 use shades::ShadeStore;
-use somfy_config::{MqttSettings, Namespaces, StoredShade, WifiCredentials};
-use somfy_domain::{Registry, RemoteIdentity, MAX_SHADES};
+use somfy_config::{
+    Announced, Catalog, LinkedRemote, MqttSettings, Namespaces, StoredShade, WifiCredentials,
+};
+use somfy_domain::{Registry, RemoteIdentity, ShadeId, MAX_SHADES};
 use somfy_rts::RollingCode;
 use somfy_store::{seed_if_absent, RegionState, Seeded};
 use store::{FlashStore, StoreError};
@@ -227,6 +236,25 @@ static COMMANDS: CommandChannel<Mutex> = CommandChannel::new();
 /// broker provisioned does.
 static DELTAS: DeltaChannel<Mutex> = DeltaChannel::new();
 
+/// Changes to the shade table, into the state task.
+///
+/// The producer is whatever the device exposes to a person. There is none in
+/// this image yet — the API surface is a separate task — so today this channel
+/// exists to be the seam rather than to carry traffic, and the state task is
+/// the only thing that may touch the registry either way.
+static EDITS: EditChannel = EditChannel::new();
+
+/// What the state task did to the table, out to the broker session.
+static SHADE_EVENTS: EventChannel = EventChannel::new();
+
+/// What the broker session did about it, back to the state task.
+///
+/// The return leg is not bookkeeping: the persisted `announced` bit may only be
+/// cleared once the tombstones have landed, or a power cut between the two
+/// loses the only record that a removed shade's entities are still on the
+/// broker. See `crate::edits`.
+static SHADE_ACKS: AckChannel = AckChannel::new();
+
 /// Report the panic, then **reboot** — which is the degradable answer, and it
 /// is the network that made it necessary.
 ///
@@ -319,6 +347,10 @@ struct Pending {
     superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
     /// The shades to announce, copied before the state task owns the registry.
     inventory: Inventory,
+    /// Ids that were announced and no longer exist. Their retained entities are
+    /// on the broker with nothing behind them, and this is the only thing that
+    /// can name them — see `somfy_config::Catalog`.
+    orphans: Vec<ShadeId, MAX_SHADES>,
     /// What the rolling-code region held at boot.
     ///
     /// Carried to the broker session so that `damaged` — the single most
@@ -408,19 +440,20 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let mut flash = peripherals.FLASH;
     let (credentials, broker, superseded) = report_config(FlashStorage::new(flash.reborrow()));
 
-    // Read **before** the rolling-code store takes the flash singleton for
-    // good, because that store owns it for the life of the program and this
-    // region cannot be reached afterwards. The shades are therefore carried
-    // across the two calls below — 2,312 bytes for a full table, which is the
-    // smallest form that survives; see `provision_shades` for what is not held.
-    let shades = report_shades(FlashStorage::new(flash.reborrow()));
-
     // Mounted here rather than inside the state task: `mount` wants roughly
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
+    //
+    // **Before the shade table now, where it used to be after it.** The shade
+    // region is written at runtime, so it can no longer read through a
+    // temporary reborrow that ends at boot: it borrows the flash from this
+    // store, which owns the peripheral for the life of the program. See
+    // `FlashStore::with_flash`.
     let mut store = FlashStore::mount(FlashStorage::new(flash)).map_err(StartError::Store)?;
     let survey = report_store(&mut store)?;
+
+    let (shade_store, shades) = report_shades(&mut store);
 
     let bus = Spi::new(
         peripherals.SPI2,
@@ -481,13 +514,18 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // mounting wants about 5 KB of stack, and on the tightest chip this builds
     // for the whole stack is 14,588.
     let mut machine = StateMachine::new(TxProfile::default());
-    provision_shades(machine.registry_mut(), &mut store, shades, survey.damaged);
+    let catalog = provision_shades(machine.registry_mut(), &mut store, shades, survey.damaged);
 
     // Copied **here**, before the state task takes ownership of the machine.
     // The MQTT session works from this copy rather than from the registry, so
     // there is no shared state between the broker and the radio at all — see
     // `mqtt`'s module docs for the other three things that keep them apart.
     let inventory = Inventory::snapshot(machine.registry());
+    // Announced and gone: entities on the broker with nothing behind them. Read
+    // here, before the state task takes the registry, because this is the last
+    // moment both halves of the comparison are in one place — and the ids are
+    // the only thing that can name what has to be cleared.
+    let orphans: Vec<ShadeId, MAX_SHADES> = catalog.orphans(machine.registry()).collect();
     if inventory.len() == 0 {
         // Said out loud, because a controller with nothing provisioned and a
         // broken one look identical from the serial line and from Home
@@ -533,6 +571,14 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let state = tasks::state(
         machine,
         store,
+        tasks::Table {
+            shades: shade_store,
+            catalog,
+            identity: RemoteIdentity::from_mac(base_mac()),
+            edits: EDITS.receiver(),
+            acks: SHADE_ACKS.receiver(),
+            events: SHADE_EVENTS.sender(),
+        },
         TRANSMIT.queue(),
         FRAMES.receiver(),
         COMMANDS.receiver(),
@@ -554,6 +600,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         broker,
         superseded,
         inventory,
+        orphans,
         survey,
     })
 }
@@ -661,13 +708,21 @@ fn report_config(
     (record.wifi, record.mqtt, survey.superseded)
 }
 
-/// The shades a boot found, in the order their registry ids will follow.
+/// The shades a boot found, in the order their registry ids will follow, plus
+/// the wall remotes linked to them and the set the last session announced.
 ///
-/// This is what is carried from [`report_shades`] across `FlashStore::mount`
-/// to [`provision_shades`], and it is the smallest form that can be: 2,312
-/// bytes for a full table. What is deliberately *not* carried is a decoded
-/// `somfy_config::ShadeRecord` per slot — see `shades::ShadeStore::load_with`.
-type Shades = Vec<StoredShade, MAX_SHADES>;
+/// This is what is carried from [`report_shades`] to [`provision_shades`], and
+/// it is the smallest form that can be: 2,312 bytes for a full table. What is
+/// deliberately *not* carried is a decoded `somfy_config::ShadeRecord` per slot
+/// — see `shades::ShadeStore::load_with`.
+struct Shades {
+    shades: Vec<StoredShade, MAX_SHADES>,
+    links: Vec<LinkedRemote, { somfy_config::MAX_LINKS }>,
+    /// What the record said this device had already published entities for.
+    /// Empty for a board with no readable table, which is the honest answer:
+    /// nothing is known, so nothing is claimed.
+    announced: Announced,
+}
 
 /// Read the persisted shade table and say what was found.
 ///
@@ -677,27 +732,40 @@ type Shades = Vec<StoredShade, MAX_SHADES>;
 /// freshly flashed device, and it still receives and decodes.
 ///
 /// Nothing is placed anywhere here. The registry does not exist yet, and that
-/// is the point: reading this region has to happen before the rolling-code
-/// store takes the flash, and a `StateMachine` alive across that mount is 8,016
-/// bytes standing next to a 5 KB spike.
-fn report_shades(flash: FlashStorage<'_>) -> Shades {
-    let mut shades = Shades::new();
+/// is the point: a `StateMachine` alive across this read is 8,016 bytes
+/// standing next to a 5 KB spike.
+///
+/// **The store is returned rather than dropped**, because this region is now
+/// written at runtime: the state task keeps it, and borrows the flash from the
+/// rolling-code store whenever it writes. Only the mount's stack cost is paid
+/// here, which is why it is paid in `main`.
+fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades) {
+    let mut found = Shades {
+        shades: Vec::new(),
+        links: Vec::new(),
+        announced: Announced::NONE,
+    };
 
-    let mut store = match ShadeStore::mount(flash) {
-        Ok(store) => store,
+    // `None` rather than a refusal, for the reason `shades`' module docs give:
+    // losing this region costs the ability to command shades until somebody
+    // re-provisions, while the rolling-code store refuses on damage because
+    // losing *that* costs a physical re-pairing at every motor. What is new is
+    // that `None` now also means no shade can be added, which is worth saying.
+    let mut shade_store = match store.with_flash(ShadeStore::mount) {
+        Ok(shade_store) => shade_store,
         Err(error) => {
             esp_println::println!(
-                "shades: region unavailable ({:?}) — no shades. A board flashed with an \
-                 older partition table has no '{}' partition; reflash it with this \
-                 crate's partitions.csv.",
+                "shades: region unavailable ({:?}) — no shades, and none can be added \
+                 either. A board flashed with an older partition table has no '{}' \
+                 partition; reflash it with this crate's partitions.csv.",
                 error,
                 shades::PARTITION_LABEL,
             );
-            return shades;
+            return (None, found);
         }
     };
 
-    let (base, slots, slot_len) = store.geometry();
+    let (base, slots, slot_len) = shade_store.geometry();
     esp_println::println!(
         "shades: partition '{}' at {:#010X}, {} slots of {} bytes",
         shades::PARTITION_LABEL,
@@ -706,19 +774,38 @@ fn report_shades(flash: FlashStorage<'_>) -> Shades {
         slot_len,
     );
 
-    // The closure is where the shades are collected. `push` cannot fail — the
-    // record's own capacity is `MAX_SHADES`, the same bound as this vector —
-    // and a failure is ignored rather than `expect`ed because a panic here
-    // would take the radio off the air over a shade table.
-    let survey = match store.load_with(|_, shade| {
-        let _ = shades.push(shade);
-    }) {
-        Ok(survey) => survey,
+    // The closures are where the table is collected. Neither `push` can fail —
+    // the record's own capacities are these vectors' — and a failure is ignored
+    // rather than `expect`ed because a panic here would take the radio off the
+    // air over a shade table.
+    let read = store.with_flash(|flash| {
+        shade_store.load_with(
+            flash,
+            |_, shade| {
+                let _ = found.shades.push(shade);
+            },
+            |link| {
+                let _ = found.links.push(link);
+            },
+        )
+    });
+    let (survey, header) = match read {
+        Ok(read) => read,
         Err(error) => {
             esp_println::println!("shades: unreadable ({:?}) — no shades", error);
-            return Shades::new();
+            return (
+                Some(shade_store),
+                Shades {
+                    shades: Vec::new(),
+                    links: Vec::new(),
+                    announced: Announced::NONE,
+                },
+            );
         }
     };
+    if let Some(header) = header {
+        found.announced = header.announced;
+    }
     esp_println::println!(
         "shades: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,
@@ -738,13 +825,13 @@ fn report_shades(flash: FlashStorage<'_>) -> Shades {
             error,
         );
     }
-    if shades.is_empty() {
+    if found.shades.is_empty() {
         esp_println::println!(
             "shades: none provisioned — the controller receives, decodes and tracks, \
-             and has nothing to command"
+             and has nothing to command until one is added"
         );
     }
-    shades
+    (Some(shade_store), found)
 }
 
 /// Put every shade in the registry, and give each one a rolling code if and
@@ -781,16 +868,38 @@ fn base_mac() -> [u8; 6] {
 fn provision_shades(
     registry: &mut Registry,
     store: &mut FlashStore<'_>,
-    shades: Shades,
+    found: Shades,
     damaged: usize,
-) {
+) -> Catalog {
     // The rolling-code region's own state, as the survey found it a moment ago.
     // A missing code in a region with damaged slots may be a lost code rather
     // than a new shade, so it is refused rather than planted.
     let region = RegionState::from_damaged(damaged);
+    let mut catalog = Catalog::new();
+    // Adopted before anything else, and never derived from the table: the whole
+    // value of this set is the case where the two disagree, which is a shade
+    // that was announced and has since been removed.
+    catalog.adopt_announced(found.announced);
 
-    for (index, shade) in shades.into_iter().enumerate() {
+    for (index, shade) in found.shades.into_iter().enumerate() {
         let address = shade.config.address;
+        // What the shade would be driven as, against what this controller
+        // transmits. Said out loud because the alternative is a shade that
+        // imports looking healthy and never moves — which is exactly what
+        // storing the width and the protocol was for.
+        if shade.config.frame_width != somfy_domain::FrameWidth::Bits56
+            || shade.config.protocol != somfy_domain::RadioProtocol::Rts
+        {
+            esp_println::println!(
+                "shades: entry {} at {:#08X} is a {:?} shade on {:?} — this controller \
+                 transmits 56-bit RTS only, so it will accept commands and never move",
+                index,
+                address,
+                shade.config.frame_width,
+                shade.config.protocol,
+            );
+        }
+        let seed_code = shade.initial_code;
         let id = match registry.add_shade(shade.config) {
             Ok(id) => id,
             Err(error) => {
@@ -810,8 +919,61 @@ fn provision_shades(
             address,
             index,
         );
-        seed(store, address, shade.initial_code, region);
+        // The seed is remembered rather than re-derived, because the record is
+        // the only place it exists: `seed_if_absent` ignores it from the second
+        // boot onward, and a table written later has to carry it forward
+        // unchanged or the boot after a lost rolling-code region would plant
+        // whatever was invented here.
+        catalog.place(id, seed_code);
+        seed(store, address, seed_code, region);
     }
+
+    // The wall remotes, after every shade, because a remote cannot be linked to
+    // a shade that is not in the registry yet. **This is the only feedback path
+    // this controller has**: RTS is one-way, so a shade whose remotes are
+    // unknown decodes their frames, matches them against nothing, and lets its
+    // position estimate drift with nothing to say why.
+    let mut linked = 0usize;
+    for link in &found.links {
+        match registry.shade_mut(link.shade) {
+            Some(shade) => match shade.link_remote(link.address) {
+                Ok(()) => linked += 1,
+                Err(error) => esp_println::println!(
+                    "shades: the remote at {:#08X} could not be linked to ShadeId({}) ({:?})",
+                    link.address,
+                    link.shade.0,
+                    error,
+                ),
+            },
+            // Reachable only if the registry refused the shade above, which it
+            // reported on its own line.
+            None => esp_println::println!(
+                "shades: the remote at {:#08X} names ShadeId({}), which is not in the registry",
+                link.address,
+                link.shade.0,
+            ),
+        }
+    }
+    if linked > 0 {
+        esp_println::println!(
+            "shades: {} wall remote(s) linked — their presses are what keeps a position \
+             estimate honest",
+            linked,
+        );
+    }
+
+    // Announced but not present: entities on the broker with nothing behind
+    // them. Named here because this is the last moment anything knows the id,
+    // and cleared by the broker session, which then acknowledges it.
+    let orphans = catalog.orphans(registry).count();
+    if orphans > 0 {
+        esp_println::println!(
+            "shades: {} shade(s) were announced and no longer exist — their retained \
+             entities will be cleared on the next broker session",
+            orphans,
+        );
+    }
+    catalog
 }
 
 /// Give one address its first rolling code, and say which of the three things
@@ -877,6 +1039,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
         pending.broker,
         pending.superseded,
         pending.inventory,
+        pending.orphans,
         pending.survey,
     );
 }
@@ -894,6 +1057,7 @@ fn start_mqtt(
     broker: Option<MqttSettings>,
     superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
     inventory: Inventory,
+    orphans: Vec<ShadeId, MAX_SHADES>,
     survey: store::Survey,
 ) {
     let Some(settings) = broker else {
@@ -940,9 +1104,12 @@ fn start_mqtt(
         settings,
         superseded,
         inventory,
+        orphans,
         survey,
         COMMANDS.sender(),
         deltas,
+        SHADE_EVENTS.receiver(),
+        SHADE_ACKS.sender(),
     ) {
         esp_println::println!(
             "mqtt: failed to start ({:?}) — running without a broker, \
