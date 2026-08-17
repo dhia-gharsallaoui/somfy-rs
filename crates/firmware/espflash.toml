@@ -6,5 +6,29 @@
 # they would flash a device that cannot persist a rolling code. That failure is
 # reported rather than silent — the firmware stops at `PartitionMissing` — but
 # a flag nobody has to remember is better than a good error message.
+# ## Which slot a serial flash writes, and why it is not configured here
+#
+# With two app partitions, "the app partition" stopped being a single thing.
+# espflash writes `ota_0` — the first app partition in the table — which is what
+# `docs/hardware-checklist.md`'s procedure is written around. That is observed
+# rather than documented: a `save-image --merge` image carries the 0xE9 image
+# header at 0x10000 and 0xFF at 0x210000.
+#
+# **`target_app_partition = "ota_0"` does not belong below, because espflash
+# 4.5.0 ignores it here.** Setting it to `ota_1` in this file leaves the image at
+# 0x10000; passing `--target-app-partition ota_1` on the command line moves it to
+# 0x210000. Both were run. The key is silently dropped on the config-file path
+# only — `partition_table` on the line below is honoured, and the same test
+# shows why: without it espflash reports the app against a 4,128,768-byte
+# partition, its built-in default, and with it against 2,031,616. So the file is
+# doing its job, and a second key that looked like a guarantee and was not would
+# be worse than no key at all.
+#
+# Separately, note what none of this fixes: `espflash flash` leaves data
+# partitions alone, `otadata` among them, so a board that has taken an
+# over-the-air update keeps a record selecting `ota_1` across a serial reflash
+# and boots the older image already sitting there. That is the one silent
+# failure this layout introduces; the remedy is `--erase-parts otadata` on the
+# reflash, and the checklist says when.
 [idf_format_args]
 partition_table = "partitions.csv"

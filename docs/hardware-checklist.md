@@ -5,7 +5,7 @@ Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
 
-Five independent procedures, because they need different equipment and carry
+Seven independent procedures, because they need different equipment and carry
 different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
@@ -17,8 +17,13 @@ different risk:
 - **[Wi-Fi provisioning](#wi-fi-provisioning)** — needs the board and the
   network's passphrase; touches only flash and puts nothing on the 433 MHz
   band.
+- **[Shade provisioning](#shade-provisioning)** — needs the board and the shade
+  details, or a backup from the controller being replaced; touches only flash.
 - **[Controller](#controller)** — the real firmware: receives, tracks, and
   transmits nothing on its own.
+- **[Partition table](#partition-table)** — what a board already in service has
+  to do to move to the A/B layout, and the one way to get it wrong. **Read this
+  before reflashing a board that is carrying real rolling codes.**
 
 Which binary is which matters here, because they differ in whether they key a
 transmitter:
@@ -933,3 +938,130 @@ against a marginal link is exactly how this project already produced one
 confident wrong diagnosis. Fixing the link and validating reception — decoded
 address, command, `bits`, and the sync counts — belongs to on-air bring-up, not
 here.
+
+---
+
+## Partition table
+
+Moving a board to the A/B layout that over-the-air updates need. **This
+procedure touches flash only** — nothing goes on the 433 MHz band.
+
+### The one-line version
+
+**Nothing moves, so there is nothing to migrate.** Reflash normally from
+`crates/firmware` and the board keeps its rolling codes, its credentials and
+its shade table. If you want the reassurance, take the backup in step 1; it
+costs one command.
+
+### What changed and what did not
+
+| Partition | Before | After |
+|---|---|---|
+| `factory` / `ota_0` | `factory`, app, 0x10000, 0x1F0000 | **renamed** `ota_0`, app, **same 0x10000, same 0x1F0000** |
+| `rollcode` | data, 0x200000, 8 KB | **unchanged** |
+| `wificfg` | data, 0x202000, 8 KB | **unchanged** |
+| `shades` | data, 0x204000, 8 KB | **unchanged** |
+| `otadata` | — | **new**, data/ota, 0x206000, 8 KB |
+| `ota_1` | — | **new**, app, 0x210000, 0x1F0000 |
+
+The app slot did not move and did not change size, so the image lands on the
+same sectors it already occupied. The three data regions did not move, so every
+byte a provisioned board is carrying stays where the firmware looks for it.
+`crates/firmware/partitions.csv` carries the derivation; `crates/firmware/build.rs`
+fails the build if a later edit moves any of the three.
+
+The table now ends at 0x400000 exactly, so it still fits a 4 MB board — which
+matters because only the ESP32-S3 here is known to carry 8 MB.
+
+### 1. Back up the rolling codes anyway
+
+Not required, and worth doing once. It is 8 KB and one command, against a
+physical re-pairing at every shade if something unforeseen goes wrong.
+
+Step 0 above — **identify the board** — applies here, every time, and it applies
+hardest here: reading the wrong board's codes and later restoring them onto this
+one would walk this board's codes *backwards*, which is the failure the backup
+exists to prevent.
+
+```bash
+espflash read-flash --port /dev/ttyUSB0 0x200000 0x2000 rollcode-backup.bin
+```
+
+Keep it exactly as you would keep a `.backup` file: it carries real radio
+addresses and rolling codes, which is what a nearby attacker would need to forge
+commands to the motors. Do not commit it.
+
+Restoring, if it ever comes to that, is `espflash write-bin 0x200000
+rollcode-backup.bin` onto an **erased** region (`espflash erase-parts …
+rollcode` first) — the store picks the record with the highest sequence number,
+so writing over live slots would not necessarily take effect.
+
+### 2. Reflash
+
+Nothing special. The ordinary controller flash from
+[Controller](#controller) writes the new table:
+
+```bash
+cd crates/firmware
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmware
+```
+
+Run it **from `crates/firmware`**, as always: `espflash.toml` there is what
+points espflash at this table. espflash writes the first app partition, `ota_0`
+at 0x10000 — the same sectors the app already occupied. If you ever need the
+other slot, it is `--target-app-partition ota_1` **on the command line**; the
+matching key in `espflash.toml` is silently ignored by espflash 4.5.0, and that
+file says so.
+
+### 3. Confirm nothing was lost
+
+Reset and read the three survey lines. They are the check, and they are the same
+lines the board printed before:
+
+```
+config: partition 'wificfg' at 0x00202000, 16 slots of 512 bytes
+shades: partition 'shades' at 0x00204000, 4 slots of 2048 bytes
+store:  partition 'rollcode' at 0x00200000, 32 slots of 256 bytes
+store:  survey slots=32 valid=3 blank=29 damaged=0 newest_seq=Some(2) addresses=1
+```
+
+`newest_seq` and `addresses` carrying over from before the reflash is the
+evidence that the codes survived. A shade line reading `seeded … from the shade
+record` on a board that had already been seeded would mean they did not — see
+[Shade provisioning](#shade-provisioning) for why that wording is the one to
+watch.
+
+### Getting it wrong
+
+Four ways, in descending order of what they cost.
+
+- **`espflash erase-flash`.** Erases the whole chip, rolling codes included, and
+  there is no partition table involved for anything to refuse. This was already
+  true; the A/B layout changes nothing about it. Never run it on a board in
+  service.
+- **Reading one board's `rollcode` and writing it to the other.** Both boards
+  are ESP32-S3s and look identical. The backup in step 1 becomes the weapon
+  rather than the insurance. Check the MAC before both the read and the write.
+- **Flashing from the wrong directory.** espflash falls back to its built-in
+  table, which has no `rollcode`, `wificfg` or `shades` and no `otadata` either.
+  This is loud, not silent: the firmware stops at `PartitionMissing`. The codes
+  themselves survive — espflash erases only the sectors it writes, and a
+  ~600 KB image does not reach 0x200000 — so reflashing from `crates/firmware`
+  recovers it.
+- **Reflashing over serial after an over-the-air update, without erasing
+  `otadata`.** `espflash flash` leaves data partitions alone, and `otadata` is
+  one. A board that has taken an update has a record selecting `ota_1`, keeps it
+  across the reflash, and boots the **older image already sitting in `ota_1`**
+  while the freshly flashed one sits unused in `ota_0`. Nothing reports a fault,
+  because nothing failed — you simply get the version you thought you had just
+  replaced. The remedy is to say so on the flash:
+
+  ```bash
+  espflash flash --port /dev/ttyUSB0 --erase-parts otadata \
+    target/xtensa-esp32s3-none-elf/release/firmware
+  ```
+
+  **This cannot happen yet.** Nothing in the firmware writes `otadata`, so it
+  stays blank and a blank record with no `factory` partition present means "boot
+  `ota_0`". It becomes reachable the moment Plan 6 Task 4 lands, which is why it
+  is written down now rather than then.
