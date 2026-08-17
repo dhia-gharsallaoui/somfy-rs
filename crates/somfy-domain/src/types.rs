@@ -174,6 +174,73 @@ impl RadioProtocol {
     }
 }
 
+/// Whether a person has reported that this shade actually works.
+///
+/// # This is a fact about a human's report, and nothing else
+///
+/// **The device cannot observe pairing and this type does not claim it does.**
+/// RTS is one-way: a `Prog` burst goes out and nothing comes back, so no
+/// controller can learn whether a motor accepted it. A field called `paired`
+/// would therefore be a belief stored as a fact, and it would keep saying
+/// "paired" long after somebody reset the motor — which is why there is no such
+/// field anywhere in this workspace.
+///
+/// What *is* observable is what an operator told us. Somebody stood at the
+/// shade, pressed Open, watched it move, and said so. That is evidence, it is
+/// evidence about the path the user will actually use, and — crucially — it is
+/// evidence this controller acquired legitimately rather than inferred from its
+/// own transmission. The variant names say whose knowledge it is, so that a
+/// reader of the field cannot mistake it for a measurement:
+/// [`ConfirmedByOperator`](PairingState::ConfirmedByOperator), never `Paired`.
+///
+/// # What it gates
+///
+/// Announcing the shade's entities to Home Assistant. A shade that has been
+/// created and not confirmed exists, is commandable over the local API — which
+/// is how the confirmation is obtained — and has **no entities**, because an
+/// entity that accepts commands and drives nothing is exactly the failure this
+/// project exists to avoid.
+///
+/// # The discriminants are stored
+///
+/// They are written into the persisted shade record, so they may not be
+/// reordered or renumbered. `somfy-config`'s record format carries the
+/// migration rule for tables written before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PairingState {
+    /// Nobody has reported this shade working yet. It may never have been
+    /// paired, or the pairing may have been attempted and not checked — the
+    /// two are indistinguishable to a one-way transmitter, and this variant
+    /// deliberately does not distinguish them.
+    AwaitingConfirmation = 0x00,
+    /// An operator reported that the shade responded to a command. Not a
+    /// measurement, not an acknowledgement from the motor: a person's account,
+    /// stored as one.
+    ConfirmedByOperator = 0x01,
+}
+
+impl PairingState {
+    /// Map a raw byte from a stored record.
+    ///
+    /// `None` for anything outside the set, reported rather than defaulted for
+    /// the same reason [`ShadeKind::from_raw`] reports: both possible defaults
+    /// are wrong in a way somebody pays for, one by hiding a working shade and
+    /// one by announcing a dead one.
+    pub fn from_raw(raw: u8) -> Option<PairingState> {
+        match raw {
+            0x00 => Some(PairingState::AwaitingConfirmation),
+            0x01 => Some(PairingState::ConfirmedByOperator),
+            _ => None,
+        }
+    }
+
+    /// Whether an operator has reported this shade working.
+    pub const fn is_confirmed(self) -> bool {
+        matches!(self, PairingState::ConfirmedByOperator)
+    }
+}
+
 /// Movement direction. Signs match the convention deployed firmware uses
 /// for its position-tracking integer: -1 toward 0 (open), +1 toward 100
 /// (closed), 0 idle.
@@ -275,6 +342,17 @@ pub struct ShadeConfig {
     /// configuration of this firmware. Storing it is what lets the device say
     /// so instead of transmitting frames the motor is not listening for.
     pub protocol: RadioProtocol,
+    /// Whether an operator has reported this shade working. See
+    /// [`PairingState`] — it is **not** a claim that the motor was paired, and
+    /// nothing here can make that claim.
+    ///
+    /// A public field like every other one here, and changed through
+    /// [`Shade::confirm_pairing`](crate::Shade::confirm_pairing) rather than by
+    /// assignment on a live shade: like `address`, it is a field
+    /// [`Shade::reconfigure`](crate::Shade::reconfigure) refuses to take from
+    /// an incoming configuration, so a rename cannot confirm a shade and a
+    /// corrected travel time cannot un-confirm one.
+    pub pairing_state: PairingState,
 }
 
 impl ShadeConfig {
@@ -302,6 +380,16 @@ impl ShadeConfig {
             // the backup recorded.
             frame_width: FrameWidth::Bits56,
             protocol: RadioProtocol::Rts,
+            // **Nobody has said this shade works, because it does not exist
+            // yet.** Every other default here is a value that behaves
+            // reasonably if left alone; this one is the absence of a report,
+            // and it is the only honest starting value — a constructor cannot
+            // know that a motor obeys an address it is being handed for the
+            // first time. The two readers that *do* know better say so
+            // explicitly: the record decoder, for a table written before this
+            // field existed, and the provisioning tool, for an address it did
+            // not allocate.
+            pairing_state: PairingState::AwaitingConfirmation,
         })
     }
 }

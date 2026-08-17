@@ -300,6 +300,41 @@ impl Catalog {
         Ok(())
     }
 
+    /// Record that an operator reported a shade working, and note that the
+    /// table has to be written again.
+    ///
+    /// # Why this is not part of [`Catalog::reconfigure`]
+    ///
+    /// Because it is not a setting. Everything `reconfigure` carries is a value
+    /// somebody typed; this is a value somebody *witnessed*, and the two want
+    /// opposite handling — `Shade::reconfigure` deliberately refuses to take
+    /// the pairing state from an incoming configuration, so a rename cannot
+    /// confirm a shade and a corrected travel time cannot retire the entities
+    /// of one that works.
+    ///
+    /// # The write is scheduled only when something changed
+    ///
+    /// Confirming an already-confirmed shade is a no-op that returns `false`,
+    /// so a client retrying — which is exactly what a flaky link produces —
+    /// costs no flash erase. The *announcement* is the caller's to repeat
+    /// either way: republishing a retained discovery config replaces it in
+    /// place, so it is cheap and it is how a lost acknowledgement recovers.
+    pub fn confirm_pairing(
+        &mut self,
+        registry: &mut Registry,
+        id: ShadeId,
+        now_ms: u64,
+    ) -> Result<bool, CatalogError> {
+        let changed = registry
+            .shade_mut(id)
+            .ok_or(DomainError::NotFound)?
+            .confirm_pairing();
+        if changed {
+            self.touch(now_ms);
+        }
+        Ok(changed)
+    }
+
     /// Replace one shade's configuration, and note that the table has to be
     /// written again.
     ///
@@ -456,7 +491,7 @@ fn link_count(registry: &Registry) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use somfy_domain::{ShadeConfig, MAX_LINKED_REMOTES};
+    use somfy_domain::{PairingState, ShadeConfig, MAX_LINKED_REMOTES};
 
     fn registry_with(names: &[(&str, u32)]) -> (Registry, Catalog) {
         let mut registry = Registry::new();
@@ -802,6 +837,103 @@ mod tests {
         let shade = registry.shade(ShadeId(0)).unwrap();
         assert_eq!(shade.config.address, 0x00_1001);
         assert_eq!(shade.config.up_time_ms, 30_000, "the rest still applied");
+    }
+
+    // -- the operator's report ---------------------------------------------
+
+    /// The state reaches the record, and schedules a write — otherwise a shade
+    /// confirmed today would be awaiting again after the next reboot, and its
+    /// entities would vanish.
+    #[test]
+    fn confirming_a_shade_reaches_the_record_and_schedules_a_write() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+        catalog.written();
+
+        let (record, _) = catalog.record(&registry);
+        assert_eq!(
+            record.shades[0].config.pairing_state,
+            PairingState::AwaitingConfirmation,
+            "a shade nobody has reported working starts unconfirmed",
+        );
+
+        assert_eq!(
+            catalog.confirm_pairing(&mut registry, ShadeId(0), 5_000),
+            Ok(true),
+        );
+        assert_eq!(catalog.due_at(), Some(5_000 + DEBOUNCE_MS));
+        let (record, _) = catalog.record(&registry);
+        assert_eq!(
+            record.shades[0].config.pairing_state,
+            PairingState::ConfirmedByOperator,
+        );
+    }
+
+    /// A repeat is a no-op, and — the part that matters — it does not schedule
+    /// a flash erase. A client retrying a confirmation over a flaky link is the
+    /// ordinary case, not an adversarial one.
+    #[test]
+    fn confirming_twice_writes_once() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+        catalog
+            .confirm_pairing(&mut registry, ShadeId(0), 1_000)
+            .unwrap();
+        catalog.written();
+
+        assert_eq!(
+            catalog.confirm_pairing(&mut registry, ShadeId(0), 2_000),
+            Ok(false),
+        );
+        assert!(!catalog.is_dirty(), "a repeat must not schedule a write");
+    }
+
+    /// An edit is not a report. A rename must not confirm a shade nobody has
+    /// watched move — which is the whole failure this change exists to end,
+    /// arriving through the one door that would otherwise be left open.
+    #[test]
+    fn reconfiguring_cannot_confirm_or_unconfirm_a_shade() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+
+        // A patch that claims confirmation leaves the shade unconfirmed.
+        let mut claiming = registry.shade(ShadeId(0)).unwrap().config.clone();
+        claiming.name = heapless::String::try_from("Cuisine").unwrap();
+        claiming.pairing_state = PairingState::ConfirmedByOperator;
+        catalog
+            .reconfigure(&mut registry, ShadeId(0), claiming, 0)
+            .unwrap();
+        assert_eq!(
+            registry.shade(ShadeId(0)).unwrap().config.pairing_state,
+            PairingState::AwaitingConfirmation,
+        );
+
+        // And the other direction: once confirmed, an edit cannot take it back.
+        catalog
+            .confirm_pairing(&mut registry, ShadeId(0), 1)
+            .unwrap();
+        let mut denying = registry.shade(ShadeId(0)).unwrap().config.clone();
+        denying.pairing_state = PairingState::AwaitingConfirmation;
+        denying.up_time_ms = 30_000;
+        catalog
+            .reconfigure(&mut registry, ShadeId(0), denying, 2)
+            .unwrap();
+        let shade = registry.shade(ShadeId(0)).unwrap();
+        assert_eq!(
+            shade.config.pairing_state,
+            PairingState::ConfirmedByOperator,
+        );
+        assert_eq!(shade.config.up_time_ms, 30_000, "the rest still applied");
+    }
+
+    /// A shade that is not there is the domain's refusal, and nothing is
+    /// scheduled for writing over it.
+    #[test]
+    fn confirming_a_missing_shade_is_refused_and_writes_nothing() {
+        let (mut registry, mut catalog) = registry_with(&[("Kitchen", 0x00_1001)]);
+        catalog.written();
+        assert_eq!(
+            catalog.confirm_pairing(&mut registry, ShadeId(7), 0),
+            Err(CatalogError::Domain(DomainError::NotFound)),
+        );
+        assert!(!catalog.is_dirty());
     }
 
     /// A shade that is not there is the domain's refusal, and nothing is

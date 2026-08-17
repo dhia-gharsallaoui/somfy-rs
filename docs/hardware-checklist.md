@@ -674,9 +674,14 @@ Three things follow:
   and part allocated cannot collide with itself.
 - **A newly allocated address means the motor does not know it yet.** Every
   shade given one has to be paired — [Pairing a shade](#pairing-a-shade) — and
-  until it is, that shade will not move. Leaving the imported address instead
-  keeps the shade working *and* keeps the two-controllers-one-identity problem;
-  there is no third option that does neither.
+  until it is, that shade will not move. The tool records that: a shade with an
+  allocated address is written **awaiting confirmation**, so the device will not
+  announce it to Home Assistant until somebody has driven it and reported that
+  it moved, and it says so per shade as it writes. A shade whose address came
+  from anywhere else is written **confirmed**, because a motor already obeys it.
+  Leaving the imported address instead keeps the shade working *and* keeps the
+  two-controllers-one-identity problem; there is no third option that does
+  neither.
 
 It validates before writing — a sentinel address (0 or 0xFFFFFF), a name over
 32 bytes, a travel time of zero, a repeated address — so a typo is refused here
@@ -787,7 +792,8 @@ walking its rolling code backwards, and every shade on it will stop responding.
 | Quantity | Value |
 |---|---|
 | Partition | `shades`, data/undefined, 0x204000, 8 KB |
-| Record | 2048 bytes: magic `RTSS`, version 1, count, seq, then 56 bytes per shade — address, seed code, kind, tilt mode, up/down/tilt times, name(32) — CRC-32 |
+| Record | 2048 bytes: magic `RTSS`, version **3**, count, seq, announced bitmap, link count, then 56 bytes per shade — address, seed code, kind, tilt mode, up/down/tilt times, frame width, protocol, pairing state, name(32) — then the shared linked-remote pool and a CRC-32 |
+| Older versions | 1 and 2 are still read. Their shades decode as **confirmed**, so a board upgrading keeps the entities it already has; see `docs/provenance.md` |
 | Slots | 4, in 2 erase sectors of 2 |
 | Capacity | 32 shades, which is the registry's own limit |
 | Written by | the host tool only — the firmware has no write path for this region |
@@ -812,21 +818,38 @@ command at all, so the dangerous case is not reachable from the button. What
 while a motor was in programming mode. The motor a `Prog` frame reaches is
 whichever one is listening, not whichever one the entity is named after.
 
+### A shade is not in Home Assistant until this procedure finishes
+
+**Adding a shade and pairing it are one flow, and the entities are the last
+step.** A shade that has been created has a radio address this controller
+invented, which no motor has ever heard — so an entity for it would accept Open
+and Close, transmit a perfectly formed frame, and move nothing. The device
+therefore announces nothing until an operator has commanded the shade, watched
+it move, and said so. Until then the shade appears in the web UI under **Finish
+setting up** and nowhere else.
+
+Which changes where this procedure is driven from: the web UI's setup flow,
+which walks the steps below and ends by asking whether the shade moved. The
+`<name> pairing` button in Home Assistant still exists for a shade that is
+already set up and needs pairing again — a motor that has been reset, say — but
+a *new* shade has no Home Assistant entities to press.
+
 ### Before you start
 
 - [ ] The shade has an address this controller allocated — see
       [The address decides whose remote this controller is](#the-address-decides-whose-remote-this-controller-is).
       Pairing a motor to an address another controller also transmits at fixes
       nothing; it re-creates the problem with an extra step.
-- [ ] The board is on the broker and the shade's entities are in Home
-      Assistant: a cover, and a `<name> pairing` button filed under the device's
-      configuration entities rather than on the room card.
+- [ ] The board is on the network and the web UI is reachable. For a shade that
+      was already set up and is being paired again, its `<name> pairing` button
+      is under the device's configuration entities in Home Assistant rather than
+      on the room card.
 - [ ] You have a working remote for this shade — a physical wall remote, or
       another controller that still drives it. **Something has to put the motor
       into programming mode, and this controller cannot: a motor that has never
       heard of it ignores everything it sends, including a `Prog`.**
-- [ ] You can see the shade from where you will press the button. The only
-      confirmation this procedure has is the motor jogging; RTS is one-way and
+- [ ] You can see the shade from where you will press the button. Every
+      confirmation this procedure has is something *you* see; RTS is one-way and
       the controller never learns whether the motor accepted anything.
 - [ ] **Ideally the shade is stationary.** A mid-range seek ends with the
       controller transmitting a `My` when its estimate says the target is
@@ -845,16 +868,23 @@ whichever one is listening, not whichever one the entity is named after.
    now in programming mode, for roughly two minutes.
    - A multi-channel remote must be on this shade's channel first.
    - On most remotes PROG is a recessed button on the back, needing a pen.
-2. **Within that window**, press the shade's `… pairing` button in Home
-   Assistant.
-3. **The motor jogs again.** That is the acknowledgement, and it is the whole
-   of it — nothing appears in Home Assistant, because there is nothing for the
-   controller to report.
-4. Programming mode ends on its own. Wait it out, or press PROG on the existing
+2. **Within that window**, send the pairing signal: the web UI's setup flow has
+   a button for it, and a shade that is already set up has a `… pairing` button
+   in Home Assistant.
+3. **The motor jogs again.** That is a good sign and it is easy to miss.
+   Nothing appears in Home Assistant, because there is nothing for the
+   controller to report — RTS is one-way.
+4. **Test it, and this is what decides.** Open and close the shade and watch it.
+   A jog proves that a frame arrived; it does not prove the shade can be driven,
+   and the two come apart in a way that matters — a rolling code at or below
+   what the motor has already accepted produces a shade that paired perfectly
+   and ignores every command afterwards. The setup flow does this step for you
+   and then asks whether the shade moved; **answering yes is what publishes the
+   Home Assistant entities.**
+5. Programming mode ends on its own. Wait it out, or press PROG on the existing
    remote again.
-5. **Test it**: open and close the shade from Home Assistant's cover entity.
 
-### If it does not jog
+### If it does not move
 
 In this order, because the cheap checks come first:
 
@@ -900,6 +930,31 @@ again: pairing teaches the motor whatever the transmitter is sending.
 - **It does not unpair.** There is no command for it here. Removing a remote
   from a motor is a hold on that motor's own PROG button, done at the shade, and
   the reason it is absent is that the cost of getting it wrong is paid there too.
+- **Abandoning a setup does not undo a pairing either, and does not need to.**
+  Discarding a half-finished shade removes it from the controller and publishes
+  nothing, because it never had entities. What it deliberately does *not* remove
+  is that address's rolling code — a counter that goes backwards is what makes a
+  motor stop obeying — so if the same slot is used again it gets the same
+  address and carries on from where it was, which is the outcome that keeps
+  working if the motor did learn it.
+
+### What only a flash can confirm
+
+Everything above is host-verified as far as a host can go. Three things are not,
+and each needs the board:
+
+- **That a confirmed shade's entities actually appear**, and that an unconfirmed
+  one's do not. The boot line to watch is per shade: an unannounced shade prints
+  `shades: ShadeId(n) is not announced — nobody has reported it working yet`.
+- **That the version-3 record is written and read back.** The check is the same
+  one [Shade provisioning](#shade-provisioning) already gives: reset twice and
+  confirm the second boot says `keeps its stored rolling code`, and that a shade
+  confirmed before the reset is still announced after it.
+- **That the three shades already on the board survive the upgrade.** They are
+  carrying a version 2 record, which this build reads as confirmed;
+  `crates/somfy-config/tests/shade_v2.rs` asserts that against a byte-for-byte
+  capture of what the previous build wrote, but only a boot proves it against
+  the bytes actually in that flash.
 
 ---
 

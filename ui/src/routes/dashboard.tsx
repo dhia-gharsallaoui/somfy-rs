@@ -7,6 +7,19 @@
  * gets its own section above them. Shades in no room are collected at the end
  * rather than dropped, because a shade you cannot see is a shade you cannot
  * fix.
+ *
+ * ## Unfinished setups are separated out, not mixed in
+ *
+ * A shade whose `pairingState` is `awaitingConfirmation` has an address no
+ * motor has heard, so its controls would transmit and move nothing. Giving it a
+ * tile among the working ones would be the same lie the Home Assistant entity
+ * used to tell, on a different screen — so it goes into its own section at the
+ * top, with the one control that is useful: a way back into the setup that
+ * finishes it.
+ *
+ * That section is also the reason abandoning a setup is safe to do by closing
+ * the tab. Nothing is lost and nothing is hidden: the half-finished shade is
+ * the first thing on the dashboard until it is either finished or discarded.
  */
 import type { Snapshot } from '../api/client';
 import type { GroupDto } from '../api/generated/GroupDto';
@@ -57,6 +70,23 @@ export function Dashboard({ device }: { device: DeviceState }) {
         </a>
       </div>
 
+      {layout.unfinished.length > 0 && (
+        <section class="section section--unfinished">
+          <h2 class="section__title">{t('dashboard.unfinished')}</h2>
+          <p class="prose">{t('dashboard.unfinishedWhy')}</p>
+          <ul class="unfinished">
+            {layout.unfinished.map((shade) => (
+              <li key={shade.id} class="unfinished__row">
+                <span class="unfinished__name">{shade.name}</span>
+                <a class="btn btn--primary" href={`/shades/${shade.id}/pair`}>
+                  {t('dashboard.unfinishedResume')}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {layout.crossRoomGroups.length > 0 && (
         <section class="section">
           <div class="section__groups">
@@ -95,12 +125,23 @@ interface RoomSection {
 }
 
 interface Layout {
+  /** Shades nobody has reported working. Shown first, with no controls. */
+  unfinished: ShadeDto[];
   crossRoomGroups: GroupDto[];
   rooms: RoomSection[];
 }
 
 function buildLayout(snapshot: Snapshot, unassignedLabel: string): Layout {
-  const shadesById = new Map(snapshot.shades.map((shade) => [shade.id, shade]));
+  // Split first, and everything below works from the working half only. A
+  // half-finished shade must not get a tile, must not be counted in a room, and
+  // must not be driven by a group command that would transmit at an address no
+  // motor knows.
+  const unfinished = snapshot.shades.filter(
+    (shade) => shade.pairingState === 'awaitingConfirmation',
+  );
+  const live = snapshot.shades.filter((shade) => shade.pairingState !== 'awaitingConfirmation');
+
+  const shadesById = new Map(live.map((shade) => [shade.id, shade]));
   const roomOfShade = new Map<number, RoomDto>();
   for (const room of snapshot.rooms) {
     for (const shadeId of room.shadeIds) roomOfShade.set(shadeId, room);
@@ -126,10 +167,10 @@ function buildLayout(snapshot: Snapshot, unassignedLabel: string): Layout {
       .filter((shade): shade is ShadeDto => shade !== undefined),
   }));
 
-  const orphans = snapshot.shades.filter((shade) => !roomOfShade.has(shade.id));
+  const orphans = live.filter((shade) => !roomOfShade.has(shade.id));
   if (orphans.length > 0) {
     rooms.push({ name: unassignedLabel, groups: [], shades: orphans });
   }
 
-  return { crossRoomGroups, rooms };
+  return { unfinished, crossRoomGroups, rooms };
 }

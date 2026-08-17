@@ -471,6 +471,15 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         config.down_time_ms = migrated.down_time_ms;
         config.tilt_time_ms = migrated.tilt_time_ms;
 
+        // An imported shade keeps the address the old controller was
+        // transmitting at, so a motor already obeys it and the setup was
+        // finished — on that controller, some time ago, by whoever installed
+        // it. `crate::provisioned_pairing_state` carries the argument, and it
+        // reads the address rather than the source, so a table that is part
+        // import and part fresh allocation gets the right answer per shade
+        // without this module having to know which is which.
+        config.pairing_state = crate::provisioned_pairing_state(config.address);
+
         // The same constructor the device decodes through, so a shade this
         // accepts is a shade the device accepts — and the rolling code goes
         // across untouched, which is the whole point of reading a file instead

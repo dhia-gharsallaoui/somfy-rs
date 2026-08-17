@@ -110,7 +110,8 @@ prose name is what a reader actually searches for.
 | `PAIR_REPEATS` = 2 repeat frames after the first, and the fact that a **long** `Prog` burst removes a remote from a motor rather than adding one — the reference sends `Prog` with 7 repeats on 56-bit frames to remove a remote | `somfy-domain/src/pairing.rs::PAIR_REPEATS` | the reference firmware's remote-removal routine, for the 7-repeat figure and therefore for the fact that burst length carries meaning. **The value 2 is not the reference's pairing figure** — it is this project's own default burst (`somfy_tasks::DEFAULT_REPEATS`), chosen because a pairing press is an ordinary short press | **Confirm the reference's own pairing repeat count before the first live pairing.** A count at or near 7 would unpair a working shade, which is why the domain pins it with `Repeats::Exactly` rather than letting a configured profile supply it — `somfy-tasks/tests/state.rs::a_pairing_burst_ignores_a_generous_profile` |
 | Linked-remote bound of **7 per shade** | `somfy-domain/src/shade.rs::MAX_LINKED_REMOTES` | the reference firmware's fixed-size linked-remotes array, whose bound is 7 | Adopted unchanged. What the record can hold is a *shared* pool of 58 across the whole table rather than 7 x 32, because 7 x 32 does not fit a 2048-byte slot — see the `somfy-config` section |
 | `FrameWidth` discriminants (56, 80) and `RadioProtocol` discriminants (`Rts`=0x00, `Rtw`=0x01, `Rtv`=0x02, `GpRelay`=0x08, `GpRemote`=0x09) | `somfy-domain/src/types.rs::FrameWidth`, `RadioProtocol` | the bit-length and radio-protocol byte values deployed device backups store, and the reference's `radio_proto` enumeration | Verified against the backup parser, which reads both fields and whose field map is pinned by `somfy-migrate`'s tests. **Carried, not honoured on the wire**: the transmit width is still per-controller (`somfy_tasks::TxProfile`) and only `Rts` is implemented, so the firmware reports a shade it cannot drive rather than driving it |
-| DIVERGENCE: there is no `paired` flag | `somfy-domain`, `somfy-config` (absent by design) | **Deliberately not adopted.** The reference has `SomfyShade::paired`, persisted and exposed on the wire — but it is set from the HTTP request body (`Web.cpp:1719`, `:1760`) and cleared in the constructor, never observed. RTS is one-way, so no controller can learn whether a motor accepted a `Prog`. A stored `paired` is therefore a user's belief recorded as a fact | The honest gate is address origin, which *is* observable: `RemoteIdentity::is_allocated`, verified by `somfy-domain/tests/pairing.rs::every_address_this_allocator_produces_reports_as_allocated` and `no_address_the_other_scheme_can_produce_reports_as_allocated` |
+| DIVERGENCE: there is no `paired` flag | `somfy-domain`, `somfy-config` (absent by design) | **Deliberately not adopted.** The reference has `SomfyShade::paired`, persisted and exposed on the wire — but it is set from the HTTP request body (`Web.cpp:1719`, `:1760`) and cleared in the constructor, never observed. RTS is one-way, so no controller can learn whether a motor accepted a `Prog`. A stored `paired` is therefore a user's belief recorded as a fact | The honest gate is address origin, which *is* observable: `RemoteIdentity::is_allocated`, verified by `somfy-domain/tests/pairing.rs::every_address_this_allocator_produces_reports_as_allocated` and `no_address_the_other_scheme_can_produce_reports_as_allocated`. **Refined, not reversed, by `PairingState` below** — that field records a *person's report*, never the device's knowledge, which is the distinction this row is about |
+| `PairingState::{AwaitingConfirmation, ConfirmedByOperator}`, and that a shade has **no Home Assistant entities** until it is confirmed | `somfy-domain/src/types.rs::PairingState`, `somfy-domain/src/shade.rs::Shade::confirm_pairing`, `crates/firmware/src/tasks.rs::announce_shade`, `crates/firmware/src/inventory.rs::Inventory::snapshot` | **Not derived — and the reference is the trap here rather than the model.** See [Why there is a pairing state after all](#why-there-is-a-pairing-state-after-all) below | Host-verified: `somfy-domain/tests/pairing.rs` (`a_freshly_allocated_shade_is_awaiting_confirmation`, `transmitting_a_pairing_burst_confirms_nothing`, `confirming_plans_no_frame_and_moves_no_position`, `reconfiguring_carries_neither_direction_of_the_report`), `somfy-config/src/catalog.rs` tests, `somfy-config/tests/shade_v2.rs`. **What only a flash can confirm** is listed in `docs/hardware-checklist.md` → Pairing a shade |
 | An allocated address never moves: the allocation and the placement are both inside the branch where the registry slot was empty | `somfy-domain/src/pairing.rs::allocate_if_absent` | **Not derived — the same shape as `somfy_store::seed_if_absent`, for the same class of loss.** A motor obeys the address it was paired at and nothing in a one-way protocol can tell it otherwise, so a reallocation is a shade that stops responding and a walk to the motor to fix. The reference's `getNextRemoteAddress` is called afresh whenever a shade is created and has no such structure; the architecture (base + shadeId, probe upward on a clash) is its | Verified by `somfy-domain/tests/pairing.rs::an_allocated_address_is_never_reallocated`, `a_second_shade_gets_its_own_address_and_leaves_the_first_alone`, `a_refused_name_allocates_nothing` |
 | The allocator's `taken` predicate covers **linked remotes** as well as shades | `somfy-domain/src/pairing.rs::allocate_if_absent` | the reference's `getNextRemoteAddress`, which checks shades *and* groups — the same principle, applied to the other thing that transmits at an address this controller must not claim | Verified by `somfy-domain/tests/pairing.rs::an_allocation_steps_over_a_linked_remotes_address`. A wall remote is a physical object that cannot be renumbered; the allocation can |
 | Per-shade address allocation from a controller-wide base, `base + shadeId`, with an upward probe past any address the table already holds | `somfy-domain/src/pairing.rs::RemoteIdentity::address_for` | the reference firmware's next-remote-address allocator, including its increment-on-collision loop | Verified by `somfy-domain/tests/pairing.rs` (`distinct_shades_of_one_board_get_distinct_addresses`, `an_address_already_in_the_table_is_stepped_over`, `a_run_of_taken_addresses_is_walked_past`) |
@@ -157,6 +158,65 @@ a `u8` shade id, so nothing that scheme can produce reaches `0x80_0000`.
 `somfy-domain/tests/pairing.rs::no_allocated_address_is_reachable_by_the_oui_derivation`
 checks that for every shade id and a spread of MACs rather than for the one board
 that prompted it.
+
+### Why there is a pairing state after all
+
+An earlier ruling in this project refused a `paired: bool` outright, on the
+grounds that RTS is one-way and the device cannot observe pairing. **That
+reasoning stands and nothing here weakens it.** What it does not establish is
+that there is no state at all, and this section is the distinction.
+
+The reference implementation has `SomfyShade::paired`. It is persisted, exposed
+on the wire, and **set from an HTTP request body** — `Somfy.h:305` declares it,
+`Web.cpp:1719` assigns it from `obj["paired"]` — and nothing ever observes it.
+That is a user's belief rendered as a device fact, and it is the trap rather
+than the model.
+
+The field here is a different claim, and the names carry the difference:
+
+- It is never set by the device from its own transmission. `Shade::handle`'s
+  `Pair` arm plans a `Prog` frame and leaves the state alone, which
+  `transmitting_a_pairing_burst_confirms_nothing` asserts directly.
+- It is set by exactly one route,
+  `POST /api/v1/shades/{id}/confirm-pairing`, which the UI reaches only after
+  the operator has commanded the shade and answered "yes, it moved".
+- It is spelled `ConfirmedByOperator`, not `Paired`, so a reader of the field
+  cannot mistake whose knowledge it is.
+  `somfy-api/tests/ts_export.rs::pairing_state_says_whose_knowledge_it_is`
+  refuses the words `paired` and `boolean` in the generated wire type.
+
+**What it buys is the thing the boolean could not.** The failure being closed is
+not "the flag was wrong"; it is that a shade could be created, announced to Home
+Assistant, and left unpaired — a cover entity that accepts Open and Close,
+transmits a perfectly formed frame, and is ignored by every motor in the house.
+That is the same shape as the discovery defect
+`docs/specs/2026-08-15-mqtt-ha-discovery-requirements.md` was written after.
+Gating the announcement on a human's report is what makes the half-finished
+state unobservable from Home Assistant rather than indistinguishable from a
+finished one.
+
+**Why the report is a functional test and not the jog.** The pairing procedure's
+only acknowledgement has always been the motor jogging, and the jog is kept — the
+send step says to watch for it. It is not what commits, for two reasons. A jog
+is a small movement that is easy to miss, so missing it is indistinguishable
+from it not happening. More importantly a jog proves only that *a frame
+arrived*: it does not prove the shade can be driven, which is a different
+question with its own failure modes — a rolling code at or below what the motor
+has already accepted being the sharpest, since it produces a shade that paired
+perfectly and then ignores everything. Pressing Open and watching the shade open
+tests the whole path, and it is the path the user will actually use.
+`docs/hardware-checklist.md`'s own sequence already ended there; this moves it
+inside the flow instead of leaving it as advice after the end.
+
+**The migration is the same error-direction argument as the announced bitmap.**
+A shade record written before this field existed (versions 1 and 2) has a zero
+in the byte the field now occupies, and zero is `AwaitingConfirmation` — which
+would un-announce every shade on a board that is working today. So the *version*
+decides, not the byte, and an older record's shades decode as
+`ConfirmedByOperator`. `somfy-config/tests/shade_v2.rs` asserts that against a
+byte-for-byte capture of what the previous build's encoder emitted, including
+the assertion that the capture really does carry a zero there — otherwise the
+test would prove nothing.
 
 ## somfy-migrate
 
@@ -409,6 +469,7 @@ fails in the same ways.
 | Broker address stored as an **`Ipv4Addr`**, never a host name | `somfy-config/src/mqtt.rs::MqttSettings` | Not derived. A consequence of this firmware's own build: `embassy-net` is compiled without its `dns` feature, so a host name is a value the record could hold and the network layer could do nothing with. Storing an address makes an unresolvable broker unrepresentable rather than merely unlikely | Host-tested by `somfy-config/tests/mqtt.rs::an_address_no_tcp_connection_could_reach_is_refused`, which walks unspecified, loopback, broadcast and multicast. **The DNS-feature claim is a fact about `crates/firmware/Cargo.toml`, not a measurement** — enabling `dns` and budgeting a resolver socket out of `SOCKETS` would remove the constraint |
 | The two stored namespaces are validated by **`somfy-mqtt`'s own** validators, including the cross-field overlap rule | `somfy-config/src/mqtt.rs::MqttSettings::new` | Not derived. R3 requires rejection at the point of entry; restating the rules in a second crate is how the two would drift, and a namespace the record accepts and the topic builder refuses is a device that boots without MQTT and says so three flashes after the value was typed | Host-tested by `the_two_roots_are_validated_by_the_topic_rules_that_will_use_them` and `two_roots_naming_the_same_namespace_are_refused`, the latter including the `home` / `homeassistant` boundary that is *not* an overlap |
 | The passphrase and the broker password are stored **in the clear** | `somfy-config/src/record.rs`, `crates/firmware/src/config.rs` | Not a decision with a source; a limitation stated rather than mitigated. Flash encryption is not enabled on this device, so `espflash read-flash` recovers the passphrase. An obfuscation layer would need its key in the same flash and would change only how safe the reader felt | Not applicable. `WifiCredentials`' hand-written `Debug` redacts the passphrase so it cannot reach a serial console through the ordinary `{:?}` error path — pinned by `debug_redacts_the_passphrase_and_keeps_the_ssid` — which is a much smaller and different claim than protection at rest |
+| Shade record **version 3**: the entry's last padding byte (offset 23) carries `somfy_domain::PairingState`, and **versions 1 and 2 decode as `ConfirmedByOperator`** | `somfy-config/src/shade.rs` (`VERSION_PAIRING`, `ENTRY_PAIRING`, `Layout::per_shade_pairing`, `decode_entry`) | Not derived. The offset is forced — 24..56 is the name field and 20..23 were spent on kind, tilt, width and protocol, so byte 23 is the only spare byte in an entry and nothing moves. The **migration** is the same error-direction argument the announced-shade bitmap already used one field along: the byte is zero in every v1 and v2 record ever written, zero is `AwaitingConfirmation`, and reading it that way would silently un-announce every shade on a board that works today. See [Why there is a pairing state after all](#why-there-is-a-pairing-state-after-all) | `somfy-config/tests/shade_v2.rs` decodes a **byte-for-byte capture of what the previous build's encoder emitted** — taken by running that build, not reconstructed by this one — and asserts both halves: that the capture really carries a zero at each entry's offset 23, and that all three shades still decode as confirmed. `shade_v1.rs` asserts the same for the older layout, and both check that a re-encode writes version 3 and round-trips. A byte outside the two states is `ShadeRecordError::Pairing`, refused rather than defaulted, because here *both* defaults are wrong — `an_unmodelled_pairing_state_is_rejected` |
 
 ## firmware
 

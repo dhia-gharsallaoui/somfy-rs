@@ -170,6 +170,52 @@ fn address_origin_is_a_string_union_the_ui_can_switch_on() {
     );
 }
 
+/// The state is named for whose knowledge it is, and it reaches the payload.
+///
+/// Two assertions, and the first is the load-bearing one: the wire must not
+/// carry a word that reads as a device measurement. `paired` is what the C++
+/// reference stores — set from an HTTP request body and never observed — and it
+/// is the trap, not the model. RTS is one-way, so the strongest true statement
+/// available is "a person told us", and the identifier has to say so or the next
+/// reader will assume the device knows.
+#[test]
+fn pairing_state_says_whose_knowledge_it_is() {
+    regenerate();
+    let state = read("PairingState.ts");
+
+    assert!(
+        state.contains(r#""awaitingConfirmation""#) && state.contains(r#""confirmedByOperator""#),
+        "PairingState must stay a camelCase string union:\n{state}"
+    );
+
+    // A boolean, or a member named for the motor's state rather than the
+    // operator's report, would be the reference's mistake with our spelling.
+    let union = declaration("PairingState.ts");
+    for forbidden in [r#""paired""#, r#""unpaired""#, "boolean"] {
+        assert!(
+            !union.contains(forbidden),
+            "PairingState must not claim device knowledge with `{forbidden}`:\n{union}"
+        );
+    }
+
+    // Required and non-nullable on the shade: the UI gates the whole
+    // finish-setup flow on it, and a possibly-absent field cannot be a gate.
+    let shade = declaration("ShadeDto.ts");
+    assert!(
+        shade.contains("pairingState: PairingState"),
+        "ShadeDto must carry a required pairingState:\n{shade}"
+    );
+
+    // And it is not editable through the patch surface. A settable field would
+    // be settable in the *other* direction, and "set this back to unconfirmed"
+    // retires the entities of a working shade.
+    let patch = declaration("PatchShadeDto.ts");
+    assert!(
+        !patch.contains("pairingState"),
+        "PatchShadeDto must not accept pairingState:\n{patch}"
+    );
+}
+
 #[test]
 fn create_shade_omits_everything_the_device_owns() {
     regenerate();

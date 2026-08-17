@@ -166,6 +166,11 @@ export class World {
       address,
       kind: body.kind,
       tiltMode: body.tiltMode,
+      // The address was invented a line above, so no motor has heard it and
+      // this shade moves nothing. It exists, it is commandable here — which is
+      // how the setup flow tests it — and it has no Home Assistant entities
+      // until somebody reports it working. `somfy_domain::PairingState`.
+      pairingState: 'awaitingConfirmation',
       // A shade nobody has moved and nobody has overheard is at the position
       // `Shade::new` starts it at. The first Open or Close corrects it against
       // a physical limit.
@@ -245,6 +250,29 @@ export class World {
     if (!shade) return { error: 'notFound' };
     if (originOf(shade.address) !== 'allocated') return { error: 'addressNotAllocated' };
     return 'accepted';
+  }
+
+  /**
+   * `POST /api/v1/shades/{id}/confirm-pairing`.
+   *
+   * The operator's report that they commanded the shade and watched it move.
+   * On a real device this is what publishes the Home Assistant entities; here
+   * there is no broker, so the whole observable effect is the state change —
+   * which is precisely what the UI branches on, so the mock exercises the same
+   * paths the device does.
+   *
+   * **Idempotent, and only in one direction.** Confirming an already-confirmed
+   * shade answers `200` and changes nothing, which is how a client retrying
+   * over a flaky link recovers. There is no way to say "unconfirmed": that
+   * direction retires a working shade's entities, and removing the shade is the
+   * loud way to do it.
+   */
+  confirmPairing(id: number): CreateResult {
+    const current = this.shades.get(id);
+    if (!current) return { error: 'notFound' };
+    const next: StoredShade = { ...current, pairingState: 'confirmedByOperator' };
+    this.shades.set(id, next);
+    return { ok: toDto(next) };
   }
 
   /** Lowest free registry slot, as `Registry::add_shade` picks it. */

@@ -1,23 +1,40 @@
 /**
- * Adding a shade — the first half of the flow that ends at the pairing
- * assistant.
+ * Adding a shade — the form, and then straight into the setup that finishes it.
  *
- * ## The shape of the screen follows what the device actually decides
+ * ## There is no "add it now, pair it later"
  *
- * The form asks for six things and no more, because six is what
- * `CreateShadeDto` carries. The id and the remote address are **not** fields:
- * the device allocates the address out of its own space so that no other
- * controller transmits at it, and a form field would hand that decision to
- * whoever is typing — which is precisely the two-controllers-one-identity
- * failure the allocator exists to end.
+ * There used to be, and it was the bug. A shade could be created, announced to
+ * Home Assistant, and left unpaired: a cover entity that accepts Open and
+ * Close, transmits perfectly, and is ignored by every motor in the house
+ * because none of them has been taught its address. It looked finished and did
+ * nothing, which is the failure mode this project exists to avoid.
  *
- * ## Why there is a confirmation step rather than a redirect
+ * So creating a shade is the first step of one flow rather than a thing you can
+ * do on its own. Submitting this form routes into the pairing assistant, and
+ * the shade acquires no entities until that flow's last step — a functional
+ * test the operator performs and reports.
  *
- * A newly allocated address is one **no motor has ever heard**, so the shade
- * that just appeared on the dashboard will not move. That is surprising enough
- * to be worth a screen of its own rather than a toast: it is the single fact
- * that decides whether the user walks to the window now or wonders later why
- * nothing works.
+ * ## Why it still cannot be one request
+ *
+ * Three constraints, none of them ours to change:
+ *
+ * 1. **The address must exist before the pairing frame.** Pairing teaches a
+ *    motor an address *we* choose, so a record has to be allocated first.
+ * 2. **A human has to act in the middle.** Only a remote the motor already
+ *    obeys can put it into programming mode, and this controller is by
+ *    definition not one of those.
+ * 3. **The device can never confirm success.** RTS is one-way.
+ *
+ * What that forces is three requests. What it does *not* force — and what
+ * changed here — is three separate things a user can leave half-done.
+ *
+ * ## The shape of the form follows what the device actually decides
+ *
+ * Six fields and no more, because six is what `CreateShadeDto` carries. The id
+ * and the remote address are **not** fields: the device allocates the address
+ * out of its own space so that no other controller transmits at it, and a form
+ * field would hand that decision to whoever is typing — which is precisely the
+ * two-controllers-one-identity failure the allocator exists to end.
  *
  * ## Validation is a courtesy, not the authority
  *
@@ -32,8 +49,6 @@ import { useLocation } from 'preact-iso/router';
 
 import { createShade } from '../api/client';
 import { errorMessageKey } from '../api/errors';
-import type { ShadeDto } from '../api/generated/ShadeDto';
-import { formatAddress } from '../components/format';
 import { KIND_OPTIONS, TILT_NONE, TILT_OPTIONS } from '../components/kind';
 import { useT, type Translate } from '../i18n';
 import type { DeviceState } from '../state/device';
@@ -59,26 +74,13 @@ const DEFAULTS = {
 
 export function ShadeNew({ device }: { device: DeviceState }) {
   const t = useT();
-  const [created, setCreated] = useState<ShadeDto | undefined>(undefined);
-
-  return created ? (
-    <Created shade={created} t={t} />
-  ) : (
-    <Form device={device} onCreated={setCreated} t={t} />
-  );
+  return <Form device={device} t={t} />;
 }
 
 // ------------------------------------------------------------------- the form
 
-function Form({
-  device,
-  onCreated,
-  t,
-}: {
-  device: DeviceState;
-  onCreated: (shade: ShadeDto) => void;
-  t: Translate;
-}) {
+function Form({ device, t }: { device: DeviceState; t: Translate }) {
+  const { route } = useLocation();
   const [name, setName] = useState('');
   const [kind, setKind] = useState(KIND_OPTIONS[0]?.value ?? 0);
   const [tiltMode, setTiltMode] = useState(TILT_NONE);
@@ -107,13 +109,17 @@ function Form({
       tiltTimeMs: hasTilt ? Math.round(tiltSeconds * 1000) : 0,
     })
       .then((shade) => {
-        // Reload before showing the confirmation: the dashboard behind this
-        // screen must already know about the shade when the user returns.
+        // Reload so the dashboard behind this flow knows about the shade, then
+        // go straight on. No confirmation screen in between: the record now
+        // exists and nothing about it works yet, which is a state to leave as
+        // fast as possible rather than one to celebrate.
         device.reload();
-        onCreated(shade);
+        route(`/shades/${shade.id}/pair`);
       })
-      .catch((cause: unknown) => setFailure(t(errorMessageKey(cause))))
-      .finally(() => setBusy(false));
+      .catch((cause: unknown) => {
+        setFailure(t(errorMessageKey(cause)));
+        setBusy(false);
+      });
   };
 
   return (
@@ -126,6 +132,7 @@ function Form({
 
       <header class="detail__head">
         <h2>{t('add.title')}</h2>
+        <p class="detail__kind">{t('add.progress')}</p>
       </header>
 
       <p class="prose">{t('add.intro')}</p>
@@ -234,36 +241,5 @@ function Seconds({
       />
       <span class="field__suffix">s</span>
     </label>
-  );
-}
-
-// ------------------------------------------------------------- what happened
-
-function Created({ shade, t }: { shade: ShadeDto; t: Translate }) {
-  const { route } = useLocation();
-  return (
-    <div class="detail">
-      <header class="detail__head">
-        <h2>{t('add.createdTitle', { name: shade.name })}</h2>
-        <p class="mono">{t('add.createdAddress', { address: formatAddress(shade.address) })}</p>
-      </header>
-
-      <section class="panel">
-        <p class="prose">{t('add.createdBody', { name: shade.name })}</p>
-      </section>
-
-      <div class="actions">
-        <button
-          type="button"
-          class="btn btn--primary"
-          onClick={() => route(`/shades/${shade.id}/pair`)}
-        >
-          {t('add.createdPair')}
-        </button>
-        <a class="link" href={`/shades/${shade.id}`}>
-          {t('add.createdLater')}
-        </a>
-      </div>
-    </div>
   );
 }
