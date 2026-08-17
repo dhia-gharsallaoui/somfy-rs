@@ -127,8 +127,13 @@ esp-radio = { version = "0.18", default-features = false, features = [
 ] }
 # The heap, and it exists for `esp-radio` alone. `internal-heap-stats` is what
 # turns "the heap is big enough" from an assertion into a measurement: it keeps
-# a high-water mark, which `heap::report` prints. It costs a few
-# instructions per allocation, and nothing on the radio path allocates.
+# a high-water mark, which `heap::report` prints and the broker session
+# publishes. Nothing on the radio path allocates, so it costs that path nothing
+# — but "a few instructions per allocation" undersells it elsewhere: an
+# associated link runs about 30,000 bytes a second through this allocator with
+# no application traffic at all, and every one of those allocations and frees
+# takes a critical section that these counters make slightly longer.
+# `src/heap.rs` carries the measurement and the argument that it is affordable.
 esp-alloc = { version = "0.10", features = ["internal-heap-stats"] }
 # The TCP/IP stack. `dhcpv4` for the address, `proto-ipv4` for the traffic;
 # no IPv6, and no DNS yet — Task 3's broker address is the first thing that
@@ -160,19 +165,23 @@ default = []
 # `chip-s2`, which has no DRAM left for it**, and that is a measurement rather
 # than a preference:
 #
+# Every figure below was re-read off real artefacts on 2026-08-17; the ones
+# this comment used to carry had drifted, and `src/heap.rs` says by how much and
+# carries the commands to re-read them again.
+#
 # - The ESP32-S2's usable `dram_seg` is 184 KB, and `esp-radio`'s statics take
-#   most of it. At the 56 KB heap `src/heap.rs` argues for, Plan 5 Task 2 left
-#   the ESP32-S2 **16,324 bytes** of main stack — everything after the statics.
-# - The broker session's task future is **14,824 bytes** (measured on an
+#   most of it. At the 56 KB heap `src/heap.rs` argues for, that leaves the
+#   ESP32-S2 **14,588 bytes** of main stack — everything after the statics.
+# - The broker session's task future is **14,816 bytes** (measured on an
 #   ESP32-S3 image: `nm --print-size` on `firmware4mqtt7session4POOL`), and
 #   `main::REQUIRED_STACK_BYTES` refuses to boot below 8,192.
 # - With it compiled in, the ESP32-S2 image does not link at all: the statics
-#   overrun the end of `dram_seg` by **5,260 bytes** before any stack is carved
-#   at all, so the shortfall against a bootable image is 5,260 + 8,192 = 13,452.
+#   overrun the end of `dram_seg` by **5,748 bytes** before any stack is carved
+#   at all, so the shortfall against a bootable image is 5,748 + 8,192 = 13,940.
 #
-# Nothing available closes that. Shrinking the heap below the **46,660-byte**
-# high-water mark measured in Task 2 would trade a link error for a
-# heap-exhaustion panic under real traffic, and `src/heap.rs` argues against a
+# Nothing available closes that. Shrinking the heap below the **55,040-byte**
+# peak measured under real MQTT traffic would trade a link error for a
+# heap-exhaustion panic, and `src/heap.rs` argues against a
 # per-chip heap for a separate reason. Reclaiming the ESP32-S2's `dram2_seg`
 # (136 KB, reachable through esp-hal's `.dram2_uninit` section) is the one real
 # option and it is unsafe, unvalidated on hardware, and out of scope here.

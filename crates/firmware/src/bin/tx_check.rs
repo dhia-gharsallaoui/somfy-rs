@@ -26,10 +26,11 @@
 
 #[path = "../chip.rs"]
 mod chip;
-// `esp_rtos::start` allocates its main-task bookkeeping, so even this binary —
-// which has no network and no radio driver beyond the CC1101 — needs a heap
-// present before the scheduler starts. See `heap` for what the heap is for and
-// why the controller's is far larger than this one.
+// `esp_rtos::start` installs allocating routines into the ROM syscall table, so
+// even this binary — which has no network and no radio driver beyond the CC1101
+// — keeps a heap present before the scheduler starts. It is a reserve rather
+// than a measured requirement, and `heap::SCHEDULER_HEAP_BYTES` says so, at
+// length, including why it cannot be measured from *this* binary.
 #[path = "../heap.rs"]
 mod heap;
 // Only the transmit half of `radio`, pulled in directly rather than through
@@ -125,8 +126,9 @@ async fn entry(_spawner: Spawner) {
 async fn bring_up() -> Result<(), BringUpError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // Before `esp_rtos::start`, which is the only thing in this binary that
-    // allocates at all.
+    // Before `esp_rtos::start`, which is the only thing in this binary that can
+    // make anything allocate at all — and, measured on the controller, does not
+    // itself allocate a byte.
     heap::install_scheduler_only();
 
     let timers = TimerGroup::new(peripherals.TIMG0);

@@ -32,6 +32,16 @@
 //!    such lines a second, forever. [`RETRY_LOG_INTERVAL`] is the answer, and
 //!    it is the same discipline `tasks::worth_reporting` already applies to
 //!    the receive-side anomalies.
+//!
+//!    **That argument is careful about the wrong order of magnitude, and it is
+//!    worth saying so here rather than leaving the imbalance to be found.** A
+//!    log line holds a critical section once; the Wi-Fi driver takes one per
+//!    allocation and one per free, and an *associated link with no application
+//!    traffic at all* churns about 30,000 bytes a second through `esp-alloc` —
+//!    measured, 2026-08-17. Nothing on the frame path allocates, which is the
+//!    claim [`crate::heap`] makes and CI checks; something else does, several
+//!    hundred times a second, with interrupts masked. See that module for the
+//!    measurement and for why it has not been observed to matter.
 //! 4. **The radio's timing does not live on the CPU at all.** `esp-radio` runs
 //!    its driver on preemptive `esp-rtos` threads that will interrupt the
 //!    Embassy executor — but a transmission is clocked out of RMT RAM by the
@@ -228,6 +238,40 @@ pub fn start(
             AuthenticationMethod::Wpa2Personal
         });
 
+    // `ControllerConfig::default()`, taken whole and deliberately. Two of the
+    // defaults it carries are worth naming, because both look wrong to a reader
+    // who does not know why they are there.
+    //
+    // **The country code is `CN`, and it stays** (owner's decision, 2026-08-17).
+    // It is inherited from the default rather than chosen by us, and what
+    // reaches the driver is `esp_wifi_set_country` with `schan: 1, nchan: 13,
+    // max_tx_power: 20` and `WIFI_COUNTRY_POLICY_MANUAL` — channels 1 to 13 at
+    // 20 dBm, always, which is exactly the EU allocation this device is deployed
+    // under. Right, then, and right by accident, which is the whole reason this
+    // paragraph exists.
+    //
+    // **The two-letter code does not select that channel range.** Read
+    // `CountryInfo::into_blob` (`esp-radio-0.18.0/src/wifi/mod.rs:2019`): only
+    // `cc` comes from the code, while `schan`, `nchan` and `max_tx_power` are
+    // literals with a `TODO` over them saying they ought to be configurable. So
+    // `.with_country_info(*b"DE")` would change the string in the beacon and
+    // **not** the channels or the power, and `esp-radio` 0.18 offers no way to
+    // change them at all. Anyone "correcting" `CN` to a European code would
+    // therefore be making a cosmetic change while believing they had made a
+    // regulatory one — which is the failure this note is here to prevent, and
+    // the reason the code is left alone rather than quietly improved.
+    //
+    // It follows that this is a **deployment-dependent** default rather than a
+    // universally safe one: under FCC rules channels 12 and 13 are not
+    // permitted, and no setting exposed here would exclude them. A board for
+    // that domain needs a change in `esp-radio`, not a change in this file.
+    //
+    // **Frame aggregation (AMPDU) is left on**, which is the default too. It was
+    // measured as a way to recover heap headroom and it does not: `crate::heap`
+    // carries fourteen boots with it and seventeen without, and the answer is
+    // 316 bytes of steady use against a worst case that does not move outside
+    // the noise. Turning it off needs `esp-radio/unstable`, which is a real cost
+    // for that; the note there has the figures so this is not re-investigated.
     let (mut controller, interfaces) =
         esp_radio::wifi::new(wifi, Default::default()).map_err(NetError::Wifi)?;
     controller
