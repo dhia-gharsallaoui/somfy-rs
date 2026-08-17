@@ -13,6 +13,8 @@
  */
 import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
+import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
+import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
 import { KIND, MAX_SHADES, TILT } from './fixtures.ts';
 
 /** `somfy_api::NAME_MAX_BYTES` — the capacity of `heapless::String<32>`. */
@@ -51,5 +53,32 @@ export function validateCreateShade(
   // correcting a field, and reporting it before a genuine typo would send the
   // user to the wrong remedy.
   if (shadeCount >= MAX_SHADES) return 'registryFull';
+  return undefined;
+}
+
+/**
+ * A port of `PatchShadeDto::apply`.
+ *
+ * Same rules, same order, checked against the **result** rather than the body —
+ * so a patch setting only `upTimeMs` to zero is refused even though it says
+ * nothing about the other direction. The invariant it protects is the one Rust
+ * protects: nothing reachable by creating a shade and then patching it may be
+ * unreachable by creating it directly.
+ */
+export function validatePatchShade(
+  body: PatchShadeDto,
+  current: ShadeDto,
+): ApiErrorCode | undefined {
+  if (body.name !== undefined) {
+    if (body.name.length === 0) return 'nameEmpty';
+    if (nameBytes(body.name) > NAME_MAX_BYTES) return 'nameTooLong';
+  }
+  if (body.kind !== undefined && !KINDS.has(body.kind)) return 'invalidKind';
+  if (body.tiltMode !== undefined && !TILT_MODES.has(body.tiltMode)) return 'invalidTiltMode';
+
+  const upTimeMs = body.upTimeMs ?? current.upTimeMs;
+  const downTimeMs = body.downTimeMs ?? current.downTimeMs;
+  if (upTimeMs === 0 || downTimeMs === 0) return 'travelTimeZero';
+
   return undefined;
 }

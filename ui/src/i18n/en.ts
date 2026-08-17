@@ -69,9 +69,21 @@ export const en = {
   'detail.seconds': '{seconds} s',
   'detail.tilt': 'Tilt',
   'detail.tiltNone': 'This shade has no tilt.',
-  'detail.calibration': 'Travel-time calibration',
-  'detail.calibrationPending':
-    'Guided calibration measures the opening and closing times separately. Not built yet — see the position-accuracy requirements, R2.',
+  'calib.factoryDefault': 'not calibrated',
+  'calib.operatorSupplied': 'entered by hand',
+  'calib.measured': 'measured by the device',
+  'calib.uncalibratedWarning':
+    'One or more of these is still the factory default. Nobody has measured this shade, so a command to a part-open position will be wrong — often badly. Identical values across several shades are evidence that nobody chose them, not that they are correct.',
+  'calib.hint':
+    'Time a full travel with a stopwatch, in each direction separately: closing is usually faster, because gravity helps. Ten seconds apart on a thirty-second shade is a third of the travel.',
+  'calib.save': 'Save travel times',
+  'calib.saving': 'Saving…',
+  'calib.revert': 'Undo changes',
+  'calib.saved': 'Saved.',
+  'calib.failed': 'The device refused these values: {reason}',
+  'calib.autoPending':
+    'Automatic measurement — where the device sweeps the shade and times it — is not built yet. Until it is, hand-measured values are the accurate ones.',
+
   'detail.linkedRemotes': 'Linked remotes',
   'detail.linkedRemotesPending': 'Not built yet.',
   'detail.origin': 'Where this address came from',

@@ -18,9 +18,10 @@ import type { AddressOrigin } from '../api/generated/AddressOrigin';
 import type { ShadeDto } from '../api/generated/ShadeDto';
 import { openPercent } from '../api/position';
 import { DeleteShade } from '../components/delete-shade';
-import { formatAddress, seconds } from '../components/format';
+import { formatAddress } from '../components/format';
 import { kindKey, TILT_NONE } from '../components/kind';
 import { ShadeTile } from '../components/shade-tile';
+import { TravelTimes } from '../components/travel-times';
 import { useT, type Translate } from '../i18n';
 import type { MessageKey } from '../i18n/en';
 import type { DeviceState } from '../state/device';
@@ -93,27 +94,12 @@ export function ShadeDetail({ device, id }: { device: DeviceState; id: number })
         )}
       </section>
 
-      <section class="panel">
-        <h3>{t('detail.travelTimes')}</h3>
-        <dl class="facts">
-          <dt>{t('detail.upTime')}</dt>
-          <dd>{t('detail.seconds', { seconds: seconds(shade.upTimeMs) })}</dd>
-          <dt>{t('detail.downTime')}</dt>
-          <dd>{t('detail.seconds', { seconds: seconds(shade.downTimeMs) })}</dd>
-          {shade.tiltMode !== TILT_NONE && (
-            <>
-              <dt>{t('detail.tiltTime')}</dt>
-              <dd>{t('detail.seconds', { seconds: seconds(shade.tiltTimeMs) })}</dd>
-            </>
-          )}
-        </dl>
-      </section>
-
-      {/* R2 lands here. */}
-      <section class="panel panel--pending">
-        <h3>{t('detail.calibration')}</h3>
-        <p>{t('detail.calibrationPending')}</p>
-      </section>
+      {/*
+        Editable, and marked per value with where that value came from. This
+        was a read-only list until a shade carrying the reference firmware's
+        untouched defaults moved 1% for a 25% command — see `TravelTimes`.
+      */}
+      <TravelTimes shade={shade} onSaved={device.reload} />
 
       <section class="panel">
         <h3>{t('detail.tilt')}</h3>

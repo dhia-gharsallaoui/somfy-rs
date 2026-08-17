@@ -72,9 +72,21 @@ export const fr: Record<MessageKey, string> = {
   'detail.seconds': '{seconds} s',
   'detail.tilt': 'Inclinaison',
   'detail.tiltNone': 'Ce volet n’a pas d’inclinaison.',
-  'detail.calibration': 'Étalonnage des temps de course',
-  'detail.calibrationPending':
-    'L’étalonnage guidé mesure séparément les temps d’ouverture et de fermeture. Pas encore implémenté — voir les exigences de précision de position, R2.',
+  'calib.factoryDefault': 'non étalonné',
+  'calib.operatorSupplied': 'saisi à la main',
+  'calib.measured': 'mesuré par l’appareil',
+  'calib.uncalibratedWarning':
+    'Au moins une de ces valeurs est encore celle d’usine. Personne n’a mesuré ce volet : une commande vers une position intermédiaire sera fausse, souvent très fausse. Des valeurs identiques sur plusieurs volets prouvent que personne ne les a choisies, pas qu’elles sont justes.',
+  'calib.hint':
+    'Chronométrez une course complète, séparément dans chaque sens : la fermeture est généralement plus rapide, car la gravité aide. Dix secondes d’écart sur un volet de trente secondes représentent un tiers de la course.',
+  'calib.save': 'Enregistrer les temps de course',
+  'calib.saving': 'Enregistrement…',
+  'calib.revert': 'Annuler les modifications',
+  'calib.saved': 'Enregistré.',
+  'calib.failed': 'L’appareil a refusé ces valeurs : {reason}',
+  'calib.autoPending':
+    'La mesure automatique — l’appareil fait parcourir le volet et le chronomètre — n’est pas encore implémentée. En attendant, les valeurs mesurées à la main sont les valeurs justes.',
+
   'detail.linkedRemotes': 'Télécommandes associées',
   'detail.linkedRemotesPending': 'Pas encore implémenté.',
   'detail.origin': 'Origine de cette adresse',

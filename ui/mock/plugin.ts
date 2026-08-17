@@ -38,6 +38,7 @@ import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { ApiErrorDto } from '../src/api/generated/ApiErrorDto.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
 import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
+import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
 import { World } from './world.ts';
 
 const API_PREFIX = '/api/v1';
@@ -168,6 +169,19 @@ async function handle(
       : sendJson(response, 404, { error: 'no such shade' });
   }
 
+  if (method === 'PATCH' && collection === 'shades' && segments.length === 2) {
+    const body = parsePatchShade(await readJson(request));
+    if (!body) return sendJson(response, 400, { error: 'malformed body' });
+
+    const patched = world.patchShade(id, body);
+    return 'error' in patched
+      ? sendError(response, patched.error)
+      : // 200 with the whole shade, not 204: the client needs the recomputed
+        // calibration sources back, and a PATCH that answered "no content"
+        // would make the UI guess at them.
+        sendJson(response, 200, patched.ok);
+  }
+
   if (method === 'DELETE' && collection === 'shades' && segments.length === 2) {
     return world.deleteShade(id) ? sendNoContent(response) : sendError(response, 'notFound');
   }
@@ -265,6 +279,39 @@ function parseCreateShade(value: unknown): CreateShadeDto | undefined {
     downTimeMs: body['downTimeMs'] as number,
     tiltTimeMs: body['tiltTimeMs'] as number,
   };
+}
+
+/**
+ * Shape-check a patch body.
+ *
+ * The distinction that matters here is **absent versus present**: an omitted
+ * field means "leave it alone", so the parser must not fill in defaults. A
+ * field that is present but the wrong type is still malformed, exactly as in
+ * the create parser — and unknown keys are ignored rather than refused, which
+ * is what keeps a client sending back a whole `ShadeDto` (address, id and all)
+ * from being rejected outright while still not being able to change them.
+ */
+function parsePatchShade(value: unknown): PatchShadeDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const body = value as Record<string, unknown>;
+  const patch: PatchShadeDto = {};
+
+  if ('name' in body && body['name'] !== undefined) {
+    if (typeof body['name'] !== 'string') return undefined;
+    patch.name = body['name'];
+  }
+
+  const numbers = ['kind', 'tiltMode', 'upTimeMs', 'downTimeMs', 'tiltTimeMs'] as const;
+  for (const field of numbers) {
+    if (!(field in body) || body[field] === undefined) continue;
+    const candidate = body[field];
+    if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 0) {
+      return undefined;
+    }
+    patch[field] = candidate;
+  }
+
+  return patch;
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

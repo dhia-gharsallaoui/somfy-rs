@@ -28,11 +28,13 @@ import type { ApiErrorCode } from '../src/api/generated/ApiErrorCode.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
 import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
 import type { GroupDto } from '../src/api/generated/GroupDto.ts';
+import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
 import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
 import type { WsEvent } from '../src/api/generated/WsEvent.ts';
-import { GROUPS, MAX_SHADES, MOCK_BASE, OUR_SPACE, ROOMS, SHADES } from './fixtures.ts';
-import { validateCreateShade } from './validate.ts';
+import { originOf, toDto, type StoredShade } from './derive.ts';
+import { GROUPS, MAX_SHADES, MOCK_BASE, ROOMS, SHADES } from './fixtures.ts';
+import { validateCreateShade, validatePatchShade } from './validate.ts';
 
 /** `Pos::FULL` — full travel in hundredths of a percent (`somfy-domain`). */
 const FULL_RAW = 10_000;
@@ -55,15 +57,6 @@ interface Motion {
   targetRaw: number;
   direction: number;
 }
-
-/**
- * The port of `AddressOrigin::of`: bit 23 is `RemoteIdentity::SPACE_START`, set
- * on every address this controller's allocator produces and on nothing it
- * imports. Derived rather than stored on both sides — it is a fact about the
- * address, and a stored copy is a copy that can be wrong.
- */
-const originOf = (address: number): ShadeDto['addressOrigin'] =>
-  (address & OUR_SPACE) !== 0 ? 'allocated' : 'imported';
 
 const percentToRaw = (percent: number): number =>
   Math.min(100, Math.max(0, Math.round(percent))) * 100;
@@ -90,7 +83,13 @@ export type CreateResult = { ok: ShadeDto } | { error: ApiErrorCode };
 export type PairResult = 'accepted' | { error: ApiErrorCode };
 
 export class World {
-  private readonly shades = new Map<number, ShadeDto>();
+  /**
+   * Stored fields only. `addressOrigin` and the three calibration sources are
+   * computed by {@link toDto} on the way out, exactly as `ShadeDto::from_shade`
+   * computes them — so nothing in here can hold a stale copy of a fact that is
+   * really a function of another field.
+   */
+  private readonly shades = new Map<number, StoredShade>();
   private readonly motion = new Map<number, Motion>();
   private readonly listeners = new Set<Listener>();
   /**
@@ -126,12 +125,13 @@ export class World {
    */
   listShades(): ShadeDto[] {
     this.tick();
-    return [...this.shades.values()];
+    return [...this.shades.values()].map(toDto);
   }
 
   getShade(id: number): ShadeDto | undefined {
     this.tick();
-    return this.shades.get(id);
+    const shade = this.shades.get(id);
+    return shade && toDto(shade);
   }
 
   listRooms(): RoomDto[] {
@@ -160,14 +160,10 @@ export class World {
     if (id === undefined) return { error: 'registryFull' };
 
     const address = this.allocateAddress(id);
-    const shade: ShadeDto = {
+    const shade: StoredShade = {
       id,
       name: body.name,
       address,
-      // Derived, not asserted. It comes out `allocated` because the address
-      // came from our own space, but running it through the same classifier
-      // the firmware uses is what makes that a consequence rather than a claim.
-      addressOrigin: originOf(address),
       kind: body.kind,
       tiltMode: body.tiltMode,
       // A shade nobody has moved and nobody has overheard is at the position
@@ -185,7 +181,41 @@ export class World {
 
     this.shades.set(id, shade);
     this.motion.set(id, { raw: 0, targetRaw: 0, direction: IDLE });
-    return { ok: shade };
+    return { ok: toDto(shade) };
+  }
+
+  /**
+   * `PATCH /api/v1/shades/{id}` — the port of `PatchShadeDto::apply`.
+   *
+   * Validates against the **result** rather than the body, and writes nothing
+   * unless the whole patch is acceptable: a shade left renamed but still
+   * holding a rejected travel time would be worse than one that changed
+   * nothing at all.
+   *
+   * The travel times take effect immediately, including mid-travel — `tick`
+   * reads them every interval, which is the same thing a real shade does when
+   * its configuration changes under a moving estimate.
+   */
+  patchShade(id: number, body: PatchShadeDto): CreateResult {
+    const current = this.shades.get(id);
+    if (!current) return { error: 'notFound' };
+
+    const dto = toDto(current);
+    const error = validatePatchShade(body, dto);
+    if (error) return { error };
+
+    const next: StoredShade = {
+      ...current,
+      ...(body.name !== undefined && { name: body.name }),
+      ...(body.kind !== undefined && { kind: body.kind }),
+      ...(body.tiltMode !== undefined && { tiltMode: body.tiltMode }),
+      ...(body.upTimeMs !== undefined && { upTimeMs: body.upTimeMs }),
+      ...(body.downTimeMs !== undefined && { downTimeMs: body.downTimeMs }),
+      ...(body.tiltTimeMs !== undefined && { tiltTimeMs: body.tiltTimeMs }),
+    };
+
+    this.shades.set(id, next);
+    return { ok: toDto(next) };
   }
 
   /**
@@ -213,7 +243,7 @@ export class World {
   pairShade(id: number): PairResult {
     const shade = this.shades.get(id);
     if (!shade) return { error: 'notFound' };
-    if (shade.addressOrigin !== 'allocated') return { error: 'addressNotAllocated' };
+    if (originOf(shade.address) !== 'allocated') return { error: 'addressNotAllocated' };
     return 'accepted';
   }
 
@@ -328,7 +358,7 @@ export class World {
   }
 
   /** `Shade::step_target`: `FULL_RAW * STEP_TRAVEL_MS / travel_ms`, clamped. */
-  private step(shade: ShadeDto, motion: Motion, direction: number): void {
+  private step(shade: StoredShade, motion: Motion, direction: number): void {
     const travelMs = direction === UP ? shade.upTimeMs : shade.downTimeMs;
     if (travelMs === 0) return;
     const stepRaw = Math.min(FULL_RAW, Math.floor((FULL_RAW * STEP_TRAVEL_MS) / travelMs));
@@ -382,7 +412,7 @@ export class World {
   }
 
   /** Mirror the motion state onto the DTO and push it to subscribers. */
-  private publish(shade: ShadeDto, motion: Motion): void {
+  private publish(shade: StoredShade, motion: Motion): void {
     shade.position = rawToPercent(motion.raw);
     shade.target = rawToPercent(motion.targetRaw);
     shade.direction = motion.direction;
@@ -390,7 +420,7 @@ export class World {
     for (const listener of this.listeners) listener(event);
   }
 
-  private eventFor(shade: ShadeDto): WsEvent {
+  private eventFor(shade: StoredShade): WsEvent {
     return {
       ev: 'shadeState',
       id: shade.id,

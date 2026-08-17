@@ -15,6 +15,7 @@ import { ApiError } from './errors';
 import type { CommandDto } from './generated/CommandDto';
 import type { CreateShadeDto } from './generated/CreateShadeDto';
 import type { GroupDto } from './generated/GroupDto';
+import type { PatchShadeDto } from './generated/PatchShadeDto';
 import type { RoomDto } from './generated/RoomDto';
 import type { ShadeDto } from './generated/ShadeDto';
 
@@ -32,14 +33,16 @@ async function getJson<T>(path: string): Promise<T> {
   return (await request(path)).json() as Promise<T>;
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
+async function sendJson<T>(method: string, path: string, body: unknown): Promise<T> {
   const response = await request(path, {
-    method: 'POST',
+    method,
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
   return response.json() as Promise<T>;
 }
+
+const postJson = <T>(path: string, body: unknown): Promise<T> => sendJson('POST', path, body);
 
 async function postCommand(path: string, command: CommandDto): Promise<void> {
   await request(path, {
@@ -74,6 +77,22 @@ export const commandGroup = (id: number, command: CommandDto): Promise<void> =>
  */
 export const createShade = (body: CreateShadeDto): Promise<ShadeDto> =>
   postJson('/shades', body);
+
+/**
+ * Edit a shade that already exists. Fields left out are left unchanged.
+ *
+ * This is how a measured travel time gets in without an automatic sweep, which
+ * the position-accuracy requirements make a MUST (R9): a sweep runs the shade
+ * end to end twice per direction, which is not always acceptable, and an
+ * operator who already has a stopwatch reading should not have to wait for one.
+ * Deleting and re-adding is not an alternative — a re-added shade gets a new
+ * address and has to be paired again at the window.
+ *
+ * Answers with the whole shade, because the calibration sources are recomputed
+ * from the values and the caller needs the new ones.
+ */
+export const patchShade = (id: number, body: PatchShadeDto): Promise<ShadeDto> =>
+  sendJson('PATCH', `/shades/${id}`, body);
 
 /**
  * Remove a shade from this controller.

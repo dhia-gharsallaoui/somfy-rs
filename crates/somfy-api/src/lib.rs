@@ -27,8 +27,13 @@
 //! | Route | Body | Success |
 //! |---|---|---|
 //! | `POST /api/v1/shades` | [`CreateShadeDto`] | `201` + [`ShadeDto`] |
+//! | `PATCH /api/v1/shades/{id}` | [`PatchShadeDto`] | `200` + [`ShadeDto`] |
 //! | `DELETE /api/v1/shades/{id}` | — | `204` |
 //! | `POST /api/v1/shades/{id}/pair` | — | `202` |
+//!
+//! `PATCH` exists because travel times were otherwise settable only at
+//! creation, and correcting one meant deleting the shade — which loses its
+//! address and costs a fresh pairing at the window. See [`PatchShadeDto`].
 //!
 //! **Pairing answers `202 Accepted` and can never answer `200 OK`.** RTS is
 //! one-way: the device queues a `Prog` burst and never learns whether the motor
@@ -64,7 +69,10 @@ mod events;
 mod shades;
 
 pub use commands::CommandDto;
-pub use entities::{AddressOrigin, GroupDto, RoomDto, ShadeDto};
+pub use entities::{
+    AddressOrigin, CalibrationSource, GroupDto, RoomDto, ShadeDto, FACTORY_DOWN_TIME_MS,
+    FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS,
+};
 pub use errors::{ApiErrorCode, ApiErrorDto};
 pub use events::{ShadeStateEvent, WsEvent};
-pub use shades::{CreateShadeDto, NAME_MAX_BYTES};
+pub use shades::{CreateShadeDto, PatchShadeDto, NAME_MAX_BYTES};

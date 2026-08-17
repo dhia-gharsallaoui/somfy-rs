@@ -68,8 +68,84 @@ fn regenerate() {
         somfy_api::CommandDto::export_all().expect("export CommandDto");
         somfy_api::WsEvent::export_all().expect("export WsEvent");
         somfy_api::CreateShadeDto::export_all().expect("export CreateShadeDto");
+        somfy_api::PatchShadeDto::export_all().expect("export PatchShadeDto");
         somfy_api::ApiErrorDto::export_all().expect("export ApiErrorDto");
     });
+}
+
+#[test]
+fn calibration_source_keeps_all_three_states() {
+    regenerate();
+    let source = read("CalibrationSource.ts");
+
+    // Three states, not a boolean. "Nobody chose this", "somebody measured it"
+    // and "the device swept it" call for three different actions, and R9 needs
+    // the last two distinguishable so a sweep can be caught disagreeing with a
+    // stopwatch.
+    for state in [
+        r#""factoryDefault""#,
+        r#""operatorSupplied""#,
+        r#""measured""#,
+    ] {
+        assert!(
+            source.contains(state),
+            "CalibrationSource lost {state}:\n{source}"
+        );
+    }
+
+    // Each travel time carries its own provenance: an operator may measure the
+    // lift and leave tilt alone, and one flag per shade would hide that.
+    let shade = declaration("ShadeDto.ts");
+    for field in [
+        "upTimeSource: CalibrationSource",
+        "downTimeSource: CalibrationSource",
+        "tiltTimeSource: CalibrationSource",
+    ] {
+        assert!(shade.contains(field), "ShadeDto lost {field}:\n{shade}");
+    }
+}
+
+#[test]
+fn patch_fields_are_optional_and_exclude_what_the_device_owns() {
+    regenerate();
+    let patch = declaration("PatchShadeDto.ts");
+
+    // Optional, because absent means "leave this alone" — a PATCH whose fields
+    // were required would be a PUT wearing the wrong verb, and would force a
+    // client correcting one travel time to resend the whole shade.
+    for field in [
+        "name?: string",
+        "kind?: number",
+        "upTimeMs?: number",
+        "downTimeMs?: number",
+        "tiltTimeMs?: number",
+    ] {
+        assert!(
+            patch.contains(field),
+            "PatchShadeDto lost {field}:\n{patch}"
+        );
+    }
+
+    // The address stays the device's. Editing it would break a pairing a motor
+    // has already learned, and the id is the Home Assistant entity's identity.
+    // `myPosition` is excluded too: the favourite lives in the motor, so
+    // changing it is a transmission, not a settings edit.
+    for forbidden in ["address", "id?", "myPosition", "position"] {
+        assert!(
+            !patch.contains(forbidden),
+            "PatchShadeDto must not accept `{forbidden}`:\n{patch}"
+        );
+    }
+
+    // R8's dead band is deliberately absent until a hardware test says which of
+    // two mechanisms produces it — they need opposite handling of the same
+    // number. See `PatchShadeDto`'s documentation.
+    for absent in ["deadBand", "deadband"] {
+        assert!(
+            !patch.contains(absent),
+            "a dead-band field was added before the mechanism was established:\n{patch}"
+        );
+    }
 }
 
 #[test]

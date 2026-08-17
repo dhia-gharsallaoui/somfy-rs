@@ -27,7 +27,7 @@
  */
 import type { GroupDto } from '../src/api/generated/GroupDto.ts';
 import type { RoomDto } from '../src/api/generated/RoomDto.ts';
-import type { ShadeDto } from '../src/api/generated/ShadeDto.ts';
+import type { StoredShade } from './derive.ts';
 
 /**
  * `RemoteIdentity::SPACE_START` — bit 23, set on every address this
@@ -45,6 +45,15 @@ export const MOCK_BASE = OUR_SPACE | 0x0a_ce00;
 
 /** `MAX_SHADES` from `somfy-domain`'s registry. */
 export const MAX_SHADES = 32;
+
+/**
+ * The reference firmware's compiled-in travel-time defaults, mirroring
+ * `somfy_api::FACTORY_*_TIME_MS`. A value equal to one of these is reported as
+ * `factoryDefault` — nobody chose it — rather than as a setting (R7).
+ */
+export const FACTORY_UP_TIME_MS = 10_000;
+export const FACTORY_DOWN_TIME_MS = 10_000;
+export const FACTORY_TILT_TIME_MS = 7_000;
 
 /**
  * `ShadeKind` discriminants from `somfy-domain` (`types.rs`): Roller 0x00,
@@ -85,13 +94,26 @@ export const TILT = {
  * of the seed data, which looks like a bug and is not one.
  *
  * Three carry allocated addresses and three imported ones; see the module note.
+ *
+ * Typed {@link StoredShade}, not `ShadeDto`: `addressOrigin` and the three
+ * calibration sources are **derived** (`./derive.ts`), so writing them here
+ * would let a fixture claim an origin its own address contradicts.
+ *
+ * ## Travel times, and why most of these are the factory defaults
+ *
+ * Deliberate, and the point of R7. Three of the six carry 10000/10000/7000 —
+ * the reference firmware's compiled-in values — which is what a real migrated
+ * setup looks like and is exactly the state that produced a 25%-open command
+ * moving a shade about 1% on 2026-08-17. Two carry the numbers hand-measured
+ * that day (**30 s up, 27 s down** — closing is gravity-assisted, so the ~10%
+ * asymmetry is real) with its tilt time left untouched, so one shade shows the
+ * mixed state and proves the flag is per field rather than per shade.
  */
-export const SHADES: ShadeDto[] = [
+export const SHADES: StoredShade[] = [
   {
     id: 0,
     name: 'Living room left',
     address: MOCK_BASE + 0,
-    addressOrigin: 'allocated',
     kind: KIND.roller,
     tiltMode: TILT.none,
     position: 0,
@@ -99,15 +121,14 @@ export const SHADES: ShadeDto[] = [
     tiltPosition: 0,
     myPosition: 35,
     direction: 0,
-    upTimeMs: 12_000,
-    downTimeMs: 9_500,
-    tiltTimeMs: 0,
+    upTimeMs: FACTORY_UP_TIME_MS,
+    downTimeMs: FACTORY_DOWN_TIME_MS,
+    tiltTimeMs: FACTORY_TILT_TIME_MS,
   },
   {
     id: 1,
     name: 'Living room right',
     address: MOCK_BASE + 1,
-    addressOrigin: 'allocated',
     kind: KIND.roller,
     tiltMode: TILT.none,
     position: 100,
@@ -115,15 +136,14 @@ export const SHADES: ShadeDto[] = [
     tiltPosition: 0,
     myPosition: 35,
     direction: 0,
-    upTimeMs: 12_000,
-    downTimeMs: 9_500,
-    tiltTimeMs: 0,
+    upTimeMs: FACTORY_UP_TIME_MS,
+    downTimeMs: FACTORY_DOWN_TIME_MS,
+    tiltTimeMs: FACTORY_TILT_TIME_MS,
   },
   {
     id: 2,
     name: 'Living room terrace',
     address: 0x7a_ce02,
-    addressOrigin: 'imported',
     kind: KIND.awning,
     tiltMode: TILT.none,
     position: 60,
@@ -131,15 +151,14 @@ export const SHADES: ShadeDto[] = [
     tiltPosition: 0,
     myPosition: null,
     direction: 0,
-    upTimeMs: 18_000,
-    downTimeMs: 18_000,
-    tiltTimeMs: 0,
+    upTimeMs: FACTORY_UP_TIME_MS,
+    downTimeMs: FACTORY_DOWN_TIME_MS,
+    tiltTimeMs: FACTORY_TILT_TIME_MS,
   },
   {
     id: 3,
     name: 'Kitchen',
     address: MOCK_BASE + 3,
-    addressOrigin: 'allocated',
     kind: KIND.blind,
     tiltMode: TILT.integrated,
     position: 40,
@@ -155,7 +174,6 @@ export const SHADES: ShadeDto[] = [
     id: 4,
     name: 'Bedroom window',
     address: 0x7a_ce04,
-    addressOrigin: 'imported',
     kind: KIND.shutter,
     tiltMode: TILT.none,
     position: 100,
@@ -163,15 +181,14 @@ export const SHADES: ShadeDto[] = [
     tiltPosition: 0,
     myPosition: null,
     direction: 0,
-    upTimeMs: 10_000,
-    downTimeMs: 10_000,
-    tiltTimeMs: 0,
+    upTimeMs: 30_000,
+    downTimeMs: 27_000,
+    tiltTimeMs: FACTORY_TILT_TIME_MS,
   },
   {
     id: 5,
     name: 'Bedroom door',
     address: 0x7a_ce05,
-    addressOrigin: 'imported',
     kind: KIND.draperyCenter,
     tiltMode: TILT.none,
     position: 0,

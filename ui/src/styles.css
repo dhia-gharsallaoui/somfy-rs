@@ -568,8 +568,32 @@ input:focus-visible {
 }
 
 .field__label {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
   font-size: 0.8rem;
   color: var(--ink-soft);
+}
+
+/*
+ * Provenance, next to the value it describes. An uncalibrated travel time has
+ * to *look* uncalibrated (R7) — a factory default shown in the same weight as a
+ * measured one is exactly how three placeholder numbers were read as settings.
+ */
+.tag {
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+
+.tag--warn {
+  border-color: color-mix(in oklab, var(--danger) 55%, var(--rule));
+  background: color-mix(in oklab, var(--danger) 10%, transparent);
+  color: var(--danger);
 }
 
 .field__input {
