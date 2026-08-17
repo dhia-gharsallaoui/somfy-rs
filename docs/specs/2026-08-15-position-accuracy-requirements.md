@@ -65,6 +65,49 @@ working perfectly, since those end at a physical limit regardless, while
 silently breaking every intermediate position. That is exactly the reported
 signature.
 
+### Field evidence, 2026-08-17: it was cause B, and R7 called it
+
+The owner reported commanding 25% open and getting "no more than 1% maybe", on
+somfy-rs driving three imported shades. The table was read back:
+
+| shade | `up_time_ms` | `down_time_ms` | `tilt_time_ms` |
+|---|---|---|---|
+| all three | 10000 | 10000 | 7000 |
+
+**Identical across three physically different shades, and identical to the
+reference firmware's compiled-in defaults** (`Somfy.cpp:698-700`,
+`Somfy.h:314-316`). Nobody had ever calibrated them; the values came across in
+the backup because they had never been changed, and `somfy-migrate` imported
+them faithfully.
+
+A 25% move therefore ran the motor for 2.5 s. Measured by hand the same day,
+the shades take **~30 s to open and 27 s to close** — so the commanded run was
+about a twelfth of the intended travel before dead time is even considered.
+That is the whole reported error, and it needs no appeal to a lost stop frame.
+
+Three things follow, and they change the weighting above:
+
+1. **Cause B was underweighted.** The document reasoned that a degraded RF path
+   made cause A more likely, from a real antenna fault on the reference device.
+   That reasoning was sound and the conclusion was still wrong here: nobody
+   checked whether the travel times were real numbers. **The cheap check should
+   have come first** — reading three stored integers costs nothing and would
+   have ended the question immediately.
+2. **The 30 s / 27 s asymmetry is real and about 10%.** Closing is
+   gravity-assisted. This is the direct justification for storing the two
+   independently rather than one scalar, and any calibration that measures one
+   direction and mirrors it is wrong by that much.
+3. **R7 should be a MUST, not a SHOULD.** It predicted this precisely —
+   "typically the untouched 10 s/10 s defaults" — and being advisory is why an
+   import that was *known* to carry placeholder values was presented to the user
+   as configured. A requirement that names the failure and then does not oblige
+   anyone to prevent it is not doing the work of a requirement.
+
+**Interim state:** 30000/27000 were written to the board by hand on 2026-08-17,
+so positions are approximately right today. That is a stopgap for one estate and
+not a fix — it is one person with a stopwatch, unrecorded provenance, and it
+does not survive a re-import. R2 remains the deliverable.
+
 ## Requirements
 
 ### R1 — Arrival-stop frames must be transmitted redundantly (MUST)
@@ -124,7 +167,19 @@ state clearly **where somfy-rs now deliberately differs from ESPSomfy-RTS and
 why**. The value of those citations is that they are trustworthy; a silent
 divergence destroys that.
 
-### R7 — Migration should flag factory-default travel times (SHOULD)
+### R7 — Migration MUST flag factory-default travel times (MUST)
+
+*Raised from SHOULD on 2026-08-17, after the failure it predicted happened in
+production. See "Field evidence" above.*
+
+A travel time equal to the reference firmware's compiled-in default
+(10000/10000/7000) MUST be surfaced as **uncalibrated** rather than presented as
+configured — in the import summary, in the API, and wherever the UI shows a
+shade's timings. A value that is merely *plausible* is not evidence anybody
+chose it, and three identical values across three different shades are evidence
+nobody did.
+
+The original wording, kept because the requirement is unchanged in substance:
 
 `somfy-migrate` imports travel times, so a migrated setup inherits whatever the
 C++ device held — typically the untouched 10 s/10 s defaults. Plan 6 SHOULD
