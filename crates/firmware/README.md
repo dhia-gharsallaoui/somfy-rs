@@ -39,21 +39,29 @@ into the root `[workspace] members` list.
 ## Supported chips
 
 Exactly one `chip-*` feature must be selected per build; esp-hal's own
-per-chip features are mutually exclusive, so "supports four chips" means four
+per-chip features are mutually exclusive, so "supports three chips" means three
 separate builds, never one combined binary.
 
 | Feature | Chip | Target triple |
 |---|---|---|
 | `chip-esp32` | ESP32 | `xtensa-esp32-none-elf` |
-| `chip-s2` | ESP32-S2 | `xtensa-esp32s2-none-elf` |
 | `chip-s3` | ESP32-S3 | `xtensa-esp32s3-none-elf` |
 | `chip-c3` | ESP32-C3 | `riscv32imc-unknown-none-elf` |
 
+Two instruction sets on purpose: the ESP32 and ESP32-S3 are Xtensa, the
+ESP32-C3 is RISC-V. The pair has already caught faults an S3-only matrix would
+have shipped — `AtomicU32::fetch_add` does not exist on `riscv32imc`, and the
+ESP32 needs an optimised `esp-storage` even to lint.
+
+The **ESP32-S2 was dropped on 2026-08-17.** It could not hold the Wi-Fi heap
+and a bootable stack at the same time, its pin map was never checked against a
+board, and nobody had ever booted it. `docs/provenance.md` carries the
+arithmetic.
+
 Only the ESP32-S3 pin map in `src/chip.rs` has been checked against a real
 working device (see `docs/provenance.md` for details and the "Hardware-verified
-values" table). The ESP32, ESP32-S2, and ESP32-C3 pin maps are unverified
-defaults — confirm them against real hardware before wiring a board to those
-pins.
+values" table). The ESP32 and ESP32-C3 pin maps are unverified defaults —
+confirm them against real hardware before wiring a board to those pins.
 
 ## Toolchain setup
 
@@ -98,7 +106,6 @@ From `crates/firmware/`, with `~/export-esp.sh` already sourced:
 ```bash
 cargo build --features chip-s3    --target xtensa-esp32s3-none-elf
 cargo build --features chip-esp32 --target xtensa-esp32-none-elf
-cargo build --features chip-s2    --target xtensa-esp32s2-none-elf
 cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
 ```
 

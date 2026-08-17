@@ -94,10 +94,6 @@ pub type Deltas =
 /// trade for a delta, which is a report about a position that a later delta
 /// reports again — and it is one of the four things that keep the broker from
 /// being able to affect radio control.
-#[cfg_attr(
-    not(feature = "mqtt"),
-    allow(dead_code, reason = "the broker session is the only subscriber")
-)]
 pub type DeltaSubscriber =
     Subscriber<'static, Mutex, StateDelta, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, 1>;
 
@@ -106,10 +102,6 @@ pub type DeltaSubscriber =
 /// Handed to the MQTT session, which uses `try_send` and never `send`: a full
 /// queue must drop the newest command rather than park the sender. See
 /// [`crate::mqtt`].
-#[cfg_attr(
-    not(feature = "mqtt"),
-    allow(dead_code, reason = "the broker session is the only producer")
-)]
 pub type CommandSender = Sender<'static, Mutex, ControlCommand, COMMAND_QUEUE_DEPTH>;
 
 /// One in this many repeats of an anomaly is logged, after the first.

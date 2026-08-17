@@ -14,8 +14,10 @@ hardware, intended as:
 1. **A daily-driver replacement** for the author's own installation
    (ESP32-S3-DevKitC-1-N8R8 + CC1101 433 MHz module).
 2. **A community-adoptable project**: supports the ESP32 chip family broadly
-   (ESP32, ESP32-C3, ESP32-S2, ESP32-S3) so existing ESPSomfy-RTS users can
-   migrate.
+   (ESP32, ESP32-C3, ESP32-S3) so existing ESPSomfy-RTS users can migrate.
+   The ESP32-S2 was in this list until 2026-08-17 and was dropped: it has too
+   little DRAM to hold the Wi-Fi driver's heap and a bootable stack at the same
+   time. `docs/provenance.md` carries the arithmetic.
 
 ### 1.2 v1.0 scope (must ship)
 
@@ -133,7 +135,7 @@ somfy-rs/
 ### 3.5 `firmware`
 
 - One binary crate; target chip selected by Cargo feature
-  (`chip-esp32`, `chip-c3`, `chip-s2`, `chip-s3`).
+  (`chip-esp32`, `chip-c3`, `chip-s3`).
 - Drivers: minimal CC1101 SPI driver (own module, `embedded-hal` traits,
   ~15 registers actually used) + RMT OOK TX/RX.
 - Embassy tasks (Section 4).
@@ -317,7 +319,7 @@ bootloader rolls back. A daily driver must not brick from a bad release.
 | RMT RX unsuitable for long Somfy frames | Contingency: GPIO-interrupt RX (Section 5.3); TX unaffected. |
 | Rolling-code corruption bricks pairings | Persist-before-TX invariant + wear-leveled region + golden-capture compatibility tests + backup export in UI. |
 | C++ backup format quirks | Parser written against `ConfigFile.cpp` as source of truth; validated with real device backups. |
-| Xtensa toolchain friction (ESP32/S2/S3) | `espup`-managed toolchain in CI and documented setup; C3 (RISC-V) remains the friction-free dev target. |
+| Xtensa toolchain friction (ESP32/S3) | `espup`-managed toolchain in CI and documented setup; C3 (RISC-V) remains the friction-free dev target. |
 
 ## 13. Success Criteria
 

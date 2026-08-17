@@ -14,15 +14,10 @@
 
 use esp_hal::gpio::AnyPin;
 
-#[cfg(not(any(
-    feature = "chip-esp32",
-    feature = "chip-s2",
-    feature = "chip-s3",
-    feature = "chip-c3"
-)))]
+#[cfg(not(any(feature = "chip-esp32", feature = "chip-s3", feature = "chip-c3")))]
 compile_error!(
     "no chip selected: build with exactly one of \
-     --features chip-esp32 | chip-s2 | chip-s3 | chip-c3"
+     --features chip-esp32 | chip-s3 | chip-c3"
 );
 
 // Two (or more) chip features enabled at once would otherwise expand two
@@ -38,20 +33,17 @@ compile_error!(
 // instead of twenty-four, and they keep working if the upstream checks ever
 // move or are relaxed.
 #[cfg(any(
-    all(feature = "chip-esp32", feature = "chip-s2"),
     all(feature = "chip-esp32", feature = "chip-s3"),
     all(feature = "chip-esp32", feature = "chip-c3"),
-    all(feature = "chip-s2", feature = "chip-s3"),
-    all(feature = "chip-s2", feature = "chip-c3"),
     all(feature = "chip-s3", feature = "chip-c3"),
 ))]
 compile_error!(
     "multiple chip features selected: build with exactly one of \
-     --features chip-esp32 | chip-s2 | chip-s3 | chip-c3"
+     --features chip-esp32 | chip-s3 | chip-c3"
 );
 
-/// RMT source clock. **Must** be 80 MHz on ESP32 and ESP32-S2 (esp-hal
-/// constraint); the others are configured the same for one tick model.
+/// RMT source clock. **Must** be 80 MHz on the ESP32 (esp-hal constraint); the
+/// other two are configured the same for one tick model.
 pub const RMT_CLOCK_MHZ: u32 = 80;
 
 /// Divider giving 1 µs ticks from `RMT_CLOCK_MHZ`.
@@ -96,18 +88,6 @@ pub mod pins {
     pub const GDO0_TX: u8 = 13;
     /// CC1101 GDO2 — RX data out, claimed by the receive path.
     pub const GDO2_RX: u8 = 12;
-}
-
-// UNVERIFIED defaults — see the note above `chip-esp32`'s pin module.
-#[cfg(feature = "chip-s2")]
-pub mod pins {
-    pub const SCK: u8 = 36;
-    pub const MOSI: u8 = 35;
-    pub const MISO: u8 = 37;
-    pub const CSN: u8 = 34;
-    pub const GDO0_TX: u8 = 15;
-    /// CC1101 GDO2 — RX data out, claimed by the receive path.
-    pub const GDO2_RX: u8 = 14;
 }
 
 // UNVERIFIED defaults — see the note above `chip-esp32`'s pin module.
@@ -173,22 +153,6 @@ macro_rules! cc1101_pins {
 }
 
 /// See the `chip-s3` definition above for why this is a macro.
-#[cfg(feature = "chip-s2")]
-#[macro_export]
-macro_rules! cc1101_pins {
-    ($peripherals:ident) => {
-        $crate::chip::Cc1101Pins {
-            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO36),
-            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO35),
-            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO37),
-            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO34),
-            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO15),
-            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO14),
-        }
-    };
-}
-
-/// See the `chip-s3` definition above for why this is a macro.
 #[cfg(feature = "chip-c3")]
 #[macro_export]
 macro_rules! cc1101_pins {
@@ -212,8 +176,8 @@ macro_rules! cc1101_pins {
 /// leaves the rest of the struct usable — but the numbers also differ per chip
 /// in two ways that are easy to get wrong:
 ///
-/// - **Not every channel can receive.** The ESP32 and ESP32-S2 let any channel
-///   do either direction; the ESP32-S3 splits them (0-3 transmit, 4-7 receive)
+/// - **Not every channel can receive.** The ESP32 lets any channel do either
+///   direction; the ESP32-S3 splits them (0-3 transmit, 4-7 receive)
 ///   and the ESP32-C3 splits them differently again (0-1 transmit, 2-3
 ///   receive). Asking channel 1 to receive on an S3 is not a runtime error, it
 ///   is a missing trait implementation.
@@ -237,17 +201,6 @@ macro_rules! rmt_channels {
 /// ESP32: every channel does either direction out of one shared block
 /// pool, so receive starts at 2 — channel 0 already owns block 1.
 #[cfg(feature = "chip-esp32")]
-#[macro_export]
-macro_rules! rmt_channels {
-    ($rmt:ident) => {
-        ($rmt.channel0, $rmt.channel2)
-    };
-}
-
-/// See the `chip-s3` definition above for why this is a macro.
-///
-/// ESP32-S2: four channels, either direction, one shared block pool.
-#[cfg(feature = "chip-s2")]
 #[macro_export]
 macro_rules! rmt_channels {
     ($rmt:ident) => {

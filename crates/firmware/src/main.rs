@@ -58,7 +58,6 @@ mod chip;
 mod config;
 mod heap;
 mod inventory;
-#[cfg(feature = "mqtt")]
 mod mqtt;
 mod net;
 mod radio;
@@ -260,6 +259,7 @@ struct Pending {
 
 #[esp_rtos::main]
 async fn entry(spawner: Spawner) {
+
     let pending = match start(spawner) {
         Ok(pending) => pending,
         Err(error) => {
@@ -779,7 +779,6 @@ fn start_network(spawner: Spawner, pending: Pending) {
 /// explicit that a broker which is down, unreachable, or rejecting credentials
 /// must not affect radio control, and a board with no broker at all is the
 /// ordinary state of one provisioned before a broker existed.
-#[cfg(feature = "mqtt")]
 fn start_mqtt(
     spawner: Spawner,
     stack: embassy_net::Stack<'static>,
@@ -842,28 +841,6 @@ fn start_mqtt(
             error,
         );
     }
-}
-
-/// The same seam on a chip whose DRAM the broker session does not fit in.
-///
-/// See the `mqtt` feature in `Cargo.toml` for the measurement. It is a line at
-/// boot rather than a silent omission, because a device that publishes nothing
-/// and a broker that is unreachable look identical from Home Assistant's side.
-#[cfg(not(feature = "mqtt"))]
-fn start_mqtt(
-    _spawner: Spawner,
-    _stack: embassy_net::Stack<'static>,
-    broker: Option<MqttSettings>,
-    _superseded: Vec<Namespaces, { config::MAX_SUPERSEDED }>,
-    _inventory: Inventory,
-    _survey: store::Survey,
-) {
-    esp_println::println!(
-        "mqtt: not built into this image — this chip has no DRAM left for a \
-         broker session alongside the Wi-Fi driver. See the `mqtt` feature. \
-         Wi-Fi and the radio are unaffected; {} broker is provisioned.",
-        if broker.is_some() { "a" } else { "no" },
-    );
 }
 
 /// Print what the rolling-code region holds before anything writes to it.

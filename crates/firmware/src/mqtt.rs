@@ -104,7 +104,7 @@ use crate::tasks::{CommandSender, DeltaSubscriber};
 /// and inbound is bounded by construction rather than by hope. Everything this
 /// device subscribes to is a cover command: `OPEN`, `CLOSE`, `STOP`, or a
 /// number. 512 bytes is two orders of magnitude beyond that and still small
-/// enough to leave the ESP32-S2 — the tightest chip in the matrix — its stack.
+/// enough to leave the ESP32 — the tightest chip in the matrix — its stack.
 const MQTT_RX_BYTES: usize = 512;
 
 /// Outbound MQTT arena: the largest packet plus whatever QoS 1 state is in
@@ -680,6 +680,20 @@ impl Broker {
                 self.perform_one(&mut connection, &online, commands).await?;
             }
         }
+
+        // **The one place the heap's high-water mark is worth reading**, and
+        // the reason it is here rather than anywhere else: the announcement
+        // above is the burst of retained discovery configs that produces the
+        // peak `crate::heap::RADIO_HEAP_BYTES` is sized against, it is reached
+        // within a second of CONNACK, and it never moves again. Reported at
+        // `heap::install_for_radio`'s two earlier call sites — "controller
+        // started" and "network up" — the figure is the one *before* the load
+        // that sizes the constant, which is how a serial console came to
+        // disagree with the constant it was supposed to justify.
+        //
+        // Nowhere near the frame path, and once per session rather than once
+        // per reconnect loop iteration.
+        crate::heap::report("session announced");
 
         // Created once, outside the loop, so the interval is a schedule rather
         // than a delay restarted by every delta and every inbound command. A
@@ -1406,9 +1420,9 @@ impl Known {
     /// Two per shade — position and direction — and never a rendered [`Topic`]:
     /// a `Topic` is 264 bytes, and a vector of them held across an `await` goes
     /// into the task's statically allocated future rather than onto a stack
-    /// that unwinds. Sixty-four of those is 17 KB of DRAM, which is what took
-    /// the ESP32-S2 below the point where its image links at all. The topic is
-    /// built where it is used instead, one at a time.
+    /// that unwinds. Sixty-four of those is 17 KB of DRAM, taken from the same
+    /// segment as the heap and the main stack and never given back. The topic
+    /// is built where it is used instead, one at a time.
     fn of(&self, id: ShadeId) -> Vec<StateValue, 2> {
         let mut out = Vec::new();
         for slot in self.shades.iter().flatten() {

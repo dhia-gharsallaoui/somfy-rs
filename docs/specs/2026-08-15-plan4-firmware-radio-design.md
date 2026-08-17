@@ -37,7 +37,7 @@ seam Plan 5 plugs into.
 |---|---|---|
 | Hardware available | Spare ESP32-S3-DevKitC-1 + CC1101, **plus** the running C++ v2.5.6 device | Golden captures are obtainable; on-air validation is in scope |
 | Vertical slice | Radio task **wired to `somfy-domain`** | Plan 2 stops being dormant; Plan 5's seam is real code |
-| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues |
+| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues<br>**Superseded 2026-08-17:** the ESP32-S2 was dropped (too little DRAM for the Wi-Fi heap *and* a bootable stack); the matrix is three chips over both instruction sets |
 | Rolling codes | **Minimal persisted counter**, nothing else persisted | Invariant honoured from frame one; survives reflashing |
 | RX strategy | `PulseSource` trait; RMT RX primary, GPIO-interrupt fallback | Spec §5.3's recorded contingency becomes a swap, not a rewrite |
 
@@ -67,7 +67,7 @@ builds, not one:
 | Feature | `esp-hal` feature | Target triple |
 |---|---|---|
 | `chip-esp32` | `esp32` | `xtensa-esp32-none-elf` |
-| `chip-s2` | `esp32s2` | `xtensa-esp32s2-none-elf` |
+| ~~`chip-s2`~~ | ~~`esp32s2`~~ | dropped 2026-08-17 |
 | `chip-s3` | `esp32s3` | `xtensa-esp32s3-none-elf` |
 | `chip-c3` | `esp32c3` | `riscv32imc-unknown-none-elf` |
 

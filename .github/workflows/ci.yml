@@ -53,8 +53,6 @@ jobs:
         include:
           - feature: chip-esp32
             target: xtensa-esp32-none-elf
-          - feature: chip-s2
-            target: xtensa-esp32s2-none-elf
           - feature: chip-s3
             target: xtensa-esp32s3-none-elf
           - feature: chip-c3
@@ -64,7 +62,7 @@ jobs:
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
-          buildtargets: esp32,esp32s2,esp32s3
+          buildtargets: esp32,esp32s3
           ldproxy: false
       # The root `cargo fmt --check` above does NOT cover this crate: it is
       # excluded from the root workspace (it builds only for ESP targets), and

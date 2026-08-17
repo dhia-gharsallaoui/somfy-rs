@@ -173,10 +173,6 @@ const RSSI_POLL_S: u64 = 30;
 static SIGNAL_DBM: Mutex<CriticalSectionRawMutex, Cell<Option<i32>>> = Mutex::new(Cell::new(None));
 
 /// The station's last measured signal strength, for whoever reports it.
-#[cfg_attr(
-    not(feature = "mqtt"),
-    allow(dead_code, reason = "read only by the broker session")
-)]
 pub fn signal_dbm() -> Option<i32> {
     SIGNAL_DBM.lock(Cell::get)
 }

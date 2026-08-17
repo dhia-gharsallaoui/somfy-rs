@@ -160,38 +160,23 @@ embassy-net = { version = "0.9.1", features = [
 [features]
 default = []
 
-# The broker session — the whole of `src/mqtt.rs`, its four packet buffers and
-# the task future that holds them. Every chip feature below enables it **except
-# `chip-s2`, which has no DRAM left for it**, and that is a measurement rather
-# than a preference:
+# Three chips, two architectures, one configuration each. There is no feature
+# here that turns a part of the firmware off: every supported chip builds the
+# same image, and `src/heap.rs` is the only file that knows they differ in size.
 #
-# Every figure below was re-read off real artefacts on 2026-08-17; the ones
-# this comment used to carry had drifted, and `src/heap.rs` says by how much and
-# carries the commands to re-read them again.
+# **There used to be a fourth chip and a `mqtt` feature to go with it.** The
+# ESP32-S2 could not hold the broker session in DRAM, so `mqtt` existed to
+# compile it out for that chip alone — eight `cfg` sites across five files and a
+# stub `start_mqtt` that printed an apology at boot. The ESP32-S2 was dropped on
+# 2026-08-17 (`docs/provenance.md` carries the arithmetic and the reason), and
+# with it the only caller of that seam; nothing else wanted a build without a
+# broker, because a board with no broker *provisioned* is already an ordinary
+# runtime state that `start_mqtt` handles without a feature flag.
 #
-# - The ESP32-S2's usable `dram_seg` is 184 KB, and `esp-radio`'s statics take
-#   most of it. At the 56 KB heap `src/heap.rs` argues for, that leaves the
-#   ESP32-S2 **14,588 bytes** of main stack — everything after the statics.
-# - The broker session's task future is **14,816 bytes** (measured on an
-#   ESP32-S3 image: `nm --print-size` on `firmware4mqtt7session4POOL`), and
-#   `main::REQUIRED_STACK_BYTES` refuses to boot below 8,192.
-# - With it compiled in, the ESP32-S2 image does not link at all: the statics
-#   overrun the end of `dram_seg` by **5,748 bytes** before any stack is carved
-#   at all, so the shortfall against a bootable image is 5,748 + 8,192 = 13,940.
-#
-# Nothing available closes that. Shrinking the heap below the **55,040-byte**
-# peak measured under real MQTT traffic would trade a link error for a
-# heap-exhaustion panic, and `src/heap.rs` argues against a
-# per-chip heap for a separate reason. Reclaiming the ESP32-S2's `dram2_seg`
-# (136 KB, reachable through esp-hal's `.dram2_uninit` section) is the one real
-# option and it is unsafe, unvalidated on hardware, and out of scope here.
-#
-# So the ESP32-S2 keeps Wi-Fi and the radio and loses the broker, and says so at
-# boot. **This is a product decision recorded in code, not a workaround**; see
-# `docs/provenance.md`.
-mqtt = []
+# The three that remain cover both instruction sets deliberately — ESP32 and
+# ESP32-S3 are Xtensa, ESP32-C3 is RISC-V — and that has caught real faults a
+# single-chip matrix would have shipped.
 chip-esp32 = [
-    "mqtt",
     "esp-hal/esp32",
     "esp-println/esp32",
     "esp-bootloader-esp-idf/esp32",
@@ -200,17 +185,7 @@ chip-esp32 = [
     "esp-radio/esp32",
     "esp-alloc/esp32",
 ]
-chip-s2 = [
-    "esp-hal/esp32s2",
-    "esp-println/esp32s2",
-    "esp-bootloader-esp-idf/esp32s2",
-    "esp-storage/esp32s2",
-    "esp-rtos/esp32s2",
-    "esp-radio/esp32s2",
-    "esp-alloc/esp32s2",
-]
 chip-s3 = [
-    "mqtt",
     "esp-hal/esp32s3",
     "esp-println/esp32s3",
     "esp-bootloader-esp-idf/esp32s3",
@@ -220,7 +195,6 @@ chip-s3 = [
     "esp-alloc/esp32s3",
 ]
 chip-c3 = [
-    "mqtt",
     "esp-hal/esp32c3",
     "esp-println/esp32c3",
     "esp-bootloader-esp-idf/esp32c3",

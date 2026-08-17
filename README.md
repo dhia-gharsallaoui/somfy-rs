@@ -153,7 +153,7 @@ policy-free:
 TypeScript generation.
 
 ² `firmware` is excluded from the root workspace: it builds only for ESP
-targets, one chip per build (`chip-esp32`/`chip-s2`/`chip-s3`/`chip-c3`).
+targets, one chip per build (`chip-esp32`/`chip-s3`/`chip-c3`).
 
 The `ui/` app arrives in a later plan.
 

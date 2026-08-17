@@ -82,10 +82,6 @@ impl Inventory {
     }
 
     /// The shades to announce, in registry order.
-    #[cfg_attr(
-        not(feature = "mqtt"),
-        allow(dead_code, reason = "read only by the broker session")
-    )]
     pub fn ids(&self) -> &[ShadeId] {
         &self.ids
     }
@@ -95,10 +91,6 @@ impl Inventory {
     /// This is the only place a user's own spelling survives: `Salon /
     /// Porte-fenêtre` is unusable in a topic and perfectly good here, because
     /// `somfy-mqtt` builds every topic segment from the shade's id instead.
-    #[cfg_attr(
-        not(feature = "mqtt"),
-        allow(dead_code, reason = "read only by the broker session")
-    )]
     pub fn name(&self, id: ShadeId) -> Option<&str> {
         let index = self.ids.iter().position(|held| *held == id)?;
         self.names.get(index).map(String::as_str)
