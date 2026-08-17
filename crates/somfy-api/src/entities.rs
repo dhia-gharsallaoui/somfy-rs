@@ -82,6 +82,77 @@ impl AddressOrigin {
     }
 }
 
+/// Whether an operator has reported that this shade actually works.
+///
+/// # Read the name twice — it is the whole design
+///
+/// This is **not** `paired`, and the difference is not pedantry. RTS is one-way:
+/// the device transmits a `Prog` burst and never hears anything back, so no
+/// controller anywhere can know whether a motor accepted it. A `paired: bool`
+/// would be a user's belief stored as a device fact, and it would keep saying
+/// `true` long after somebody reset the motor — which is why this workspace has
+/// never had one and why [`AddressOrigin`] was the previous answer to the
+/// question.
+///
+/// What *is* knowable is what a person told us. The variant names say so:
+/// [`ConfirmedByOperator`](PairingState::ConfirmedByOperator) attributes the
+/// claim to the human who made it, so a reader of this field cannot mistake it
+/// for something the device measured. `AddressOrigin` is still the other half
+/// and still derived — it says whether pairing *could* accomplish anything;
+/// this says whether anybody has seen that it did.
+///
+/// # What it gates, on the wire
+///
+/// **Announcement to Home Assistant.** A shade in
+/// [`AwaitingConfirmation`](PairingState::AwaitingConfirmation) exists, appears
+/// in `GET /api/v1/shades`, and accepts commands on this API — which is how the
+/// setup flow gets the operator to test it — and has **no MQTT entities at
+/// all**. That is the point: an entity that appears in Home Assistant, accepts
+/// commands and drives nothing is the failure this endpoint set was rebuilt to
+/// prevent.
+///
+/// # How it moves
+///
+/// `POST /api/v1/shades/{id}/confirm-pairing`, and nothing else. It is not a
+/// [`crate::PatchShadeDto`] field, because a PATCH field would be settable both
+/// ways and "set this back to unconfirmed" would retire the entities of a
+/// working shade from a body a client sent by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingState {
+    /// Nobody has reported this shade working. It has entities nowhere and is
+    /// presented as an unfinished setup.
+    AwaitingConfirmation,
+    /// An operator reported that it responded to a command.
+    ConfirmedByOperator,
+}
+
+impl PairingState {
+    /// Carry the domain's state onto the wire.
+    ///
+    /// A separate type rather than a `serde` derive on
+    /// [`somfy_domain::PairingState`], for the reason every DTO here is
+    /// separate: `somfy-domain` depends on neither `serde` nor `ts-rs`, and the
+    /// wire form is this crate's contract to keep stable rather than the
+    /// domain's. The mapping is exhaustive, so a third state added in the domain
+    /// stops this compiling.
+    pub fn of(state: somfy_domain::PairingState) -> PairingState {
+        match state {
+            somfy_domain::PairingState::AwaitingConfirmation => PairingState::AwaitingConfirmation,
+            somfy_domain::PairingState::ConfirmedByOperator => PairingState::ConfirmedByOperator,
+        }
+    }
+}
+
 /// The reference firmware's compiled-in travel-time defaults, which are also
 /// [`somfy_domain::ShadeConfig::new`]'s.
 ///
@@ -227,6 +298,11 @@ pub const SHADE_JSON_MAX_BYTES: usize = 640;
 ///   ever measured that travel time, which decides how much the position
 ///   estimate computed from it is worth. See [`CalibrationSource`].
 ///
+/// One field is **stored and settable through exactly one route**:
+/// `pairingState`, which decides whether the shade has Home Assistant entities
+/// at all. See [`PairingState`], including why it is not a `paired` boolean and
+/// not a [`crate::PatchShadeDto`] field.
+///
 /// There is deliberately **no dead-band field** for the non-linear first
 /// seconds of Up travel off the closed limit. See the note on
 /// [`crate::PatchShadeDto`].
@@ -249,6 +325,7 @@ pub struct ShadeDto {
     pub name: heapless::String<32>,
     pub address: u32,
     pub address_origin: AddressOrigin,
+    pub pairing_state: PairingState,
     pub kind: u8,
     pub tilt_mode: u8,
     pub position: u8,
@@ -274,6 +351,7 @@ impl ShadeDto {
             name: shade.config.name.clone(),
             address: shade.config.address,
             address_origin: AddressOrigin::of(shade.config.address),
+            pairing_state: PairingState::of(shade.config.pairing_state),
             kind: shade.config.kind as u8,
             tilt_mode: shade.config.tilt_mode as u8,
             position: shade.pos().percent(),

@@ -202,6 +202,20 @@ async function handle(
     return void response.end();
   }
 
+  if (method === 'POST' && action === 'confirm-pairing') {
+    if (collection !== 'shades') return sendJson(response, 404, { error: 'no such route' });
+
+    const confirmed = world.confirmPairing(id);
+    // 200 with the whole shade, not 204: `pairingState` has changed and the UI
+    // has to stop presenting the shade as an unfinished setup. Unlike `/pair`
+    // this may honestly say 200 — the device recorded the report and published
+    // the entities before answering, and neither of those is a claim about a
+    // motor.
+    return 'error' in confirmed
+      ? sendError(response, confirmed.error)
+      : sendJson(response, 200, confirmed.ok);
+  }
+
   if (method === 'POST' && action === 'command') {
     const command = parseCommand(await readJson(request));
     if (!command) return sendJson(response, 400, { error: 'malformed command' });

@@ -234,6 +234,32 @@ impl Registry {
             .filter_map(|(i, s)| s.as_ref().map(|s| (ShadeId(i as u8), s)))
     }
 
+    /// The shades an operator has reported working — a subset of
+    /// [`Registry::shades`].
+    ///
+    /// # Why this is a named method and not a filter at each call site
+    ///
+    /// Because the filter is a *claim*, and a reader of the call site cannot
+    /// check it. What it says is: these are the shades a motor has been taught
+    /// to answer, as far as anybody has told us. The complement is shades whose
+    /// address this controller invented and nobody has yet driven, which
+    /// transmit perfectly and move nothing.
+    ///
+    /// **Everything that publishes a shade to the outside world walks this
+    /// rather than [`Registry::shades`]** — the boot-time Home Assistant
+    /// announcement and the runtime one both do — because an entity that
+    /// accepts commands and drives nothing is worse than no entity at all. The
+    /// local API deliberately does *not*: an unconfirmed shade has to be
+    /// commandable, or there would be no way to test it and therefore no way to
+    /// ever confirm it.
+    ///
+    /// See [`PairingState`](crate::PairingState) for why "an operator reported
+    /// it" is the strongest claim a one-way protocol allows.
+    pub fn confirmed_shades(&self) -> impl Iterator<Item = (ShadeId, &Shade)> {
+        self.shades()
+            .filter(|(_, shade)| shade.config.pairing_state.is_confirmed())
+    }
+
     fn named<T>(name: &str, make: impl FnOnce(String<32>) -> T) -> Result<T, DomainError> {
         let mut n: String<32> = String::new();
         n.push_str(name).map_err(|_| DomainError::NameTooLong)?;

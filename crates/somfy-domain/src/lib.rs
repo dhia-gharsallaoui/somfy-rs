@@ -44,6 +44,12 @@
 //! controller sharing another controller's identity is a controller that will
 //! stop working.
 //!
+//! [`PairingState`] is the third piece, and it is deliberately **not** a claim
+//! that pairing succeeded — nothing in a one-way protocol can make that claim.
+//! It records whether a person reported the shade working, which is what
+//! [`Shade::confirm_pairing`] stores and what everything downstream gates an
+//! announcement on.
+//!
 //! ## Ownership boundaries
 //!
 //! This crate owns no clock, no channels, no rolling codes, and no repeat
@@ -77,5 +83,6 @@ pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MA
 pub use shade::{PlannedTx, Repeats, Shade, ShadeCommand, MAX_LINKED_REMOTES};
 pub use tilt::tilt_first;
 pub use types::{
-    Direction, DomainError, FrameWidth, Pos, RadioProtocol, ShadeConfig, ShadeKind, TiltMode,
+    Direction, DomainError, FrameWidth, PairingState, Pos, RadioProtocol, ShadeConfig, ShadeKind,
+    TiltMode,
 };

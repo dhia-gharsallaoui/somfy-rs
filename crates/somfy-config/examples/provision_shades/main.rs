@@ -75,8 +75,39 @@ use std::path::{Path, PathBuf};
 use somfy_config::{
     Announced, ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
 };
-use somfy_domain::{RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
+use somfy_domain::{PairingState, RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
+
+/// Whether a provisioned shade starts out needing to be paired, decided by the
+/// one thing that actually answers the question: **where its address came
+/// from.**
+///
+/// An address this controller's allocator produced is one **no motor has ever
+/// heard**, so the shade will not move until somebody stands at it with a
+/// working remote — it is awaiting confirmation, and the device offers to walk
+/// them through it. An address that came from anywhere else — a backup, or a
+/// number the operator read off the controller being replaced — is one a motor
+/// already obeys, so the setup was completed on that other controller and there
+/// is nothing here to finish.
+///
+/// The alternative was asking. It was rejected because the honest form of the
+/// question is "has a motor been taught this address?", the tool has just
+/// finished telling the operator the answer, and a prompt whose right answer is
+/// already on screen is a prompt people get wrong.
+///
+/// **The error direction, since both are reachable**: called wrongly
+/// `AwaitingConfirmation`, an imported shade appears under "finish setting up"
+/// and one press of *it already works* clears it. Called wrongly
+/// `ConfirmedByOperator`, a freshly allocated shade is announced to Home
+/// Assistant and silently obeys nothing, which is the failure this whole flow
+/// exists to end. So the test is the one that cannot get the second case wrong.
+fn provisioned_pairing_state(address: u32) -> PairingState {
+    if RemoteIdentity::is_allocated(address) {
+        PairingState::AwaitingConfirmation
+    } else {
+        PairingState::ConfirmedByOperator
+    }
+}
 
 /// Factory-default travel times, the same ones `ShadeConfig::new` applies.
 /// Offered as defaults rather than demanded because a measured value is
@@ -506,6 +537,16 @@ fn describe(record: &ShadeRecord) {
             shade.config.tilt_time_ms,
             shade.initial_code.0,
         );
+        // Said out loud per shade, because it decides whether the shade appears
+        // in Home Assistant at all. A silent "no entity" is exactly the thing
+        // this flow exists to stop being a surprise.
+        if !shade.config.pairing_state.is_confirmed() {
+            eprintln!(
+                "    ^ this address is one this controller invented, so no motor knows it \
+                 yet. The shade will not be announced to Home Assistant until it has been \
+                 paired and the web UI's setup flow confirms it moves."
+            );
+        }
     }
 }
 
@@ -527,6 +568,7 @@ fn read_shade(
     let mut config = ShadeConfig::new(name, address)
         .map_err(ShadeError::Domain)
         .inspect_err(|error| eprintln!("refusing to write: {error}"))?;
+    config.pairing_state = provisioned_pairing_state(address);
     config.kind = read_choice("kind", &KINDS, ShadeKind::Roller)?;
     config.tilt_mode = read_choice("tilt mode", &TILT_MODES, TiltMode::None)?;
     config.up_time_ms = read_millis("full travel up", DEFAULT_TRAVEL_MS)?;

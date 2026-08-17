@@ -21,7 +21,7 @@
 //!
 //! ## Shade lifecycle
 //!
-//! Three routes beyond the command surface, and the shapes of their answers are
+//! Five routes beyond the command surface, and the shapes of their answers are
 //! the contract:
 //!
 //! | Route | Body | Success |
@@ -30,6 +30,23 @@
 //! | `PATCH /api/v1/shades/{id}` | [`PatchShadeDto`] | `200` + [`ShadeDto`] |
 //! | `DELETE /api/v1/shades/{id}` | — | `204` |
 //! | `POST /api/v1/shades/{id}/pair` | — | `202` |
+//! | `POST /api/v1/shades/{id}/confirm-pairing` | — | `200` + [`ShadeDto`] |
+//!
+//! ### Adding a shade is one flow, and it cannot be one request
+//!
+//! Three constraints force the shape, and none of them is negotiable. The
+//! address a motor will be taught has to **exist before** the `Prog` frame that
+//! teaches it, so a record must be created first. A **person has to act in the
+//! middle**: only a remote the motor already obeys can put it into programming
+//! mode, and this controller is by definition not one of those. And the device
+//! **can never confirm success**, because RTS is one-way.
+//!
+//! So it is three requests — create, pair, confirm — and the thing that makes it
+//! one *flow* rather than three optional steps is that the intermediate state is
+//! not presented as finished: a created shade has [`PairingState`]
+//! `awaitingConfirmation` and **no Home Assistant entities at all** until the
+//! last request lands. Abandoning halfway is a `DELETE`, and it leaves nothing
+//! behind because there was never anything on the broker to clear.
 //!
 //! `PATCH` exists because travel times were otherwise settable only at
 //! creation, and correcting one meant deleting the shade — which loses its
@@ -39,10 +56,18 @@
 //! one-way: the device queues a `Prog` burst and never learns whether the motor
 //! took it. `202` is the honest code for "this has been accepted for
 //! processing" with no claim about the outcome, and the outcome genuinely lives
-//! outside the system — it is a person watching the shade jog.
+//! outside the system — it is a person watching the shade move.
 //!
 //! It is also **not** a [`CommandDto`] action, and that is deliberate rather
 //! than an omission; [`CommandDto`]'s own documentation carries the argument.
+//!
+//! **Confirmation answers `200 OK` with the shade**, because unlike pairing it
+//! *is* a claim about something that happened: a person watched the shade obey a
+//! command and said so, and the device has recorded that and announced the
+//! entities. The client needs the new [`ShadeDto`] to stop presenting the shade
+//! as unfinished. It is a route of its own rather than a [`PatchShadeDto`]
+//! field for the reasons on [`PairingState`] — chiefly that a field would be
+//! settable in the other direction.
 //!
 //! ## Manual tagged (de)serialization
 //!
@@ -70,8 +95,8 @@ mod shades;
 
 pub use commands::CommandDto;
 pub use entities::{
-    AddressOrigin, CalibrationSource, GroupDto, RoomDto, ShadeDto, FACTORY_DOWN_TIME_MS,
-    FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS, SHADE_JSON_MAX_BYTES,
+    AddressOrigin, CalibrationSource, GroupDto, PairingState, RoomDto, ShadeDto,
+    FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS, SHADE_JSON_MAX_BYTES,
 };
 pub use errors::{ApiErrorCode, ApiErrorDto};
 pub use events::{ShadeStateEvent, WsEvent};

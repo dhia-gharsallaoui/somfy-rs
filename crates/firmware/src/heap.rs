@@ -221,6 +221,16 @@ const NETWORK_CHAIN_BYTES: usize = 14_416;
 /// `api::routes` deepens this and nothing else, and the `max` below is what
 /// notices.
 ///
+/// **Re-measured when `/confirm-pairing` was added**, because that is exactly
+/// the change the paragraph above warns about. The router flattens far more
+/// than its type suggests: of nineteen `picoserve::routing::Route`
+/// monomorphisations in the image only three have frames of their own — the
+/// `/api/v1/shades/:id` route at **8,720**, the WebSocket route at 7,456, and
+/// **one** frame at 2,512 for the whole `(&str, ParsePathSegment<u8>, &str)`
+/// family, into which `/pair`, `/command` and now `/confirm-pairing` are all
+/// inlined. So the 8,720 this figure was walked through is byte-identical, the
+/// new route added no frame of its own, and the clearance is unchanged.
+///
 /// Zero without the web server, which is not a rounding — there is no connection
 /// task in that image at all.
 #[cfg(feature = "http")]

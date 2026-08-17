@@ -17,6 +17,7 @@
 //! | What a command does to a shade | `somfy_tasks::StateMachine::apply` via `tasks::run_command` | the MQTT command channel |
 //! | What adding, editing or removing a shade does | `tasks::apply_edit` | `edits::EditChannel` |
 //! | Whether a shade may be paired | `somfy_domain::RemoteIdentity::is_allocated` | `inventory::Inventory::snapshot` |
+//! | Whether a shade has Home Assistant entities at all | `tasks::announce_shade` | `inventory::Inventory::snapshot` |
 //! | Which status a refusal carries | `somfy_api::ApiErrorCode::http_status` | `ui/mock/plugin.ts` |
 //!
 //! # The contract is `ui/mock/plugin.ts`
@@ -137,6 +138,14 @@ fn router() -> Router<impl PathRouter> {
         .route(
             ("/api/v1/shades", parse_path_segment::<u8>(), "/pair"),
             post(pair_shade),
+        )
+        .route(
+            (
+                "/api/v1/shades",
+                parse_path_segment::<u8>(),
+                "/confirm-pairing",
+            ),
+            post(confirm_pairing),
         )
         .route(
             ("/api/v1/shades", parse_path_segment::<u8>(), "/command"),
@@ -447,6 +456,48 @@ async fn delete_shade(id: u8) -> impl IntoResponse {
 async fn pair_shade(id: u8) -> impl IntoResponse {
     match RPC.call(Rpc::Pair(ShadeId(id))).await {
         Some(Reply::Done) => Ok((StatusCode::ACCEPTED, NoContent)),
+        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        None => Err(Err(Unavailable)),
+    }
+}
+
+/// `200 OK` with the whole shade — and unlike `/pair` it may say `200`.
+///
+/// # What this route is, in one sentence
+///
+/// The operator reporting that they commanded the shade and watched it move.
+/// That is a fact about a person, not about a motor, and it is the only kind of
+/// fact this protocol permits: RTS is one-way, and
+/// `somfy_domain::PairingState` carries the argument.
+///
+/// # Why `200` here and `202` next door
+///
+/// `/pair` answers `202` because the device has queued something whose outcome
+/// it will never learn. This one has no such gap: recording the report and
+/// announcing the entities both happen before the response is written, so by
+/// the time the client sees `200` the shade really does have entities on the
+/// broker. The body is the recomputed [`somfy_api::ShadeDto`], because the
+/// client needs the new `pairingState` in order to stop presenting the shade as
+/// an unfinished setup — the same reason `PATCH` answers with a body.
+///
+/// # Why a route rather than a `PATCH` field
+///
+/// A `PATCH` field would be settable in both directions, and the other
+/// direction retires a working shade's entities — an automation pointing at a
+/// cover that stops existing because a client round-tripped a whole `ShadeDto`
+/// back with one field stale. There is deliberately no way to say
+/// "unconfirmed"; removing the shade is the way to undo this, and it is
+/// deliberately the loud way. It is also not idempotent in the shape `PATCH`
+/// implies — it *is* idempotent, but what it triggers is a publish, and a
+/// verb whose job is "set these fields" is the wrong place for that.
+async fn confirm_pairing(id: u8) -> impl IntoResponse {
+    let id = ShadeId(id);
+    match RPC.call(Rpc::Edit(ShadeEdit::ConfirmPairing { id })).await {
+        Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
+            Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
+            _ => Err(Ok(Refusal(ApiErrorCode::NotFound))),
+        },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
         Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),

@@ -50,16 +50,34 @@
 //!
 //! ## Versions, and the board in the field
 //!
-//! There are two, and both are read. Version 1 has a 12-byte header and no
-//! per-shade radio settings; version 2 adds the announced-shade bitmap to the
+//! There are three, and all three are read. Version 1 has a 12-byte header and
+//! no per-shade radio settings; version 2 adds the announced-shade bitmap to the
 //! header — which moves the entries down four bytes — and gives each entry a
-//! frame width and a radio protocol in bytes it already had as padding.
+//! frame width and a radio protocol in bytes it already had as padding. Version
+//! 3 spends the last of those padding bytes on
+//! [`somfy_domain::PairingState`], and moves nothing.
 //!
 //! Version 1 is not a historical curiosity: a provisioned board is carrying one
 //! right now, and refusing it would make its shades vanish at the next boot.
 //! [`Layout`] is the whole of the difference, and
 //! `tests/shade_v1.rs` decodes a byte-for-byte copy of a record the previous
 //! build wrote rather than one this build reconstructs.
+//!
+//! ### What an older record's shades are taken to be
+//!
+//! **Confirmed.** A version 1 or 2 record has no pairing byte, and the two
+//! candidate answers are not symmetric — the same asymmetry that decided the
+//! announced-shade bitmap's own migration, one field along.
+//!
+//! Read as *awaiting confirmation*, every shade on the board that upgrades to
+//! this build stops being announced: three working Home Assistant entities
+//! vanish, the automations pointing at them break, and nothing on the device
+//! says why. Read as *confirmed by the operator*, the only shade that is
+//! wrongly described is one that was provisioned and never actually paired —
+//! and that shade was already announced and already not moving, so the reading
+//! changes nothing about it except that the operator is not invited to finish a
+//! setup they may already have finished. One direction breaks what works; the
+//! other leaves an existing wrong thing exactly as wrong as it was.
 //!
 //! ## The seed is not a preference
 //!
@@ -71,7 +89,8 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    DomainError, FrameWidth, RadioProtocol, ShadeConfig, ShadeId, ShadeKind, TiltMode, MAX_SHADES,
+    DomainError, FrameWidth, PairingState, RadioProtocol, ShadeConfig, ShadeId, ShadeKind,
+    TiltMode, MAX_SHADES,
 };
 use somfy_rts::RollingCode;
 
@@ -120,7 +139,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"RTSS");
 /// has no reader for is reported as such rather than as damage, so a later
 /// implementation can migrate instead of erasing shades it does not recognise —
 /// and [`VERSION_INITIAL`] is what that promise was written for.
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 
 /// The first layout, still readable: no `announced` word, entries at
 /// [`HEADER_LEN_V1`], and no frame width or protocol in an entry.
@@ -134,6 +153,13 @@ const VERSION_INITIAL: u16 = 1;
 /// The version that added the announced-shade bitmap and the per-shade frame
 /// width and protocol.
 const VERSION_ANNOUNCED: u16 = 2;
+
+/// The version that added [`somfy_domain::PairingState`] to each entry.
+///
+/// It takes the entry's last padding byte, so nothing moved and both older
+/// layouts are still read at their own offsets. See this module's docs for what
+/// a record without the byte is taken to mean.
+const VERSION_PAIRING: u16 = 3;
 
 const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -219,8 +245,15 @@ const ENTRY_WIDTH: usize = 21;
 /// answer ([`RadioProtocol::Rts`]) — which is a coincidence, not a licence to
 /// read it out of a v1 record.
 const ENTRY_PROTOCOL: usize = 22;
-// 23 is padding, so the name starts on a word boundary and a hex dump lines
-// up. It is zero-filled and covered by the checksum.
+/// New in [`VERSION_PAIRING`], in the entry's last padding byte — so the name
+/// still starts on a word boundary and nothing an older record holds moved.
+///
+/// Zero in every version 1 and 2 record ever written, and zero is
+/// [`PairingState::AwaitingConfirmation`], which is the **wrong** answer for
+/// such a record: it would hide three working shades. That is precisely why the
+/// version gate decides whether to read this byte at all, rather than the byte
+/// deciding for itself.
+const ENTRY_PAIRING: usize = 23;
 const ENTRY_NAME: usize = 24;
 
 /// Bytes a stored name may occupy — `somfy_domain::ShadeConfig`'s own capacity,
@@ -565,6 +598,20 @@ pub enum ShadeRecordError {
         /// The byte the record carried.
         raw: u8,
     },
+    /// A pairing-state byte outside the two
+    /// [`somfy_domain::PairingState`] has.
+    ///
+    /// Reported rather than defaulted, and this is the one place in the record
+    /// where *both* defaults are bad: "awaiting" hides a shade that works and
+    /// "confirmed" announces one that does not. Refusing the record sends the
+    /// operator to re-provision, which is the only action that resolves the
+    /// ambiguity rather than picking a side of it.
+    Pairing {
+        /// Which entry.
+        index: usize,
+        /// The byte the record carried.
+        raw: u8,
+    },
     /// The entry decoded and the shade it describes would have been refused had
     /// it been entered by hand.
     Shade {
@@ -663,6 +710,7 @@ impl ShadeRecord {
             entry[ENTRY_TILT] = config.tilt_mode as u8;
             entry[ENTRY_WIDTH] = config.frame_width as u8;
             entry[ENTRY_PROTOCOL] = config.protocol as u8;
+            entry[ENTRY_PAIRING] = config.pairing_state as u8;
             for (offset, value) in [
                 (ENTRY_UP_MS, config.up_time_ms),
                 (ENTRY_DOWN_MS, config.down_time_ms),
@@ -939,6 +987,10 @@ pub struct Layout {
     links: Option<usize>,
     /// Whether an entry carries its own frame width and radio protocol.
     per_shade_radio: bool,
+    /// Whether an entry carries its own [`PairingState`]. `false` in a version
+    /// that predates it, where the byte is zero and zero would be the wrong
+    /// answer — see [`ENTRY_PAIRING`].
+    per_shade_pairing: bool,
 }
 
 impl Layout {
@@ -951,12 +1003,21 @@ impl Layout {
                 announced: None,
                 links: None,
                 per_shade_radio: false,
+                per_shade_pairing: false,
             }),
             VERSION_ANNOUNCED => Some(Layout {
                 entries: OFF_ENTRIES,
                 announced: Some(OFF_ANNOUNCED),
                 links: Some(OFF_LINKS),
                 per_shade_radio: true,
+                per_shade_pairing: false,
+            }),
+            VERSION_PAIRING => Some(Layout {
+                entries: OFF_ENTRIES,
+                announced: Some(OFF_ANNOUNCED),
+                links: Some(OFF_LINKS),
+                per_shade_radio: true,
+                per_shade_pairing: true,
             }),
             _ => None,
         }
@@ -1052,6 +1113,21 @@ fn decode_entry(
                 raw: entry[ENTRY_PROTOCOL],
             })?;
     }
+
+    // A record from before this byte was a field left it zero, and zero is
+    // `AwaitingConfirmation` — which would un-announce every shade on a board
+    // that is working today. So the *layout* decides, and a table that predates
+    // the field is read as one whose shades an operator has already reported
+    // working: see this module's docs for why that direction of error is the
+    // survivable one.
+    config.pairing_state = if layout.per_shade_pairing {
+        PairingState::from_raw(entry[ENTRY_PAIRING]).ok_or(ShadeRecordError::Pairing {
+            index,
+            raw: entry[ENTRY_PAIRING],
+        })?
+    } else {
+        PairingState::ConfirmedByOperator
+    };
 
     let initial_code = RollingCode(u16::from_le_bytes([
         entry[ENTRY_CODE],
@@ -1235,15 +1311,64 @@ mod tests {
         );
     }
 
-    /// The padding inside an entry is checksummed, so a later format cannot put
-    /// a field there and have this version accept the record anyway.
+    /// The unused tail of an entry's name field is checksummed, so a later
+    /// format cannot put a field there and have this version accept the record
+    /// anyway.
+    ///
+    /// It used to be byte 23 that was tested here, which is now the pairing
+    /// state — version 3 spent the entry's last spare byte. What is left over is
+    /// the part of the 32-byte name field past `name_len`, and it is zero-filled
+    /// for the same reason: equal records must encode identically.
     #[test]
-    fn entry_padding_is_covered_by_the_checksum() {
+    fn the_unused_tail_of_a_name_is_covered_by_the_checksum() {
         let mut bytes = record().encode();
-        // The one byte of an entry that is still padding: 23, between the
-        // protocol and the name.
-        bytes[field(0, ENTRY_PROTOCOL) + 1] = 0x01;
+        // "Kitchen" is seven bytes, so byte 8 of the field is spare.
+        bytes[field(0, ENTRY_NAME) + 8] = 0x01;
         assert_eq!(ShadeRecord::decode(&bytes), Err(ShadeRecordError::Checksum));
+    }
+
+    /// A pairing byte outside the two the domain models is refused rather than
+    /// resolved. Both possible defaults are wrong here — one hides a working
+    /// shade, the other announces a dead one — so the record is the thing to
+    /// fix.
+    #[test]
+    fn an_unmodelled_pairing_state_is_rejected() {
+        let bytes = tampered(|bytes| bytes[field(1, ENTRY_PAIRING)] = 0x07);
+        assert_eq!(
+            ShadeRecord::decode(&bytes),
+            Err(ShadeRecordError::Pairing {
+                index: 1,
+                raw: 0x07
+            }),
+        );
+    }
+
+    /// The state survives the round trip per shade, rather than per table.
+    #[test]
+    fn each_shades_pairing_state_round_trips_on_its_own() {
+        let mut shades = Vec::new();
+        let mut awaiting = shade("Kitchen", 0x00_1001, 7);
+        awaiting.config.pairing_state = PairingState::AwaitingConfirmation;
+        let mut confirmed = shade("Salon", 0x00_1002, 9);
+        confirmed.config.pairing_state = PairingState::ConfirmedByOperator;
+        shades.push(awaiting).expect("fits");
+        shades.push(confirmed).expect("fits");
+        let written = ShadeRecord {
+            seq: 1,
+            announced: Announced::NONE,
+            shades,
+            links: Vec::new(),
+        };
+
+        let read = ShadeRecord::decode(&written.encode()).expect("its own output is readable");
+        assert_eq!(
+            read.shades[0].config.pairing_state,
+            PairingState::AwaitingConfirmation,
+        );
+        assert_eq!(
+            read.shades[1].config.pairing_state,
+            PairingState::ConfirmedByOperator,
+        );
     }
 
     /// The unused tail of the linked-remote pool is checksummed too, so a later

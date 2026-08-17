@@ -286,6 +286,67 @@ fn a_failed_write_is_reported_rather_than_reported_as_seeded() {
     assert_eq!(flash.borrow().stored, None);
 }
 
+/// **An abandoned shade must not reset the address it was using.**
+///
+/// The setup flow can be walked away from: a shade is created, its address is
+/// allocated, its first rolling code is seeded, some frames go out — and then
+/// the operator gives up and deletes it. Deleting frees the *registry slot*, so
+/// the next shade added takes the same slot and therefore the same allocated
+/// address, and the firmware seeds it again from a fresh `RollingCode(1)`.
+///
+/// If that seed landed, the motor — which has already accepted 5, 6 and 7 —
+/// would reject everything from 1 upward as a replay, look exactly like a dead
+/// radio, and cost a walk to the shade. The rolling-code region is deliberately
+/// **not** touched by a removal for this reason: nothing in this firmware
+/// deletes a code, and `seed_if_absent` cannot express an overwrite.
+#[test]
+fn reallocating_an_abandoned_address_continues_its_code_upward() {
+    let flash = RefCell::new(Flash::default());
+    let log = RefCell::new(Vec::new());
+
+    // The abandoned attempt: created, seeded, three frames sent.
+    {
+        let mut store = MockStore::mount(&flash, &log);
+        assert_eq!(
+            seed_if_absent(&mut store, ADDRESS, SEED, RegionState::Intact),
+            Ok(Seeded::Planted(SEED)),
+        );
+        let mut queue = MockQueue::default();
+        for _ in 0..3 {
+            transmit(&mut store, &mut queue, plan()).expect("transmit");
+        }
+        assert_eq!(queue.sent, vec![5, 6, 7]);
+    }
+    // …then deleted. Nothing here removes the stored code, and that absence is
+    // the whole mechanism.
+    assert_eq!(flash.borrow().stored, Some(RollingCode(8)));
+
+    // A new shade lands in the freed slot and is handed the same address, with
+    // the seed a freshly created shade gets.
+    let fresh_seed = RollingCode(1);
+    let mut store = MockStore::mount(&flash, &log);
+    assert_eq!(
+        seed_if_absent(&mut store, ADDRESS, fresh_seed, RegionState::Intact),
+        Ok(Seeded::Kept(RollingCode(8))),
+        "the abandoned attempt's counter is what this address is at",
+    );
+
+    let mut queue = MockQueue::default();
+    transmit(&mut store, &mut queue, plan()).expect("transmit");
+    assert_eq!(
+        queue.sent,
+        vec![8],
+        "the re-created shade must carry on from 8, not restart at 1",
+    );
+
+    let committed = commits(&log);
+    assert_eq!(committed, vec![5, 6, 7, 8, 9]);
+    assert!(
+        committed.windows(2).all(|pair| pair[1] > pair[0]),
+        "no committed code may be at or below the one before it: {committed:?}"
+    );
+}
+
 /// `RegionState::from_damaged` is what a caller builds from a store survey, so
 /// the zero case has to be the intact one.
 #[test]
