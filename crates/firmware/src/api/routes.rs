@@ -30,6 +30,22 @@
 //! [`somfy_api::ApiErrorCode::http_status`] is where the shared half of it
 //! lives.
 //!
+//! # One narrow divergence in how a bad name is refused
+//!
+//! `picoserve`'s `Json` extractor unescapes strings through a 32-byte scratch
+//! buffer, and it uses it **only when the string contains a backslash** — the
+//! common path, including every accented character a browser sends, is borrowed
+//! straight out of the request and never touches it. So the one input that
+//! behaves differently here from the mock is a name that is *both* over 32
+//! bytes once unescaped *and* contains a `\"`, `\\` or `\uXXXX` sequence: it is
+//! refused as a malformed body rather than as [`ApiErrorCode::NameTooLong`].
+//!
+//! Both answers are `400` and both names were going to be refused — 32 bytes is
+//! the domain's own limit — so what is lost is the *reason*, on an input a
+//! person reaches by putting a quotation mark in a name they typed too long.
+//! Recorded rather than fixed because the fix is a larger buffer in every
+//! connection task's future, which is the resource this module is tightest on.
+//!
 //! # Deep links, and why there is a catch-all
 //!
 //! The UI routes in the browser with the history API, so `/shades/3` is a URL a
