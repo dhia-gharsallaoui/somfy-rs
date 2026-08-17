@@ -149,7 +149,7 @@ const RETRY_LOG_INTERVAL: u32 = 10;
 /// a property of who connects to it, and the alternative — sizing for the
 /// largest configuration always — costs the ESP32 about 1.5 KB of its Wi-Fi
 /// heap for sockets an image without a web server can never open.
-const SOCKETS: usize = DHCP_SOCKETS + BROKER_SOCKETS + SERVER_SOCKETS;
+const SOCKETS: usize = DHCP_SOCKETS + BROKER_SOCKETS + SERVER_SOCKETS + MDNS_SOCKETS + SNTP_SOCKETS;
 
 /// DHCP holds one for as long as the address is configured.
 const DHCP_SOCKETS: usize = 1;
@@ -167,6 +167,27 @@ const SERVER_SOCKETS: usize = crate::api::HTTP_TASKS;
 /// See the `http` definition above.
 #[cfg(not(feature = "http"))]
 const SERVER_SOCKETS: usize = 0;
+
+/// The responder's, one per DHCP lease. It is closed and reopened when the
+/// address changes, on the same slot.
+#[cfg(feature = "mdns")]
+const MDNS_SOCKETS: usize = crate::mdns::SOCKETS;
+/// See the `mdns` definition above.
+#[cfg(not(feature = "mdns"))]
+const MDNS_SOCKETS: usize = 0;
+
+/// The SNTP exchange's, **and the resolver's**.
+///
+/// Two rather than one, and the second is the one that is easy to miss: turning
+/// on `embassy-net`'s `dns` feature makes `embassy_net::new` add a DNS socket to
+/// the set unconditionally, before any of this firmware's code runs. It is
+/// counted here because `sntp` is the feature that turns `dns` on — see this
+/// crate's `Cargo.toml` — and [`resolve`] is the only thing that uses it.
+#[cfg(feature = "sntp")]
+const SNTP_SOCKETS: usize = crate::sntp::SOCKETS;
+/// See the `sntp` definition above.
+#[cfg(not(feature = "sntp"))]
+const SNTP_SOCKETS: usize = 0;
 
 /// How often the station's signal strength is re-read while the link is up.
 ///
@@ -487,6 +508,94 @@ async fn hold_link(
 fn sample_signal(controller: &WifiController<'static>) {
     record_signal(controller.rssi().ok());
 }
+
+/// Turn a name or an address literal into an IPv4 address.
+///
+/// # Why this is here and not in its caller
+///
+/// [`crate::sntp`] is the only caller today, and it needs this because the only
+/// sane default NTP server is a *name* — there is no stable address for one, and
+/// hard-coding a pool member's current IP would be a constant with no derivation
+/// and a shelf life.
+///
+/// It is written as a general resolver rather than folded into that module
+/// because of what is coming next: `somfy_config::MqttSettings` holds the broker
+/// as an `Ipv4Addr`, so a broker on a home network cannot be named. Closing that
+/// needs a field change in `somfy-config` and **one call to this function** —
+/// the resolver, the DNS socket and the servers DHCP hands out are all in place
+/// now, and the remaining work is entirely in the record.
+///
+/// # It answers with one address, not the set
+///
+/// `dns_query` returns everything the server sent, and `pool.ntp.org` returns
+/// four. Taking the first is right for this device: they are interchangeable by
+/// construction, and a client that tried them in turn would be implementing
+/// server selection — which is NTP's job, not SNTP's, and is what a client
+/// asking one question an hour has no use for.
+///
+/// # Timeouts
+///
+/// Bounded here rather than by the caller, because smoltcp's resolver retries on
+/// its own schedule and "no DNS server answered" is otherwise a future that
+/// never completes. [`RESOLVE_TIMEOUT_S`] is the whole budget including those
+/// retries.
+///
+/// A literal costs none of this: `dns_query` parses `name` as an address first
+/// and returns it without a packet, so a configuration that names an address
+/// still works on a network with no working resolver.
+#[cfg(feature = "sntp")]
+pub async fn resolve(stack: Stack<'static>, name: &str) -> Option<core::net::Ipv4Addr> {
+    use embassy_net::dns::DnsQueryType;
+    use embassy_time::with_timeout;
+
+    let answers = with_timeout(
+        Duration::from_secs(RESOLVE_TIMEOUT_S),
+        stack.dns_query(name, DnsQueryType::A),
+    )
+    .await;
+
+    let answers = match answers {
+        Ok(Ok(answers)) => answers,
+        Ok(Err(error)) => {
+            esp_println::println!("net: could not resolve '{}' ({:?})", name, error);
+            return None;
+        }
+        Err(_) => {
+            esp_println::println!(
+                "net: no answer resolving '{}' within {} s",
+                name,
+                RESOLVE_TIMEOUT_S,
+            );
+            return None;
+        }
+    };
+
+    // Only `DnsQueryType::A` was asked for, so only V4 can come back — and this
+    // is written as a filter rather than an `expect` because it is also the
+    // guard that keeps an IPv6 address out of `sntpc-net-embassy`, whose
+    // address conversion answers one with `unreachable!()` in a build without
+    // its `ipv6` feature. A panic there would reset the board over a DNS reply.
+    answers.iter().find_map(|address| match address {
+        embassy_net::IpAddress::Ipv4(v4) => Some(*v4),
+        #[allow(
+            unreachable_patterns,
+            reason = "only V4 exists while `proto-ipv6` is off, and this arm is \
+                      what keeps that true if it is ever turned on"
+        )]
+        _ => None,
+    })
+}
+
+/// The whole budget for one name lookup, in seconds.
+///
+/// A **policy figure**, and it is a ceiling rather than an expectation: a home
+/// resolver answers in single-digit milliseconds, and smoltcp retries a lost
+/// query on its own before this fires. Ten seconds is chosen to match
+/// [`STABLE_LINK_MS`] — the same "comfortably longer than anything a working
+/// network does" reasoning — so that a resolver which is simply absent costs one
+/// bounded wait rather than a task that never returns.
+#[cfg(feature = "sntp")]
+const RESOLVE_TIMEOUT_S: u64 = 10;
 
 /// `embassy-net`'s own runner: polls smoltcp, drives DHCP, moves frames.
 ///

@@ -68,36 +68,54 @@ jobs:
       - name: bundle size against the 200 KB gzipped budget (design spec §8)
         run: bun run size
 
-  # Three chips × three transport features is eighteen configurations, and this
-  # builds seven of them. The choice is deliberate, because *silent* partial
-  # coverage is the thing this project keeps being bitten by — five CI holes so
-  # far, every one of them a configuration nobody built.
+  # Three chips × five service features is a large space, and this builds nine
+  # of it. The choice is deliberate, because *silent* partial coverage is the
+  # thing this project keeps being bitten by — five CI holes so far, every one
+  # of them a configuration nobody built.
   #
   # What each row buys:
   #
   # - **The shipping build, per chip.** What a user flashes.
   # - **Radio only, per chip.** The structural test: if the core compiles with
-  #   `mqtt` off, `http` off and `ui` off, then no transport logic leaked into
-  #   `somfy-domain`, `somfy-tasks`, `edits` or the state task. It found two
-  #   couplings the first time it was run, and both were fixed rather than
-  #   gated — see `crates/firmware/Cargo.toml`.
-  # - **`http` alone, on one chip.** `ui` off *and* `mqtt` off at once, which is
-  #   what proves the two are separable rather than merely optional together.
+  #   every service off, then no transport logic leaked into `somfy-domain`,
+  #   `somfy-tasks`, `edits` or the state task. It found two couplings the first
+  #   time it was run, and both were fixed rather than gated — see
+  #   `crates/firmware/Cargo.toml`.
+  # - **`http` alone, on one chip.** `ui` off *and* `mqtt` off at once, and now
+  #   `mdns` and `sntp` off as well — which is what proves the web server is
+  #   separable from the thing that advertises it, not merely optional together
+  #   with it.
+  # - **`mdns` alone, on one chip.** It pulls `http` in with it and nothing else,
+  #   so this is the row that proves the responder does not depend on `ui` or on
+  #   a broker — and it is the only row that builds `edge-mdns` without
+  #   `picoserve`'s UI routes beside it.
+  # - **`sntp` alone, on one chip.** The strongest of the structural rows,
+  #   because `sntp` implies *nothing*: it builds the resolver, the socket
+  #   accounting in `net::SOCKETS` and the wall clock with no other network
+  #   service in the image at all.
   #
   # What is deliberately not covered, and why:
   #
-  # - **The ESP32 with `http` or `ui`.** It cannot be built at all: the chip has
-  #   54,556 bytes of DRAM for a 66,280-byte stack budget once the server is in,
-  #   and `heap.rs` refuses it with a `compile_error!` naming the measurement.
-  #   The refusal was proved by hand rather than by a job, because a CI step
-  #   whose success is a compilation *failure* inverts every other row here.
+  # - **The ESP32 with `http`, `ui`, `mdns` or `sntp`.** The first three cannot
+  #   be built at all — `mdns` implies `http`, and `http` on that chip leaves
+  #   54,556 bytes of DRAM for a 66,280-byte stack budget, so the image does not
+  #   link. `sntp` *would* link and is refused anyway, because it leaves 872
+  #   bytes of heap inside a ~4,216-byte spread. Both refusals are
+  #   `compile_error!`s in `heap.rs` naming their measurements, and both were
+  #   proved by hand rather than by a job, because a CI step whose success is a
+  #   compilation *failure* inverts every other row here.
   # - **Feature interactions on the ESP32-C3.** They are architecture-
-  #   independent — the same modules, the same statics — and the ESP32-S3 row
-  #   covers them. What the C3 is in the matrix *for* is the RISC-V code path,
-  #   which its two rows exercise.
+  #   independent — the same modules, the same statics — and the ESP32-S3 rows
+  #   cover them. What the C3 is in the matrix *for* is the RISC-V code path,
+  #   which its two rows exercise; note that its shipping row does build
+  #   `edge-mdns`, `domain` and `sntpc` for RISC-V, which is the part that could
+  #   plausibly differ.
   # - **`ui` without `mqtt` as its own row.** The shipping build covers `ui` on
   #   and the `http` row covers it off, so the module selection in `api/mod.rs`
   #   is exercised both ways already.
+  # - **`mdns` and `sntp` together without `mqtt`.** They share nothing but
+  #   `net::SOCKETS`, which every row's `StackResources<SOCKETS>` already sizes,
+  #   and the shipping row builds both.
   firmware:
     runs-on: ubuntu-latest
     strategy:
@@ -111,16 +129,22 @@ jobs:
           - label: esp32 (radio only)
             target: xtensa-esp32-none-elf
             args: --no-default-features --features chip-esp32
-          - label: s3 (mqtt + ui)
+          - label: s3 (mqtt + ui + mdns + sntp)
             target: xtensa-esp32s3-none-elf
             args: --features chip-s3
-          - label: s3 (http, no ui, no mqtt)
+          - label: s3 (http, no ui, no mqtt, no mdns, no sntp)
             target: xtensa-esp32s3-none-elf
             args: --no-default-features --features chip-s3,http
+          - label: s3 (mdns only — pulls http, nothing else)
+            target: xtensa-esp32s3-none-elf
+            args: --no-default-features --features chip-s3,mdns
+          - label: s3 (sntp only — pulls nothing)
+            target: xtensa-esp32s3-none-elf
+            args: --no-default-features --features chip-s3,sntp
           - label: s3 (radio only)
             target: xtensa-esp32s3-none-elf
             args: --no-default-features --features chip-s3
-          - label: c3 (mqtt + ui)
+          - label: c3 (mqtt + ui + mdns + sntp)
             target: riscv32imc-unknown-none-elf
             args: --features chip-c3
           - label: c3 (radio only)
