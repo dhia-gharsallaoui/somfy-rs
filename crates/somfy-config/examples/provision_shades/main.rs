@@ -57,6 +57,14 @@
 //! means new entities and retained orphans left under the old ones. An import
 //! takes its order from the backup, and not from the ids the old controller
 //! happened to assign.
+//!
+//! **This is a limitation of the record, not of the registry.** The registry
+//! can now be told an id — `somfy_domain::Registry::add_shade_with_id` — but
+//! this format stores none and the firmware that reads it still places shades
+//! by position, so nothing here can offer an id column yet. It would be worse
+//! than the rule above if it did: a reorder this tool accepted and the board
+//! silently undid. See `somfy_config::shade`'s module docs for the order the
+//! two halves have to land in.
 
 mod import;
 

@@ -129,6 +129,18 @@ pub enum DomainError {
     RegistryFull,
     DuplicateAddress,
     NotFound,
+    /// Two entries claimed the same registry slot. Only
+    /// [`Registry::add_shade_with_id`](crate::Registry::add_shade_with_id)
+    /// raises it: the caller named an id, and the slot already holds a shade.
+    /// Refused rather than overwritten, because overwriting would delete a
+    /// provisioned shade to make room for one that asked for its place.
+    DuplicateId,
+    /// An id past the last slot the registry has
+    /// ([`MAX_SHADES`](crate::MAX_SHADES) is one past it). Distinct from
+    /// [`DomainError::RegistryFull`] on purpose: a full registry may be fixed
+    /// by removing a shade, and an id of 200 in a 32-slot registry cannot be
+    /// fixed by anything except correcting the id.
+    IdOutOfRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

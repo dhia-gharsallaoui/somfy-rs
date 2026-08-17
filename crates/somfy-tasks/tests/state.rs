@@ -90,6 +90,42 @@ fn a_command_commits_before_it_enqueues() {
     );
 }
 
+/// A shade provisioned at a caller-chosen id commands, dispatches and reports
+/// exactly as one the registry numbered itself. Pinned here because the state
+/// task is the layer between the registry's ids and the radio, and it routes
+/// entirely by [`ShadeId`] — a sparse id must not be mistaken for an unknown
+/// one, which is the failure that would look like a shade that never moves.
+#[test]
+fn a_shade_at_a_chosen_id_commands_like_any_other() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+
+    let mut state = StateMachine::new(TxProfile::default());
+    // 31 is the last slot the registry has, and the id a positional registry
+    // would only reach with 32 shades provisioned.
+    let id = state
+        .registry_mut()
+        .add_shade_with_id(ShadeId(31), ShadeConfig::new("A", A).unwrap())
+        .expect("the last slot is in range and free");
+
+    let dispatch = state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::Down,
+            0,
+            &mut deltas(),
+        )
+        .expect("a chosen id is a known shade");
+
+    assert_eq!(dispatch.planned, 1);
+    assert_eq!(dispatch.sent, 1);
+    assert!(dispatch.first_error.is_none());
+    assert_eq!(queue.sent.len(), 1);
+}
+
 #[test]
 fn a_queued_frame_carries_the_command_and_the_profile() {
     let log = RefCell::new(Vec::new());

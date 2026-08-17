@@ -18,18 +18,38 @@
 //! Nothing here stores an id. The firmware fills an **empty** registry in
 //! record order, and `somfy_domain::Registry::add_shade` assigns the lowest
 //! free slot, so the first entry is `ShadeId(0)`, the second `ShadeId(1)`, and
-//! so on. That is deliberate — the registry's id is the thing `somfy-mqtt`
-//! builds `shade_0`, `shade_1` … out of, and an id stored here that the
-//! registry did not agree with would be a field that is quietly wrong.
+//! so on. The registry's id is the thing `somfy-mqtt` builds `shade_0`,
+//! `shade_1` … out of, so a field stored here that the registry did not agree
+//! with would be quietly wrong.
 //!
-//! **The consequence belongs to whoever writes a record: appending a shade is
-//! safe, and reordering or removing one is not.** Removing the first of three
-//! shades renumbers the other two, so in Home Assistant they become different
-//! entities and the ones they were are left behind as retained orphans. There
-//! is no fix for that inside this format — an id the registry cannot honour
-//! would not help — so it is stated here and by the provisioning tool, and
-//! properly closing it needs `Registry` to be able to take an id, which is a
-//! domain change and not a record change.
+//! **So the consequence belongs to whoever writes a record: appending a shade
+//! is safe, and reordering or removing one is not.** Removing the first of
+//! three shades renumbers the other two, so in Home Assistant they become
+//! different entities and the ones they were are left behind as retained
+//! orphans. It is stated here and by the provisioning tool because the format
+//! cannot fix it alone.
+//!
+//! ### What has changed, and what has not
+//!
+//! The half that was missing is no longer missing: `Registry` now has
+//! `add_shade_with_id`, which places a shade at an id the caller names and
+//! refuses a duplicate or out-of-range one rather than substituting a
+//! different slot. An id stored here would now be a field the registry *can*
+//! honour.
+//!
+//! What has not changed is this format, deliberately, and the ordering is the
+//! reason. The firmware is the only thing that turns a record into registry
+//! entries, and it calls `add_shade`. Growing an id field here before the
+//! firmware reads it would give the provisioning tool an id column the device
+//! ignores — a reorder the tool accepts and the board silently undoes, which
+//! is worse than the honest limitation above. A reader that understands ids
+//! has to ship before a writer that emits them, and the reader is firmware.
+//!
+//! When that lands it is a `VERSION` bump, not a reinterpretation of the
+//! three padding bytes in each entry: those are zero in every record ever
+//! written, so a reader that took them for ids would read every shade as
+//! `ShadeId(0)`. The version field exists precisely so an older reader reports
+//! a record it does not understand instead of half-reading it.
 //!
 //! ## The seed is not a preference
 //!
