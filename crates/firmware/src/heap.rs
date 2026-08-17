@@ -305,9 +305,33 @@ const INTERRUPT_FRAMES_BYTES: usize = 1_712;
 /// changes too. What *is* asserted at compile time is that this fits the
 /// division below.
 pub const REQUIRED_STACK_BYTES: usize = larger(
-    larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
-    REQUEST_CHAIN_BYTES,
+    larger(
+        larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
+        REQUEST_CHAIN_BYTES,
+    ),
+    SERVICE_CHAIN_BYTES,
 ) + INTERRUPT_FRAMES_BYTES;
+
+/// The deepest chain through the mDNS responder and the SNTP client, measured
+/// the same way as the others — 5,456 bytes, far below [`BOOT_CHAIN_BYTES`], so
+/// it does not set the requirement today.
+///
+/// It is a term in [`REQUIRED_STACK_BYTES`] rather than a comment for the reason
+/// [`REQUEST_CHAIN_BYTES`] is: an mDNS record type added to `crate::mdns`'s
+/// `Service`, or a deeper path through `sntpc`, deepens this and nothing else,
+/// and the `max` above is what notices. **This term survived a merge in which
+/// the boot chain was re-derived on a branch that did not know these services
+/// existed** — recorded because a `max` whose smaller terms quietly disappear
+/// still produces the right number, and stops producing it the moment one of
+/// them grows.
+///
+/// Zero when neither service is compiled in, which is not a rounding — there is
+/// no such task in that image.
+#[cfg(any(feature = "mdns", feature = "sntp"))]
+const SERVICE_CHAIN_BYTES: usize = 5_456;
+/// See the `mdns`/`sntp` definition above.
+#[cfg(not(any(feature = "mdns", feature = "sntp")))]
+const SERVICE_CHAIN_BYTES: usize = 0;
 
 /// `usize::max`, which is not a `const fn`.
 const fn larger(left: usize, right: usize) -> usize {
