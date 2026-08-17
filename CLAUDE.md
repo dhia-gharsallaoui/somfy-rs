@@ -105,9 +105,23 @@ this rule exists to prevent.
   is built wrongly, the firmware's account of what it sent is wrong in the same
   way. Verify against an independent receiver. The same applies in reverse for
   receive.
-- **A single trial that shows nothing proves nothing.** Run at least ten. One
-  3-frame burst decoding nothing was read as a broken RMT path; it was not, and
-  that cost hours.
+- **Match the sample size to the effect, not to a ritual.** Repetition exists to
+  separate signal from noise, so the question is always *how big is the effect
+  next to the noise?*
+  - **Comparing two configurations, or claiming a margin**: repeat, ~10 runs.
+    The known boot-to-boot heap noise is ~4,216 bytes; an AMPDU change whose
+    real effect was ~364 bytes looked like 3,820 because two samples landed at
+    opposite ends of that band. A control experiment is not a substitute for a
+    sample size.
+  - **A single run is enough when the effect dwarfs the noise** — a heap moving
+    from 56 KiB to 200 KiB needs no repetition — and for functional checks: does
+    it boot, associate, connect, decode.
+  - **A null result is the dangerous case.** "Nothing happened" needs repetition
+    almost always, because absence is what noise looks like. One 3-frame burst
+    decoding nothing was read as a broken RMT path; it was not, and that cost
+    hours.
+  - When a result lands within a few multiples of the noise, say so rather than
+    reporting the single number as though it settled the matter.
 - **Match the CI matrix exactly.** Clippy runs on the dev profile and builds run
   on release, so four green release builds do not imply four green clippy runs —
   the ESP32 clippy job was silently red for three tasks that way.
