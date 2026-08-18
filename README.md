@@ -1,259 +1,220 @@
+<div align="center">
+
 # somfy-rs
 
-A ground-up Rust rewrite of [ESPSomfy-RTS](https://github.com/xkain/ESPSomfy-RTS),
-firmware for controlling Somfy RTS shades from ESP32-class hardware. The goal is
-a `no_std` `esp-hal` + Embassy firmware that is a daily-driver replacement for
-the C++ original and a clean, host-testable, community-adoptable codebase. The
-full design specification lives in [`docs/specs/`](docs/specs/).
+**A ground-up Rust firmware for Somfy RTS shades on ESP32-class hardware.**
+
+`no_std` · `esp-hal` + Embassy · allocation-free outside the Wi-Fi driver ·
+Home Assistant over MQTT · a web UI served from flash
+
+[![CI](https://github.com/dhia-gharsallaoui/somfy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhia-gharsallaoui/somfy-rs/actions/workflows/ci.yml)
+[![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-no__std-orange.svg)](https://www.rust-lang.org)
+
+</div>
+
+---
+
+## Standing on ESPSomfy-RTS
+
+This project exists because of **[ESPSomfy-RTS](https://github.com/xkain/ESPSomfy-RTS)**,
+and it owes it more than a citation.
+
+That firmware has been controlling real shades in real houses for years. Every
+protocol timing here was **derived from it and then verified**, not guessed:
+the 640 µs half-symbol, the wake-up and sync structure, the hardware-sync counts
+that differ between first and repeat frames and again between 56- and 80-bit
+frames, the rule that a long `Prog` burst *removes* a remote where a short one
+adds it. Its architecture taught us things a datasheet could not — it receives
+with a GPIO change-interrupt rather than the RMT peripheral, which sidesteps a
+constraint that cost this project a long detour before we read it properly.
+
+It is released into the **public domain (Unlicense)**, which is a generous thing
+to do with years of work.
+
+**This is a rewrite, not a fork.** Where the two differ, it is recorded
+deliberately in [`docs/provenance.md`](docs/provenance.md) — including the
+handful of places where reading the reference closely turned up defects we chose
+not to reproduce. Those are noted there with the evidence, in the spirit of a
+project that made its own work inspectable.
+
+---
+
+## Why a rewrite
+
+Not because the original is bad — because a few things are easier to guarantee
+than to retrofit:
+
+| | |
+|---|---|
+| **Host-testable core** | The protocol, domain model, position engine and config format are `no_std` crates with no hardware in them. ~950 tests run on a laptop in seconds. |
+| **One command path** | HTTP and MQTT reach the *same* functions. Feature-gating the transports proves it: the core compiles with both switched off. |
+| **Measured, not assumed** | Stack and heap budgets are derived from linked ELFs and **checked again at every boot**, printed next to the claim. A board refuses to start rather than overflow. |
+| **Provenance** | Every constant is traceable to a measurement, a reference line, or an honest "this is a policy figure". |
+
+---
+
+## Features
+
+### Radio
+
+- **Somfy RTS**, 56-bit and 80-bit frames, **per shade** — a shade imported from
+  a controller that drove it at 80 bits is driven at 80 bits.
+- Transmit and receive via the **RMT peripheral**; CC1101 in asynchronous-serial
+  OOK at 433.42 MHz.
+- **Rolling codes persisted before the frame goes out**, never after. Overwriting
+  a stored code is not expressible in the API.
+- **Overheard frames tracked** — press a wall remote and the position estimate
+  follows, provided the remote is registered as linked.
+
+### Shades
+
+- 32 shades, 16 rooms, 16 groups; 7 linked remotes per shade.
+- **Pairing with the controller's own virtual remote**, derived from
+  device-unique MAC bytes, so two boards never collide.
+- **Adding a shade and pairing it are one flow.** Nothing is announced to Home
+  Assistant until you confirm the motor actually moved — RTS is one-way, so the
+  device can never know on its own, and it does not pretend to.
+- **Position dead-reckoning** with per-direction travel times, dead-time
+  compensation, endpoint resynchronisation and reported confidence.
+- **A dedicated vent command** for perforated shutters: drives to the closed
+  limit, then up by the measured slat-separation time. Uses no position estimate
+  at all, so it is immune to drift.
+- **Guided calibration**, with hand-entered values always available — and a value
+  equal to the reference firmware's factory defaults is reported as
+  *uncalibrated* rather than presented as configured.
+
+### Network
+
+- Wi-Fi via `esp-radio` + `embassy-net`.
+- **MQTT with Home Assistant discovery** — covers, per-shade pairing buttons and
+  device diagnostics, with no YAML. Discovery and state namespaces are separate
+  values that **cannot be concatenated**; the type system refuses it.
+- **Web UI served from flash** (Preact + Vite, English and French, well inside a
+  200 KB gzipped budget), with REST and a WebSocket event stream.
+- **mDNS** — reachable at `http://somfy-<mac>.local`.
+- **SNTP**, kept strictly out of everything that must stay monotonic.
+- **Origin and Host validation**, and a **per-shade rate limit** on commands.
+  Not authentication — the two mitigations that need no password, one stopping a
+  page in somebody else's browser tab driving your shades, the other bounding
+  flash wear.
+
+### Migration
+
+- Import a **backup from the C++ firmware**: shades, addresses, rolling codes,
+  rooms, groups and broker settings.
+- The old firmware's topic concatenation is **undone**, not carried across.
+- Anything unrecoverable — a group whose rolling code predates the format that
+  stored it — is **surfaced to you**, not silently defaulted.
+
+### Operations
+
+- **A/B partitions** with the rolling-code region pinned where it already is, so
+  moving to the new layout is a rename rather than a migration.
+- Per-chip heap and stack sizing, verified at boot.
+- Feature-gated transports (`mqtt`, `http`, `ui`, `mdns`, `sntp`).
+
+---
+
+## Hardware
+
+| Chip | Status |
+|---|---|
+| **ESP32-S3** | **Hardware-proven.** The reference platform; everything below was measured on one. |
+| ESP32-C3 | Builds and is budgeted; never run. Heap margin is tight — the firmware warns at boot. |
+| ESP32 | Builds without the web server, which its DRAM cannot hold (refused at compile time, with the reason). Never run. |
+
+Plus a **CC1101** 433 MHz module. Pin maps are in `crates/firmware/src/chip.rs`;
+only the S3 map is verified.
+
+> **Note** — the ESP32-S2 was supported until it was measured: it has too little
+> DRAM to hold the Wi-Fi driver's heap and a bootable stack at once.
+
+---
+
+## Quick start
+
+```bash
+# Toolchain (Xtensa needs espup; the C3 does not)
+cargo install espup && espup install && source ~/export-esp.sh
+cargo install espflash
+
+# Build and flash
+cd crates/firmware
+cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
+espflash flash --port /dev/ttyUSB0 target/xtensa-esp32s3-none-elf/release/firmware
+espflash monitor --port /dev/ttyUSB0
+```
+
+Then provision Wi-Fi and shades — [`docs/hardware-checklist.md`](docs/hardware-checklist.md)
+has the procedures, including **how to identify the right board before flashing**,
+which matters more than it sounds if you own two.
+
+---
+
+## Workspace
+
+```
+crates/
+├── somfy-rts/      protocol: frames, rolling codes, pulse rendering, RX decode
+├── somfy-domain/   shades, groups, rooms, the position engine, pairing
+├── somfy-store/    rolling-code flash ring — overwrite is inexpressible
+├── somfy-config/   persisted device, shade and estate records
+├── somfy-api/      REST/WS/MQTT DTOs, with ts-rs TypeScript generation
+├── somfy-mqtt/     topic construction and Home Assistant discovery
+├── somfy-migrate/  C++ backup-file parser
+├── somfy-cc1101/   radio driver      somfy-rmt/  RMT pulse I/O
+├── somfy-tasks/    Embassy task bodies, transport-agnostic
+└── firmware/       the only hardware-aware crate
+ui/                 Preact + Vite, embedded in the image
+```
+
+Everything above `firmware` is `no_std` and host-testable. CI builds each of them
+for `thumbv7em-none-eabihf` — a target with no allocator — so "allocation-free"
+is checked rather than claimed.
+
+---
+
+## Development
+
+```bash
+cargo test --workspace          # ~950 tests, no hardware needed
+cargo clippy --workspace --all-targets -- -D warnings
+cd ui && bun run dev            # UI against a mock device, no firmware required
+```
+
+The UI's mock serves the **real API paths**, so the same client code runs against
+mock and device with no "mock mode" branch — and the generated TypeScript is a CI
+gate, so the two cannot drift.
+
+`crates/firmware` is excluded from the workspace (it needs a different target and
+`build-std`), so **workspace-wide commands skip it** — see its README, and note
+that its `rust-analyzer.toml` is what stops the crate looking broken in an editor.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/specs/`](docs/specs/) | Design specification and the requirement documents behind each subsystem |
+| [`docs/plans/`](docs/plans/) | Implementation plans, in order |
+| [`docs/provenance.md`](docs/provenance.md) | **Where every constant came from** — reference line, measurement, or an honest policy figure |
+| [`docs/hardware-checklist.md`](docs/hardware-checklist.md) | Bring-up procedures, written from the mistakes |
+
+---
 
 ## Status
 
-**Plans 1–4 of 7 complete.** The `somfy-rts` protocol engine (frames, rolling
-codes, TX pulse rendering, RX decoding, repeat-frame dedupe), the `somfy-domain`
-model (shade/group/room registries, travel-time position dead-reckoning, command
-orchestration, overheard-remote tracking), and the Plan 3 contract layer —
-`somfy-api` (serde REST/WS DTOs with `ts-rs` TypeScript generation) and
-`somfy-migrate` (C++ backup-file parser) — are implemented and green on the host.
-**Plan 4 is complete and proven on hardware, in both directions.**
-**Plan 5 is in progress**: WiFi and the TCP/IP stack are up on hardware, and
-the MQTT client, its retention lifecycle and its bounded reconnect are written
-and host-tested. Nothing has yet been run against a real broker.
+Daily-driver on the author's own installation: shades paired, driven from Home
+Assistant, and served from the device's own web UI.
 
-Receive was proven on 2026-08-16: with a second device transmitting real Somfy
-frames, the firmware decoded **4 of 4**, each carrying the correct address and
-the command actually sent, with rolling codes advancing in step:
+**Still to come:** OTA (partitions are ready), a diagnostics screen,
+backup/restore in the UI, and captive-portal onboarding.
 
-```
-rx[1]: address=0x0FC115 command=Up   rolling_code=177
-rx[2]: address=0x0FC115 command=Down rolling_code=178
-rx[3]: address=0x0FC115 command=Up   rolling_code=179
-rx[4]: address=0x0FC115 command=Down rolling_code=180
-```
-
-The whole receive chain is exercised there: CC1101 → GDO2 → RMT capture →
-`RmtPulseSource` → `RxDecoder` → radio task → frame channel. The RMT peripheral
-proved sufficient, so the `GpioPulseSource` interrupt-timestamping fallback that
-§6.1 holds in reserve has not been needed.
-
-**On-air validation landed 2026-08-16.** somfy-rs firmware running on an
-ESP32-S3 drove a real Somfy roller shade in both directions, confirmed by the
-owner. Every transmission was independently decoded by a second, unrelated
-radio, which reported the correct address, command, rolling code, `bits == 56`,
-`valid == true`, and the sync counts the protocol requires — `sync == 4` on
-first frames and `sync == 14` on repeats, matching the wall-remote captures.
-The verification deliberately lives in a separate receiver rather than in the
-firmware: a transmitter that reports on its own output cannot detect the
-failures that matter, because a wrongly built pulse train and the account it
-gives of itself are wrong in the same way.
-
-Golden-capture validation **landed 2026-08-15**: the `somfy-rts` RX path is
-pinned against pulses captured from a physical Somfy wall remote, and all three
-fixture-backed tests pass **unmodified** — the engine decoded genuine hardware on
-the first attempt. The capture independently confirmed the sync model (first
-frames `hwsync == 4`, repeats `hwsync == 14`). `somfy-migrate` is likewise
-validated against a real v25 device backup, though that test stays `#[ignore]`d
-because the backup itself is private (see
-[`crates/somfy-migrate/tests/fixtures/README.md`](crates/somfy-migrate/tests/fixtures/README.md)).
-
-> **Before this repository is made public**, the committed pulse fixtures must be
-> re-captured with a throwaway address or removed — they encode a real remote's
-> radio address and rolling codes. See
-> [`crates/somfy-rts/tests/fixtures/README.md`](crates/somfy-rts/tests/fixtures/README.md).
-
-Plans (per [`docs/specs/`](docs/specs/)):
-
-| Plan | Scope |
-|------|-------|
-| 1 | Protocol engine (`somfy-rts`) — **complete** |
-| 2 | Domain model: shades/groups/rooms + position/tilt engine — **complete** |
-| 3 | API + migration DTOs (`somfy-api`, `somfy-migrate`) — **complete** |
-| 4a | Firmware transmit: CC1101 driver + `esp-hal` RMT TX — **complete, hardware-proven** |
-| 4b | Firmware receive: RMT RX, Embassy tasks, persisted rolling codes — **complete, hardware-proven** |
-| 5 | Network: WiFi, MQTT, Home Assistant discovery — **in progress** (Tasks 1–4 of 5) |
-| 6 | Persistence + OTA (A/B partitions, rollback) |
-| 7 | Web UI (Preact) served from flash + the HTTP/WebSocket server that serves it — **in progress** (UI and device server land; settings, backup and diagnostics screens still stubs) |
-
-## Contracts for later plans
-
-Boundaries deliberately left to downstream plans so the protocol engine stays
-policy-free:
-
-- **Plan 2 (domain layer)** owns the extended→56-bit *downgrade* policy. The
-  `somfy-rts` `encode56` rejects extended commands outright
-  (`FrameError::ExtendedCommand`); mapping `Stop → My` for a 56-bit motor (per
-  Somfy.cpp:2944) is a product decision the domain layer makes explicitly. Plan
-  2 also owns the C++ address / rolling-code plausibility guards
-  (Somfy.cpp:169-170), which `somfy-rts` does not enforce.
-- **Plan 4 (firmware TX)** — **discharged 2026-08-15.** `encode80` now takes a
-  `repeat` parameter and re-encodes byte 7 per repeat exactly like the C++
-  reference (`196 + 4*repeat`, cycling by -15 past 255; Favorite/Stop flip
-  `196→132` on any repeat > 0), for both extended and base commands — see
-  `encode80_byte7`/`encode80_tail` in `frame.rs`. A transmitter MUST call
-  `encode80` once per frame sent with the matching repeat index.
-- **Plans 5 & 7 (network + UI)** consume the `somfy-api` DTOs as the single wire
-  contract. The `ts-rs`-generated TypeScript in `ui/src/api/generated/` is the
-  UI's source of truth; regenerate it (build with `--features ts`) whenever a DTO
-  changes so UI/firmware drift stays a compile error rather than a runtime bug.
-- **Plan 6 (persistence)** owns applying `somfy-migrate` output. Four
-  obligations:
-  (1) persist `MigrationData` (shades, rooms, groups) into the new config store,
-  surfacing v19–v22 groups and linked remotes whose rolling codes could not be
-  recovered from the backup so the user re-pairs or sets them manually;
-  (2) **import MQTT settings**, which `somfy-migrate` deliberately deferred until
-  there was somewhere to store the result. This is a recorded deviation from
-  design spec §3.4, not a dropped requirement;
-  (3) **default unknown shade kinds to `Roller` and warn the user.**
-  `ShadeKind::from_raw`/`TiltMode::from_raw` return `None` for a valid C++ kind
-  outside the v1.0 subset (garage/gate/drycontact) or an invalid byte; Plan 6
-  imports such a shade with `kind` defaulted to `ShadeKind::Roller` and surfaces a
-  warning rather than dropping the shade or guessing a behavior; and
-  (4) **warn when `MigrationData::skipped_resyncs` is nonzero.** A nonzero count
-  means one or more records did not align exactly (e.g. an unescaped comma in a
-  name shifted every field, which can yield a *plausible but wrong* rolling code),
-  so Plan 6 must show the user the imported values for confirmation instead of
-  silently applying them.
-
-  **(3) and (4) are discharged for the shade table, 2026-08-17**, by
-  `provision_shades --from-backup` (`crates/somfy-config/examples/provision_shades/`).
-  An unknown kind or tilt byte is imported as `Roller`/`TiltMode::None` and
-  reported per shade by name, and a nonzero `skipped_resyncs` prints the whole
-  table and refuses to write without a typed `yes`. That covers the shades and
-  their rolling codes — the values that cost a physical re-pairing to get wrong
-  — on the host, before anything is flashed.
-
-  **A linked remote's *address* is discharged too, 2026-08-17.** The record
-  carries the wall remotes now (a shared pool of 58 across the table, since
-  shortened to 26) and the firmware loads them into `Shade::linked`, so
-  overheard presses finally reach the position estimate — which, RTS being
-  one-way, is the only feedback path this controller has. What the file never
-  carried is their **rolling codes**, and that turns out not to matter: a linked
-  remote is listened to and never transmitted as, so its address is the whole of
-  what is needed.
-
-  **(1) and (2) are discharged, 2026-08-18.** Rooms and groups are persisted in
-  a **fourth** flash region, `estate` at 0x208000 — a `RTSE` record beside the
-  shade table's `RTSS`, because that one is full to the byte and a compile-time
-  assertion says so. `provision_shades --from-backup` writes both images from
-  one import and the firmware loads both into the registry, so
-  `GET /api/v1/rooms` and `/api/v1/groups` answer with the imported estate and a
-  group command fans out to the shades the old controller had in it.
-
-  The **v19–v22 fabricated group code** is surfaced twice, and deliberately: the
-  importer prints a per-group caveat naming the format version, and the record
-  carries a `code_recovered` bit beside the code, because the warning is read
-  once by one person and the value outlives them. Nothing transmits as a group
-  in v1.0 — a group command is sent to each member shade — so it costs nothing
-  today; it is the first thing a group-transmit path must read.
-
-  The **MQTT settings** come from the backup's *net* record (not its settings
-  record — see `docs/provenance.md`, which corrects the citation that used to be
-  here), and `provision --from-backup` maps them onto `somfy_config::MqttSettings`
-  with the **concatenation undone**: a migrated `discoTopic` becomes
-  `discovery_prefix` on its own and `rootTopic` becomes `state_root` on its own.
-  An import that would produce an invalid pair — an empty namespace, or both set
-  to `homeassistant`, which puts availability on Home Assistant's own birth
-  topic — is refused with the field named, per requirements-spec R3. The backup
-  does not carry the broker's username or password (the C++ keeps both in NVS),
-  so both are still asked for.
-
-  **What is still open:** applying any of this *on the device* rather than into
-  a provisioning image. `estate` is read-only to the firmware, exactly as
-  `shades` was before Plan 6 Task 2 gave it a writer, because rooms and groups
-  have no runtime edit vocabulary yet.
-- **Group commands stay per-shade fan-out in v1.0.** The domain executes a group
-  command by fanning it out to each member shade (Plan 2 `Controller::command_group`),
-  not by transmitting a single group virtual-remote frame. Even so, group
-  virtual-remote identities (`address` + `next_code` from `MigratedGroup`) MUST
-  still be persisted by Plan 6 for future group-TX support and to preserve the
-  option of pairing-compatible group frames. The v19–v22 fabricated-code warning
-  applies only if/when group-TX is implemented. **Both are done**: the identity
-  is stored in `somfy_config::StoredGroup` and the warning is stored beside it
-  as `code_recovered`, so a group-TX path can refuse a placeholder rather than
-  transmit one.
-
-## Workspace crates
-
-| Crate | `no_std` | Description |
-|-------|:--------:|-------------|
-| [`somfy-rts`](crates/somfy-rts) | yes | Somfy RTS protocol engine: 56/80-bit frame encode/decode, rolling codes, OOK pulse rendering (TX) and dual-stream pulse decoding (RX), repeat-frame dedupe. Hardware-free — pure pulse data in/out. |
-| [`somfy-domain`](crates/somfy-domain) | yes | Domain model: shade/group/room registries + position dead-reckoning. Travel-time position/tilt estimator, command orchestration (commands in → planned radio TX + state-delta events out), and overheard-remote tracking. Also the controller's own virtual-remote identity: a per-shade radio address derived from the device-unique half of the board's MAC, so this controller never transmits as a remote another controller also owns. Clock-free — callers inject `now_ms`. |
-| [`somfy-api`](crates/somfy-api) | yes¹ | Shared REST/WebSocket contract: serde DTOs mirroring the domain entities (camelCase wire, whole-percent `u8` positions, C++ numeric discriminants). The `ts` feature generates TypeScript types into `ui/src/api/generated/` so UI/firmware drift is a compile error. |
-| [`somfy-migrate`](crates/somfy-migrate) | yes | C++ ESPSomfy-RTS backup-file parser: reads an exported `.backup` into `MigrationData` (shades, rooms, groups, and the broker settings out of the net record) so an existing setup migrates without re-pairing. Applies the rolling-code `+1` (last-sent → next-to-send) contract; allocation-free. Carries `rootTopic` and `discoTopic` **apart**, exactly as the file holds them — undoing the concatenation the C++ performs at publish time is the importer's job, not a deserializer's. |
-| [`somfy-rmt`](crates/somfy-rmt) | yes | Packs Somfy pulse trains into ESP32 RMT symbols: renders, merges adjacent same-level halves, packs two pulses per 32-bit symbol and terminates the buffer. Pure data, so the packing that hardware depends on is host-testable. |
-| [`somfy-cc1101`](crates/somfy-cc1101) | yes | CC1101 radio driver for on-off-keyed asynchronous-serial transmission at 433.42 MHz. Speaks only `embedded-hal` SPI. Every register byte is assembled from named bit-fields carrying the datasheet arithmetic that produced it, re-checked by compile-time assertion. |
-| [`somfy-mqtt`](crates/somfy-mqtt) | yes | MQTT topic construction, configuration validation, Home Assistant discovery payloads, and the publish/subscribe **lifecycle as data**. The discovery prefix and the state root are separate types that hold their text privately, so concatenating them — the fault that made discovery unusable on the C++ build — does not compile. Bad configuration is refused with a typed error naming the field, never repaired. No user text reaches a topic segment: identifiers are built from literals and stable ids, so a rename cannot move a discovery topic. Payload and publisher are derived from one topic table so they cannot drift apart. The lifecycle is a value rather than a sequence of calls: a message carries its own retention with no constructor that takes one, removal is a zero-length retained publish, and whatever an announcement retains the matching retirement clears — so an entity cannot be added without also being removable, per-shade and device-level alike. The entity set is a cover and a pairing button per shade, plus five device diagnostics — uptime, Wi-Fi signal, free heap, peak heap use and damaged rolling-code slots — chosen by one rule: **an entity backed by nothing is worse than an absent one**, so anything the firmware cannot actually report is omitted and recorded rather than stubbed. Network-free. |
-| [`somfy-store`](crates/somfy-store) | yes | Rolling-code persistence seam: the `RollingCodeStore` trait, wear-levelling slot arithmetic, and a `transmit()` helper that makes persist-before-transmit **unforgeable** — the queue accepts only a ticket minted after a successful commit, so no call site can transmit a code that has not reached flash. |
-| [`somfy-tasks`](crates/somfy-tasks) | yes | The radio and state task bodies, written where a host compiler can reach them. Owns the transmit channel, whose producer end is deliberately unreachable from outside so the ordering guarantee above holds end to end. |
-| [`somfy-config`](crates/somfy-config) | yes | The device's persisted configuration — Wi-Fi credentials and MQTT settings — as pure data: the validation rules and the bytes one flash slot holds. Refuses rather than repairs, because a truncated SSID names a different network and a padded passphrase is the wrong passphrase; both present as a device that will not connect with nothing saying why. The broker is an IPv4 address rather than a host name, because the firmware has no resolver, and the two topic namespaces go through `somfy-mqtt`'s own validators so a record cannot deliver a value the topic builder would refuse. **A Plan 5 stopgap that Plan 6 replaces**, and **not** secrets-at-rest: the passphrase and the broker password are stored in the clear and anyone holding the board can read them. |
-| [`firmware`](crates/firmware) | yes² | The ESP binary: board wiring, per-chip pin maps, the RMT transmit and receive paths, the two flash regions, Wi-Fi, and the MQTT broker session. Deliberately thin — it holds only what genuinely needs `esp-hal`, because this crate cannot be compiled for the host at all, so anything testable lives in a crate beside it. It is also the **only** crate with a heap, and that heap exists for `esp-radio`; the ten crates above it are allocation-free, which CI checks by building every one of them for a target that has no allocator. |
-
-¹ `somfy-api` is `no_std` by default; the `std`/`ts` features are host-only for
-TypeScript generation.
-
-² `firmware` is excluded from the root workspace: it builds only for ESP
-targets, one chip per build (`chip-esp32`/`chip-s3`/`chip-c3`). Its transports
-are features — `mqtt`, `http` and `ui`, all on by default — so that a build with
-every transport off still compiles, which is what proves no transport logic has
-leaked into the domain or the task layer. **`http`/`ui` do not fit the ESP32**;
-see [`crates/firmware/README.md`](crates/firmware/README.md).
-
-### The web UI
-
-[`ui/`](ui) is the Preact + Vite + TypeScript app the firmware serves from
-flash. It is **mock-driven**: `bun run dev` starts a Vite plugin that serves a
-fake `/api/v1/` REST + WebSocket device, so every screen can be built and
-exercised with no hardware and no firmware running. The **device** serves the
-same paths — `crates/firmware/src/api/` — so the same client code runs against
-both with no "mock mode" branch anywhere in the app.
-
-The mock is not a hand-written imitation of the API — it is *typed by* the
-generated bindings in `ui/src/api/generated/`, down to an exhaustive `switch`
-over `CommandDto` and a total map over the `WsEvent` tags. A DTO change in
-`somfy-api` therefore lands as a TypeScript error rather than as a mock that
-quietly describes a device the firmware is not.
-
-```sh
-cd ui
-bun install
-bun run dev      # dashboard against the mock device
-bun run check    # typecheck + lint + build + bundle-size budget
-```
-
-Positions on the wire are Somfy's — 0 fully open, 100 fully closed. The UI
-presents *openness* (100 = open, as Home Assistant and every consumer blind app
-do), and the conversion between the two lives in exactly one file,
-[`ui/src/api/position.ts`](ui/src/api/position.ts).
-
-Built and shipping today: the dashboard (rooms → groups → shade tiles, with
-up/my/down and a position slider), shade detail, and English + French. The
-pairing assistant, settings, backup/restore, diagnostics and captive-portal
-onboarding are routed stubs.
-
-## Build & test
-
-Everything in this plan runs on the host — no hardware required:
-
-```sh
-cargo test --workspace          # full suite (unit, property, loopback, golden)
-cargo fmt --check               # formatting
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-`no_std` compilation is guarded against a bare-metal target:
-
-```sh
-rustup target add thumbv7em-none-eabihf
-cargo build -p somfy-rts --target thumbv7em-none-eabihf
-```
-
-(ESP-specific targets arrive with the firmware radio in Plan 4;
-`thumbv7em-none-eabihf` is a cheap universal `no_std` guard until then.)
-
-CI runs all of the above on every push and pull request
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+---
 
 ## License
 
-GPL-3.0-only (declared in the workspace manifest). The ESPSomfy-RTS reference
-implementation is released into the public domain (Unlicense); this rewrite is
-independently licensed.
+**GPL-3.0-only.** ESPSomfy-RTS is public domain (Unlicense); this rewrite is
+independently licensed and shares no code with it.
