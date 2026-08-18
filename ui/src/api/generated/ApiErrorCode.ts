@@ -7,4 +7,4 @@
  * code the UI can only render as "something went wrong" belongs in a log, not
  * on the wire.
  */
-export type ApiErrorCode = "nameEmpty" | "nameTooLong" | "invalidKind" | "invalidTiltMode" | "travelTimeZero" | "invalidAddress" | "registryFull" | "notFound" | "addressNotAllocated";
+export type ApiErrorCode = "nameEmpty" | "nameTooLong" | "invalidKind" | "invalidTiltMode" | "travelTimeZero" | "invalidAddress" | "registryFull" | "notFound" | "addressNotAllocated" | "invalidDeadBand" | "ventBandNotMeasured" | "notCalibrating" | "calibrationImplausible";

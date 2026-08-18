@@ -32,4 +32,4 @@
  *
  * [`ApiErrorCode::AddressNotAllocated`]: crate::ApiErrorCode::AddressNotAllocated
  */
-export type CommandDto = { "action": "up" } | { "action": "down" } | { "action": "my" } | { "action": "stepUp" } | { "action": "stepDown" } | { "action": "goTo", position: number, } | { "action": "setMy", position: number | null, };
+export type CommandDto = { "action": "up" } | { "action": "down" } | { "action": "my" } | { "action": "stepUp" } | { "action": "stepDown" } | { "action": "goTo", position: number, } | { "action": "setMy", position: number | null, } | { "action": "vent" };
