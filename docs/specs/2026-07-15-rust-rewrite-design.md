@@ -13,11 +13,25 @@ hardware, intended as:
 
 1. **A daily-driver replacement** for the author's own installation
    (ESP32-S3-DevKitC-1-N8R8 + CC1101 433 MHz module).
-2. **A community-adoptable project**: supports the ESP32 chip family broadly
-   (ESP32, ESP32-C3, ESP32-S3) so existing ESPSomfy-RTS users can migrate.
-   The ESP32-S2 was in this list until 2026-08-17 and was dropped: it has too
-   little DRAM to hold the Wi-Fi driver's heap and a bootable stack at the same
-   time. `docs/provenance.md` carries the arithmetic.
+2. **A community-adoptable project**: supports the ESP32 chip family across both
+   its instruction sets (ESP32-S3, ESP32-C3) so existing ESPSomfy-RTS users can
+   migrate.
+
+   **This list has shrunk twice, and the criterion each time was the same:
+   whether the claim could be backed.** The ESP32-S2 went on 2026-08-17 — too
+   little DRAM to hold the Wi-Fi driver's heap and a bootable stack at once. The
+   ESP32 went on 2026-08-18: it could not hold the web server at all, and in its
+   only buildable configuration its Wi-Fi heap cleared the measured announcement
+   peak by 1,700 bytes, which is inside that peak's own ~2,000-byte boot-to-boot
+   spread. **Neither chip had ever booted this firmware**, so both were listed
+   support rather than demonstrated support, and both were withdrawn rather than
+   maintained. `docs/provenance.md` carries both sets of arithmetic.
+
+   The ESP32-C3 remains, with `mdns` and `sntp` refused on it for the same kind
+   of measured reason — so it is reached by IP rather than by name and has no
+   wall clock. It is still build-only: no C3 has been booted either, and what it
+   earns its place with is the RISC-V code path, which has caught a fault an
+   Xtensa-only matrix would have shipped.
 
 ### 1.2 v1.0 scope (must ship)
 
@@ -134,8 +148,9 @@ somfy-rs/
 
 ### 3.5 `firmware`
 
-- One binary crate; target chip selected by Cargo feature
-  (`chip-esp32`, `chip-c3`, `chip-s3`).
+- One binary crate; target chip selected by Cargo feature (`chip-s3`,
+  `chip-c3`). `chip-esp32` was dropped 2026-08-18 and `chip-s2` 2026-08-17; see
+  §1.2.
 - Drivers: minimal CC1101 SPI driver (own module, `embedded-hal` traits,
   ~15 registers actually used) + RMT OOK TX/RX.
 - Embassy tasks (Section 4).
@@ -294,9 +309,12 @@ this codebase spends `api::REST_TASKS_RESERVED` to make impossible.
 reopen it.
 
 TLS was considered and declined for now: `esp-mbedtls` handshake buffers want
-32–64 KB against the S3's ~38 KB of heap headroom, it would likely end C3
-support as it already ended ESP32's, and self-signed certificates train users to
-click through warnings. Revisit if the heap picture changes.
+32–64 KB against the S3's ~11 KB of heap headroom over the measured announcement
+peak, it would certainly end C3 support as it already ended the ESP32's, and
+self-signed certificates train users to click through warnings. The C3 has a
+second reason of its own: `sntp` is refused there, so it has no wall clock, and
+certificate validity is a wall-clock question. Revisit if the heap picture
+changes.
 
 ### 7.4 MQTT + Home Assistant
 
@@ -379,7 +397,7 @@ bootloader rolls back. A daily driver must not brick from a bad release.
 | RMT RX unsuitable for long Somfy frames | Contingency: GPIO-interrupt RX (Section 5.3); TX unaffected. |
 | Rolling-code corruption bricks pairings | Persist-before-TX invariant + wear-leveled region + golden-capture compatibility tests + backup export in UI. |
 | C++ backup format quirks | Parser written against `ConfigFile.cpp` as source of truth; validated with real device backups. |
-| Xtensa toolchain friction (ESP32/S3) | `espup`-managed toolchain in CI and documented setup; C3 (RISC-V) remains the friction-free dev target. |
+| Xtensa toolchain friction (S3) | `espup`-managed toolchain in CI and documented setup; C3 (RISC-V) remains the friction-free dev target, which is also why `crates/firmware/rust-analyzer.toml` names it. |
 
 ## 13. Success Criteria
 

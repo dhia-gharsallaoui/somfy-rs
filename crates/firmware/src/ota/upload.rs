@@ -92,20 +92,17 @@ impl Page {
 /// Which chip this image runs on, and therefore which `chip_id` an uploaded
 /// image has to carry.
 ///
-/// The three values were read off real images built from this repository
-/// rather than out of a header file; `somfy_ota::image::Chip` holds them and
+/// Both values were read off real images built from this repository rather
+/// than out of a header file; `somfy_ota::image::Chip` holds them and
 /// `docs/provenance.md` records the images. The `compile_error!` below is the
-/// part that matters: a fourth chip added to the build matrix without a
+/// part that matters: a third chip added to the build matrix without a
 /// `chip_id` here would otherwise be a board that accepts any image at all.
-#[cfg(feature = "chip-esp32")]
-const THIS_CHIP: Chip = Chip::Esp32;
-/// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
 const THIS_CHIP: Chip = Chip::Esp32S3;
-/// See the `chip-esp32` definition above.
+/// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
 const THIS_CHIP: Chip = Chip::Esp32C3;
-#[cfg(not(any(feature = "chip-esp32", feature = "chip-s3", feature = "chip-c3")))]
+#[cfg(not(any(feature = "chip-s3", feature = "chip-c3")))]
 compile_error!(
     "an over-the-air update refuses an image built for a different chip, and that check needs \
      this chip's `chip_id`. Add one to `somfy_ota::image::Chip` and name it here."

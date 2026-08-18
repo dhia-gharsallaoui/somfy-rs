@@ -104,7 +104,7 @@ actually want it gone.
 If espflash reports **"ESP-IDF App Descriptor missing"**, the image lacks
 `esp_bootloader_esp_idf::esp_app_desc!()`. Note that nothing in the build
 catches this: the descriptor has no runtime behaviour, so the compiler, clippy
-and the entire four-chip CI matrix stay green on a binary that cannot be put on
+and the entire CI matrix stay green on a binary that cannot be put on
 a device at all.
 
 If it reports **"Error while running FlashEnd command"**, drop `--no-stub`.
@@ -1171,16 +1171,27 @@ Since then the heap is **per chip**, derived by subtracting a fixed stack
 budget from the DRAM each chip has to divide, so both numbers below move
 together and both are printed on every boot:
 
-| chip | heap | main stack | required |
-|---|---|---|---|
-| ESP32 | 60 KiB = 61,440 | 66,908 | 49,592 |
-| ESP32-S3 | 163 KiB = 166,912 | 66,788 | 49,592 |
-| ESP32-C3 | 150 KiB = 153,600 | 66,856 | 49,592 |
+| chip | build measured | heap | main stack | required |
+|---|---|---|---|---|
+| ESP32-S3 | `mqtt`+`ui`+`mdns`+`sntp` | 64 KiB = 65,536 | 66,724 | 57,120 |
+| ESP32-C3 | `mqtt`+`ui` | 59 KiB = 60,416 | 66,448 | 57,120 |
 
-Read on 2026-08-17 from the release ELFs; the ESP32-S3 row was confirmed on the
-spare board, which printed `stack: 66788 bytes available, 49592 required` —
-the ELF figure exactly. `crates/firmware/src/heap.rs` carries the derivation
-and the commands that regenerate the table.
+Read on 2026-08-18 from the release ELFs; the ESP32-S3 row was confirmed on the
+board, which printed `stack: 66724 bytes available, 57120 required` — the ELF
+figure exactly. `crates/firmware/src/heap.rs` carries the derivation and the
+commands that regenerate the table.
+
+**The `build measured` column is not decoration.** Each row is measured with the
+largest feature set that chip is *permitted* to build, which is what makes one
+figure per chip sound — a smaller build leaves the residue on the stack, the
+safe direction. The ESP32-C3 is permitted less than the S3: `mdns` and `sntp`
+are refused there by `compile_error!`, so a C3 is reached by IP address rather
+than by a `.local` name and has no wall clock.
+
+**The ESP32 row is gone.** That chip was dropped on 2026-08-18 — it had never
+booted this firmware, could not link the web server, and its one buildable
+configuration left its heap 1,700 bytes above the announcement peak, inside that
+peak's own spread. The ESP32-S2 went the same way on 2026-08-17.
 
 **The line worth reading is `heap: session announced`.** It is printed one line
 after the burst of retained discovery configs that produces the heap's peak;
@@ -1635,10 +1646,13 @@ Three ways, in descending order of what they cost.
 ### What this procedure does not establish
 
 - **That the update path works on the ESP32-C3.** The upload endpoint exists in
-  that build and has never run: `crates/firmware/src/heap.rs` records that the
-  route takes its Wi-Fi heap to 52,224 bytes, which is 2,396 below the worst
-  announcement peak ever measured — on a different chip. `warn_if_tight` says
-  so at boot. If a C3 ever runs this, read that line first.
+  that build and has never run. Its heap arithmetic changed on 2026-08-18:
+  refusing `mdns` and `sntp` on that chip took its Wi-Fi heap from 52,224 bytes
+  — 2,396 *below* the worst announcement peak ever measured — to 60,416, which
+  is 5,796 above it. That is about 2.9× the peak's own boot-to-boot spread, so
+  `warn_if_tight` no longer fires. **But the peak is an ESP32-S3 measurement and
+  the C3's own has never been observed**, so if a C3 ever runs this, watch
+  `heap: session announced` on it before trusting the margin.
 - **That an image with an appended digest that does not match is refused
   *here*.** This firmware checks the image's own one-byte checksum, not its
   SHA-256; a corruption that survives both TCP and that byte is caught by the
@@ -1799,6 +1813,6 @@ espflash flash --port /dev/ttyUSB0 --erase-parts otadata \
   — and the design deliberately does not depend on it. If it *is* enabled it
   agrees with everything above; `crates/somfy-ota/src/verdict.rs` carries why
   the two readings converge.
-- **Anything about the ESP32 or the ESP32-C3.** The ESP32 cannot link the web
-  server at all, so it has the boot-side roll-back and no way to be sent an
-  update over the network; the C3 has both and no hardware.
+- **Anything about the ESP32-C3.** It has the web server, the upload route and
+  the boot-side roll-back, and no hardware. (The ESP32, which had the roll-back
+  and no way to be sent an update over the network, was dropped on 2026-08-18.)

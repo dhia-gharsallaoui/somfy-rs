@@ -69,10 +69,17 @@ jobs:
       - name: bundle size against the 200 KB gzipped budget (design spec §8)
         run: bun run size
 
-  # Three chips × five service features is a large space, and this builds nine
-  # of it. The choice is deliberate, because *silent* partial coverage is the
-  # thing this project keeps being bitten by — five CI holes so far, every one
-  # of them a configuration nobody built.
+  # Two chips × five service features, and this builds seven of it. The choice
+  # is deliberate, because *silent* partial coverage is the thing this project
+  # keeps being bitten by — five CI holes so far, every one of them a
+  # configuration nobody built.
+  #
+  # **It was nine rows over three chips until 2026-08-18**, when the ESP32 was
+  # dropped: it had never booted this firmware, was already excluded from the web
+  # server, and its one buildable configuration left its Wi-Fi heap 1,700 bytes
+  # above the measured announcement peak — inside that peak's own ~2,000-byte
+  # spread. Its two rows went with it. `docs/provenance.md` carries the
+  # arithmetic beside the ESP32-S2's, dropped the same way on 2026-08-17.
   #
   # What each row buys:
   #
@@ -97,20 +104,23 @@ jobs:
   #
   # What is deliberately not covered, and why:
   #
-  # - **The ESP32 with `http`, `ui`, `mdns` or `sntp`.** The first three cannot
-  #   be built at all — `mdns` implies `http`, and `http` on that chip leaves
-  #   54,556 bytes of DRAM for a 66,280-byte stack budget, so the image does not
-  #   link. `sntp` *would* link and is refused anyway, because it leaves 872
-  #   bytes of heap inside a ~4,216-byte spread. Both refusals are
-  #   `compile_error!`s in `heap.rs` naming their measurements, and both were
-  #   proved by hand rather than by a job, because a CI step whose success is a
+  # - **The ESP32-C3 with `mdns` or `sntp`.** Neither can be built: that chip has
+  #   the DRAM for the web server but not for a responder or a clock on top of
+  #   it, and `heap.rs` refuses both with a `compile_error!` naming the
+  #   measurement. Those refusals are load-bearing rather than advisory — they
+  #   are what keeps `heap::DRAM_FOR_STACK_AND_HEAP` a per-chip *maximum*, since
+  #   it is measured at the largest set each chip can build. Both were proved to
+  #   fire by hand rather than by a job, because a CI step whose success is a
   #   compilation *failure* inverts every other row here.
-  # - **Feature interactions on the ESP32-C3.** They are architecture-
-  #   independent — the same modules, the same statics — and the ESP32-S3 rows
-  #   cover them. What the C3 is in the matrix *for* is the RISC-V code path,
-  #   which its two rows exercise; note that its shipping row does build
-  #   `edge-mdns`, `domain` and `sntpc` for RISC-V, which is the part that could
-  #   plausibly differ.
+  # - **Feature interactions on the ESP32-C3 beyond that.** They are
+  #   architecture-independent — the same modules, the same statics — and the
+  #   ESP32-S3 rows cover them. What the C3 is in the matrix *for* is the RISC-V
+  #   code path, which its two rows exercise, and which has caught a real fault
+  #   nothing else would have (`AtomicU32::fetch_add` does not exist on
+  #   `riscv32imc`). Note that `edge-mdns`, `domain` and `sntpc` are **no longer
+  #   built for RISC-V by any row**, since the C3 refuses the features that pull
+  #   them — a coverage loss the ESP32-S3 rows do not make up, and the one thing
+  #   this change costs.
   # - **`ui` without `mqtt` as its own row.** The shipping build covers `ui` on
   #   and the `http` row covers it off, so the module selection in `api/mod.rs`
   #   is exercised both ways already.
@@ -123,13 +133,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The ESP32 tops out at MQTT; see the note above.
-          - label: esp32 (mqtt)
-            target: xtensa-esp32-none-elf
-            args: --no-default-features --features chip-esp32,mqtt
-          - label: esp32 (radio only)
-            target: xtensa-esp32-none-elf
-            args: --no-default-features --features chip-esp32
           - label: s3 (mqtt + ui + mdns + sntp)
             target: xtensa-esp32s3-none-elf
             args: --features chip-s3
@@ -145,9 +148,12 @@ jobs:
           - label: s3 (radio only)
             target: xtensa-esp32s3-none-elf
             args: --no-default-features --features chip-s3
-          - label: c3 (mqtt + ui + mdns + sntp)
+          # The C3's shipping build is NOT `--features chip-c3`: the default
+          # feature set includes `mdns` and `sntp`, which `heap.rs` refuses on
+          # that chip. Spelled out so this row is the image a C3 would run.
+          - label: c3 (mqtt + ui — its shipping build; mdns and sntp refused)
             target: riscv32imc-unknown-none-elf
-            args: --features chip-c3
+            args: --no-default-features --features chip-c3,mqtt,ui
           - label: c3 (radio only)
             target: riscv32imc-unknown-none-elf
             args: --no-default-features --features chip-c3
@@ -156,7 +162,7 @@ jobs:
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
-          buildtargets: esp32,esp32s3
+          buildtargets: esp32s3
           ldproxy: false
       # The web UI is embedded in the image with `include_bytes!`, so
       # `crates/firmware/build.rs` needs `ui/dist/` to exist — and it is a build

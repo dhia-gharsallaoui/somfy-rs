@@ -109,16 +109,23 @@ pub const APPENDED_DIGEST_BYTES: usize = 32;
 /// is not, which matters because the walk below is driven by that number.
 pub const MAX_SEGMENTS: u8 = 16;
 
-/// A chip this firmware is built for.
+/// A chip this project has produced images for.
 ///
-/// Only the three, deliberately. An image built for an ESP32-C6 is not a thing
-/// this project can produce, so modelling its id would be modelling a value
-/// that could only ever arrive by mistake — and [`ImageError::WrongChip`]
-/// reports the raw number, which tells an operator more than a name this crate
-/// guessed at.
+/// **Not the same set as the chips it builds today**, and the difference is
+/// deliberate. `chip-esp32` was dropped from the firmware on 2026-08-18, so no
+/// new ESP32 image can be produced — but images already exist, on operators'
+/// disks and in earlier releases, which makes an ESP32 upload a *realistic
+/// mistake* rather than an impossible one. Naming it costs one match arm and
+/// turns the refusal into "this is an esp32 image" instead of a raw number.
+///
+/// That is the whole membership rule, and it is why an ESP32-C6 is still absent:
+/// this project has never produced one, so its id could only ever arrive by
+/// accident or malice, and [`ImageError::WrongChip`] reports the raw number,
+/// which tells an operator more than a name this crate guessed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chip {
-    /// ESP32, Xtensa.
+    /// ESP32, Xtensa. **No longer built** — kept so an image from before
+    /// 2026-08-18 is refused by name.
     Esp32,
     /// ESP32-S3, Xtensa.
     Esp32S3,

@@ -1,6 +1,6 @@
 //! Per-chip constants. Exactly one `chip-*` feature must be enabled; esp-hal's
-//! own chip features are mutually exclusive, so "all four chips" means four
-//! separate builds, never one.
+//! own chip features are mutually exclusive, so "two chips" means two separate
+//! builds, never one.
 //!
 //! The pin numbers here are documentation and diagnostics; the pins the driver
 //! actually claims come from [`cc1101_pins!`], which names the same GPIOs as
@@ -14,36 +14,31 @@
 
 use esp_hal::gpio::AnyPin;
 
-#[cfg(not(any(feature = "chip-esp32", feature = "chip-s3", feature = "chip-c3")))]
-compile_error!(
-    "no chip selected: build with exactly one of \
-     --features chip-esp32 | chip-s3 | chip-c3"
-);
-
-// Two (or more) chip features enabled at once would otherwise expand two
-// `pub mod pins` definitions into the same scope, which surfaces as a
-// confusing "duplicate definition" error far from its real cause. Fail with
-// a message that names the actual problem instead.
+// The zero-chip and two-chip guards below are kept at two chips, and it is
+// worth saying why rather than leaving it to be rediscovered: with one chip
+// left they would collapse into nothing, and they did not.
 //
-// In practice neither `compile_error!` above or below is what a
-// mis-invoked build actually hits: esp-println's build script rejects a
-// zero-feature build, and esp-metadata-generated emits ~24 duplicate-macro
-// errors for a two-feature build, both before this crate is compiled. These
-// stay as a backstop — they cost nothing, they name the problem in one line
-// instead of twenty-four, and they keep working if the upstream checks ever
-// move or are relaxed.
-#[cfg(any(
-    all(feature = "chip-esp32", feature = "chip-s3"),
-    all(feature = "chip-esp32", feature = "chip-c3"),
-    all(feature = "chip-s3", feature = "chip-c3"),
-))]
+// Neither is what a mis-invoked build actually hits. esp-println's build script
+// rejects a zero-feature build and esp-metadata-generated emits ~24
+// duplicate-macro errors for a two-feature build, both before this crate is
+// compiled. These stay as a backstop — they cost nothing, they name the problem
+// in one line instead of twenty-four, and they keep working if the upstream
+// checks ever move or are relaxed.
+#[cfg(not(any(feature = "chip-s3", feature = "chip-c3")))]
+compile_error!("no chip selected: build with exactly one of --features chip-s3 | chip-c3");
+
+// Two chip features at once would otherwise expand two `pub mod pins`
+// definitions into the same scope, which surfaces as a confusing "duplicate
+// definition" error far from its real cause. Fail with a message that names the
+// actual problem instead.
+#[cfg(all(feature = "chip-s3", feature = "chip-c3"))]
 compile_error!(
     "multiple chip features selected: build with exactly one of \
-     --features chip-esp32 | chip-s3 | chip-c3"
+     --features chip-s3 | chip-c3"
 );
 
-/// RMT source clock. **Must** be 80 MHz on the ESP32 (esp-hal constraint); the
-/// other two are configured the same for one tick model.
+/// RMT source clock, and the divider giving 1 µs ticks from it. The same on
+/// both chips, for one tick model.
 pub const RMT_CLOCK_MHZ: u32 = 80;
 
 /// Divider giving 1 µs ticks from `RMT_CLOCK_MHZ`.
@@ -79,18 +74,6 @@ pub mod pins {
 // The chip-s3 map above is the only one checked against a working device —
 // see docs/provenance.md for where these numbers came from. Do not wire a
 // board to these pins without checking them first.
-#[cfg(feature = "chip-esp32")]
-pub mod pins {
-    pub const SCK: u8 = 18;
-    pub const MOSI: u8 = 23;
-    pub const MISO: u8 = 19;
-    pub const CSN: u8 = 5;
-    pub const GDO0_TX: u8 = 13;
-    /// CC1101 GDO2 — RX data out, claimed by the receive path.
-    pub const GDO2_RX: u8 = 12;
-}
-
-// UNVERIFIED defaults — see the note above `chip-esp32`'s pin module.
 #[cfg(feature = "chip-c3")]
 pub mod pins {
     pub const SCK: u8 = 15;
@@ -137,22 +120,6 @@ macro_rules! cc1101_pins {
 }
 
 /// See the `chip-s3` definition above for why this is a macro.
-#[cfg(feature = "chip-esp32")]
-#[macro_export]
-macro_rules! cc1101_pins {
-    ($peripherals:ident) => {
-        $crate::chip::Cc1101Pins {
-            sck: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO18),
-            mosi: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO23),
-            miso: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO19),
-            csn: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO5),
-            gdo0_tx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO13),
-            gdo2_rx: ::esp_hal::gpio::Pin::degrade($peripherals.GPIO12),
-        }
-    };
-}
-
-/// See the `chip-s3` definition above for why this is a macro.
 #[cfg(feature = "chip-c3")]
 #[macro_export]
 macro_rules! cc1101_pins {
@@ -176,15 +143,14 @@ macro_rules! cc1101_pins {
 /// leaves the rest of the struct usable — but the numbers also differ per chip
 /// in two ways that are easy to get wrong:
 ///
-/// - **Not every channel can receive.** The ESP32 lets any channel do either
-///   direction; the ESP32-S3 splits them (0-3 transmit, 4-7 receive)
-///   and the ESP32-C3 splits them differently again (0-1 transmit, 2-3
-///   receive). Asking channel 1 to receive on an S3 is not a runtime error, it
-///   is a missing trait implementation.
+/// - **Not every channel can receive.** The ESP32-S3 splits them (0-3 transmit,
+///   4-7 receive) and the ESP32-C3 splits them differently again (0-1 transmit,
+///   2-3 receive). Asking channel 1 to receive on an S3 is not a runtime error,
+///   it is a missing trait implementation.
 /// - **Each channel is configured for two memory blocks**, so it occupies its
 ///   neighbour's as well. That is why the receive channel is never the one
-///   immediately after the transmit channel on the chips that share a block
-///   pool: channel 0 with `memsize = 2` already owns block 1.
+///   immediately after the transmit channel on a chip that shares a block pool:
+///   channel 0 with `memsize = 2` already owns block 1.
 ///
 /// ESP32-S3: channels 0-3 transmit, 4-7 receive, with separate memory
 /// banks per direction.
@@ -193,18 +159,6 @@ macro_rules! cc1101_pins {
 macro_rules! rmt_channels {
     ($rmt:ident) => {
         ($rmt.channel0, $rmt.channel4)
-    };
-}
-
-/// See the `chip-s3` definition above for why this is a macro.
-///
-/// ESP32: every channel does either direction out of one shared block
-/// pool, so receive starts at 2 — channel 0 already owns block 1.
-#[cfg(feature = "chip-esp32")]
-#[macro_export]
-macro_rules! rmt_channels {
-    ($rmt:ident) => {
-        ($rmt.channel0, $rmt.channel2)
     };
 }
 

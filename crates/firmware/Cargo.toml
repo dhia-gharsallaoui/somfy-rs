@@ -78,8 +78,8 @@ esp-idf-part = "0.6"
 # 620,040,372 downloads (137,601,615 recent), MIT OR Apache-2.0, last release
 # 2026-02-03, and it lives under `rust-lang/`. `default-features = false` plus
 # `rust_backend` keeps it off `libz`/`zlib-ng`, so building this crate needs no
-# C toolchain and no system library — which matters because the three chip
-# targets already bring their own.
+# C toolchain and no system library — which matters because the chip targets
+# already bring their own.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [dependencies]
@@ -304,12 +304,12 @@ default = ["mqtt", "ui", "mdns", "sntp"]
 # is the domain's, and the state task's request seam was living inside the HTTP
 # module rather than beside the task it belongs to.
 #
-# **And on the ESP32 the web server does not fit.** That is measured, not
-# estimated: with `http` on, the DRAM left for the stack and the heap falls to
-# 57,236 bytes against a stack budget of 66,280 — the image does not link at
-# all, let alone leave the Wi-Fi driver its 47,464-byte working set. `src/heap.rs`
-# carries the arithmetic per chip. `http` is therefore off for that chip and on
-# for the two that have the DRAM.
+# **And DRAM decides which of them a chip can carry.** That is measured, not
+# estimated, and `src/heap.rs` carries the arithmetic: the ESP32-C3 has the room
+# for `mqtt`, `http` and `ui` but not for `mdns` or `sntp` on top of them, and
+# `heap.rs` refuses those two on that chip with a `compile_error!` naming the
+# figure. The ESP32-S3 carries everything. (The ESP32 could carry only `mqtt`
+# and was dropped on 2026-08-18; see the chip section below.)
 mqtt = ["dep:minimq", "dep:somfy-mqtt"]
 http = ["dep:picoserve", "dep:serde", "dep:serde-json-core"]
 # The UI implies the server, because a UI with nothing to serve it is not a
@@ -327,13 +327,12 @@ ui = ["http"]
 # all because it looks like a device that has broken rather than one that was
 # never there.
 #
-# The consequence is that the **ESP32 never has mDNS**, because it never has
-# `http` (see the `compile_error!` in `src/heap.rs`). That is the right answer
-# rather than a casualty: on that chip the image has no inbound service to find.
-#
 # The reverse — `http` without `mdns` — is a real build and stays one. It is what
-# an integration test rig wants when it already knows the address, and it is the
-# configuration the ESP32-C3 row in CI uses to prove the two are separable.
+# an integration test rig wants when it already knows the address, and since
+# 2026-08-18 it is also **the ESP32-C3's shipping configuration**: that chip has
+# the DRAM for the web server but not for the responder as well, so `heap.rs`
+# refuses `mdns` there. A C3 is reached by IP address; an S3 answers to
+# `<hostname>.local` as before.
 mdns = [
     "http",
     "dep:edge-mdns",
@@ -350,8 +349,11 @@ mdns = [
 # is. A build with it off has no wall clock at all — which is a stronger
 # statement than "nothing reads it", because there is nothing to read.
 #
-# It is the one feature here the ESP32 keeps, for the same reason: an SNTP client
-# is one 48-byte datagram an hour and two small buffers.
+# **The ESP32-C3 is such a build**: `sntp` is refused there (`src/heap.rs`), so
+# that chip has no wall clock at all. An SNTP client is one 48-byte datagram an
+# hour, which is nothing on the wire, and 2,880 bytes of DRAM in the image, which
+# is the currency that chip is short of. Nothing this firmware does depends on
+# it; log timestamps do, and TLS on a future update path would.
 sntp = [
     "dep:sntpc",
     "dep:sntpc-net-embassy",
@@ -379,31 +381,38 @@ sntp = [
 bad-image-selftest = []
 bad-image-panic = []
 
-# Three chips, two architectures, one configuration each. There is no feature
-# here that turns a part of the firmware off: every supported chip builds the
-# same image, and `src/heap.rs` is the only file that knows they differ in size.
+# Two chips, two architectures. There is no feature here that turns a part of
+# the firmware off: both build the same code, and `src/heap.rs` is the only file
+# that knows they differ in size.
 #
-# **There used to be a fourth chip and a `mqtt` feature to go with it.** The
-# ESP32-S2 could not hold the broker session in DRAM, so `mqtt` existed to
-# compile it out for that chip alone — eight `cfg` sites across five files and a
-# stub `start_mqtt` that printed an apology at boot. The ESP32-S2 was dropped on
-# 2026-08-17 (`docs/provenance.md` carries the arithmetic and the reason), and
-# with it the only caller of that seam; nothing else wanted a build without a
-# broker, because a board with no broker *provisioned* is already an ordinary
-# runtime state that `start_mqtt` handles without a feature flag.
+# **Two chips have been dropped, both for the same reason and both recorded in
+# `docs/provenance.md` with their arithmetic.**
 #
-# The three that remain cover both instruction sets deliberately — ESP32 and
-# ESP32-S3 are Xtensa, ESP32-C3 is RISC-V — and that has caught real faults a
-# single-chip matrix would have shipped.
-chip-esp32 = [
-    "esp-hal/esp32",
-    "esp-println/esp32",
-    "esp-bootloader-esp-idf/esp32",
-    "esp-storage/esp32",
-    "esp-rtos/esp32",
-    "esp-radio/esp32",
-    "esp-alloc/esp32",
-]
+# The ESP32-S2 went on 2026-08-17: it could not hold the broker session in DRAM,
+# and a `mqtt` feature existed solely to compile that session out for it — eight
+# `cfg` sites across five files and a stub `start_mqtt` that printed an apology
+# at boot. Nothing else ever wanted a build without a broker, because a board
+# with no broker *provisioned* is an ordinary runtime state `start_mqtt` handles
+# without a feature flag.
+#
+# The ESP32 went on 2026-08-18, and the point is that **neither chip had ever
+# booted this firmware**. It was already excluded from the web server by a
+# `compile_error!`, and its one buildable configuration — `mqtt` alone — left its
+# Wi-Fi heap 1,700 bytes above the measured announcement peak, inside that peak's
+# own ~2,000-byte boot-to-boot spread, with nothing smaller to retreat to. That
+# is not a fit; it is a claim the project could not back, so it was withdrawn
+# rather than maintained.
+#
+# The two that remain still cover both instruction sets deliberately — ESP32-S3
+# is Xtensa, ESP32-C3 is RISC-V — and that has caught real faults a single-chip
+# matrix would have shipped (`AtomicU32::fetch_add` does not exist on
+# `riscv32imc`, and nothing but the RISC-V row found it).
+#
+# **The ESP32-C3 refuses `mdns` and `sntp`**, so its shipping image is
+# `mqtt,ui` — the web UI, the REST API and the update route, reached by IP
+# rather than by name, and with no wall clock. `src/heap.rs` carries the
+# measurement and, more importantly, why those refusals are what keep its
+# `DRAM_FOR_STACK_AND_HEAP` figure a maximum rather than a sample.
 chip-s3 = [
     "esp-hal/esp32s3",
     "esp-println/esp32s3",
@@ -423,14 +432,20 @@ chip-c3 = [
     "esp-alloc/esp32c3",
 ]
 
-# `esp-storage`'s build script **refuses** to build for the ESP32 below
-# optimization level 2, 3 or s: its flash routines run from RAM with the cache
-# disabled and are timing-sensitive, so an unoptimized build is not slow, it is
-# wrong. The default dev profile is level 0, which means `cargo clippy` — which
-# uses this profile, and which CI runs per chip before the release build —
-# fails at `esp-storage` for `chip-esp32` alone, with a message about
-# optimization that reads like a warning and is a hard error. Setting it here
-# is what keeps the four-chip lint matrix able to run at all.
+# **The constraint that forced this is gone, and the setting is kept anyway.**
+#
+# `esp-storage`'s build script refuses to build below optimization level 2, 3 or
+# s — its flash routines run from RAM with the cache disabled and are
+# timing-sensitive, so an unoptimized build is not slow, it is wrong. The check
+# is `cfg!(feature = "esp32")` and nothing else (`esp-storage-0.9.0/build.rs`),
+# so it applied to the plain ESP32 alone, and that chip was dropped on
+# 2026-08-18. The default dev profile is level 0, and `cargo clippy` uses the dev
+# profile, which is why the lint matrix needed this to run at all.
+#
+# It stays because removing it is not a simplification: it would change what
+# every dev-profile build of this crate compiles, on both remaining chips, in
+# exchange for nothing anybody asked for. Should the ESP32 ever come back, this
+# is already correct.
 [profile.dev]
 opt-level = "s"
 

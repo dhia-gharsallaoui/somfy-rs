@@ -120,15 +120,19 @@ than to retrofit:
 
 | Chip | Status |
 |---|---|
-| **ESP32-S3** | **Hardware-proven.** The reference platform; everything below was measured on one. |
-| ESP32-C3 | Builds and is budgeted; never run. Heap margin is tight — the firmware warns at boot. |
-| ESP32 | Builds without the web server, which its DRAM cannot hold (refused at compile time, with the reason). Never run. |
+| **ESP32-S3** | **Hardware-proven.** The reference platform; everything below was measured on one. Carries every feature. |
+| ESP32-C3 | Builds and is budgeted; never run. Ships without mDNS and without SNTP — so it is reached by **IP address rather than by name**, and has no wall clock. Both are refused at compile time, with the measurement. |
 
 Plus a **CC1101** 433 MHz module. Pin maps are in `crates/firmware/src/chip.rs`;
 only the S3 map is verified.
 
-> **Note** — the ESP32-S2 was supported until it was measured: it has too little
-> DRAM to hold the Wi-Fi driver's heap and a bootable stack at once.
+> **Note** — two chips were supported until they were measured, and both were
+> dropped rather than maintained, because **neither had ever booted this
+> firmware**. The ESP32-S2 (2026-08-17) has too little DRAM to hold the Wi-Fi
+> driver's heap and a bootable stack at once. The ESP32 (2026-08-18) could not
+> hold the web server at all, and even in its smallest build its heap margin over
+> the measured announcement peak was smaller than that peak's own boot-to-boot
+> variation. `docs/provenance.md` carries both sets of arithmetic.
 
 ---
 
