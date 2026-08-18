@@ -1,0 +1,33 @@
+# Editor configuration for this crate. It changes nothing about how the
+# firmware is built or tested — only what rust-analyzer passes when it checks.
+#
+# ## The problem it solves
+#
+# `src/chip.rs` opens with a `compile_error!` when no `chip-*` feature is
+# enabled, because esp-hal's own chip features are mutually exclusive and a
+# zero-feature or two-feature build otherwise fails ~24 macro expansions deep
+# with a message that names none of that. rust-analyzer checks with no features
+# by default, so it trips the guard and greys out the entire crate: the error
+# is correct and the editor is useless.
+#
+# ## Why the C3
+#
+# It is the one chip whose target needs no special toolchain —
+# `riscv32imc-unknown-none-elf` ships with stable Rust, while the ESP32 and
+# ESP32-S3 are Xtensa and need the `esp` toolchain from `espup`. So this gives
+# working analysis out of the box.
+#
+# What it costs: anything genuinely Xtensa-specific is analysed against the
+# wrong chip, and the `chip-esp32`/`chip-s3` arms of `src/chip.rs` and
+# `src/heap.rs` show as inactive. Set the two keys below to `chip-s3` and
+# `xtensa-esp32s3-none-elf` if you are working on those, and run
+# `source ~/export-esp.sh` before starting the editor so it inherits the
+# toolchain.
+#
+# ## If your rust-analyzer ignores this file
+#
+# Per-directory `rust-analyzer.toml` is a relatively recent feature. The
+# equivalent editor-side settings are `rust-analyzer.cargo.features` and
+# `rust-analyzer.cargo.target`; `README.md` carries a worked example.
+cargo.features = ["chip-c3"]
+cargo.target = "riscv32imc-unknown-none-elf"

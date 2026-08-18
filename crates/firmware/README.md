@@ -176,6 +176,60 @@ fails before this crate's own guards get a chance to run; the outcome (build
 fails) is the same either way, just with a less specific upstream error
 message instead of the one in `chip.rs`.
 
+## Editor setup, and why the crate looks broken without it
+
+Open any file in this crate in an editor and rust-analyzer will most likely
+report:
+
+```
+no chip selected: build with exactly one of --features chip-esp32 | chip-s3 | chip-c3
+```
+
+with the whole file greyed out as inactive. **Nothing is wrong.** rust-analyzer
+checks with no features by default, `src/chip.rs` refuses a build that names no
+chip, and the guard is doing its job — esp-hal's own chip features are mutually
+exclusive, and without that `compile_error!` a zero-feature build fails roughly
+twenty-four macro expansions deep in a dependency, naming none of the actual
+problem.
+
+`rust-analyzer.toml` in this directory fixes it by naming a chip. It picks the
+**C3**, because `riscv32imc-unknown-none-elf` ships with stable Rust — the
+ESP32 and ESP32-S3 are Xtensa and need the `esp` toolchain from `espup`, so
+they would require the editor to be launched from a shell that had already
+sourced `~/export-esp.sh`. Verified: `cargo check --features chip-c3 --target
+riscv32imc-unknown-none-elf` completes on a plain stable toolchain.
+
+The cost is that the `chip-esp32` and `chip-s3` arms of `chip.rs` and `heap.rs`
+show as inactive, and anything Xtensa-specific is analysed against the wrong
+chip. Working on those, change both keys and start the editor from an
+esp-sourced shell.
+
+Per-directory `rust-analyzer.toml` is a recent feature and your editor may
+ignore it. The equivalent settings, for Neovim with `nvim-lspconfig`:
+
+```lua
+require("lspconfig").rust_analyzer.setup({
+  settings = {
+    ["rust-analyzer"] = {
+      cargo = {
+        features = { "chip-c3" },
+        target = "riscv32imc-unknown-none-elf",
+      },
+    },
+  },
+})
+```
+
+That applies to every Rust project you open, which is wrong for all of them
+except this one — so prefer a per-project override if your setup has one
+(`.nvim.lua` with `exrc` enabled, `neoconf.nvim`, or a directory-local
+`lspconfig` setup keyed on the root).
+
+**One thing this does not fix**: the root workspace *excludes* `crates/firmware`
+(see below), so an editor opened at the repository root may treat this crate as
+a separate project or not analyse it at all. If that happens, either open this
+directory directly, or add it to `rust-analyzer.linkedProjects`.
+
 ## Notes on `build-std`
 
 The `esp` toolchain does not ship a prebuilt `core` for these bare-metal
