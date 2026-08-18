@@ -1,0 +1,29 @@
+[package]
+name = "somfy-backup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The `RTSB` configuration backup container somfy-rs exports and reads back"
+
+[dependencies]
+# The SSID this container carries, so a person restoring onto a fresh board
+# knows which passphrase to retype. A `String<32>` because that is
+# `somfy_config::MAX_SSID_LEN` and the 802.11 beacon field it comes from.
+heapless = "0.8"
+# The checksum, `CRC_32_ISO_HDLC`, which is what `RTSC`, `RTSW`, `RTSS` and
+# `RTSE` already use. A fifth record in that family that checked itself a
+# different way would be a second algorithm to know about for no gain.
+crc = "3"
+# The two record lengths this container carries verbatim, and the credential
+# rules the SSID field is validated against. **The dependency direction is the
+# point**: a backup is a file *about* what is in flash, so it knows the flash
+# format and the flash format knows nothing about it.
+somfy-config = { path = "../somfy-config" }
+
+[dev-dependencies]
+# The shade and estate records the round-trip tests build. Already a dependency
+# above; named again so the tests can use its `Default`s without the crate
+# having to re-export them.
+somfy-domain = { path = "../somfy-domain" }
+somfy-rts = { path = "../somfy-rts" }

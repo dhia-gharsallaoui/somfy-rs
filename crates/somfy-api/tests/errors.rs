@@ -58,7 +58,14 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::ImageTooLarge
         | ApiErrorCode::ImageDamaged
         | ApiErrorCode::UpdateInProgress
-        | ApiErrorCode::UpdateUnwritable => true,
+        | ApiErrorCode::UpdateUnwritable
+        | ApiErrorCode::BackupNotRecognised
+        | ApiErrorCode::BackupTooLarge
+        | ApiErrorCode::BackupDamaged
+        | ApiErrorCode::BackupUnsupportedVersion
+        | ApiErrorCode::RestoreInProgress
+        | ApiErrorCode::BackupUnwritable
+        | ApiErrorCode::AddressInUse => true,
     }
 }
 
@@ -145,6 +152,21 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
     (ApiErrorCode::ImageDamaged, "imageDamaged", 400),
     (ApiErrorCode::UpdateInProgress, "updateInProgress", 409),
     (ApiErrorCode::UpdateUnwritable, "updateUnwritable", 500),
+    (
+        ApiErrorCode::BackupNotRecognised,
+        "backupNotRecognised",
+        400,
+    ),
+    (ApiErrorCode::BackupTooLarge, "backupTooLarge", 413),
+    (ApiErrorCode::BackupDamaged, "backupDamaged", 400),
+    (
+        ApiErrorCode::BackupUnsupportedVersion,
+        "backupUnsupportedVersion",
+        400,
+    ),
+    (ApiErrorCode::RestoreInProgress, "restoreInProgress", 409),
+    (ApiErrorCode::BackupUnwritable, "backupUnwritable", 500),
+    (ApiErrorCode::AddressInUse, "addressInUse", 400),
 ];
 
 #[test]

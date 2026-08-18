@@ -188,7 +188,7 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
     let hostname = crate::identity::hostname();
     let token = responder(stack)?;
     spawner.spawn(token);
-    esp_println::println!(
+    crate::logln!(
         "mdns: answering for '{}.local' — the UI is at http://{}.local",
         hostname,
         hostname,
@@ -220,7 +220,7 @@ async fn responder(stack: Stack<'static>) -> ! {
         let address = config.address.address();
 
         if let Err(error) = serve(stack, &hostname, &instance, address).await {
-            esp_println::println!(
+            crate::logln!(
                 "mdns: the responder stopped ({:?}) — retrying in {} ms. The UI is still \
                  reachable at http://{}/",
                 error,

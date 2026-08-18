@@ -333,7 +333,7 @@ pub async fn watch(stack: Stack<'static>) -> ! {
                 // Printed before the reset, because after it there is nothing
                 // to read: this line and the boot banner that follows it are the
                 // whole record of what happened.
-                esp_println::println!(
+                crate::logln!(
                     "wifi: the credential trial was not proved ({}) — restarting onto \
                      the stored credential, which was never overwritten",
                     describe(reason),

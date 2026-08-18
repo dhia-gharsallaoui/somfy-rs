@@ -1199,6 +1199,8 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 name = "firmware"
 version = "0.1.0"
 dependencies = [
+ "crc",
+ "critical-section",
  "edge-mdns",
  "edge-nal",
  "edge-nal-embassy",
@@ -1228,9 +1230,11 @@ dependencies = [
  "sntpc",
  "sntpc-net-embassy",
  "somfy-api",
+ "somfy-backup",
  "somfy-cc1101",
  "somfy-config",
  "somfy-domain",
+ "somfy-migrate",
  "somfy-mqtt",
  "somfy-ota",
  "somfy-rmt",
@@ -2073,6 +2077,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "somfy-backup"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "heapless 0.8.0",
+ "somfy-config",
+]
+
+[[package]]
 name = "somfy-cc1101"
 version = "0.1.0"
 dependencies = [
@@ -2086,6 +2099,7 @@ dependencies = [
  "crc",
  "heapless 0.8.0",
  "somfy-domain",
+ "somfy-migrate",
  "somfy-mqtt",
  "somfy-rts",
 ]
@@ -2095,6 +2109,15 @@ name = "somfy-domain"
 version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
+ "somfy-rts",
+]
+
+[[package]]
+name = "somfy-migrate"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "somfy-domain",
  "somfy-rts",
 ]
 

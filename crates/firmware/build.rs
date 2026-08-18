@@ -100,6 +100,16 @@ const PINNED: &[(&str, u32, u32, &str)] = &[
          a group's membership is a row of the shade table — an estate read at \
          the wrong offset would name the wrong shades rather than none",
     ),
+    (
+        "import",
+        0x0020_A000,
+        0x5000,
+        "this region is where a restore is staged and where the report of the \
+         last one lives; moving it loses a staged backup that has been accepted \
+         but not yet applied, and its size is `firmware::restore`'s staged-file \
+         bound, which is also the size of the stack buffer the boot path parses \
+         a backup in",
+    ),
 ];
 
 /// The largest flash this table is allowed to assume.

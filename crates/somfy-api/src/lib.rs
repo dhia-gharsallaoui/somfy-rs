@@ -95,6 +95,7 @@ mod events;
 pub mod origin;
 mod settings;
 mod shades;
+mod system;
 
 pub use calibration::{CalibrationLegDto, CalibrationMarkDto, CalibrationStepDto};
 pub use commands::CommandDto;
@@ -110,3 +111,8 @@ pub use settings::{
     SETTINGS_JSON_MAX_BYTES,
 };
 pub use shades::{CreateShadeDto, PatchShadeDto, NAME_MAX_BYTES};
+pub use system::{
+    BackupContentsDto, BackupFormatDto, ChipDto, HeapDto, LogDto, PanicDto, ResetReasonDto,
+    RestoreOutcomeDto, RestoreReportDto, StackDto, SystemDto, MAX_HOST_LEN, MAX_PANIC_TEXT_LEN,
+    MAX_VERSION_LEN, RESTORE_JSON_MAX_BYTES, SYSTEM_JSON_MAX_BYTES,
+};

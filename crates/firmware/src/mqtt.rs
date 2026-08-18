@@ -642,7 +642,7 @@ pub fn start(
             // has already refused everything this can report — but reported
             // rather than `expect`ed, because a panic here reboots the board,
             // and it would do so on every boot.
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: stored settings are not a usable topic configuration ({}) \
                  — running without a broker",
                 error,
@@ -667,7 +667,7 @@ pub fn start(
             Ok(config) => {
                 let _ = stale.push(config);
             }
-            Err(error) => esp_println::println!(
+            Err(error) => crate::logln!(
                 "mqtt: cannot clear the retained topics under '{}'/'{}' ({})",
                 old.discovery_prefix(),
                 old.state_root(),
@@ -791,7 +791,7 @@ fn configuration_url() -> Option<ConfigurationUrl> {
     let _ = text.push_str(MDNS_DOMAIN);
     match ConfigurationUrl::new(&text) {
         Ok(url) => {
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: Home Assistant's device page will link to {} — which is where a shade is \
                  added, because pairing needs a person at the motor and a remote this controller \
                  is not",
@@ -804,7 +804,7 @@ fn configuration_url() -> Option<ConfigurationUrl> {
             // construction and the assertion above bounds the length. Reported
             // rather than `expect`ed, because a panic here reboots the board
             // over a hyperlink.
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: this device's own URL is not a usable configuration_url ({}) — \
                  Home Assistant's device page will have no link to its web UI",
                 error,
@@ -817,7 +817,7 @@ fn configuration_url() -> Option<ConfigurationUrl> {
 /// No mDNS responder, so no name to link to. See the other arm.
 #[cfg(not(feature = "mdns"))]
 fn configuration_url() -> Option<ConfigurationUrl> {
-    esp_println::println!(
+    crate::logln!(
         "mqtt: no mDNS responder in this image, so Home Assistant's device page will have no \
          link to this controller's web UI — a DHCP address is not used instead, because a \
          retained discovery config would outlive the lease"
@@ -939,9 +939,9 @@ async fn session(
         {
             match &outcome {
                 Ok(()) => {
-                    esp_println::println!("mqtt: session at {} ended after {} ms", endpoint, lasted,)
+                    crate::logln!("mqtt: session at {} ended after {} ms", endpoint, lasted,)
                 }
-                Err(end) => esp_println::println!(
+                Err(end) => crate::logln!(
                     "mqtt: session at {} ended after {} ms — {:?} ({} in a row)",
                     endpoint,
                     lasted,
@@ -953,7 +953,7 @@ async fn session(
 
         let waiting = backoff.fail();
         if waiting != previous_delay {
-            esp_println::println!("mqtt: reconnecting in {} ms", waiting);
+            crate::logln!("mqtt: reconnecting in {} ms", waiting);
         }
         previous_delay = waiting;
         Timer::after(Duration::from_millis(waiting as u64)).await;
@@ -982,7 +982,7 @@ impl Broker {
         // per boot, because it is a fact about the broker rather than about
         // this session.
         if !self.version_logged {
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: broker accepted an MQTT v5 CONNECT and answered CONNACK ({:?})",
                 event,
             );
@@ -1099,7 +1099,7 @@ impl Broker {
                 // for the state task to publish `DELTA_QUEUE_DEPTH` updates, so
                 // the position now on the broker is behind the shade.
                 Either4::Second(WaitResult::Lagged(missed)) => {
-                    esp_println::println!("mqtt: fell behind, {} state updates dropped", missed);
+                    crate::logln!("mqtt: fell behind, {} state updates dropped", missed);
                     None
                 }
                 Either4::Third(()) => Some(Woken::Diagnostics),
@@ -1286,7 +1286,7 @@ impl Broker {
         commands: &CommandSender,
     ) -> Result<(), SessionEnd> {
         if !self.stale.is_empty() {
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: clearing the retained topics of {} superseded configuration(s)",
                 self.stale.len(),
             );
@@ -1353,7 +1353,7 @@ impl Broker {
                 // Unreachable while `somfy_mqtt::MAX_NAME_LEN` and
                 // `Inventory`'s own capacity are the same figure, which they
                 // are; nothing ties them together, so the branch is here.
-                esp_println::println!(
+                crate::logln!(
                     "mqtt: shade {}'s name does not fit its buffer — \
                      leaving whatever the broker holds rather than clearing it",
                     shade.0,
@@ -1391,7 +1391,7 @@ impl Broker {
         // one, which it does only once these have settled — so a power cut here
         // costs a repeat, and the id survives in flash either way.
         if !self.orphans.is_empty() {
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: clearing the entities of {} removed shade(s)",
                 self.orphans.len(),
             );
@@ -1899,7 +1899,7 @@ struct Rare {
 fn report_rare(counter: &mut u32, message: &str) {
     *counter = counter.saturating_add(1);
     if *counter == 1 || counter.is_multiple_of(RETRY_LOG_INTERVAL) {
-        esp_println::println!("{} ({} so far)", message, counter);
+        crate::logln!("{} ({} so far)", message, counter);
     }
 }
 
@@ -1933,7 +1933,7 @@ async fn execute<'buf, IO: minimq::Io>(
                     // Unreachable: the plan is built from this inventory's own
                     // ids. Reported rather than panicked, because a panic here
                     // would reboot the board over a discovery config.
-                    esp_println::println!(
+                    crate::logln!(
                         "mqtt: shade {} is in the plan and not in the inventory — \
                          its {} entity is not published",
                         shade.0,
@@ -1957,7 +1957,7 @@ async fn execute<'buf, IO: minimq::Io>(
                     // nothing publishes is exactly the half-configured state
                     // this integration exists to prevent.
                     other => {
-                        esp_println::println!(
+                        crate::logln!(
                             "mqtt: no payload renderer for a '{}' entity — \
                              shade {} will be missing one",
                             other.as_str(),
@@ -1967,7 +1967,7 @@ async fn execute<'buf, IO: minimq::Io>(
                     }
                 };
                 if rendered.is_err() {
-                    esp_println::println!(
+                    crate::logln!(
                         "mqtt: the '{}' discovery config for shade {} does not fit \
                          its buffer — the entity will not appear",
                         component.as_str(),
@@ -2008,7 +2008,7 @@ async fn execute<'buf, IO: minimq::Io>(
             }
             Payload::DeviceDiscovery(entity) => {
                 if config.diagnostic_discovery(entity).render(payload).is_err() {
-                    esp_println::println!(
+                    crate::logln!(
                         "mqtt: the discovery config for '{}' does not fit its buffer — \
                          the entity will not appear",
                         entity.slug(),
@@ -2143,7 +2143,7 @@ async fn publish_bytes<'buf, IO: minimq::Io>(
 /// Separate from the match above so the three causes read as one policy rather
 /// than as three arms that happen to agree.
 fn report_oversize(topic: &str, bytes: usize, limit: &str) {
-    esp_println::println!(
+    crate::logln!(
         "mqtt: a {} byte payload for '{}' exceeds {} — not published, \
          and the session is kept because reconnecting would meet it again",
         bytes,

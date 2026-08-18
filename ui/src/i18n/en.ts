@@ -11,6 +11,7 @@ export const en = {
   'app.name': 'somfy-rs',
 
   'nav.settings': 'Settings',
+  'nav.backup': 'Backup',
   'nav.diagnostics': 'Diagnostics',
   'nav.language': 'Language',
 
@@ -323,6 +324,18 @@ export const en = {
   'error.updateUnwritable':
     'the device could not store the update — it is still running the firmware it had',
 
+  'error.backupNotRecognised':
+    'that file is not a backup this device can read — a backup is the file this device writes, or one from the controller it replaces',
+  'error.backupTooLarge': 'that backup is larger than this device has room to check',
+  'error.backupDamaged':
+    'the backup did not arrive intact — its checksum does not match, and nothing was restored',
+  'error.backupUnsupportedVersion':
+    'that backup was written in a format this firmware does not know how to read',
+  'error.restoreInProgress': 'a restore is already running',
+  'error.backupUnwritable':
+    'the device could not store the restored configuration — it still has the one it had',
+  'error.addressInUse': 'a shade on this controller already has that remote address',
+
   'settings.title': 'Settings',
   'settings.loading': 'Reading the device’s settings…',
   'settings.unreachable': 'Could not reach the device: {detail}',
@@ -390,11 +403,195 @@ export const en = {
     'The device is restarting. This page will come back on its own in a few seconds.',
   'settings.failed': 'Refused: {reason}',
 
+  'diag.title': 'Diagnostics',
+  'diag.intro':
+    'What the device can tell you about itself. If something has gone wrong, the log and the panic below are the evidence — copy them before clearing anything.',
+  'diag.loading': 'Reading the device…',
+  'diag.unreachable': 'Could not reach the device: {detail}',
+  'diag.retry': 'Try again',
+  'diag.refresh': 'Refresh',
+  'diag.refreshing': 'Reading…',
+
+  'diag.identityTitle': 'This device',
+  'diag.firmware': 'Firmware',
+  'diag.chip': 'Chip',
+  'diag.host': 'Name',
+  'diag.uptime': 'Running for',
+  'diag.resetReason': 'Started by',
+
+  'diag.resetPowerOn': 'Power on',
+  'diag.resetPowerOnNote':
+    'The power was cut and came back, or somebody plugged it in. Anything the device remembered about a panic was erased with it.',
+  'diag.resetSoftware': 'The firmware itself',
+  'diag.resetSoftwareNote':
+    'The device asked for the restart. Saving settings does that, and so does recovering from a panic.',
+  'diag.resetWatchdog': 'The watchdog',
+  'diag.resetWatchdogNote':
+    'Something stopped answering for long enough to look hung, and the hardware restarted the board. That is a fault, not routine — the log below is where its cause will be, if anything got printed.',
+  'diag.resetBrownout': 'A brownout',
+  'diag.resetBrownoutNote':
+    'The supply voltage fell below what the chip needs. That is almost always the power supply or the cable, not the firmware — and it repeats until the supply is changed.',
+  'diag.resetDebugger': 'A debugger',
+  'diag.resetDebuggerNote': 'A debugger or a flashing tool restarted it.',
+  'diag.resetOther': 'Something else',
+  'diag.resetOtherNote':
+    'The chip reported a cause this firmware has no name for. Unusual enough to be worth mentioning if you are reporting a fault.',
+
+  'diag.panicTitle': 'The device fell over',
+  'diag.panicWhat': 'What it said',
+  'diag.panicThisBoot':
+    'This is the boot the panic caused. The device restarted itself and came back as what you are looking at now — so whatever led to it happened minutes or seconds before this page loaded.',
+  'diag.panicBootsSinceOne': 'One restart ago.',
+  'diag.panicBootsSince': '{boots} restarts ago.',
+  'diag.panicWhen': 'It had been running for {uptime} when it happened.',
+  'diag.panicLoop':
+    'It fell over seconds into a boot, and the boot you are talking to now is the one that produced. That is the shape a boot loop has — the device restarts, reaches the same point, and falls over again. Watch the uptime above: if it never gets past a minute, that is what is happening, and nobody gets a window to change anything.',
+  'diag.panicTruncated':
+    'This text is cut short — the device keeps only its first part. The whole message went to the log below and to the serial line, if anything was listening.',
+  'diag.panicVolatile':
+    'This record lives in memory the chip keeps across a restart and clears on a power cut, so unplugging the device erases it. Copy it before you do.',
+  'diag.panicNoneTitle': 'No panic recorded',
+  'diag.panicNone':
+    'Either the device has not fallen over, or it has been unplugged since — the record does not survive a power cut, only a restart.',
+
+  'diag.memoryTitle': 'Memory',
+  'diag.stackTitle': 'Stack',
+  'diag.stackLine':
+    '{used} bytes used at the deepest point of this boot, of {required} required — {unspent} unspent.',
+  'diag.stackAvailable': 'The linker set aside {available} bytes for it.',
+  'diag.stackUnmeasured':
+    'Not measured yet on this boot. The figure is read off a painted stack once the controller is running.',
+  'diag.stackWhy':
+    'Only "used" was measured; the other two are written into the build. The gap between the first two is the whole point of the line — a requirement that has gone stale says nothing at all until a boot contradicts it.',
+  'diag.stackStale':
+    'This boot used more than the build says it needs, so the requirement is stale. That is the exact state that produced a silent boot loop here once before. Worth reporting.',
+
+  'diag.heapTitle': 'Heap',
+  'diag.heapPeak': '{peak} bytes at the highest since boot, of {size}.',
+  'diag.heapUsed': '{used} bytes in use right now.',
+  'diag.heapWhy':
+    'The heap is there for the Wi-Fi driver; nothing else in this firmware allocates, so the peak is a measurement of somebody else’s code. A board that restarts a few seconds into every boot with a peak close to the whole heap has run out — and that looks exactly like a bad access point until these two numbers are seen together.',
+
+  'diag.logTitle': 'Log',
+  'diag.logRing': '{bytes} of {capacity} bytes, {lines} lines.',
+  'diag.logIntact': 'Nothing has been thrown away, so this is everything since the ring last emptied.',
+  'diag.logDropped':
+    '{dropped} lines have been thrown away to make room for newer ones. The oldest output is gone — and the oldest output is the boot, which is usually the part worth reading. If you are reporting a fault, say so: it means this ring is too small.',
+  'diag.logEmpty': 'The log is empty.',
+  'diag.logLoading': 'Reading the log…',
+  'diag.logFailed': 'Could not read the log: {detail}',
+  'diag.logCopy': 'Copy the log and these details',
+  'diag.logCopied': 'Copied — that is the whole page as text, ready to paste into a report.',
+  'diag.logCopyFailed':
+    'This browser would not let the page write to the clipboard. Serving over plain HTTP is enough for some browsers to withhold it. Select the text above and copy it by hand.',
+
+  'diag.forgetTitle': 'Forget',
+  'diag.forget': 'Forget the panic and empty the log',
+  'diag.forgetWarning':
+    'One action, because they are one thing: the panic record and every line of the log are what this device remembers about its own past, and both go. Nothing is kept anywhere else — not in flash, not in a backup. If you have not copied the log, it is gone. Do this after reporting a fault, not before.',
+  'diag.forgetConfirm': 'Yes, forget it',
+  'diag.forgetCancel': 'Keep it',
+  'diag.forgetting': 'Forgetting…',
+  'diag.forgetDone': 'Forgotten. The panic record is cleared and the log is empty.',
+  'diag.forgetFailed': 'The device refused: {reason}',
+
+  'diag.durationSeconds': '{seconds} s',
+  'diag.durationMinutes': '{minutes} min',
+  'diag.durationHours': '{hours} h {minutes} min',
+  'diag.durationDay': '1 day, {hours} h',
+  'diag.durationDays': '{days} days, {hours} h',
+
+  'backup.title': 'Backup & restore',
+  'backup.intro':
+    'A backup holds the shade table, the rooms, the groups — and the rolling codes, which are the reason it is worth having. A motor only obeys a remote whose counter it recognises, so a lost rolling code costs a walk to every window and a fresh pairing at each motor. Everything else on this page can be retyped in a few minutes; that cannot.',
+  'backup.loading': 'Reading the device…',
+  'backup.unreachable': 'Could not reach the device: {detail}',
+  'backup.retry': 'Try again',
+  'backup.refresh': 'Refresh',
+  'backup.refreshing': 'Reading…',
+
+  'backup.exportTitle': 'Save a backup',
+  'backup.exportWhat':
+    'The file is about four kilobytes: the shade table, the rooms, the groups, and every shade’s rolling code. The device names it somfy-rs.rtsb as it sends it.',
+  'backup.exportNotSecrets':
+    'It deliberately does not contain the Wi-Fi passphrase or the broker password. Nothing on this device asks who you are, so anything on the network can request this file — and an export carrying secrets would be a way to read the passphrase off the device over the LAN. What it does keep is the network’s name and the broker’s address, so whoever restores it onto a fresh board is told exactly which two values to retype instead of having to guess which network the old one was on.',
+  'backup.exportWhen':
+    'Take a fresh one after adding or re-pairing a shade. Rolling codes move forward with every command, and a file from last month plants last month’s codes on a board that has none of its own — which a motor rejects as a replay.',
+  'backup.export': 'Download the backup',
+
+  'backup.importTitle': 'Restore from a file',
+  'backup.importWhat':
+    'Two kinds of file are accepted: the .rtsb this device writes, and the .backup an ESPSomfy-RTS controller exports. The second is how an existing installation moves across without re-pairing anything.',
+  'backup.importStaged':
+    'Uploading does not restore anything on the spot. The device stores the file, restarts, and reads it on the way back up — so this page loses its connection for a few seconds and the answer arrives afterwards. Until that boot has read it, nothing has been checked and nothing has been written.',
+  'backup.importCodes':
+    'A restore cannot move a rolling code backwards. The device only plants a code for an address it has none for, so restoring an old backup onto the board it came from changes no codes at all and is safe to try. Restoring onto a fresh board is the case that plants them, and it is what a backup is for.',
+  'backup.importWhole':
+    'A file is applied whole or not at all. One record the device will not accept refuses the lot, and the board keeps the configuration it already had.',
+  'backup.file': 'Backup file',
+  'backup.anyFile': 'Show every file, not only .rtsb and .backup',
+  'backup.fileHint':
+    'The extension is only what the picker offers — the device decides by looking at the first bytes, and refuses anything it does not recognise before storing it. Turn the filter off if the file you want has been renamed.',
+  'backup.chosen': '{name} — {bytes} bytes',
+  'backup.upload': 'Upload and restart',
+  'backup.uploading': 'Sending…',
+  'backup.uploadRefused':
+    'The device refused the file: {reason}. Nothing was stored and nothing has changed.',
+  'backup.waiting':
+    'Taken. The device is restarting to read the file — it will be unreachable for a few seconds, and this page will say what happened as soon as it answers again.',
+  'backup.lost':
+    'The device has not answered for a while. It may still be starting, or it may have come back on a different address. Open this page again once you can reach it: the file is stored, and the boot that reads it records what it did.',
+  'backup.checkAgain': 'Check again',
+
+  'backup.reportTitle': 'The last restore',
+  'backup.outcomeNoneTitle': 'Nothing has been restored',
+  'backup.outcomeNone':
+    'No backup has ever been uploaded to this device. Everything it holds was set up here.',
+  'backup.outcomeStagedTitle': 'A backup is waiting to be applied',
+  'backup.outcomeStaged':
+    'A file is stored and will be read the next time the device starts. Nothing has been checked yet, and what is running now is the configuration the device already had.',
+  'backup.outcomeAppliedTitle': 'Restored',
+  'backup.appliedShades': 'Shades written',
+  'backup.appliedRooms': 'Rooms written',
+  'backup.appliedGroups': 'Groups written',
+  'backup.outcomeRefusedTitle': 'The backup was refused',
+  'backup.refusedWhy': 'The device refused it: {reason}.',
+  'backup.refusedNothing':
+    'Nothing was written. The device is running the configuration it had before the upload.',
+  'backup.refusedRow': 'It came from record {row} of the file, counting shades from zero.',
+  'backup.refusedFile': 'The refusal is about the file itself rather than any one record in it.',
+
+  'backup.format': 'Read as {format}.',
+  'backup.formatSomfyRs': 'a backup from a somfy-rs device',
+  'backup.formatEspSomfyRts': 'a backup from an ESPSomfy-RTS controller',
+
+  'backup.warningsNone': 'Every record was taken exactly as written.',
+  'backup.warningsOne':
+    'One record was accepted with a caveat — an unknown kind of shade read as a roller, a group whose rolling code the old controller never wrote out, a member naming a shade that is no longer there. It is a line in the log, with the record and the reason.',
+  'backup.warnings':
+    '{warnings} records were accepted with a caveat — an unknown kind of shade read as a roller, a group whose rolling code the old controller never wrote out, a member naming a shade that is no longer there. Each one is a line in the log, with the record and the reason.',
+  'backup.warningsLink': 'Read the log',
+
+  'backup.retypeTitle': 'What you have to retype',
+  'backup.retypeWhy':
+    'A backup carries no secrets, so these are the values the restore could not put back for you.',
+  'backup.retypeSsid':
+    'The device this file came from was on {ssid}. Type that network’s passphrase again under Settings.',
+  'backup.retypeSsidOpen':
+    'The device this file came from was on {ssid}, which is an open network — there is no passphrase to retype.',
+  'backup.retypeNoSsid': 'It had no network stored, so there is nothing to retype for Wi-Fi.',
+  'backup.retypeBroker':
+    'It published to the broker at {broker}. Type that broker’s password again under Settings.',
+  'backup.retypeBrokerOpen': 'It published to the broker at {broker}, which needed no password.',
+  'backup.retypeNoBroker': 'It had no broker configured.',
+  'backup.retypeUnknown':
+    'A backup from an ESPSomfy-RTS controller keeps its network credentials outside the file, so it says nothing about which network or which broker that device used. Check its own settings screen while it is still running, if you can.',
+  'backup.retypeLink': 'Open settings',
+
   'stub.heading': '{screen}',
   'stub.body': 'This screen is not built yet.',
   'stub.settings': 'Settings',
   'stub.backup': 'Backup & restore',
-  'stub.diagnostics': 'Diagnostics',
   'stub.onboarding': 'Setup',
 
   'route.notFound': 'That page does not exist.',

@@ -45,6 +45,7 @@ import type { SecretDto } from '../src/api/generated/SecretDto.ts';
 import type { TrialDecisionDto } from '../src/api/generated/TrialDecisionDto.ts';
 import type { WifiUpdateDto } from '../src/api/generated/WifiUpdateDto.ts';
 import { Settings, type Rejection } from './settings.ts';
+import { System } from './system.ts';
 import { World } from './world.ts';
 
 const API_PREFIX = '/api/v1';
@@ -147,14 +148,34 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   imageDamaged: 400,
   updateInProgress: 409,
   updateUnwritable: 500,
+  // Backup and restore. The four `backup*` refusals split along the same seam
+  // as the firmware ones above: three are statements about the *bytes* and are
+  // 400, while `backupTooLarge` is 413 because the device knows the length is
+  // wrong before it has read the body — the one case where the status can carry
+  // the whole answer.
+  backupNotRecognised: 400,
+  backupTooLarge: 413,
+  backupDamaged: 400,
+  backupUnsupportedVersion: 400,
+  // 409, matching `updateInProgress`: the request is well-formed and would
+  // succeed on its own, and what refuses it is the device already doing the
+  // same thing. That is a conflict with state, and it is what a second browser
+  // tab produces.
+  restoreInProgress: 409,
+  backupUnwritable: 500,
+  // 400, not 409. The address in the body is one this controller already has,
+  // which makes it a value the caller must change — and, unlike
+  // `addressNotAllocated`, there *is* a form field to point at.
+  addressInUse: 400,
 };
 
 export function mockApi(): Plugin {
   const world = new World();
   const settings = new Settings();
+  const system = new System();
 
   const attach = (server: ViteDevServer | PreviewServer) => {
-    server.middlewares.use(restMiddleware(world, settings));
+    server.middlewares.use(restMiddleware(world, settings, system));
     server.httpServer?.on('upgrade', upgradeHandler(world));
   };
 
@@ -170,7 +191,11 @@ export function mockApi(): Plugin {
 // REST
 // ---------------------------------------------------------------------------
 
-function restMiddleware(world: World, settings: Settings): Connect.NextHandleFunction {
+function restMiddleware(
+  world: World,
+  settings: Settings,
+  system: System,
+): Connect.NextHandleFunction {
   return (request, response, next) => {
     const url = new URL(request.url ?? '/', 'http://device.invalid');
     if (!url.pathname.startsWith(API_PREFIX) || url.pathname === EVENTS_PATH) {
@@ -179,7 +204,7 @@ function restMiddleware(world: World, settings: Settings): Connect.NextHandleFun
     }
 
     const segments = url.pathname.slice(API_PREFIX.length).split('/').filter(Boolean);
-    handle(world, settings, request, response, segments).catch((error: unknown) => {
+    handle(world, settings, system, request, response, segments).catch((error: unknown) => {
       sendJson(response, 500, { error: String(error) });
     });
   };
@@ -188,6 +213,7 @@ function restMiddleware(world: World, settings: Settings): Connect.NextHandleFun
 async function handle(
   world: World,
   settings: Settings,
+  system: System,
   request: IncomingMessage,
   response: ServerResponse,
   segments: string[],
@@ -197,6 +223,10 @@ async function handle(
 
   if (collection === 'settings') {
     return handleSettings(settings, request, response, segments, method);
+  }
+
+  if (collection === 'system') {
+    return handleSystem(system, request, response, segments, method);
   }
 
   if (segments.length === 1 && collection === 'shades' && method === 'POST') {
@@ -360,6 +390,83 @@ async function handleSettings(
 
   return sendJson(response, 404, { error: 'no such route' });
 }
+
+/**
+ * The diagnostics and backup surface: four paths, five methods.
+ *
+ * The one shape worth being careful about is the log's `text/plain`. It is not
+ * JSON on the device either — the ring is already a run of newline-terminated
+ * lines, and wrapping it in a JSON string would mean escaping every one of them
+ * on a part with no allocator, to produce something the browser must then
+ * un-escape before it can be shown or copied. So this answers with the same
+ * media type, and the screen's `<pre>` and its clipboard payload are the bytes
+ * the device sent.
+ *
+ * `DELETE` clears the panic record *and* empties the ring, deliberately as one
+ * action: they are the two halves of what the device remembers about its own
+ * past, and a mock that let a screen clear one would be modelling an endpoint
+ * that does not exist.
+ *
+ * **`/system/backup` is one resource with two methods**, exactly as the
+ * firmware's router declares it: `GET` is the export and `POST` is the import.
+ * The import answers `202` and nothing else — never `200` — because on the
+ * device that status is the whole contract: the file has been *staged*, and the
+ * boot that follows is what reads, validates and applies it. A mock that
+ * answered `200` would let a screen ship that treated an upload as finished, and
+ * the connection dropping a moment later would be its first hint otherwise.
+ * `/system/restore` is where the answer actually appears.
+ */
+async function handleSystem(
+  system: System,
+  request: IncomingMessage,
+  response: ServerResponse,
+  segments: string[],
+  method: string,
+): Promise<void> {
+  const [, half] = segments;
+
+  if (segments.length === 1 && method === 'GET') {
+    return sendJson(response, 200, system.read());
+  }
+
+  if (segments.length === 1 && method === 'DELETE') {
+    system.forget();
+    return sendNoContent(response);
+  }
+
+  if (segments.length === 2 && half === 'log' && method === 'GET') {
+    return sendText(response, 200, system.log());
+  }
+
+  if (segments.length === 2 && half === 'backup' && method === 'GET') {
+    return sendFile(response, system.backup(), BACKUP_FILENAME);
+  }
+
+  if (segments.length === 2 && half === 'backup' && method === 'POST') {
+    const staged = system.stage(await readBytes(request));
+    if ('error' in staged) return sendError(response, staged.error);
+    response.statusCode = 202;
+    return void response.end();
+  }
+
+  if (segments.length === 2 && half === 'restore' && method === 'GET') {
+    return sendJson(response, 200, system.restoreReport());
+  }
+
+  return sendJson(response, 404, { error: 'no such route' });
+}
+
+/**
+ * What the device calls its own backup, quoted from
+ * `firmware::api::routes::BACKUP_FILENAME`.
+ *
+ * It is here and not in the UI because the UI must not know it: the export is a
+ * plain `<a download>` and the browser takes the name from this header, so a
+ * change to the firmware's filename reaches a saved file without anything in
+ * `src/` being edited. A mock that omitted the header would let that dependency
+ * be broken without the browser noticing.
+ */
+const BACKUP_FILENAME = 'attachment; filename="somfy-rs.rtsb"';
 
 /** A settings outcome, as a response. */
 function settle(
@@ -580,12 +687,57 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   }
 }
 
+/**
+ * The whole request body, as bytes.
+ *
+ * Separate from {@link readJson} rather than layered under it because a backup
+ * is not text: a C++ export is, but an `RTSB` container is two flash records and
+ * a checksum, and decoding it as UTF-8 to hand back a string would corrupt every
+ * byte over 0x7F before the format check ever saw it.
+ */
+async function readBytes(request: IncomingMessage): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(chunk as Buffer);
+  return new Uint8Array(Buffer.concat(chunks));
+}
+
+/**
+ * A binary body the browser should save rather than display.
+ *
+ * `octet-stream` plus the disposition header is what makes it a download: a
+ * browser handed these bytes as any displayable type would render mojibake in a
+ * tab. `no-store` matters more here than elsewhere — a cached backup is a file
+ * whose rolling codes have since moved on, and the whole point of taking a fresh
+ * export is that they have.
+ */
+function sendFile(response: ServerResponse, body: Uint8Array, disposition: string): void {
+  response.statusCode = 200;
+  response.setHeader('content-type', 'application/octet-stream');
+  response.setHeader('content-disposition', disposition);
+  response.setHeader('cache-control', 'no-store');
+  response.end(Buffer.from(body));
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   response.statusCode = status;
   response.setHeader('content-type', 'application/json; charset=utf-8');
   response.setHeader('cache-control', 'no-store');
   response.end(payload);
+}
+
+/**
+ * A `text/plain` body — the log, and nothing else on this surface.
+ *
+ * `charset=utf-8` is spelled out because the device spells it out: the boot
+ * line's stack report contains an em dash, and a browser left to guess the
+ * encoding renders it as mojibake in the one place somebody is reading closely.
+ */
+function sendText(response: ServerResponse, status: number, body: string): void {
+  response.statusCode = status;
+  response.setHeader('content-type', 'text/plain; charset=utf-8');
+  response.setHeader('cache-control', 'no-store');
+  response.end(body);
 }
 
 function sendNoContent(response: ServerResponse): void {

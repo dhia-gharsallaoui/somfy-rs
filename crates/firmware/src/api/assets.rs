@@ -152,6 +152,29 @@ pub const INDEX: Negotiated = Negotiated::new(File::MIME_HTML, INDEX_HTML, INDEX
 pub const CSS: Negotiated = Negotiated::new(File::MIME_CSS, APP_CSS, APP_CSS_GZ);
 
 /// Its script.
+///
+/// **`long_running_const_eval` is allowed here, and the lint is right rather
+/// than wrong.** `picoserve::response::File::with_body` computes each asset's
+/// ETag as a SHA-1 *at compile time*, so the whole application script is hashed
+/// by the const evaluator — and rustc's default step budget for one constant is
+/// exceeded once that script passes about a hundred kilobytes, which it did
+/// when the diagnostics and backup screens landed (106 KB identity, 42.2 KiB
+/// gzipped). The lint's own note says an allow is the remedy when the
+/// evaluation is genuinely long rather than looping, which this is: it is a
+/// fixed number of rounds over a fixed number of bytes.
+///
+/// What it costs is build time — a few seconds, once, per asset change — and
+/// what it buys is the reason the ETag is compile-time at all: a browser that
+/// has the script gets a `304` and no body, which is most of what makes a
+/// reload of this UI free on a device with a 512-byte send buffer.
+///
+/// The alternative, hashing at boot, would put a SHA-1 over 100 KB of flash on
+/// the critical path of every start-up, on a device that has a radio to bring
+/// up.
+#[allow(
+    long_running_const_eval,
+    reason = "the compile-time ETag hashes the whole application script; see above"
+)]
 pub const JS: Negotiated = Negotiated::new(File::MIME_JS, APP_JS, APP_JS_GZ);
 
 /// How much flash the three assets take, both representations together.
@@ -177,7 +200,7 @@ const COMPRESSED_BYTES: usize = INDEX_HTML_GZ.len() + APP_CSS_GZ.len() + APP_JS_
 /// compressed size, because that is what crosses the network on a first page
 /// load and what `ui/scripts/size.ts` budgets at 200 KB.
 pub fn report() {
-    esp_println::println!(
+    crate::logln!(
         "api: web UI embedded — {} bytes of flash, {} of it compressed (what a browser fetches)",
         EMBEDDED_BYTES,
         COMPRESSED_BYTES,

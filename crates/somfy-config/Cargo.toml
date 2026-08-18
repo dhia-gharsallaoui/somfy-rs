@@ -31,18 +31,53 @@ somfy-domain = { path = "../somfy-domain" }
 # and there is no bare `u16` anywhere on the path between them.
 somfy-rts = { path = "../somfy-rts" }
 
-[dev-dependencies]
-# The backup parser behind `provision_shades --from-backup`, which recovers a
-# shade table — names, addresses, kinds, travel times and the next-to-send
-# rolling code — from a file exported by the controller being replaced.
+# The backup parser behind `somfy_config::import`, which recovers a shade table
+# and the estate around it — names, addresses, kinds, travel times and the
+# next-to-send rolling code — from a file exported by the controller being
+# replaced.
 #
-# A dev-dependency, not a dependency, and the distinction is the point:
-# importing a backup is a host-side provisioning step that happens once, on a
-# workstation, before anything is flashed. The device links the *record*, which
-# is this crate's lib; it has no reason to carry a parser for a file it will
-# never see. So `cargo build -p somfy-config --target thumbv7em-none-eabihf`
-# does not build this, and neither does the firmware.
-somfy-migrate = { path = "../somfy-migrate" }
+# **Optional, off by default, and the firmware is what turns it on.** This was
+# a dev-dependency until the import moved into the library, on the argument
+# that reading a backup is a host-side step and the device "has no reason to
+# carry a parser for a file it will never see". That has stopped being true:
+# the firmware imports a C++ backup at boot from a staging flash region, so it
+# does see one.
+#
+# What survives of the old argument is the *default*. A board provisioned any
+# other way pays nothing for this, because `cargo build -p somfy-config
+# --target thumbv7em-none-eabihf` without `--features migrate` builds neither
+# the parser nor the module that consumes it — which is why the CI `no_std`
+# step now has two rows for this crate rather than one.
+#
+# The host tools and the firmware then run the **same** importer: one set of
+# refusal rules, one set of caveats, and one place the rolling-code `+1`
+# contract is applied, rather than a library copy and a tool copy free to
+# drift apart on the one field that cannot be corrected afterwards.
+somfy-migrate = { path = "../somfy-migrate", optional = true }
+
+[features]
+# `somfy_config::import` — reading a C++ backup into the two records this crate
+# writes. Off by default; the dependency comment above says why the default is
+# off and who turns it on.
+migrate = ["dep:somfy-migrate"]
+
+[dev-dependencies]
+# A dependency on this crate, from this crate, and it is deliberate: it is how
+# a **non-default** feature is switched on for a package's own dev targets.
+# Without it, `cargo test -p somfy-config`, `cargo clippy --workspace
+# --all-targets` and `cargo doc --workspace` would each build the examples and
+# integration tests with `migrate` off — at which point `tests/import.rs`
+# compiles to nothing and the `provision_shades` example does not compile at
+# all.
+#
+# The alternative was `required-features = ["migrate"]` on that example, and it
+# was rejected for being quiet: cargo *skips* a target whose required features
+# are absent, so the example and its tests would vanish from the default
+# invocation without anything going red. That is the exact shape of CI hole
+# this project keeps finding. A self dev-dependency instead makes the default
+# invocation build, lint and test everything, while `cargo build` — which links
+# no dev-dependencies — stays feature-free for the four bare-metal targets.
+somfy-config = { path = ".", features = ["migrate"] }
 
 # Both examples are listed explicitly for one reason: `test = true`, which is
 # what makes `cargo test` run the unit tests inside them. Their mapping and

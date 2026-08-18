@@ -75,6 +75,15 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   imageDamaged: 'error.imageDamaged',
   updateInProgress: 'error.updateInProgress',
   updateUnwritable: 'error.updateUnwritable',
+  // Backup and restore. Translated here because this record is total over the
+  // generated union; the screen that provokes them is built separately.
+  backupNotRecognised: 'error.backupNotRecognised',
+  backupTooLarge: 'error.backupTooLarge',
+  backupDamaged: 'error.backupDamaged',
+  backupUnsupportedVersion: 'error.backupUnsupportedVersion',
+  restoreInProgress: 'error.restoreInProgress',
+  backupUnwritable: 'error.backupUnwritable',
+  addressInUse: 'error.addressInUse',
 };
 
 /**

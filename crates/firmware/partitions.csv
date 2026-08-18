@@ -61,17 +61,42 @@
 #
 # ## What is deliberately not allocated
 #
-# 0x20A000–0x210000, 24 KB, six erase sectors. It is what is left of the space
-# between the last data region and the 64 KB boundary `ota_1` has to start on,
-# so it costs neither app slot anything, and it is the only room a further data
-# region can have without shrinking a slot or pushing the table past 4 MB.
+# 0x20F000–0x210000, 4 KB, one erase sector. That is all that is left, and it is
+# **not enough for another region**: every data region here is at least two
+# sectors, because only two guarantee that erasing one can never take the newest
+# record with it. So the space between the last data region and the 64 KB
+# boundary `ota_1` has to start on is now spent, and the next region needs a
+# layout change rather than a line.
 #
-# `estate` took the first 8 KB of it, which is what that reserve was for. It is
-# **purely additive**: it sits above every region a provisioned board already
-# has, so nothing moves and a board reflashed with this table keeps its rolling
-# codes, its credentials and its shade table exactly as before. What it does not
-# keep is an estate, because it never had one — a blank `estate` region reads as
-# "no rooms and no groups", which is what that board is running today.
+# What that reserve was for, and where it went:
+#
+# `estate` took the first 8 KB, at 0x208000. `import` took 20 KB more, at
+# 0x20A000. Both are **purely additive**: each sits above every region a
+# provisioned board already has, so nothing moves and a board reflashed with
+# this table keeps its rolling codes, its credentials and its shade table
+# exactly as before. What it does not keep is an estate or a staged restore,
+# because it never had either — and a blank region of each reads as "no rooms
+# and no groups" and "nothing staged", which is what that board is running
+# today.
+#
+# ## `import` is 20 KB, and the figure is two things at once
+#
+# Its first sector is a 128-byte state record — what the last upload was, and
+# what the boot path did about it — and the four after it are the staged file.
+# 16 KB of staged file is `firmware::restore::STAGE_MAX_BYTES`, and that
+# constant carries the arithmetic: the worst C++ ESPSomfy-RTS backup a
+# supported controller can produce, with 32 shades at 276 bytes each and every
+# other collection full, is about 14.5 KB. This firmware's own `RTSB` container
+# is 4,420.
+#
+# It is **also the size of the buffer the boot path reads it into**, on the main
+# stack, which is the only place on this device with room to parse a backup
+# whole. So it cannot simply be "the rest of the region": every byte here is a
+# byte of `firmware::heap::REQUIRED_STACK_BYTES`.
+#
+# The state record has a sector to itself because it is rewritten on a path that
+# must not disturb the file beside it, and an erase takes a whole sector whether
+# it wants to be or not.
 #
 # On an 8 MB board 0x400000–0x800000 is unallocated too. Spending it would mean
 # either slots larger than 0x1F0000 — impossible while `rollcode` stays put —
@@ -96,6 +121,13 @@
 # records tile a 4 KB sector and the region is two sectors for the same
 # guarantee as the other two.
 #
+# `import` is the fifth, and the one that is not a ring. A staged restore is
+# written once, read once at the next boot and then superseded, so wear
+# levelling would be protecting against a write pattern that does not exist; and
+# a torn state record reads as "nothing staged", which is the safe direction —
+# the worst it costs is a report an operator has to reproduce, where a torn
+# rolling-code record costs a re-pairing.
+#
 # `estate` is the fourth: the rooms, which room each shade is in, and the groups
 # with their names, members and virtual-remote identities. It is a fourth region
 # for the same reason `shades` was a third — there is nowhere else to put it.
@@ -114,8 +146,14 @@
 # ## What a board already in service keeps
 #
 # `rollcode`, `wificfg` and `shades` keep their offsets, their sizes and their
-# contents. `estate` is new and blank, which reads as no rooms and no groups —
-# the state that board is already in.
+# contents. `estate` and `import` are new and blank, which read as no rooms and
+# no groups, and nothing staged — the state that board is already in.
+#
+# **A board that is *not* reflashed keeps working and cannot take a restore.**
+# `firmware::restore::Staging::mount` reports the missing region once at boot
+# and the controller carries on; a `POST /api/v1/system/backup` is refused with
+# `backupUnwritable` rather than timing out. Exporting one still works, because
+# an export reads regions that board already has.
 #
 # Original text, which still holds for the three older regions: A provisioned board reflashed with this table keeps its rolling
 # codes, its credentials and its shade table; `factory` becomes `ota_0` at the
@@ -162,4 +200,5 @@ wificfg,    data, undefined, 0x202000, 0x2000,
 shades,     data, undefined, 0x204000, 0x2000,
 otadata,    data, ota,       0x206000, 0x2000,
 estate,     data, undefined, 0x208000, 0x2000,
+import,     data, undefined, 0x20A000, 0x5000,
 ota_1,      app,  ota_1,     0x210000, 0x1F0000,

@@ -113,22 +113,53 @@ const HTTP_BUFFER_BYTES: usize = 1_536;
 ///
 /// Smaller than [`HTTP_BUFFER_BYTES`] deliberately: this is the window, not the
 /// request, and `picoserve` drains it into the request buffer as the request
-/// arrives. 1,024 holds most requests in a single segment and costs the rest
-/// one extra round trip on a link where a round trip is under a millisecond.
-const TCP_RX_BYTES: usize = 1_024;
+/// arrives. 512 holds a command or a settings `PUT` in one segment and costs a
+/// browser's ~760-byte `GET` two, on a link where a round trip is under a
+/// millisecond.
+///
+/// **Halved from 1,024 on 2026-08-18, and the two screens that made it
+/// necessary are what paid for it.** See [`TCP_TX_BYTES`], which carries the
+/// arithmetic for both.
+const TCP_RX_BYTES: usize = 512;
 
 /// TCP send buffer.
 ///
 /// This one bounds throughput rather than correctness: the largest response is
 /// the compressed application script at about 21 KB, and the buffer is how much
-/// of it can be in flight unacknowledged. At 1,024 bytes that is roughly twenty
+/// of it can be in flight unacknowledged. At 512 bytes that is roughly forty
 /// round trips, which on a home network is a few tens of milliseconds — paid
 /// once per page load, and not at all on a reload, because the assets carry
 /// compile-time ETags and answer `304`.
 ///
-/// It is the figure to raise if the UI ever feels slow to load, and the one to
-/// check first against `heap::report` if it does not.
-const TCP_TX_BYTES: usize = 1_024;
+/// # Why both of these were halved, and what it bought
+///
+/// **The diagnostics and backup screens cost DRAM, and this is where it came
+/// from.** Their routes, their response buffers and `crate::restore`'s share of
+/// the connection task futures took [`DRAM_FOR_STACK_AND_HEAP`] down by 2,936
+/// bytes on the ESP32-S3 and 2,992 on the ESP32-C3 — and that constant is what
+/// [`RADIO_HEAP_BYTES`] is a *subtraction* from, so the Wi-Fi driver's heap
+/// falls by the same amount. On the C3 that would have left 1,700 bytes over
+/// the measured announcement peak: the exact figure the plain ESP32 was dropped
+/// for on 2026-08-18, and inside that peak's own ~2,000-byte boot-to-boot
+/// spread.
+///
+/// Halving both buffers gives back `HTTP_TASKS × 1,024` = 4,096 bytes, which
+/// returns the C3 to 5,796 bytes of margin — **exactly where it was before
+/// either screen existed**. Measured both ways; `docs/provenance.md` records
+/// the four figures.
+///
+/// What it costs is round trips on a LAN, and the trade was chosen in that
+/// direction deliberately: a page load that takes twenty extra sub-millisecond
+/// round trips is invisible, and a Wi-Fi heap that runs out part-way through
+/// publishing retained discovery configs is a board that reboots and looks like
+/// a broker fault.
+///
+/// It is still the figure to raise if the UI ever feels slow to load — and now
+/// the one to check first against `heap::warn_if_tight` before raising it.
+///
+/// [`DRAM_FOR_STACK_AND_HEAP`]: crate::heap
+/// [`RADIO_HEAP_BYTES`]: crate::heap::RADIO_HEAP_BYTES
+const TCP_TX_BYTES: usize = 512;
 
 /// The port. 80, because the UI's own `fetch` and `WebSocket` calls are
 /// same-origin and relative — there is no port to configure and nowhere to
@@ -261,7 +292,7 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
     }
     spawner.spawn(restarter);
 
-    esp_println::println!(
+    crate::logln!(
         "api: serving the UI and /api/v1 on port {} — {} connections, at most {} websockets, \
          {} always free for REST",
         PORT,
@@ -269,7 +300,7 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
         WS_MAX,
         REST_TASKS_RESERVED,
     );
-    esp_println::println!(
+    crate::logln!(
         "api: every route is behind the Origin/Host check — this device answers to its own \
          address and to {}.local, and refuses a request naming anything else. It is not \
          authentication, and it is what stops a page in somebody else's browser tab driving \

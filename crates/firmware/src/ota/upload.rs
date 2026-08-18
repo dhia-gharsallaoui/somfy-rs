@@ -243,7 +243,7 @@ pub fn begin(
     // leaves a stale session and possibly a page in flight. Both are cleared
     // here, which is the only place that can see either.
     if pages.session.is_some() {
-        esp_println::println!(
+        crate::logln!(
             "ota: a previous upload was abandoned part-way; its half-written slot is being \
              overwritten, and it was never marked bootable",
         );
@@ -252,7 +252,7 @@ pub fn begin(
     pages.rx.clear();
 
     let Some(slots) = SLOTS.lock(Cell::get) else {
-        esp_println::println!(
+        crate::logln!(
             "ota: this board has no otadata region, so an update could never be activated. \
              Reflash from crates/firmware so espflash writes this crate's partition table."
         );
@@ -264,7 +264,7 @@ pub fn begin(
     store
         .with_flash(|flash| seed_otadata(flash, slots))
         .map_err(|error| {
-            esp_println::println!("ota: otadata could not be prepared ({:?})", error);
+            crate::logln!("ota: otadata could not be prepared ({:?})", error);
             ApiErrorCode::UpdateUnwritable
         })?;
 
@@ -274,7 +274,7 @@ pub fn begin(
     // image about to be written gets its own full attempt. See
     // `somfy_ota::verdict::boot_verdict`.
     super::clear_attempts();
-    esp_println::println!(
+    crate::logln!(
         "ota: accepting {} bytes for {:?} at {:#010X} — the running slot is not touched",
         declared,
         slots.target,
@@ -315,7 +315,7 @@ fn seed_otadata(flash: &mut FlashStorage<'_>, slots: Slots) -> Result<(), OtaErr
             // exactly what the bootloader reads as "boot ota_0". Refused rather
             // than worked around, because the workaround would be the
             // sequence-zero write this function exists to avoid.
-            esp_println::println!(
+            crate::logln!(
                 "ota: otadata is blank but this image is running from {:?}, which cannot happen \
                  with this partition table — refusing rather than writing a sequence number \
                  that would select nothing",
@@ -323,7 +323,7 @@ fn seed_otadata(flash: &mut FlashStorage<'_>, slots: Slots) -> Result<(), OtaErr
             );
             return Err(OtaError::NotInASlot);
         }
-        esp_println::println!(
+        crate::logln!(
             "ota: otadata is blank — seeding it to {:?}, the slot this image runs from. From \
              here a serial reflash needs `--erase-parts otadata`; see \
              docs/hardware-checklist.md.",
@@ -340,6 +340,26 @@ fn seed_otadata(flash: &mut FlashStorage<'_>, slots: Slots) -> Result<(), OtaErr
 /// what makes the first page's refusals — not a firmware image, built for
 /// another chip, no application descriptor — cost the target slot nothing at
 /// all.
+/// Hand the lent page to `f`, then give the buffer back.
+///
+/// **The one thing in this module that is not about firmware.** A configuration
+/// restore is also an upload, and it crosses from the web server to this task
+/// the same way a firmware image does — so it borrows this channel rather than
+/// declaring a second one, which would be a second page buffer out of the DRAM
+/// `crate::heap` carves the Wi-Fi driver's heap from. See `crate::restore`.
+///
+/// `None` is a page that was asked for and never sent. Unreachable — the web
+/// server posts a page and only then asks for it to be written, and the request
+/// gate serialises the two — and answered rather than asserted, because a panic
+/// on a request path reboots the board over one request.
+pub fn with_page<T>(pages: &mut Pages, len: usize, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
+    let buffer = pages.rx.try_receive()?;
+    let len = len.min(buffer.bytes.len());
+    let outcome = f(&buffer.bytes[..len]);
+    pages.rx.receive_done();
+    Some(outcome)
+}
+
 pub fn page(
     pages: &mut Pages,
     store: &mut FlashStore<'static>,
@@ -351,7 +371,7 @@ pub fn page(
     let Some(buffer) = pages.rx.try_receive() else {
         // Unreachable: the web server posts a page and only then asks for it to
         // be written, and the request gate serialises the two.
-        esp_println::println!("ota: a page was asked for and none had been sent");
+        crate::logln!("ota: a page was asked for and none had been sent");
         pages.session = None;
         return Err(ApiErrorCode::UpdateUnwritable);
     };
@@ -373,7 +393,7 @@ pub fn page(
         // A short page is only legitimate as the *last* one, which is exactly
         // the page whose length is everything the verifier still expects.
         Some(session) if short && len != session.verifier.remaining() => {
-            esp_println::println!(
+            crate::logln!(
                 "ota: a {}-byte page arrived with {} bytes of the image still to come — every \
                  page but the last has to be {}, or the sector-erase rule stops holding",
                 len,
@@ -391,10 +411,7 @@ pub fn page(
                     store
                         .with_flash(|flash| write_page(flash, session, &buffer.bytes, len))
                         .map_err(|error| {
-                            esp_println::println!(
-                                "ota: the target slot refused a write ({:?})",
-                                error
-                            );
+                            crate::logln!("ota: the target slot refused a write ({:?})", error);
                             ApiErrorCode::UpdateUnwritable
                         })
                 });
@@ -485,7 +502,7 @@ pub fn finish(pages: &mut Pages, store: &mut FlashStore<'static>) -> Result<(), 
     let slots = session.slots;
     let accepted = session.verifier.finish().map_err(refuse)?;
 
-    esp_println::println!(
+    crate::logln!(
         "ota: {} bytes verified — {} version '{}', built for {}. Marking {:?} bootable.",
         accepted.len,
         accepted.project,
@@ -531,7 +548,7 @@ pub fn finish(pages: &mut Pages, store: &mut FlashStore<'static>) -> Result<(), 
             })
         })
         .map_err(|error| {
-            esp_println::println!(
+            crate::logln!(
                 "ota: the image is written and verified but otadata could not be marked ({:?}) \
                  — the selection has been put back to {:?}, so this board boots what it is \
                  running now. Check the next boot's `ota: running from` line before assuming \
@@ -541,7 +558,7 @@ pub fn finish(pages: &mut Pages, store: &mut FlashStore<'static>) -> Result<(), 
             );
             ApiErrorCode::UpdateUnwritable
         })?;
-    esp_println::println!(
+    crate::logln!(
         "ota: the next boot runs {:?}. It has to pass a self-test within {} s or the board \
          comes back to {:?} on its own.",
         slots.target,
@@ -554,7 +571,7 @@ pub fn finish(pages: &mut Pages, store: &mut FlashStore<'static>) -> Result<(), 
 /// Give up on an upload without touching what is running.
 pub fn abort(pages: &mut Pages) {
     if pages.session.take().is_some() {
-        esp_println::println!(
+        crate::logln!(
             "ota: upload abandoned — the running slot was never touched and nothing was marked \
              bootable"
         );

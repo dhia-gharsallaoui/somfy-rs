@@ -42,6 +42,21 @@
 //! the secret reaching a serial console through the ordinary `{:?}` error
 //! path. It is not protection at rest.
 //!
+//! ## One optional half: reading a C++ backup
+//!
+//! Everything above is unconditional. `somfy_config::import` is not: it is
+//! behind the non-default `migrate` cargo feature — hence a code span rather
+//! than a link, since the module is absent from a default build — and it is
+//! the only module here that
+//! reads the file format of the controller this project replaces — turning one
+//! into a [`ShadeRecord`] and an [`EstateRecord`], rolling codes and all.
+//!
+//! Off by default because a board provisioned any other way should not link a
+//! parser for a file it will never see. On for the firmware, which imports a
+//! backup at boot from a staging flash region, and on for the provisioning
+//! tools — the *same* code in both, so there is one importer rather than a
+//! library copy and a tool copy free to drift.
+//!
 //! ## The posture: refuse, never repair
 //!
 //! Every rule below rejects rather than adjusts. A truncated SSID names a
@@ -79,6 +94,8 @@
 mod catalog;
 mod credentials;
 mod estate;
+#[cfg(feature = "migrate")]
+pub mod import;
 mod mqtt;
 mod record;
 mod shade;

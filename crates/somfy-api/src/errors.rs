@@ -335,6 +335,76 @@ pub enum ApiErrorCode {
     /// is: the request was fine and there is nothing the caller could send
     /// instead.
     UpdateUnwritable,
+
+    // -----------------------------------------------------------------------
+    // Backup and restore
+    //
+    // Five codes for an upload that is a *configuration* rather than a
+    // firmware image. They mirror the update codes above deliberately — the
+    // two routes stream a file to flash and answer the same three questions
+    // about it (is it the right kind of thing, does it fit, did it arrive
+    // intact) — and they are separate variants rather than shared ones because
+    // the sentence a person needs is different: "that is an ELF, not an image"
+    // and "that is not a backup" send them to different files.
+    //
+    // What is deliberately *not* here is a code per way a backup's contents can
+    // be refused. A restore is refused by the same rules a hand-typed shade is,
+    // so it is refused with the same codes — [`NameTooLong`](ApiErrorCode::NameTooLong),
+    // [`InvalidKind`](ApiErrorCode::InvalidKind), [`TravelTimeZero`](ApiErrorCode::TravelTimeZero)
+    // — and `RestoreReportDto::row` says which record carried it. A second
+    // vocabulary for the same refusals would be a second thing to translate and
+    // a second thing to keep in step with the domain.
+    // -----------------------------------------------------------------------
+    /// The upload is not a backup this device can read.
+    ///
+    /// Neither a `RTSB` container produced by this firmware's own export nor a
+    /// configuration backup exported by a C++ ESPSomfy-RTS controller. The most
+    /// likely cause is the wrong file — a firmware image belongs at
+    /// `POST /api/v1/ota`, not here.
+    BackupNotRecognised,
+    /// The upload is larger than the region a backup is staged in.
+    ///
+    /// Settled from `Content-Length` before any flash is touched. There is no
+    /// backup a supported controller can produce that reaches this — see
+    /// `firmware::restore::REGION_MIN_BYTES` for the arithmetic — so it means
+    /// the file is not what it is thought to be.
+    BackupTooLarge,
+    /// The upload did not arrive intact, or its checksum does not match.
+    ///
+    /// One code for short, long and corrupt, exactly as
+    /// [`ImageDamaged`](ApiErrorCode::ImageDamaged) is, and for the same
+    /// reason: the action is to upload it again, and nothing has been applied.
+    BackupDamaged,
+    /// The backup was written by a version this firmware does not read.
+    ///
+    /// Distinct from [`BackupNotRecognised`](ApiErrorCode::BackupNotRecognised)
+    /// because it is the one case where the file *is* the right kind of thing:
+    /// the answer is a different firmware, not a different file. C++ backups
+    /// below 19 or above 25 reach this, as does an `RTSB` container from a
+    /// later release of this firmware.
+    BackupUnsupportedVersion,
+    /// A restore is already staged and has not been applied yet.
+    ///
+    /// Refused rather than queued, for the reason
+    /// [`UpdateInProgress`](ApiErrorCode::UpdateInProgress) is: two uploads
+    /// would be two writers to one staging region. The staged one is applied on
+    /// the next boot, so the action is to let the device restart.
+    RestoreInProgress,
+    /// The device could not stage or apply the backup.
+    ///
+    /// A flash write that did not read back, or a missing staging region on a
+    /// board flashed with an older partition table. **In every case the shade
+    /// table and the rolling codes are untouched** — this is a failed restore,
+    /// not a damaged device.
+    BackupUnwritable,
+    /// A shade in the backup wants an address another shade already has.
+    ///
+    /// The registry keys movement by address, so two shades at one address are
+    /// one shade with two names and a rolling code that advances twice as fast.
+    /// It is a property of the file rather than of anything the caller typed,
+    /// which is why it has no [`SettingsFieldDto`] beside it —
+    /// `RestoreReportDto::row` names the record instead.
+    AddressInUse,
 }
 
 /// Which configured value a settings rejection is about.
@@ -433,7 +503,13 @@ impl ApiErrorCode {
             // here, and no state on the device would change that.
             | ApiErrorCode::ImageNotFirmware
             | ApiErrorCode::ImageForAnotherChip
-            | ApiErrorCode::ImageDamaged => 400,
+            | ApiErrorCode::ImageDamaged
+            // The four that are about the backup *file*, for the same reason
+            // the three above are about the image file.
+            | ApiErrorCode::BackupNotRecognised
+            | ApiErrorCode::BackupDamaged
+            | ApiErrorCode::BackupUnsupportedVersion
+            | ApiErrorCode::AddressInUse => 400,
             ApiErrorCode::NotFound => 404,
             ApiErrorCode::RegistryFull
             | ApiErrorCode::AddressNotAllocated
@@ -447,12 +523,13 @@ impl ApiErrorCode {
             | ApiErrorCode::NoTrialInProgress
             | ApiErrorCode::TrialInProgress
             | ApiErrorCode::TrialNotAssociated
-            | ApiErrorCode::UpdateInProgress => 409,
+            | ApiErrorCode::UpdateInProgress
+            | ApiErrorCode::RestoreInProgress => 409,
             // The one 413 here, and the only status in this table that says
             // something about the *size* of a request rather than its content.
             // A generic 400 would have been true and would have sent the
             // operator looking at the file's contents instead of its length.
-            ApiErrorCode::ImageTooLarge => 413,
+            ApiErrorCode::ImageTooLarge | ApiErrorCode::BackupTooLarge => 413,
             // 403 rather than 401: there is no credential that would make the
             // request acceptable, so `WWW-Authenticate` would be a lie and a
             // browser prompting for a password over it would be worse than the
@@ -466,7 +543,8 @@ impl ApiErrorCode {
             ApiErrorCode::CommandRateLimited => 429,
             ApiErrorCode::InvalidAddress
             | ApiErrorCode::SettingsUnwritable
-            | ApiErrorCode::UpdateUnwritable => 500,
+            | ApiErrorCode::UpdateUnwritable
+            | ApiErrorCode::BackupUnwritable => 500,
         }
     }
 }

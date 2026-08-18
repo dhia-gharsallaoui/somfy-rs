@@ -681,6 +681,89 @@ input:focus-visible {
   background: color-mix(in oklab, var(--danger) 7%, var(--paper));
 }
 
+/* ------------------------------------------------------------- diagnostics */
+
+/* A detail head that carries a page-level action beside its title.
+
+   A modifier rather than a change to `.detail__head`, because the shade screen
+   uses the same head with a subtitle as its second child, and that one belongs
+   underneath the name rather than opposite it. */
+.detail__head--action {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+/* The panic panel is the one thing in this app allowed to shout.
+
+   `.panel--error` already borders in danger and is used for a request that
+   failed — something the user can retry. This is not that: it is the device
+   reporting that it fell over and restarted itself, and it has to be what the
+   eye lands on first among five panels of numbers. The fill is what does that;
+   a second border colour would not. */
+.panel--panic {
+  border-width: 2px;
+  background: color-mix(in oklab, var(--danger) 8%, var(--paper-raised));
+}
+
+/* Device output, shown as the device wrote it.
+
+   Three choices, each because of what is in here. Monospace, because these
+   lines were written to line up in a serial console and half of them are
+   numbers. `pre-wrap` rather than horizontal scrolling, because a panic message
+   is one long line and the end of it — the assertion that failed — is the part
+   worth reading; a horizontal scrollbar hides exactly that. And a fixed maximum
+   height with its own scrollbar, because the ring holds kilobytes and a page
+   that grew to eight screens would put every control below the fold. */
+.log {
+  inline-size: 100%;
+  margin: 0;
+  padding: 0.7rem 0.8rem;
+  max-block-size: 22rem;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  border-radius: calc(var(--radius) - 6px);
+  background: var(--paper);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The panic text is short and is the message itself rather than a stream, so it
+   gets the raised surface and no scroll height worth speaking of. */
+.log--panic {
+  max-block-size: 12rem;
+  background: var(--paper-raised);
+  color: var(--danger);
+}
+
+/* ------------------------------------------------------------------ backup */
+
+/* A checkbox and its explanation on one line.
+
+   `.field` is a grid of stacked rows, which is right for a labelled input and
+   wrong for a checkbox: a tick box above its own label reads as two controls.
+   This is the only such control in the app, so it is a modifier on `.field`
+   rather than a new block — it keeps the same label typography and the same
+   full-width footprint inside a panel. */
+.field--check {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+/* Nudged down to sit on the first line of the hint beside it, which is set
+   smaller than the body text and so has a lower cap height than a checkbox's
+   own box. */
+.field--check input {
+  margin-block-start: 0.15rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 1ms !important;

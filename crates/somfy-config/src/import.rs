@@ -15,6 +15,45 @@
 //! measured travel times. Reading them is strictly better than copying them by
 //! eye from another device's screen, and the rolling code is the reason.
 //!
+//! ## Where this runs, and why it is a feature rather than a tool
+//!
+//! **Behind the non-default `migrate` cargo feature, and both sides turn it
+//! on.** This module and the parser under it used to be host-only — a
+//! dev-dependency and a module of `examples/provision_shades` — on the
+//! argument that reading a backup happens once, on a workstation, before
+//! anything is flashed. The firmware now imports a backup at boot from a
+//! staging flash region, so that argument is gone and only the *default*
+//! survives: a board provisioned any other way links neither the parser nor
+//! this module.
+//!
+//! What the move buys is that there is **one** importer. The refusal rules,
+//! the caveats and the rolling-code contract are read by the device and by the
+//! provisioning tool from the same source, rather than from a library copy and
+//! a tool copy free to drift on the one field that cannot be corrected
+//! afterwards.
+//!
+//! Everything here is `no_std` and allocation-free, which is what that move
+//! cost: every collection is a [`heapless`] one sized from the worst case the
+//! backup format can produce.
+//!
+//! ### One importer, two ways to be told what it found
+//!
+//! The mapping is [`import_with`], which hands each caveat to a sink as it is
+//! raised and returns an [`ImportedTable`]. Everything else is that function
+//! with a sink chosen:
+//!
+//! - [`import`] and [`read_backup`] keep every warning, in an [`Import`]. A
+//!   host tool prints the list under the table it is about, so it wants one.
+//! - [`import_with`] and [`read_backup_with`] keep none. The firmware writes
+//!   each warning to the log ring as it arrives and reports a count, so it
+//!   never builds the 33 KiB the list would cost on a boot stack it shares with
+//!   a staged-file buffer.
+//!
+//! Both walk the backup **once**, in one function, so they cannot come to
+//! different conclusions about what a file contains — which was the reason for
+//! a sink rather than a second traversal, and [`MAX_WARNINGS`] is where the
+//! arithmetic and the byte figures are.
+//!
 //! ## What is carried, and into which of two images
 //!
 //! The backup describes a whole installation and this import writes **two**
@@ -27,8 +66,7 @@
 //!
 //! They are written together because they are one thing: a group's membership
 //! and a room assignment are both *rows of the shade table*, so an estate
-//! beside a different table names the wrong shades. See
-//! `somfy_config::EstateRecord`.
+//! beside a different table names the wrong shades. See [`crate::EstateRecord`].
 //!
 //! **Still not written:** network credentials (the operator re-enters them —
 //! design spec §3.4), the broker settings (a different region and a different
@@ -41,8 +79,8 @@
 //! favourite set is a *no-op in the domain* while the motor still recalls its
 //! own, so the position estimate silently walks away from the shade — but
 //! `ShadeConfig` has no field to provision one into. [`Import`] therefore
-//! counts the favourites it had to drop, so the tool can say so rather than let
-//! a person discover it.
+//! counts the favourites it had to drop, so the caller can say so rather than
+//! let a person discover it.
 //!
 //! Shade flags (sun and wind sensor bits, `SimMy`) are dropped without a count:
 //! nothing in this firmware models any of them, so there is no behaviour to
@@ -56,12 +94,12 @@
 //!
 //! They are not the same loss. A linked remote is only ever *listened to* — its
 //! address is all that is needed to recognise its frames and move the position
-//! estimate — so the missing code costs nothing, and the tool says so in one
+//! estimate — so the missing code costs nothing, and the caller says so in one
 //! line rather than warning about it. A group is *transmitted as*, so a
 //! fabricated code is a group a motor will reject; that one is a per-group
 //! warning ([`Caveat::FabricatedGroupCode`]) **and** a bit in the record
-//! (`somfy_config::StoredGroup::code_recovered`), because the warning is read
-//! once and the value is stored forever.
+//! ([`crate::StoredGroup::code_recovered`]), because the warning is read once
+//! and the value is stored forever.
 //!
 //! ## Order is identity, and the backup's own ids are not it
 //!
@@ -94,18 +132,21 @@
 //!   not land where they were expected — a comma inside a name shifts every
 //!   field after it — and a shifted field is not obviously wrong. It is a
 //!   *plausible* rolling code that is not the right one, which is the failure
-//!   at the top of this file. The tool shows the table and demands confirmation.
+//!   at the top of this file. The caller shows the table and demands
+//!   confirmation before writing it.
 
-use somfy_config::{
-    EstateRecord, LinkedRemote, Members, ShadeError, StoredGroup, StoredRoom, StoredShade,
-    ESTATE_GROUP_CAPACITY, ESTATE_ROOM_CAPACITY, MAX_LINKED_REMOTES, MAX_LINKS,
-    SHADE_TABLE_CAPACITY,
-};
 use somfy_domain::{
-    DomainError, FrameWidth, RadioProtocol, RoomId, ShadeConfig, ShadeId, ShadeKind, TiltMode,
+    DomainError, FrameWidth, PairingState, RadioProtocol, RemoteIdentity, RoomId, ShadeConfig,
+    ShadeId, ShadeKind, TiltMode,
 };
 use somfy_migrate::{
     parse_backup, MigrateError, MigrationData, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
+};
+
+use crate::{
+    EstateRecord, LinkedRemote, Members, ShadeError, StoredGroup, StoredRoom, StoredShade,
+    ESTATE_GROUP_CAPACITY, ESTATE_ROOM_CAPACITY, MAX_LINKED_REMOTES, MAX_LINKS,
+    SHADE_TABLE_CAPACITY,
 };
 
 /// The lowest backup version whose file carries a **group's** rolling code.
@@ -145,7 +186,209 @@ const ROOM_UNASSIGNED: [u8; 2] = [0, 255];
 /// stored protocol differs from the absent-field default was deliberately set
 /// to something else, and this firmware cannot honour the difference.** What
 /// the other values *are* is not asserted here, because nothing here needs it.
-const TRANSMITTED_PROTOCOL: u8 = 0x00;
+pub const TRANSMITTED_PROTOCOL: u8 = 0x00;
+
+/// The width of every name this module copies, and it is the domain's own.
+///
+/// `somfy_domain::ShadeConfig::name`, [`crate::StoredRoom::name`] and
+/// [`crate::StoredGroup::name`] are all `heapless::String<32>`, and so is every
+/// name the backup parser hands over — `MigratedShade::name`,
+/// `MigratedRoom::name`, `MigratedGroup::name`. A [`Warning`] or a [`Refusal`]
+/// naming an entity is therefore copying 32 bytes into 32 bytes.
+///
+/// That is the whole reason the copy below is infallible, and it is pinned by
+/// `a_name_at_the_domains_limit_survives_a_warning` rather than assumed.
+pub const NAME_LEN: usize = 32;
+
+/// An entity's name, carried by a [`Warning`] or a [`Refusal`] so that either
+/// names something a person recognises rather than an index.
+pub type Name = heapless::String<NAME_LEN>;
+
+/// Caveats one **shade** record can raise, which is not one.
+///
+/// Five, because the five per-shade sites below are independent of each other:
+/// a shade can carry an unmodelled kind *and* an unmodelled tilt mode *and* a
+/// bit length that is not a frame width *and* a protocol this controller does
+/// not speak *and* a room the backup does not contain. Four of them fire
+/// together in `a_shade_needing_every_caveat_is_warned_about_for_each`, and the
+/// fifth — [`Caveat::UnknownRoom`] — is decided at the end of the same loop
+/// body from a different field, so nothing rules it out alongside the other
+/// four. `every_per_shade_caveat_can_fire_on_one_shade` pins all five at once,
+/// which is what stops this figure drifting from the code it describes.
+pub const CAVEATS_PER_SHADE: usize = 5;
+
+/// Shades a backup can hand over.
+///
+/// The capacity of `MigrationData::shades`, which is what actually bounds the
+/// loop below — not [`SHADE_TABLE_CAPACITY`], which bounds the table the loop
+/// *writes*. The two are equal today and [`Refusal::TooManyShades`] exists for
+/// the day they are not; on that day the caveats for the shades past the table
+/// are still recorded before the refusal returns, so the parser's figure is the
+/// one this buffer has to be sized from.
+///
+/// Restated rather than imported because it is private to `somfy-migrate`, and
+/// pinned against the real field by
+/// `the_parsers_capacities_are_the_ones_the_warning_buffer_is_sized_from`.
+pub const PARSED_SHADES: usize = 32;
+
+/// Groups a backup can hand over — the capacity of `MigrationData::groups`,
+/// for the reason [`PARSED_SHADES`] gives.
+pub const PARSED_GROUPS: usize = 16;
+
+/// Member ids one group record can list — the capacity of
+/// `MigratedGroup::member_shade_ids`, which is the C++ `linkedShades[0..32]`
+/// array with its empty slots compacted out.
+///
+/// **Every one of them can raise a caveat**, because
+/// [`Caveat::MissingMember`] fires per id the shade table does not answer to
+/// and a group that outlived all of its members is a file the old controller
+/// really produces: deleting a shade there clears its slot and leaves its id in
+/// every group it was in.
+pub const PARSED_GROUP_MEMBERS: usize = 32;
+
+/// Warnings one import can raise, and the length of [`Import::warnings`].
+///
+/// **The arithmetic worst case rather than a comfortable number**, which is
+/// what makes the vector unable to overflow and so removes "which warning do we
+/// drop?" from this module entirely. A dropped warning is the failure this
+/// whole file is arranged against: it is a shade that will not move, or a group
+/// that quietly moves fewer shades than the old controller's did, with nothing
+/// anywhere saying which one.
+///
+/// `32 × 5 + 16 × 33 = 688`: [`CAVEATS_PER_SHADE`] for each of
+/// [`PARSED_SHADES`], plus [`PARSED_GROUP_MEMBERS`] dangling members and one
+/// fabricated rolling code for each of [`PARSED_GROUPS`]. The naive figure —
+/// one caveat per record — is 48, and is wrong by more than a factor of
+/// fourteen, which is why the arithmetic is spelled out here rather than
+/// assumed.
+///
+/// **What it costs, measured rather than estimated.** A [`Warning`] is a
+/// [`Subject`], a 32-byte [`Name`] and a [`Caveat`], which comes to **48 bytes
+/// on `thumbv7em-none-eabihf`** — read off the compiler with a
+/// `[(); size_of::<Warning>()]` probe, not derived on paper. So the buffer is
+/// `688 × 48 = 33,024` bytes and an [`Import`] is **36,976** bytes in all,
+/// nine tenths of it this vector. An [`ImportedTable`] — the same import with
+/// the vector left out — is **3,952**, which is the difference stated as one
+/// number.
+///
+/// **The device does not pay any of that**, and this is the field's whole
+/// resolution. The firmware imports at boot on the main stack, sharing it with
+/// a 16 KiB staged-file buffer and a `somfy_migrate::MigrationData`, and 36,976
+/// bytes does not fit under what is already there. It also does not want the
+/// list: each warning goes to the log ring as its own line and only a count is
+/// reported, because `somfy_api::RestoreReportDto::warnings` is a `u8`. So the
+/// device calls [`import_with`] and receives an [`ImportedTable`] — the same
+/// import with the collection left out. This constant is what [`import`]
+/// chooses to spend, not what an import costs.
+///
+/// **The alternative weighed** — before the split existed, when every caller
+/// got a list — was a shorter vector plus a count of what would not fit. It was
+/// rejected then and the split is why it stays rejected: a truncation count is
+/// the one thing a person cannot act on, because "3 warnings dropped" names a
+/// number where the warning would have named the group that quietly lost its
+/// members. The 528 of these 688 that are [`Caveat::MissingMember`] are exactly
+/// what a cap sheds first, and they are the ones describing an installation
+/// shrinking. A caller that cannot afford the list now streams it instead of
+/// losing part of it.
+pub const MAX_WARNINGS: usize =
+    PARSED_SHADES * CAVEATS_PER_SHADE + PARSED_GROUPS * (PARSED_GROUP_MEMBERS + 1);
+
+// The proof that [`Import::warnings`] cannot overflow, written as something the
+// compiler checks rather than a sentence a reader has to trust.
+//
+// It is **not** a restatement of the line above: that one is computed from the
+// *parser's* capacities, and this one from *this crate's*, which are a
+// different pair of numbers and free to move independently. They are equal
+// today, so this is quiet; the day `SHADE_TABLE_CAPACITY` or
+// `ESTATE_GROUP_CAPACITY` grows past what a backup can hand over, it is the
+// line that notices the buffer no longer covers a full table.
+const _: () = assert!(
+    MAX_WARNINGS
+        >= SHADE_TABLE_CAPACITY * CAVEATS_PER_SHADE
+            + ESTATE_GROUP_CAPACITY * (PARSED_GROUP_MEMBERS + 1)
+);
+
+/// Every value an import could not carry across as it stands.
+pub type Warnings = heapless::Vec<Warning, MAX_WARNINGS>;
+
+/// Copy a name the backup carried into a [`Warning`] or a [`Refusal`].
+///
+/// **Infallible, and [`NAME_LEN`] is why**: every source is already a
+/// `heapless::String<32>` and the destination is one too, so there is no
+/// truncation to handle and no `Result` to return. That is stated here rather
+/// than left as an unexamined `unwrap_or_default` at each of the nine call
+/// sites.
+///
+/// The fallback is the empty string, which decides only how the impossible
+/// would present if the two widths ever parted: an unnamed entity in a report
+/// is *visibly* wrong, where a name shortened to fit is plausibly right — and
+/// plausible-but-wrong is the failure mode this whole module is careful about.
+fn name_of(text: &str) -> Name {
+    Name::try_from(text).unwrap_or_default()
+}
+
+/// Raise a caveat: build the [`Warning`], hand it to the sink, and count it.
+///
+/// One function rather than four call sites, so the single place a warning
+/// comes into existence is the single place its lifetime is decided. It is
+/// **borrowed** to `on_warning` rather than moved, and that is the whole reason
+/// the device can afford this module: its sink formats the warning into a log
+/// line and lets it go, so no caller is obliged to own [`MAX_WARNINGS`] of
+/// them. [`import`] is the one caller that chooses to.
+///
+/// The count is kept here rather than left to the sink, for the same reason the
+/// warning is built here: a sink that forgot to count would report an import as
+/// clean, and "clean" is the one answer this module must never invent.
+fn note_warning(
+    on_warning: &mut impl FnMut(&Warning),
+    raised: &mut usize,
+    subject: Subject,
+    name: &str,
+    caveat: Caveat,
+) {
+    *raised += 1;
+    on_warning(&Warning {
+        subject,
+        name: name_of(name),
+        caveat,
+    });
+}
+
+/// Whether a provisioned shade starts out needing to be paired, decided by the
+/// one thing that actually answers the question: **where its address came
+/// from.**
+///
+/// An address this controller's allocator produced is one **no motor has ever
+/// heard**, so the shade will not move until somebody stands at it with a
+/// working remote — it is awaiting confirmation, and the device offers to walk
+/// them through it. An address that came from anywhere else — a backup, or a
+/// number the operator read off the controller being replaced — is one a motor
+/// already obeys, so the setup was completed on that other controller and there
+/// is nothing here to finish.
+///
+/// The alternative was asking. It was rejected because the honest form of the
+/// question is "has a motor been taught this address?", the caller has just
+/// finished telling the operator the answer, and a prompt whose right answer is
+/// already on screen is a prompt people get wrong.
+///
+/// **The error direction, since both are reachable**: called wrongly
+/// `AwaitingConfirmation`, an imported shade appears under "finish setting up"
+/// and one press of *it already works* clears it. Called wrongly
+/// `ConfirmedByOperator`, a freshly allocated shade is announced to Home
+/// Assistant and silently obeys nothing, which is the failure this whole flow
+/// exists to end. So the test is the one that cannot get the second case wrong.
+///
+/// It reads the **address** rather than the source, so a table that is part
+/// import and part fresh allocation gets the right answer per shade without any
+/// caller having to know which is which — which is why it lives here beside the
+/// import rather than being duplicated by every tool that builds a table.
+pub fn provisioned_pairing_state(address: u32) -> PairingState {
+    if RemoteIdentity::is_allocated(address) {
+        PairingState::AwaitingConfirmation
+    } else {
+        PairingState::ConfirmedByOperator
+    }
+}
 
 /// A value the backup carried that this firmware cannot use as it stands.
 ///
@@ -212,7 +455,7 @@ pub enum Caveat {
     /// transmitting to each member shade rather than as the group. It costs a
     /// walk to a motor the first time anything transmits as the group, which
     /// is why the fact is written into the record as well as printed here —
-    /// see `somfy_config::StoredGroup::code_recovered`.
+    /// see [`crate::StoredGroup::code_recovered`].
     FabricatedGroupCode {
         /// The backup's format version, which is why it could not be read.
         version: u8,
@@ -303,20 +546,93 @@ pub struct Warning {
     /// it will have on the device.
     pub subject: Subject,
     /// Its name, so the warning names something a person recognises.
-    pub name: String,
+    pub name: Name,
     /// What could not be carried across as it stands.
     pub caveat: Caveat,
 }
 
+/// A shade table recovered from a backup — everything [`import_with`] produces
+/// **except** the warnings themselves, which went to its sink as they were
+/// raised.
+///
+/// ## Why this exists beside [`Import`], which has one more field
+///
+/// Because that one field is 33 KiB and the device has nowhere to put it. The
+/// firmware imports at boot, on the main stack, beside a staged-file buffer and
+/// a `somfy_migrate::MigrationData` — and it does not want the list anyway: it
+/// writes each warning to the log ring as its own line and reports a count,
+/// because `somfy_api::RestoreReportDto::warnings` is a `u8` and the detail is
+/// served from the log rather than held in RAM.
+///
+/// So this is the same import with the collection left to the caller. Every
+/// other field is identical, and [`warnings`](ImportedTable::warnings) is the
+/// count that a sink cannot forget to keep.
+///
+/// **The figure, measured the same way [`MAX_WARNINGS`] measures its own** —
+/// a `[(); size_of::<T>()]` probe against `thumbv7em-none-eabihf`, not paper
+/// arithmetic: `ImportedTable` is **3,952 bytes** where [`Import`] is 36,976.
+/// The whole 33,024-byte difference is the warning vector, and it is what makes
+/// a boot-time import fit under a stack that already carries a 16 KiB
+/// staged-file buffer and the parser's own `MigrationData`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedTable {
+    /// The shades, in the order their ids will follow.
+    pub shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY>,
+    /// Every linked remote the backup carried, ready for the record's pool.
+    /// See [`Import::links`], which is the same value.
+    pub links: heapless::Vec<LinkedRemote, MAX_LINKS>,
+    /// The rooms, the room each shade is in, and the groups. See
+    /// [`Import::estate`], which is the same value.
+    pub estate: EstateRecord,
+    /// How many caveats were raised — one per call the sink received, in the
+    /// order it received them.
+    ///
+    /// A count and not a list, which is the entire point of this type: the
+    /// caller decided what to do with each warning while it still had it, and
+    /// this is what is left to report. Zero is the ordinary case, and it is the
+    /// one claim worth being careful about — see `note_warning`, which is why
+    /// the count is not the sink's job.
+    pub warnings: usize,
+    /// Records whose fields did not align exactly. **Nonzero means at least one
+    /// value in this table may be wrong**, including a rolling code — see the
+    /// module docs and [`Import::misaligned`], whose rule is the same one.
+    pub skipped_resyncs: u16,
+    /// The backup's format version, for the report.
+    pub version: u8,
+    /// Shades whose "my" favourite could not be provisioned. See
+    /// [`Import::favourites`].
+    pub favourites: usize,
+}
+
+impl ImportedTable {
+    /// Whether any record's fields failed to align, which is the condition that
+    /// makes this table something to confirm rather than something to write.
+    ///
+    /// The same rule as [`Import::misaligned`], stated on both because both are
+    /// returned to callers that have to decide whether to write.
+    pub fn misaligned(&self) -> bool {
+        self.skipped_resyncs > 0
+    }
+}
+
 /// A shade table recovered from a backup, and everything about the recovery a
 /// person has to be told before it is written.
+///
+/// The collecting counterpart of [`ImportedTable`]: identical but for holding
+/// every [`Warning`] rather than a count of them. [`import`] produces it, host
+/// tools want it, and a device should not — [`MAX_WARNINGS`] has the figures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
     /// The shades, in the order their ids will follow.
     pub shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY>,
     /// Every value that could not be carried across as it stands. Empty is the
     /// ordinary case.
-    pub warnings: Vec<Warning>,
+    ///
+    /// **Nothing here is ever dropped**: the vector is [`MAX_WARNINGS`] long,
+    /// which is the worst case the backup format can produce, so there is no
+    /// overflow path and no count of what did not fit. That constant carries
+    /// the arithmetic and the byte cost it implies.
+    pub warnings: Warnings,
     /// Records whose fields did not align exactly. **Nonzero means at least one
     /// value in this table may be wrong**, including a rolling code — see the
     /// module docs.
@@ -330,7 +646,7 @@ pub struct Import {
     /// as `shades` and only meaningful beside it: a group's membership and a
     /// room assignment are both *rows of the shade table*, so importing one
     /// without the other would leave references pointing at whatever was there
-    /// before. See `somfy_config::EstateRecord`.
+    /// before. See [`crate::EstateRecord`].
     pub estate: EstateRecord,
     /// Every linked remote the backup carried, ready for the record's pool.
     ///
@@ -389,7 +705,7 @@ pub enum Refusal {
         /// The shade's index in the backup's shade order.
         index: usize,
         /// Its name, so the refusal names something a person recognises.
-        name: String,
+        name: Name,
         /// Why it was refused.
         error: ShadeError,
     },
@@ -401,16 +717,16 @@ pub enum Refusal {
         /// The earlier of the two.
         first: usize,
         /// The later one's name.
-        name: String,
+        name: Name,
         /// The address they share.
         address: u32,
     },
     /// More linked remotes than one record can carry. The per-shade bound is
     /// the domain's seven and is not what runs out; the record's shared pool is
-    /// [`somfy_config::MAX_LINKS`] across the whole table, and a big enough
-    /// installation can exceed it. Refused rather than truncated: a dropped
-    /// link is a wall remote whose presses stop correcting the position
-    /// estimate, and nothing would say which one.
+    /// [`MAX_LINKS`] across the whole table, and a big enough installation can
+    /// exceed it. Refused rather than truncated: a dropped link is a wall
+    /// remote whose presses stop correcting the position estimate, and nothing
+    /// would say which one.
     TooManyLinks {
         /// Links the backup carried.
         wanted: usize,
@@ -423,7 +739,7 @@ pub enum Refusal {
         /// The shade's index in the imported table.
         index: usize,
         /// The shade's name.
-        name: String,
+        name: Name,
         /// The remote's address.
         address: u32,
         /// Why it was refused.
@@ -435,7 +751,7 @@ pub enum Refusal {
         /// The later of the two rooms, by row.
         index: usize,
         /// Its name.
-        name: String,
+        name: Name,
         /// The id they share.
         room_id: u8,
     },
@@ -447,7 +763,7 @@ pub enum Refusal {
         /// The group's row in the imported table.
         index: usize,
         /// Its name.
-        name: String,
+        name: Name,
         /// The address the backup carried.
         address: u32,
     },
@@ -462,7 +778,7 @@ pub enum Refusal {
         /// The group's row in the imported table.
         index: usize,
         /// Its name.
-        name: String,
+        name: Name,
         /// The address it shares.
         address: u32,
         /// What else already holds it.
@@ -625,22 +941,96 @@ impl core::fmt::Display for Refusal {
 impl core::error::Error for Refusal {}
 
 /// Read a backup's bytes as a shade table, or say why it is not one.
+///
+/// The **collecting** form: every caveat lands in [`Import::warnings`], which
+/// is what a host tool wants and what a device cannot afford. On the device use
+/// [`read_backup_with`]; [`MAX_WARNINGS`] carries the byte figures that make
+/// that a rule rather than a preference.
 pub fn read_backup(bytes: &[u8]) -> Result<Import, Refusal> {
     let data = parse_backup(bytes).map_err(Refusal::Unreadable)?;
     import(&data)
 }
 
-/// Map already-parsed backup data onto the table this tool writes.
+/// Read a backup's bytes, handing each caveat to `on_warning` as it is raised.
+///
+/// The **streaming** form of [`read_backup`], and the one the firmware uses: no
+/// warning list is ever built, so an import costs an [`ImportedTable`] and not
+/// an [`Import`].
+pub fn read_backup_with(
+    bytes: &[u8],
+    on_warning: &mut impl FnMut(&Warning),
+) -> Result<ImportedTable, Refusal> {
+    let data = parse_backup(bytes).map_err(Refusal::Unreadable)?;
+    import_with(&data, on_warning)
+}
+
+/// Map already-parsed backup data onto the table this tool writes, collecting
+/// every caveat into [`Import::warnings`].
 ///
 /// Split from [`read_backup`] so the mapping and refusal rules can be exercised
 /// against constructed data, without a backup's bytes standing between the test
 /// and the rule it is checking.
+///
+/// **This is [`import_with`] with one particular sink**, and the sink is the
+/// only difference between them: it pushes what it is handed into a
+/// [`Warnings`] vector. So the two cannot disagree about which caveats are
+/// raised or in what order — there is one traversal here, not two — and
+/// `the_streaming_form_raises_exactly_what_the_collecting_form_keeps` is what
+/// holds that to the assertion rather than to the argument.
 pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
+    let mut warnings = Warnings::new();
+    let table = import_with(data, &mut |warning: &Warning| {
+        // Cannot overflow: `MAX_WARNINGS` is the arithmetic worst case and the
+        // `const` assertion beside it is what checks the arithmetic. The result
+        // is dropped rather than unwrapped because an `expect` here would be a
+        // panic guarding a bound the compiler has already proved; the
+        // `debug_assert` is what fails a host test if a sixth per-shade caveat
+        // is ever added without `CAVEATS_PER_SHADE` moving with it.
+        debug_assert!(
+            warnings.len() < MAX_WARNINGS,
+            "MAX_WARNINGS is meant to be the arithmetic worst case and this import exceeded it",
+        );
+        let _ = warnings.push(warning.clone());
+    })?;
+    debug_assert_eq!(
+        warnings.len(),
+        table.warnings,
+        "the collected list and the import's own count disagree",
+    );
+
+    Ok(Import {
+        shades: table.shades,
+        warnings,
+        skipped_resyncs: table.skipped_resyncs,
+        version: table.version,
+        estate: table.estate,
+        links: table.links,
+        favourites: table.favourites,
+    })
+}
+
+/// Map already-parsed backup data onto the table this tool writes, handing each
+/// caveat to `on_warning` as it is raised.
+///
+/// **This is the one traversal.** [`import`] is this function with a sink that
+/// keeps what it is given; the firmware's sink writes a log line and lets it
+/// go. A [`Warning`] is passed by reference and is not alive after
+/// `on_warning` returns, so a caller that does not want a list does not pay for
+/// one — which is the whole difference between an [`ImportedTable`] and an
+/// [`Import`], and the reason this is a pair of functions rather than one.
+///
+/// The refusals are identical in both, and so is the order caveats arrive in:
+/// the shades in the backup's order and then the groups, and within one shade
+/// kind, tilt mode, frame width, protocol, room.
+pub fn import_with(
+    data: &MigrationData,
+    on_warning: &mut impl FnMut(&Warning),
+) -> Result<ImportedTable, Refusal> {
     if data.shades.is_empty() {
         return Err(Refusal::NoShades);
     }
 
-    let mut warnings: Vec<Warning> = Vec::new();
+    let mut raised = 0usize;
     let mut estate = EstateRecord::empty(0);
 
     // The rooms first, because a shade carries the *backup's* room id and this
@@ -653,7 +1043,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         if let Some(_earlier) = room_row[room.room_id as usize] {
             return Err(Refusal::DuplicateRoomId {
                 index,
-                name: room.name.as_str().to_string(),
+                name: name_of(room.name.as_str()),
                 room_id: room.room_id,
             });
         }
@@ -661,8 +1051,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         estate
             .rooms
             .push(StoredRoom {
-                // Infallible: both capacities are 32 bytes.
-                name: heapless::String::try_from(room.name.as_str()).unwrap_or_default(),
+                name: name_of(room.name.as_str()),
             })
             .map_err(|_| Refusal::TooManyEstate {
                 what: "rooms",
@@ -701,7 +1090,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         }
         let refuse = |error| Refusal::Shade {
             index,
-            name: name.to_string(),
+            name: name_of(name),
             error,
         };
 
@@ -712,11 +1101,13 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             ShadeConfig::new(name, migrated.address).map_err(|e| refuse(ShadeError::Domain(e)))?;
 
         let mut note = |caveat| {
-            warnings.push(Warning {
-                subject: Subject::Shade(index),
-                name: name.to_string(),
+            note_warning(
+                &mut *on_warning,
+                &mut raised,
+                Subject::Shade(index),
+                name,
                 caveat,
-            })
+            )
         };
 
         // The two substitutions. A kind or tilt mode outside the modelled set
@@ -761,11 +1152,11 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         // An imported shade keeps the address the old controller was
         // transmitting at, so a motor already obeys it and the setup was
         // finished — on that controller, some time ago, by whoever installed
-        // it. `crate::provisioned_pairing_state` carries the argument, and it
-        // reads the address rather than the source, so a table that is part
-        // import and part fresh allocation gets the right answer per shade
-        // without this module having to know which is which.
-        config.pairing_state = crate::provisioned_pairing_state(config.address);
+        // it. [`provisioned_pairing_state`] carries the argument, and it reads
+        // the address rather than the source, so a table that is part import
+        // and part fresh allocation gets the right answer per shade without
+        // this module having to know which is which.
+        config.pairing_state = provisioned_pairing_state(config.address);
 
         // The same constructor the device decodes through, so a shade this
         // accepts is a shade the device accepts — and the rolling code goes
@@ -780,7 +1171,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             return Err(Refusal::DuplicateAddress {
                 index,
                 first,
-                name: name.to_string(),
+                name: name_of(name),
                 address: shade.config.address,
             });
         }
@@ -799,7 +1190,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         for remote in migrated.linked_addresses.iter().copied() {
             let refuse_link = |error| Refusal::Link {
                 index,
-                name: name.to_string(),
+                name: name_of(name),
                 address: remote,
                 error,
             };
@@ -844,11 +1235,13 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         if !ROOM_UNASSIGNED.contains(&migrated.room_id) {
             match room_row[migrated.room_id as usize] {
                 Some(row) => estate.room_of[index] = Some(RoomId(row as u8)),
-                None => warnings.push(Warning {
-                    subject: Subject::Shade(index),
-                    name: name.to_string(),
-                    caveat: Caveat::UnknownRoom(migrated.room_id),
-                }),
+                None => note_warning(
+                    &mut *on_warning,
+                    &mut raised,
+                    Subject::Shade(index),
+                    name,
+                    Caveat::UnknownRoom(migrated.room_id),
+                ),
             }
         }
     }
@@ -866,7 +1259,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         if migrated.address == 0 || migrated.address >= 0xFF_FFFF {
             return Err(Refusal::GroupAddress {
                 index,
-                name: name.to_string(),
+                name: name_of(name),
                 address: migrated.address,
             });
         }
@@ -890,7 +1283,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         if let Some(with) = clash {
             return Err(Refusal::GroupAddressClash {
                 index,
-                name: name.to_string(),
+                name: name_of(name),
                 address: migrated.address,
                 with,
             });
@@ -901,11 +1294,13 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             match shade_row[id as usize] {
                 Some(row) => members = members.with(ShadeId(row as u8)),
                 // Expected rather than exceptional — see `Caveat::MissingMember`.
-                None => warnings.push(Warning {
-                    subject: Subject::Group(index),
-                    name: name.to_string(),
-                    caveat: Caveat::MissingMember(id),
-                }),
+                None => note_warning(
+                    &mut *on_warning,
+                    &mut raised,
+                    Subject::Group(index),
+                    name,
+                    Caveat::MissingMember(id),
+                ),
             }
         }
 
@@ -913,20 +1308,21 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         // and the one this task exists for.
         let code_recovered = data.version >= GROUP_CODE_MIN_VERSION;
         if !code_recovered {
-            warnings.push(Warning {
-                subject: Subject::Group(index),
-                name: name.to_string(),
-                caveat: Caveat::FabricatedGroupCode {
+            note_warning(
+                &mut *on_warning,
+                &mut raised,
+                Subject::Group(index),
+                name,
+                Caveat::FabricatedGroupCode {
                     version: data.version,
                 },
-            });
+            );
         }
 
         estate
             .groups
             .push(StoredGroup {
-                // Infallible: both capacities are 32 bytes.
-                name: heapless::String::try_from(name).unwrap_or_default(),
+                name: name_of(name),
                 address: migrated.address,
                 next_code: migrated.next_code,
                 code_recovered,
@@ -938,17 +1334,13 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             })?;
     }
 
-    Ok(Import {
+    Ok(ImportedTable {
         shades,
-        warnings,
+        links,
+        estate,
+        warnings: raised,
         skipped_resyncs: data.skipped_resyncs,
         version: data.version,
-        estate,
-        links,
         favourites,
     })
 }
-
-#[cfg(test)]
-#[path = "import_tests.rs"]
-mod tests;

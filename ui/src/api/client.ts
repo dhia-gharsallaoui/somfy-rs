@@ -18,8 +18,10 @@ import type { CreateShadeDto } from './generated/CreateShadeDto';
 import type { GroupDto } from './generated/GroupDto';
 import type { MqttUpdateDto } from './generated/MqttUpdateDto';
 import type { PatchShadeDto } from './generated/PatchShadeDto';
+import type { RestoreReportDto } from './generated/RestoreReportDto';
 import type { RoomDto } from './generated/RoomDto';
 import type { SettingsDto } from './generated/SettingsDto';
+import type { SystemDto } from './generated/SystemDto';
 import type { TrialDecisionDto } from './generated/TrialDecisionDto';
 import type { ShadeDto } from './generated/ShadeDto';
 import type { WifiUpdateDto } from './generated/WifiUpdateDto';
@@ -271,6 +273,135 @@ export const saveMqtt = (body: MqttUpdateDto): Promise<void> =>
  */
 export const clearMqtt = (): Promise<void> =>
   request('/settings/mqtt', { method: 'DELETE' }).then(() => undefined);
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+//
+// The device's account of its own past. Every hard failure this project has had
+// was diagnosed over a serial cable, and the person holding the device does not
+// have one — so these three calls exist to put the same bytes on a screen.
+// ---------------------------------------------------------------------------
+
+/**
+ * What the device is, how it started, and what it has spent.
+ *
+ * One request rather than five, and `SystemDto`'s own documentation carries the
+ * reason: the useful facts are the *relations* — a heap peak beside a heap
+ * size, a stack depth beside the requirement that claims to bound it — and five
+ * endpoints polled separately could report a peak from one moment against a
+ * size from another.
+ */
+export const getSystem = (): Promise<SystemDto> => getJson('/system');
+
+/**
+ * The whole log ring, oldest line first.
+ *
+ * **Plain text, not JSON**, and the device sends it that way for a reason worth
+ * repeating here: the ring already *is* a run of newline-terminated lines, so
+ * JSON would mean escaping every one of them on a part with no allocator to
+ * produce something the browser must un-escape before showing it. What this
+ * resolves with is what the device holds, byte for byte — which is also what
+ * makes it safe to hand straight to the clipboard.
+ */
+export async function getSystemLog(): Promise<string> {
+  return (await request('/system/log')).text();
+}
+
+/**
+ * Forget the last panic **and** empty the log ring.
+ *
+ * One call because it is one endpoint, and one endpoint because they are one
+ * thing: both are what the device remembers about its own past, and a UI that
+ * cleared the panic while keeping the log would leave the log's account of that
+ * panic behind with nothing to explain it.
+ *
+ * There is no copy anywhere else. The panic record lives in RTC memory and the
+ * ring lives in RAM; neither is written to flash, so this is not a delete that
+ * a backup undoes. The screen confirms before calling it.
+ */
+export const forgetSystem = (): Promise<void> =>
+  request('/system', { method: 'DELETE' }).then(() => undefined);
+
+// ---------------------------------------------------------------------------
+// Backup and restore
+//
+// One resource read two ways — `GET` is the export, `POST` is the import — plus
+// a separate report, because the answer to an import arrives after a reboot
+// rather than in the response. `RestoreReportDto`'s own documentation carries
+// the arithmetic behind that: a C++ backup is about twelve kilobytes and has to
+// be parsed whole, and the only stack on this device with room for it is the
+// boot stack.
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the backup file is served from, as a URL a link can point at.
+ *
+ * **Exported as a URL rather than as a `downloadBackup()` function, because a
+ * plain `<a href download>` is the right implementation here and a `fetch` would
+ * be a worse one.** Three reasons, in order:
+ *
+ * 1. **The filename is the device's, and only the device knows it.** The
+ *    response carries `Content-Disposition: attachment;
+ *    filename="somfy-rs.rtsb"`, and a browser following a link honours it. Going
+ *    through `fetch` + `Blob` + `createObjectURL` means naming the file in
+ *    TypeScript instead — a second copy of a value the firmware already states,
+ *    free to drift the moment the firmware changes it.
+ * 2. **Nothing has to be held.** The device streams the container out of flash
+ *    sixty-four bytes at a time precisely so that four kilobytes never exists in
+ *    one piece; pulling it into a `Blob` to hand back to the browser undoes that
+ *    on the client side for no gain, and adds an object URL that has to be
+ *    revoked or it leaks.
+ * 3. **There is no error path worth catching.** The only refusals this endpoint
+ *    can produce are the `Origin`/`Host` checks, and this page was served by the
+ *    device, so its own requests always carry the device's own origin. Anything
+ *    else is the device being gone, which the report below already polls for and
+ *    says out loud.
+ */
+export const BACKUP_URL = `${API_BASE}/system/backup`;
+
+/**
+ * Send a backup file back to the device. **`202` means staged, not applied.**
+ *
+ * The device writes the bytes into a flash region, records that one is staged,
+ * and restarts; the boot path is what reads, validates and applies it. So this
+ * resolving means the upload was *taken* — the connection this page is on is
+ * about to go away, and {@link getRestoreReport}, polled afterwards, is where
+ * the outcome actually appears. A screen that renders this promise's resolution
+ * as "restored" would be claiming something no part of the device has decided
+ * yet.
+ *
+ * **The file is the raw body, not a multipart form**, and that is a requirement
+ * rather than a preference. The firmware reads `Content-Length` and then streams
+ * exactly that many bytes to flash a page at a time; a `FormData` body would put
+ * the length of the *envelope* in that header and begin the stream with a
+ * boundary line, so the first page would fail the device's format check and the
+ * last would be short. Handing `fetch` a `Blob` is what makes the browser set
+ * `Content-Length` to the file's own size.
+ *
+ * The declared type is `application/octet-stream` rather than whatever the file
+ * picker guessed from the extension — a C++ `.backup` is text and would
+ * otherwise be announced as such, which is a claim about bytes this client has
+ * not looked at. The device ignores the header either way.
+ */
+export async function uploadBackup(file: Blob): Promise<void> {
+  await request('/system/backup', {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: file,
+  });
+}
+
+/**
+ * What the last upload did — or, before the reboot, that one is pending.
+ *
+ * Answers `none` on a device that has never been sent a backup, `staged` in the
+ * window between an upload being accepted and the boot that reads it, and
+ * `applied` or `refused` afterwards. A refusal names an ordinary
+ * `ApiErrorCode`, because a backup is refused by the same rules a hand-typed
+ * shade is: a name over thirty-two bytes is `nameTooLong` whether it was typed
+ * or imported.
+ */
+export const getRestoreReport = (): Promise<RestoreReportDto> => getJson('/system/restore');
 
 /** A JSON body sent to an endpoint that answers with no body. */
 async function sendNoBody(method: string, path: string, body: unknown): Promise<void> {

@@ -344,7 +344,7 @@ pub fn start(
     #[cfg(feature = "http")]
     spawner.spawn(trial);
 
-    esp_println::println!("wifi: joining '{}'", credentials.ssid());
+    crate::logln!("wifi: joining '{}'", credentials.ssid());
     Ok(stack)
 }
 
@@ -430,7 +430,7 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
                 // reading for up to `RSSI_POLL_S`, which is the "appears and
                 // does nothing" shape this project avoids everywhere else.
                 sample_signal(&controller);
-                esp_println::println!(
+                crate::logln!(
                     "wifi: associated on channel {} ({:?} dBm)",
                     info.channel,
                     signal_dbm(),
@@ -439,8 +439,8 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
                 // Timed, because the reset below depends on it having lasted.
                 let joined = Instant::now();
                 match hold_link(&controller).await {
-                    Ok(info) => esp_println::println!("wifi: disconnected — {:?}", info.reason),
-                    Err(error) => esp_println::println!("wifi: link lost — {:?}", error),
+                    Ok(info) => crate::logln!("wifi: disconnected — {:?}", info.reason),
+                    Err(error) => crate::logln!("wifi: link lost — {:?}", error),
                 }
                 // The link is gone, so the last sample is no longer a fact about
                 // anything. Cleared rather than left: a stale signal strength is
@@ -452,7 +452,7 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
                 if backoff.succeed_after(lasted, STABLE_LINK_MS) {
                     consecutive = 0;
                 } else {
-                    esp_println::println!(
+                    crate::logln!(
                         "wifi: the link lasted {} ms, under the {} ms it takes to count \
                          as working — backing off rather than retrying at full rate",
                         lasted,
@@ -473,7 +473,7 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
                     || backoff.delay_ms() != previous_delay
                     || consecutive.is_multiple_of(RETRY_LOG_INTERVAL)
                 {
-                    esp_println::println!(
+                    crate::logln!(
                         "wifi: association failed ({} in a row) — {:?}",
                         consecutive,
                         error,
@@ -484,7 +484,7 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
 
         let waiting = backoff.fail();
         if waiting != previous_delay {
-            esp_println::println!("wifi: retrying in {} ms", waiting);
+            crate::logln!("wifi: retrying in {} ms", waiting);
         }
         previous_delay = waiting;
         // **`select`, not a bare `Timer`.** The wait itself is unchanged and
@@ -512,13 +512,13 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
 /// working, so running a deadline against it would revert a device that had
 /// nothing wrong with it.
 async fn apply_candidate(controller: &mut WifiController<'static>, candidate: WifiCredentials) {
-    esp_println::println!(
+    crate::logln!(
         "wifi: trying '{}' — the stored credential is untouched and comes back \
          unless somebody confirms from the new network",
         candidate.ssid(),
     );
     if let Err(error) = controller.set_config(&WifiConfig::Station(station_config(&candidate))) {
-        esp_println::println!(
+        crate::logln!(
             "wifi: the driver refused the candidate configuration ({:?}) — staying on \
              the stored credential",
             error,
@@ -655,11 +655,11 @@ pub async fn resolve(stack: Stack<'static>, name: &str) -> Option<core::net::Ipv
     let answers = match answers {
         Ok(Ok(answers)) => answers,
         Ok(Err(error)) => {
-            esp_println::println!("net: could not resolve '{}' ({:?})", name, error);
+            crate::logln!("net: could not resolve '{}' ({:?})", name, error);
             return None;
         }
         Err(_) => {
-            esp_println::println!(
+            crate::logln!(
                 "net: no answer resolving '{}' within {} s",
                 name,
                 RESOLVE_TIMEOUT_S,
@@ -722,17 +722,17 @@ async fn address_watch(stack: Stack<'static>) -> ! {
         // vote. See `somfy_ota::selftest`.
         crate::ota::associated();
         match stack.config_v4() {
-            Some(config) => esp_println::println!(
+            Some(config) => crate::logln!(
                 "net: address {} gateway {:?}",
                 config.address,
                 config.gateway,
             ),
             // Unreachable in practice — `wait_config_up` returned — but a
             // panic here would take the radio off the air over a log line.
-            None => esp_println::println!("net: configured, but no IPv4 address to report"),
+            None => crate::logln!("net: configured, but no IPv4 address to report"),
         }
         crate::heap::report("network up");
         stack.wait_config_down().await;
-        esp_println::println!("net: address lost");
+        crate::logln!("net: address lost");
     }
 }
