@@ -13,7 +13,7 @@
 //! and driving one asynchronous RX transaction per burst. Deliberately no index
 //! arithmetic — the first draft of this file kept its own cursor, and the bound
 //! that stops it reading a previous burst was wrong, which nothing in a
-//! four-chip build could have told anyone.
+//! multi-chip build could have told anyone.
 //!
 //! ## What owns this
 //!
@@ -72,7 +72,7 @@ pub const MEMSIZE_BLOCKS: u8 = 2;
 /// The ESP32-S3 and ESP32-C3 *can* wrap, so a larger buffer would be legal
 /// there and would let one reception carry more than the reserved RAM. It is
 /// deliberately not taken: a single Somfy frame fits comfortably, and one
-/// buffer size across three chips is one fewer thing that behaves differently
+/// buffer size across every chip is one fewer thing that behaves differently
 /// on the boards nobody has in front of them.
 ///
 /// ## What a reception longer than this costs

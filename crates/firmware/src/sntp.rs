@@ -173,7 +173,7 @@ struct Anchor {
 /// **A `blocking_mutex` around a `Cell` rather than an atomic, for the reason
 /// `crate::net::SIGNAL_DBM` gives**: `riscv32imc` — the ESP32-C3's target — has
 /// no atomic read-modify-write instruction, so the natural shape is unavailable
-/// on one of the three chips. A critical-section mutex costs a handful of
+/// on one of the supported chips. A critical-section mutex costs a handful of
 /// instructions and is held for a single load or store.
 ///
 /// `None` until a server has answered, and it never returns to `None`: an answer

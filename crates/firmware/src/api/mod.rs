@@ -37,7 +37,7 @@
 //! Wi-Fi driver's heap by *subtracting* the stack budget from whatever DRAM the
 //! chip has left after its statics, so every byte declared below comes out of
 //! the heap on the tightest chip. The buffer sizes are therefore argued rather
-//! than rounded up, and `docs/provenance.md` records what the three chips
+//! than rounded up, and `docs/provenance.md` records what the chips
 //! measured afterwards.
 
 use embassy_executor::{SpawnError, Spawner};

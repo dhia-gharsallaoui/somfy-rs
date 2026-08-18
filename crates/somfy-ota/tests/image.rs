@@ -228,9 +228,11 @@ fn the_wrong_chips_image_is_refused_and_says_which_two() {
 }
 
 #[test]
-fn every_chip_this_project_builds_for_has_a_distinct_id() {
+fn every_chip_this_project_has_produced_images_for_has_a_distinct_id() {
     // The ids were read off real images; this is the property that makes them
-    // usable as a check at all.
+    // usable as a check at all. `Chip::Esp32` is still here although the
+    // firmware stopped building for it on 2026-08-18: images from before then
+    // exist, so the id has to stay distinct for one to be refused by name.
     let ids = [Chip::Esp32.id(), Chip::Esp32S3.id(), Chip::Esp32C3.id()];
     assert_eq!(ids, [0x0000, 0x0009, 0x0005]);
     for (at, id) in ids.iter().enumerate() {

@@ -45,7 +45,7 @@ credentials and its shade table across the change.** There is no migration; see
 `build.rs` parses that file with `esp-idf-part` — the same crate espflash uses —
 and fails the build if the layout's invariants are broken. It exists because the
 table is data: an edit that moves `rollcode` compiles, links, lints and passes
-the whole three-chip matrix, and the first thing to notice would be a device
+the whole two-chip matrix, and the first thing to notice would be a device
 that had already lost the codes.
 
 This crate is its own Cargo workspace — stated by an empty `[workspace]` table
@@ -59,29 +59,47 @@ builds the same way wherever the checkout happens to sit. Do not add
 ## Supported chips
 
 Exactly one `chip-*` feature must be selected per build; esp-hal's own
-per-chip features are mutually exclusive, so "supports three chips" means three
+per-chip features are mutually exclusive, so "supports two chips" means two
 separate builds, never one combined binary.
 
-| Feature | Chip | Target triple |
-|---|---|---|
-| `chip-esp32` | ESP32 | `xtensa-esp32-none-elf` |
-| `chip-s3` | ESP32-S3 | `xtensa-esp32s3-none-elf` |
-| `chip-c3` | ESP32-C3 | `riscv32imc-unknown-none-elf` |
+| Feature | Chip | Target triple | Ships with |
+|---|---|---|---|
+| `chip-s3` | ESP32-S3 | `xtensa-esp32s3-none-elf` | everything: `mqtt`, `ui`, `mdns`, `sntp` |
+| `chip-c3` | ESP32-C3 | `riscv32imc-unknown-none-elf` | `mqtt`, `ui`; `mdns` and `sntp` refused |
 
-Two instruction sets on purpose: the ESP32 and ESP32-S3 are Xtensa, the
-ESP32-C3 is RISC-V. The pair has already caught faults an S3-only matrix would
-have shipped — `AtomicU32::fetch_add` does not exist on `riscv32imc`, and the
-ESP32 needs an optimised `esp-storage` even to lint.
+Two instruction sets on purpose: the ESP32-S3 is Xtensa, the ESP32-C3 is
+RISC-V. The pair has already caught a fault an S3-only matrix would have
+shipped — `AtomicU32::fetch_add` does not exist on `riscv32imc`.
 
-The **ESP32-S2 was dropped on 2026-08-17.** It could not hold the Wi-Fi heap
-and a bootable stack at the same time, its pin map was never checked against a
-board, and nobody had ever booted it. `docs/provenance.md` carries the
-arithmetic.
+**The ESP32-C3 is reached by IP address, not by name**, and has no wall clock.
+It has the DRAM for the web server but not for the mDNS responder or the SNTP
+client on top of it, so `src/heap.rs` refuses both with a `compile_error!`
+naming the measurement: with them on, that chip's Wi-Fi heap is 52,224 bytes
+against a 54,620-byte announcement peak; without them it is 60,416. Those
+refusals are not advice. They are what keeps `heap::DRAM_FOR_STACK_AND_HEAP` a
+per-chip *maximum* — it is measured at the largest feature set each chip can
+build, and a build larger than its own measurement takes DRAM the constant has
+already promised to the stack.
+
+### Two chips have been dropped
+
+Both for the same reason, and both recorded with their arithmetic in
+`docs/provenance.md`: **neither had ever booted this firmware.**
+
+- **ESP32-S2, 2026-08-17.** It could not hold the Wi-Fi heap and a bootable
+  stack at the same time.
+- **ESP32, 2026-08-18.** It was already excluded from the web server by a
+  `compile_error!`, and its one buildable configuration — `mqtt` alone — left
+  its Wi-Fi heap 1,700 bytes above the measured announcement peak, inside that
+  peak's own ~2,000-byte boot-to-boot spread, with nothing smaller to retreat
+  to. That is not a fit; it is a claim the project could not back.
+
+Removing them removed unverified claims rather than capability.
 
 Only the ESP32-S3 pin map in `src/chip.rs` has been checked against a real
 working device (see `docs/provenance.md` for details and the "Hardware-verified
-values" table). The ESP32 and ESP32-C3 pin maps are unverified defaults —
-confirm them against real hardware before wiring a board to those pins.
+values" table). The ESP32-C3 pin map is an unverified default — confirm it
+against real hardware before wiring a board to those pins.
 
 ## Toolchain setup
 
@@ -134,11 +152,10 @@ than producing an image whose UI is a 404.
 Then from `crates/firmware/`, with `~/export-esp.sh` already sourced:
 
 ```bash
-cargo build --features chip-s3    --target xtensa-esp32s3-none-elf
-cargo build --features chip-c3    --target riscv32imc-unknown-none-elf
-# The ESP32 has no DRAM for the web server — see below.
-cargo build --no-default-features --features chip-esp32,mqtt \
-  --target xtensa-esp32-none-elf
+cargo build --features chip-s3 --target xtensa-esp32s3-none-elf
+# The C3 has no DRAM for mDNS or SNTP on top of the web server — see below.
+cargo build --no-default-features --features chip-c3,mqtt,ui \
+  --target riscv32imc-unknown-none-elf
 ```
 
 Each of those builds all four binaries. Add `--bin store-check`,
@@ -156,15 +173,22 @@ builds exactly that per chip; `Cargo.toml` carries the argument.
 | build | command |
 |---|---|
 | everything (default) | `--features chip-s3` |
+| the C3's shipping image | `--no-default-features --features chip-c3,mqtt,ui` |
 | API with no browser front end | `--no-default-features --features chip-s3,http` |
 | broker only | `--no-default-features --features chip-s3,mqtt` |
 | radio only | `--no-default-features --features chip-s3` |
 
-**`http` and `ui` cannot be built for the ESP32.** With the server in, that chip
-has 54,556 bytes of DRAM for a 66,280-byte stack budget and the image does not
-link; `src/heap.rs` refuses it with a `compile_error!` naming the measurement.
-The ESP32-S3 and ESP32-C3 carry it with 38,760 and 25,448 bytes of Wi-Fi heap to
-spare.
+**`mdns` and `sntp` cannot be built for the ESP32-C3.** They cost 4,672 and
+2,880 bytes of DRAM, and with both on that chip's Wi-Fi heap falls to 52,224
+against a 54,620-byte announcement peak — a board that would associate, connect
+to the broker, and then exhaust the heap part-way through publishing its
+discovery configs. `src/heap.rs` refuses both with a `compile_error!` naming the
+measurement. Without them its heap is 60,416, which is 5,796 above that peak.
+The ESP32-S3 carries everything with 10,916 bytes to spare.
+
+Note that the web UI is *not* what does not fit: it costs 240 bytes of DRAM,
+because its assets are `include_bytes!` in flash. The connection tasks and
+`picoserve`'s monomorphised router come with `http`, which the C3 keeps.
 
 A bare `cargo build` (no chip feature) or a build with more than one chip
 feature enabled is expected to fail — see `src/chip.rs`'s `compile_error!`
@@ -182,7 +206,7 @@ Open any file in this crate in an editor and rust-analyzer will most likely
 report:
 
 ```
-no chip selected: build with exactly one of --features chip-esp32 | chip-s3 | chip-c3
+no chip selected: build with exactly one of --features chip-s3 | chip-c3
 ```
 
 with the whole file greyed out as inactive. **Nothing is wrong.** rust-analyzer
@@ -194,15 +218,14 @@ problem.
 
 `rust-analyzer.toml` in this directory fixes it by naming a chip. It picks the
 **C3**, because `riscv32imc-unknown-none-elf` ships with stable Rust — the
-ESP32 and ESP32-S3 are Xtensa and need the `esp` toolchain from `espup`, so
-they would require the editor to be launched from a shell that had already
-sourced `~/export-esp.sh`. Verified: `cargo check --features chip-c3 --target
+ESP32-S3 is Xtensa and needs the `esp` toolchain from `espup`, so it would
+require the editor to be launched from a shell that had already sourced
+`~/export-esp.sh`. Verified: `cargo check --features chip-c3 --target
 riscv32imc-unknown-none-elf` completes on a plain stable toolchain.
 
-The cost is that the `chip-esp32` and `chip-s3` arms of `chip.rs` and `heap.rs`
-show as inactive, and anything Xtensa-specific is analysed against the wrong
-chip. Working on those, change both keys and start the editor from an
-esp-sourced shell.
+The cost is that the `chip-s3` arms of `chip.rs` and `heap.rs` show as inactive,
+and anything Xtensa-specific is analysed against the wrong chip. Working on
+those, change both keys and start the editor from an esp-sourced shell.
 
 Per-directory `rust-analyzer.toml` is a recent feature and your editor may
 ignore it. The equivalent settings, for Neovim with `nvim-lspconfig`:

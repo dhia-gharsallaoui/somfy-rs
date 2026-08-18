@@ -76,7 +76,7 @@
 //!
 //! That trade is settled once, in one direction: [`STACK_BUDGET_BYTES`] fixes
 //! what the stack keeps and [`RADIO_HEAP_BYTES`] takes the rest of whatever DRAM
-//! the chip being built happens to have. **It is one rule over three inputs
+//! the chip being built happens to have. **It is one rule over two inputs
 //! rather than one number**, and the reason is that the chips are not the same
 //! size: a single shared figure has to fit the smallest of them, which is how an
 //! ESP32-S3 with 233,700 bytes to divide came to run its heap at 96% full next
@@ -84,11 +84,25 @@
 //!
 //! The objection to per-chip figures is that it makes the chip nobody can test
 //! the one running a configuration nobody has measured. That is true, and it was
-//! equally true of the shared constant — no ESP32 and no ESP32-C3 had ever run
-//! that either. What changes it is that the rule is now identical on every chip
-//! and only its input differs, and that both quantities it is built from are
-//! measurements rather than arguments: [`REQUIRED_STACK_BYTES`] out of the
-//! linked ELF, and [`WIFI_WORKING_SET_BYTES`] against a live broker.
+//! equally true of the shared constant — no ESP32-C3 had ever run that either.
+//! What changes it is that the rule is now identical on every chip and only its
+//! input differs, and that both quantities it is built from are measurements
+//! rather than arguments: [`REQUIRED_STACK_BYTES`] out of the linked ELF, and
+//! [`WIFI_WORKING_SET_BYTES`] against a live broker.
+//!
+//! ## Why the ESP32 is no longer one of them
+//!
+//! Dropped 2026-08-18, and it is the removal of an unverified claim rather than
+//! a reduction in capability: **no ESP32 has ever booted this firmware.** It was
+//! already excluded from the web server by a `compile_error!` here, and its one
+//! buildable configuration — `mqtt` alone — measured 123,284 bytes of DRAM, so
+//! its heap was 56,320 against a [`WIFI_PEAK_BYTES`] of 54,620. **+1,700, inside
+//! that peak's own ~2,000-byte boot-to-boot spread**, with no smaller
+//! configuration left to retreat to. A margin inside its own noise is a
+//! coincidence with a good track record, not a fit, and the claim that the chip
+//! was supported could not be backed. `docs/provenance.md` carries the
+//! arithmetic next to the ESP32-S2's, which was dropped on 2026-08-17 for the
+//! same reason.
 //!
 //! ## The stack half was measured once and then left
 //!
@@ -109,6 +123,30 @@
 //! — nothing written in this file can — which is what `crate::stack_used` is
 //! for: it paints the unused stack at boot and reads back how far down the paint
 //! was destroyed, so every boot prints a *measurement* next to the claim.
+//!
+//! ## This file loses things in merges, and a partial repair is its own failure
+//!
+//! Three times, and the third is the one worth recording because it was silent.
+//! Two branches each added statics to the image and each re-measured
+//! [`DRAM_FOR_STACK_AND_HEAP`] against a tree without the other; resolving by
+//! taking one side kept a figure correct for neither, and the board refused to
+//! boot — caught, loudly, by `crate::check_stack_headroom`. A second resolution
+//! dropped [`SERVICE_CHAIN_BYTES`] from the `max`, which was noticed and
+//! restored in a commit that says so in its subject.
+//!
+//! **That same resolution also dropped a `compile_error!` — one refusing the
+//! ESP32 the SNTP client — and nobody looked.** It was gone for weeks while a
+//! comment in `.github/workflows/ci.yml` went on asserting that "both refusals
+//! are `compile_error!`s in `heap.rs`". Nothing failed, because what was lost
+//! was a *guard*: its whole job is to be silent, so losing it is
+//! indistinguishable from it passing. The lesson is not "merge carefully" — it
+//! is that **noticing one thing a bad resolution dropped is evidence there are
+//! others, and the repair is to diff the whole file against both parents rather
+//! than to fix the item that announced itself.**
+//!
+//! It is moot for the constant it guarded, since the ESP32 was dropped
+//! (2026-08-18). It is not moot for the two refusals beside
+//! [`DRAM_FOR_STACK_AND_HEAP`], which are now what keeps that row a maximum.
 
 // How every stack figure below is read off a linked image. The commands are
 // here because these are the rows that go stale — one of them already did, and
@@ -266,6 +304,14 @@
 /// The constant takes the larger of the two chips, as it always has: **55,408**.
 /// The ESP32-C3 is still not walked — see the note above — and the inference
 /// that it sits below the Xtensa figures is unchanged.
+///
+/// **The ESP32 was dropped on 2026-08-18 and this figure does not move**, which
+/// is the one thing worth checking when a chip leaves: it was the *smaller* of
+/// the two Xtensa columns above (54,832 against the ESP32-S3's 55,408), so the
+/// `max` was never its. The tables above keep their ESP32 columns because they
+/// are a record of measurements that were taken, not a claim about what is
+/// built today — and because the repeated finding they carry is that this row
+/// goes stale, which is about the reading rather than about the chip.
 const BOOT_CHAIN_BYTES: usize = 55_408;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
@@ -468,50 +514,46 @@ const fn larger(left: usize, right: usize) -> usize {
 
 /// The main stack every chip is left, before the heap takes the rest.
 ///
-/// **This is the division, and it is one number for all three chips.**
+/// **This is the division, and it is one number for both chips.**
 /// `esp_alloc::heap_allocator!` declares a static array and esp-hal's linker
 /// script gives the main stack whatever DRAM is left once the statics are
 /// placed, so the heap and the stack are two shares of one fixed quantity —
-/// measurably so, and checked rather than assumed: the heap moved by +4,096 on
-/// the ESP32, +109,568 on the ESP32-S3 and +96,256 on the ESP32-C3 when this
-/// constant was introduced, and each chip's stack fell by exactly that, to the
-/// byte, in the relinked ELF. There is no third option and no slack between
-/// them; choosing one chooses the other.
+/// measurably so, and checked rather than assumed: the heap moved by +109,568 on
+/// the ESP32-S3 and +96,256 on the ESP32-C3 when this constant was introduced,
+/// and each chip's stack fell by exactly that, to the byte, in the relinked ELF.
+/// There is no third option and no slack between them; choosing one chooses the
+/// other.
 ///
 /// ### Why it is 66,280 and why it must not rise
 ///
 /// It used to be written as `49_592 + 16_688` — a requirement plus a margin —
-/// and **both halves of that were wrong while their sum was right.** The
-/// requirement is 55,792, so the margin this division actually buys is
-/// 66,280 − 55,792 = 10,488 rather than 16,688. Nothing available then was
-/// unavailable now; only the account of it was wrong, which is why the sum is
-/// kept unchanged and every heap figure measured against it stays valid.
+/// and **both halves of that were wrong while their sum was right.** Nothing
+/// available then was unavailable now; only the account of it was wrong, which
+/// is why the sum is kept unchanged and every heap figure measured against it
+/// stays valid. At today's [`REQUIRED_STACK_BYTES`] of 57,120 the margin this
+/// division actually buys is 66,280 − 57,120 = **9,160**, not 16,688.
 ///
-/// The figure is fixed **by the ESP32's heap**, which is the binding constraint
-/// on the whole design and the reason a "pick the stack first" rule cannot be
-/// followed all the way down:
+/// ### It was fixed by the ESP32, and the ESP32 is gone
 ///
-/// ```text
-/// ESP32 DRAM for stack and heap                                125,116
-///   − this budget                                               66,280
-///   = 58,836, rounded down to a whole KiB                        58,368   heap
-///   − the largest heap high-water yet measured                   54,424
-///   = what the ESP32 has left at the announcement burst           3,944
-/// ```
+/// The figure was chosen because it was the most the *ESP32* could give the
+/// stack while still leaving the Wi-Fi driver a heap — that chip was the binding
+/// constraint on the whole design, and the reason a "pick the stack first" rule
+/// could not be followed all the way down. It was dropped on 2026-08-18 (see the
+/// module docs), so the binding constraint is gone with it.
 ///
-/// **3,944 bytes is the entire slack in this design**, and it is inside the
-/// heap's own ~4,216-byte boot-to-boot noise, which is why that figure is the
-/// one to watch on that chip. Every byte added to this budget comes out of it.
-/// Raising the budget by 4 KiB does not cost the ESP32 a margin; it costs it the
-/// ability to finish announcing.
-///
-/// The two chips with DRAM to spare are not the constraint and do not get to set
-/// it: at this budget the ESP32-S3 runs a 93,184-byte heap against the same
-/// 54,424 peak, and the ESP32-C3 79,872.
+/// **The figure is kept unchanged anyway, and that is a judgement rather than an
+/// oversight.** Lowering it is the only direction that would buy anything — more
+/// heap on both remaining chips — and there is almost nothing there to buy:
+/// [`REQUIRED_STACK_BYTES`] is 57,120 and [`STACK_MARGIN_FLOOR_BYTES`] is 8,192,
+/// so the floor on this budget is 65,312 and the whole available move is **968
+/// bytes**, which does not cross the whole-KiB boundary the division rounds on
+/// for either chip. It would change no heap by a byte while pinning a number
+/// that a growing call graph moves. Every heap figure ever measured against
+/// 66,280 also stays valid, which is worth more than 968 bytes of nothing.
 ///
 /// ### What the difference buys
 ///
-/// 66,280 − [`REQUIRED_STACK_BYTES`] = 10,488 bytes, and
+/// 66,280 − [`REQUIRED_STACK_BYTES`] = 9,160 bytes, and
 /// [`STACK_MARGIN_FLOOR_BYTES`] is the least of it this division may leave.
 pub const STACK_BUDGET_BYTES: usize = 66_280;
 
@@ -525,7 +567,7 @@ pub const STACK_BUDGET_BYTES: usize = 66_280;
 /// measurement, and 8 KiB is chosen as roughly five times the entry cost
 /// [`INTERRUPT_FRAMES_BYTES`] does account for.
 ///
-/// The actual margin today is 10,488, so this floor is 2,296 bytes of slack
+/// The actual margin today is 9,160, so this floor is 968 bytes of slack
 /// before the build stops. That is deliberate: it is a *gate*, not a target, and
 /// it exists so that the failure of a growing call graph is a build error naming
 /// two numbers rather than a device that passes its own boot check and then
@@ -541,19 +583,19 @@ const STACK_MARGIN_FLOOR_BYTES: usize = 8 * 1024;
 // **The gate, and it is the one thing here that can stop a build.**
 //
 // A configuration whose deepest chain has grown past what the division leaves
-// fails to compile, naming both numbers — which is what the ESP32 + `http`
-// refusal below already does for a different reason, generalised to the reason
-// that actually bit.
+// fails to compile, naming both numbers — which is what the `chip-c3` + `mdns` /
+// `sntp` refusals below already do for a different reason, generalised to the
+// reason that actually bit.
 //
 // It is deliberately *not* satisfied by construction: `STACK_BUDGET_BYTES` is
-// the DRAM division, fixed by the ESP32's heap, and `REQUIRED_STACK_BYTES` is
-// what the compiler emitted. Neither is defined in terms of the other, so the
-// comparison is a real one.
+// the DRAM division and `REQUIRED_STACK_BYTES` is what the compiler emitted.
+// Neither is defined in terms of the other, so the comparison is a real one.
 //
 // The two ways out when it fires are both real work and neither is editing this
 // line: make the chain shallower — `crate::start_network`'s `#[inline(never)]`
 // is what that looks like, and it recovered 18,576 bytes — or move the division
-// and pay for it out of the ESP32's 3,944-byte heap slack, which needs hardware.
+// and pay for it out of the ESP32-C3's 5,796-byte heap slack, which needs
+// hardware nobody has.
 const _: () = assert!(
     STACK_BUDGET_BYTES >= REQUIRED_STACK_BYTES + STACK_MARGIN_FLOOR_BYTES,
     "the deepest stack chain in this configuration no longer fits the DRAM \
@@ -599,18 +641,30 @@ const _: () = assert!(
 /// ESP32-S3 figure is the same 66,724 the boot loop printed, which is what says
 /// this row was not the one at fault.
 ///
-/// # Measured per chip *and* per configuration
+/// # One figure per chip, and what makes that sound
 ///
-/// Each figure is taken with every feature that chip supports enabled, which is
-/// the largest the statics get. A smaller build simply leaves the residue on
-/// the stack, which is the safe direction and the same reason the division
-/// rounds down.
+/// **This is a per-chip constant describing a per-*configuration* quantity, and
+/// the only thing that reconciles those is an invariant: each figure is measured
+/// with the largest feature set that chip is *permitted* to build.** A smaller
+/// build then leaves the residue on the stack, which is the safe direction and
+/// the same reason the division rounds down. A *larger* build would take the
+/// residue out of a stack the constant already promised away — silently, and in
+/// the direction that overflows.
 ///
-/// | chip | features measured with | DRAM |
+/// So "permitted" cannot be a convention. It is a `compile_error!`: the ESP32-C3
+/// refuses `mdns` and `sntp` immediately below, and those refusals are what keep
+/// its figure a maximum rather than a sample. **Deleting one of them without
+/// re-measuring this row is the same defect as letting the row go stale**, which
+/// it has done three times, once refusing to boot.
+///
+/// | chip | largest permitted set | DRAM |
 /// |---|---|---|
-/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 123,996 |
-/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 136,020 |
-/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 122,816 |
+/// | ESP32-S3 | `mqtt`, `ui`, `mdns`, `sntp` — everything | 132,260 |
+/// | ESP32-C3 | `mqtt`, `ui` (and so `http`); `mdns` and `sntp` refused | 126,864 |
+///
+/// The **ESP32 was dropped on 2026-08-18** and its row with it; see the module
+/// docs for the arithmetic. The historical notes below keep their ESP32 columns
+/// because they record measurements that were taken.
 ///
 /// The web server costs about **69,000 bytes on the ESP32, 70,000 on the
 /// ESP32-S3 and 70,000 on the ESP32-C3** — three measurements of one thing, and the spread is
@@ -760,53 +814,99 @@ const _: () = assert!(
 /// costs the executor's stack for the length of a call and nothing when it is
 /// not running — see `crate::ota::tick_self_test`.
 ///
-/// **What this costs, chip by chip, and the ESP32-C3 is the one to read.** With
-/// the division applied, [`RADIO_HEAP_BYTES`] becomes 56,320 on the ESP32,
-/// 65,536 on the ESP32-S3 and **52,224 on the ESP32-C3** — which is 2,396 bytes
-/// **below** [`WIFI_PEAK_BYTES`], and the first time any chip in this matrix has
-/// been. It clears [`WIFI_WORKING_SET_BYTES`] by 4,760, so association is not in
-/// question; what is in question is the retained-discovery burst on a full
-/// installation. [`warn_if_tight`] says so at boot, in as many words, and the
-/// ESP32 now trips the softer half of the same warning at 1,700 above the peak.
+/// **Re-measured 2026-08-18 when the ESP32 was dropped, and the ESP32-C3's row
+/// moved for a reason that is about its feature set rather than about the
+/// chip.** Both remaining figures were read the documented way on that day, and
+/// the ESP32-S3's is confirmed twice over: `readelf -S` gives `.stack` = 66,724,
+/// and a live board printed `stack: 66724 bytes available` — the same number.
 ///
-/// Neither figure is a refusal, for the reason that function gives: a
-/// compile-time refusal would take the affected chip out of the matrix at the
-/// moment the matrix is what would catch the problem. **The lever, if the C3
-/// ever runs and the warning turns out to be real, is to gate the upload route
-/// behind a feature the way `http` is gated off for the ESP32** — the boot-side
-/// roll-back costs 432 bytes and would stay.
-#[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 123_284;
-/// See the `chip-esp32` definition above.
+/// The C3 was measured across its whole feature space, because the reason its
+/// full build did not fit had been misattributed to the web UI:
+///
+/// | ESP32-C3 configuration | `.stack` | DRAM | heap | vs [`WIFI_PEAK_BYTES`] |
+/// |---|---|---|---|---|
+/// | `mqtt`+`ui`+`mdns`+`sntp` | 66,840 | 119,064 | 52,224 | **−2,396** |
+/// | `mqtt`+`mdns`+`sntp`, no `ui` | 67,080 | 119,304 | 52,224 | **−2,396** |
+/// | `mqtt`+`ui`+`sntp`, no `mdns` | 71,752 | 123,976 | 57,344 | +2,724 |
+/// | **`mqtt`+`ui`, no `mdns`/`sntp`** | 74,632 | 126,856 | **60,416** | **+5,796** |
+/// | `mqtt` alone | 163,168 | 215,392 | 148,480 | +93,860 |
+///
+/// Those six rows were all read at the heap the *old* constant gave (52,224), so
+/// they are directly comparable with each other, which is what the table is for.
+/// **The chosen row then had to be re-measured against its own heap**, and it
+/// moved by 8 bytes: at a 60,416-byte heap the C3's `.stack` links to 66,448
+/// rather than 74,632 − 8,192 = 66,440, so the constant below is **126,864**.
+/// The eight bytes are the linker's alignment response to a heap 8,192 bytes
+/// larger, and they are worth a sentence because they are the whole reason this
+/// row is *measured* rather than computed: `DRAM = .stack + heap`, and `heap` is
+/// derived from `DRAM`, so the constant is a fixpoint and only a second build
+/// proves you have reached it. 126,864 − 66,280 = 60,584, which still rounds
+/// down to the same 60,416, so the image does not move again — checked.
+///
+/// **`ui` costs 240 bytes of DRAM. `mdns` costs 4,672 and `sntp` 2,880**, and
+/// the two are additive to the byte (4,672 + 2,880 = 7,792 = 126,856 − 119,064).
+/// The intuition that the UI is what does not fit is wrong twice over: the
+/// connection tasks and `picoserve`'s monomorphised router come with **`http`**,
+/// which every row above except the last still has, and `ui` adds only
+/// `include_bytes!` assets, which are `.rodata` in flash rather than DRAM.
+///
+/// So the C3 ships the fourth row — the web UI, the REST API and the update
+/// route, reached by IP rather than by name — and `mdns` and `sntp` are refused
+/// below. 60,416 is 5,796 above the worst announcement peak ever measured, about
+/// **2.9× that peak's own ~2,000-byte boot-to-boot spread**, where the full
+/// build sat 2,396 *below* it.
+///
+/// **The number to distrust, if you are the first person to boot a C3:**
+/// [`WIFI_PEAK_BYTES`] is an **ESP32-S3** measurement. No C3 has ever run this
+/// firmware, so its own announcement peak has never been observed — a different
+/// Wi-Fi blob on a different core could want more or less. +5,796 against
+/// another chip's peak is a great deal better than −2,396 against it, and it is
+/// not the same as knowing. Watch `heap: session announced` on that board before
+/// trusting any of this.
 #[cfg(feature = "chip-s3")]
 const DRAM_FOR_STACK_AND_HEAP: usize = 132_260;
-/// See the `chip-esp32` definition above.
+/// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 119_064;
+const DRAM_FOR_STACK_AND_HEAP: usize = 126_864;
 
-// **The ESP32 cannot carry the web server, and this says so at compile time
-// rather than at link time.**
+// **The ESP32-C3 does not have the DRAM for the mDNS responder or the SNTP
+// client on top of the web server, and these say so at compile time.**
 //
-// Measured 2026-08-17: with `http` enabled the DRAM left for the stack and the
-// heap falls to 54,556 bytes against a stack budget of 66,280 — the image does
-// not link at all, and what `ld` says about it is `stack.x:11 cannot move
-// location counter backwards`, which names neither the feature nor the chip.
+// Measured 2026-08-18, in the table on `DRAM_FOR_STACK_AND_HEAP` above: with
+// both on, that chip's heap is 52,224 against a 54,620-byte announcement peak.
+// It clears the driver's resting working set by 4,760, so it would associate and
+// connect — and then exhaust the heap part-way through publishing its retained
+// discovery configs, which `esp-alloc` answers with a null, which reaches
+// `handle_alloc_error`, which panics. A board that reboots while announcing
+// looks like a broker fault and is not.
 //
-// It is not close and it is not a tuning problem. Even at one connection task
-// instead of four the server costs about 16,500 bytes, which would leave the
-// Wi-Fi driver a heap of roughly 42 KB against a resting working set of 47,464
-// — so the board would link and then fail to associate.
+// **Why a refusal here when `warn_if_tight` argues for a warning.** That
+// function's argument is against refusing a *chip*, because a compile-time
+// refusal would take it out of the matrix at the moment the matrix is what would
+// catch the problem. These refuse two *features* on one chip and leave it in the
+// matrix for everything else, so that argument does not reach them. What does
+// reach them is the invariant above: `DRAM_FOR_STACK_AND_HEAP` is one figure per
+// chip, sound only because it is measured at the largest set that chip can
+// build. Downgrade either of these to a warning and the C3 can build an image
+// larger than its own constant was measured on — which is the unsafe direction,
+// and the direction this row has failed in three times.
 //
-// The ESP32-S3 and the ESP32-C3 both have the DRAM for it, with 38,760 and
-// 25,448 bytes of heap to spare over the worst peak yet measured — against the
-// 3,944 the ESP32 has left with only a broker in it, which is itself inside
-// this heap's known ~4,216-byte boot-to-boot noise and is the figure to watch
-// on that chip.
-#[cfg(all(feature = "chip-esp32", feature = "http"))]
+// The ESP32-S3 carries both with 10,916 bytes of heap to spare over the same
+// peak.
+#[cfg(all(feature = "chip-c3", feature = "mdns"))]
 compile_error!(
-    "the ESP32 does not have the DRAM for the web server: with `http` enabled it has 54,556 \
-     bytes for a stack budget of 66,280, so the image cannot link. Build it with \
-     `--no-default-features --features chip-esp32,mqtt`, or use an ESP32-S3 or ESP32-C3. \
+    "the ESP32-C3 does not have the DRAM for the mDNS responder as well as the web server: it \
+     costs 4,672 bytes, which takes this chip's Wi-Fi heap from 60,416 to 55,296 against a \
+     54,620-byte announcement peak — inside that peak's own ~2,000-byte spread. Build it with \
+     `--no-default-features --features chip-c3,mqtt,ui` and reach the device by IP, or use an \
+     ESP32-S3. See `heap::DRAM_FOR_STACK_AND_HEAP` for the measurement."
+);
+#[cfg(all(feature = "chip-c3", feature = "sntp"))]
+compile_error!(
+    "the ESP32-C3 does not have the DRAM for the SNTP client as well as the web server: it \
+     costs 2,880 bytes of this chip's Wi-Fi heap, and with `mdns` as well the heap falls 2,396 \
+     bytes BELOW the 54,620-byte announcement peak. Build it with `--no-default-features \
+     --features chip-c3,mqtt,ui` — that image has no wall clock at all — or use an ESP32-S3. \
      See `heap::DRAM_FOR_STACK_AND_HEAP` for the measurement."
 );
 
@@ -823,28 +923,31 @@ compile_error!(
 /// that fails silently — a heap that is a kilobyte small panics and says so,
 /// while a stack that is a kilobyte small corrupts whatever it grows into.
 ///
-/// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] |
-/// |---|---|---|---|---|
-/// | ESP32 | 123,740 | 56 KiB = 57,344 | 66,396 | 10,604 |
-/// | ESP32-S3 | 135,068 | 67 KiB = 68,608 | 66,460 | 10,668 |
-/// | ESP32-C3 | 121,856 | 54 KiB = 55,296 | 66,560 | 10,768 |
+/// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] | vs [`WIFI_PEAK_BYTES`] |
+/// |---|---|---|---|---|---|
+/// | ESP32-S3 | 132,260 | 64 KiB = 65,536 | 66,724 | 9,604 | +10,916 |
+/// | ESP32-C3 | 126,864 | 59 KiB = 60,416 | 66,448 | 9,328 | +5,796 |
 ///
-/// **The ESP32-S3 and the ESP32-C3 each lost a kilobyte here on 2026-08-18**,
-/// to the `Origin`/`Host` check and the command limiter; the ESP32 lost none,
-/// because the rounding happened to fall the other way for it. The C3 is the one
-/// that matters and the one to watch: its heap goes 55 KiB → 54 KiB, which
-/// leaves **872 bytes** over the worst announcement peak ever measured (54,424)
-/// where it had 1,896 — and both figures are inside the ~2,000-byte spread that
-/// peak itself showed between boots, which is what [`warn_if_tight`] says at
-/// boot. **It has still never been run on hardware.**
+/// **Both rows moved on 2026-08-18**, and for different reasons. The ESP32-S3's
+/// is the same image it has always been, re-read after the ESP32 was dropped and
+/// unchanged by that. The ESP32-C3's is a *different configuration*: `mdns` and
+/// `sntp` are now refused on that chip, which is what takes its heap from 52,224
+/// — 2,396 bytes below the announcement peak — to 60,416, which is 5,796 above
+/// it. See [`DRAM_FOR_STACK_AND_HEAP`] for the whole feature-by-feature table
+/// and for why the web UI was *not* the thing to cut.
+///
+/// **Neither chip trips [`warn_if_tight`] now**, which is the first time that
+/// has been true since it was written; the C3 was the reason it exists. It is
+/// kept, and the reason is in its own doc comment: the figure it compares
+/// against is one chip's reading, and the C3's own peak is still unmeasured.
 ///
 /// The available lever, recorded rather than taken because it spends the
 /// operator's page-load time and that is not this change's to spend:
-/// `api::TCP_TX_BYTES` at 512 instead of 1,024 returns 2,048 bytes of DRAM,
-/// which would put the C3 back above where it was. Its own documentation calls
-/// it the figure to raise if the UI feels slow, so this is the trade in the
-/// other direction — roughly twenty extra round trips on a 21 KB script, once
-/// per page load and never on a reload, since the assets answer `304`.
+/// `api::TCP_TX_BYTES` at 512 instead of 1,024 returns 2,048 bytes of DRAM. Its
+/// own documentation calls it the figure to raise if the UI feels slow, so this
+/// is the trade in the other direction — roughly twenty extra round trips on a
+/// 21 KB script, once per page load and never on a reload, since the assets
+/// answer `304`.
 ///
 /// Nothing in that table is chosen; it is what the rule returns. Every `stack
 /// left` column was read back out of the linked ELF on 2026-08-18 — they are the
@@ -922,9 +1025,9 @@ pub const RADIO_HEAP_BYTES: usize = (DRAM_FOR_STACK_AND_HEAP - STACK_BUDGET_BYTE
 /// is here so that [`warn_if_undersized`] has something to compare against that
 /// was read off a serial line rather than argued for.
 ///
-/// It is one chip's number used for all three, which is the honest limit of it:
-/// the ESP32-C3 has never been measured, and the ESP32's driver is a different
-/// blob again.
+/// It is one chip's number used for both, which is the honest limit of it: the
+/// ESP32-C3 has never been booted, so its driver's resting set has never been
+/// observed either.
 #[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
 pub const WIFI_WORKING_SET_BYTES: usize = 47_464;
 
@@ -990,18 +1093,27 @@ pub fn warn_if_undersized() {
 /// board that associates, connects to the broker, and dies while publishing,
 /// which looks like a broker problem and is not.
 ///
-/// **The ESP32-C3 is the reason it exists.** The settings screen cost 10,664
-/// bytes of DRAM in the web server's connection tasks, and on the C3 that takes
-/// the heap from 65 KiB to 55 KiB — 1,700 bytes above [`WIFI_PEAK_BYTES`],
-/// against a peak that itself moved 2,000 bytes between boots of one unchanged
-/// image. A margin inside its own noise is a coincidence, not a design, and the
-/// honest thing is to say which boot it was measured on and let the board report
-/// what it actually sees.
+/// **The ESP32-C3 is the reason it exists**, and as of 2026-08-18 no chip in the
+/// matrix trips it: the C3 refuses `mdns` and `sntp`, which takes its heap to
+/// 60,416 — 5,796 above [`WIFI_PEAK_BYTES`], about 2.9× that peak's own spread —
+/// and the ESP32, whose 1,700-byte margin was the other case, was dropped.
+///
+/// **It is kept anyway, and not as decoration.** [`RADIO_HEAP_BYTES`] is a
+/// subtraction, not a chosen number: every static added anywhere in the image
+/// comes out of [`DRAM_FOR_STACK_AND_HEAP`], and the day that row is re-measured
+/// after a Plan's worth of new buffers the heap shrinks by exactly as much, with
+/// no diff to review. This is the line that would say so. And the figure it
+/// compares against is still an **ESP32-S3** reading — the C3's own announcement
+/// peak has never been observed, so the margin above is against another chip's
+/// number.
 ///
 /// Not a refusal, and not a `const` assertion, for the same reason
 /// [`warn_if_undersized`] is neither: the peak is one chip's measurement and a
 /// compile-time refusal would take the affected chip out of the matrix that
-/// would catch the problem.
+/// would catch the problem. The two `compile_error!`s beside
+/// [`DRAM_FOR_STACK_AND_HEAP`] are not a counter-example — they refuse two
+/// *features* on one chip and leave it in the matrix for everything else, and
+/// they exist to keep that constant a maximum rather than to price a heap.
 #[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
 fn warn_if_tight() {
     // Only when the heap clears the resting set, so this never doubles up on

@@ -37,7 +37,7 @@ seam Plan 5 plugs into.
 |---|---|---|
 | Hardware available | Spare ESP32-S3-DevKitC-1 + CC1101, **plus** the running C++ v2.5.6 device | Golden captures are obtainable; on-air validation is in scope |
 | Vertical slice | Radio task **wired to `somfy-domain`** | Plan 2 stops being dormant; Plan 5's seam is real code |
-| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues<br>**Superseded 2026-08-17:** the ESP32-S2 was dropped (too little DRAM for the Wi-Fi heap *and* a bootable stack); the matrix is three chips over both instruction sets |
+| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues<br>**Superseded twice.** 2026-08-17: the ESP32-S2 was dropped (too little DRAM for the Wi-Fi heap *and* a bootable stack). 2026-08-18: the ESP32 was dropped too — it could not link the web server, and its one buildable configuration left its heap 1,700 bytes above the announcement peak, inside that peak's own spread. **Neither had ever been booted**, which is what made both "no porting debt accrues" and the support claim itself unbacked. The matrix is now two chips over both instruction sets |
 | Rolling codes | **Minimal persisted counter**, nothing else persisted | Invariant honoured from frame one; survives reflashing |
 | RX strategy | `PulseSource` trait; RMT RX primary, GPIO-interrupt fallback | Spec §5.3's recorded contingency becomes a swap, not a rewrite |
 
@@ -66,10 +66,15 @@ builds, not one:
 
 | Feature | `esp-hal` feature | Target triple |
 |---|---|---|
-| `chip-esp32` | `esp32` | `xtensa-esp32-none-elf` |
+| ~~`chip-esp32`~~ | ~~`esp32`~~ | dropped 2026-08-18 |
 | ~~`chip-s2`~~ | ~~`esp32s2`~~ | dropped 2026-08-17 |
 | `chip-s3` | `esp32s3` | `xtensa-esp32s3-none-elf` |
 | `chip-c3` | `esp32c3` | `riscv32imc-unknown-none-elf` |
+
+The ESP32-C3 additionally refuses `mdns` and `sntp` (2026-08-18), so its
+shipping build is `--no-default-features --features chip-c3,mqtt,ui`: a web UI
+and REST API reached by IP address, with no `.local` name and no wall clock.
+`crates/firmware/src/heap.rs` carries the measurement.
 
 - **No default chip feature.** A bare `cargo build` hits a `compile_error!`
   naming the four options rather than silently selecting one.
