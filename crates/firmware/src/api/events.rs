@@ -202,7 +202,7 @@ impl WebSocketCallback for Events {
         // `GET /api/v1/shades`, and a socket that spins on a fault is worse
         // than one that starts a little behind.
         if send_snapshot(&mut tx).await? {
-            esp_println::println!(
+            crate::logln!(
                 "api: a websocket opened without its opening snapshot — the client's positions \
                  will catch up on the next movement"
             );
@@ -247,7 +247,7 @@ impl WebSocketCallback for Events {
                         // next delta reports again, so the client is at most
                         // one movement stale and self-corrects.
                         embassy_sync::pubsub::WaitResult::Lagged(missed) => {
-                            esp_println::println!(
+                            crate::logln!(
                                 "api: a websocket client missed {} state update(s)",
                                 missed,
                             );

@@ -108,8 +108,9 @@ use picoserve::routing::{get, parse_path_segment, post, PathRouter};
 use picoserve::{ResponseSent, Router};
 use serde::Serialize;
 use somfy_api::{
-    ApiErrorCode, ApiErrorDto, CalibrationStepDto, CommandDto, CreateShadeDto, MqttUpdateDto,
-    PatchShadeDto, SettingsDto, TrialDecisionDto, WifiUpdateDto,
+    ApiErrorCode, ApiErrorDto, CalibrationStepDto, ChipDto, CommandDto, CreateShadeDto, HeapDto,
+    MqttUpdateDto, PatchShadeDto, SettingsDto, StackDto, SystemDto, TrialDecisionDto,
+    WifiUpdateDto,
 };
 use somfy_domain::{GroupId, ShadeId};
 use somfy_tasks::ControlCommand;
@@ -228,6 +229,23 @@ fn router() -> Router<impl PathRouter> {
             "/api/v1/settings/mqtt",
             picoserve::routing::put(save_mqtt).delete(clear_mqtt),
         )
+        // The `system` resource design spec §7.2 promises. Three plain literal
+        // paths, so the same `&str` monomorphisation family the settings routes
+        // are already in — none of them deepens
+        // `crate::heap::REQUEST_CHAIN_BYTES`, which is the reason the URLs are
+        // shaped this way rather than as `/api/v1/system?what=log`.
+        .route("/api/v1/system", get(get_system).delete(forget_the_past))
+        .route("/api/v1/system/log", get(get_log))
+        // Two methods on one path, the shape `/api/v1/settings/mqtt` is already
+        // in: `GET` is the export and `POST` is the restore. They are one
+        // resource — the backup this device has — read one way and written the
+        // other, and a second path would have been a second route out of the
+        // DRAM the connection task futures come from.
+        .route(
+            "/api/v1/system/backup",
+            get(get_backup).post_service(RestoreUpload),
+        )
+        .route("/api/v1/system/restore", get(get_restore))
         .route("/api/v1/events", get(events))
         // The one route that is a *service* rather than a handler function,
         // because it is the one that must not have its body extracted for it.
@@ -299,7 +317,7 @@ impl<T: Serialize, const N: usize> Content for JsonBody<T, N> {
         let written = match serde_json_core::to_slice(&self.0, &mut scratch) {
             Ok(written) => written,
             Err(_) => {
-                esp_println::println!(
+                crate::logln!(
                     "api: an entity did not fit {} bytes and was answered as an empty body — \
                      this is a bug in somfy_api::SHADE_JSON_MAX_BYTES, not in the request",
                     ENTITY_JSON_BYTES,
@@ -462,7 +480,7 @@ impl Chunks for Collection {
                     // that was skipped.
                     first = false;
                 }
-                None => esp_println::println!(
+                None => crate::logln!(
                     "api: an entity did not fit {} bytes and was left out of the list — \
                      this is a bug in somfy_api::SHADE_JSON_MAX_BYTES, not in the request",
                     ENTITY_JSON_BYTES,
@@ -727,7 +745,7 @@ async fn events(
     match Events::admit() {
         Some(events) => Ok(upgrade.on_upgrade(events)),
         None => {
-            esp_println::println!(
+            crate::logln!(
                 "api: refusing a websocket — {} of {} slots are in use. REST is unaffected: \
                  {} of this device's {} connection tasks can never be taken by one.",
                 Events::held(),
@@ -917,7 +935,7 @@ async fn apply_mqtt(request: Rpc) -> Result<(StatusCode, NoContent), Result<Refu
 /// Rolling codes, the shade table and the announced set are all in flash and
 /// survive it.
 fn restart_for_mqtt() {
-    esp_println::println!(
+    crate::logln!(
         "config: broker settings stored — restarting so the retained topics of the \
          superseded namespaces are cleared before the new ones are published"
     );
@@ -925,6 +943,412 @@ fn restart_for_mqtt() {
     // connection is not going to be re-established. The Wi-Fi trial's settle
     // delay exists for the same reason and is the same figure.
     RESTART.signal(());
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Bytes of log copied out of the ring per chunk.
+///
+/// **64, which is [`crate::restore::EXPORT_CHUNK_BYTES`], and one figure rather
+/// than two is the point.** Both are a scratch buffer held across a socket
+/// write inside each connection task's future — four copies each, out of the
+/// DRAM the Wi-Fi driver's heap is carved from — and two different sizes would
+/// have been two slots the compiler has no reason to overlap.
+///
+/// Each chunk is one critical section over a `memcpy` in RTC RAM plus about
+/// eight bytes of chunked-transfer framing on the wire, so the whole 4 KiB ring
+/// is 64 chunks: half a kilobyte of framing and 64 critical sections, once, on a
+/// page a person opens when something has already gone wrong.
+///
+/// It is deliberately *not* the ring's size. A single chunk would hold the
+/// critical section for the length of a socket write, which is the one thing a
+/// degradable service may never do — see [`crate::diag::log_read`].
+const LOG_CHUNK_BYTES: usize = crate::restore::EXPORT_CHUNK_BYTES;
+
+/// The log ring, streamed as text.
+///
+/// `text/plain` rather than JSON, and the reason is the buffer above: escaping
+/// four kilobytes into a JSON string would need a buffer up to six times that,
+/// held across the write, four times over. A `<pre>` is what the UI does with it
+/// either way, and `curl` shows it without a parser.
+///
+/// Chunked because the length is not knowable in advance — the ring is being
+/// appended to while it is read — and streaming hands the executor back between
+/// chunks so a log fetch cannot sit between the state task and an arrival stop.
+struct LogText;
+
+impl Chunks for LogText {
+    fn content_type(&self) -> &'static str {
+        // `charset=utf-8` because a log line carries shade names, and a name is
+        // whatever the operator typed. The ring evicts **whole lines**, so a
+        // response can never begin part-way through a character.
+        "text/plain; charset=utf-8"
+    }
+
+    async fn write_chunks<W: Write>(
+        self,
+        mut writer: ChunkWriter<W>,
+    ) -> Result<ChunksWritten, W::Error> {
+        let mut scratch = [0u8; LOG_CHUNK_BYTES];
+        let mut at = 0usize;
+        loop {
+            let taken = crate::diag::log_read(at, &mut scratch);
+            if taken == 0 {
+                break;
+            }
+            writer.write_chunk(&scratch[..taken]).await?;
+            at += taken;
+        }
+        writer.finalize().await
+    }
+}
+
+/// Which part this image was built for.
+#[cfg(feature = "chip-s3")]
+const THIS_CHIP: ChipDto = ChipDto::Esp32S3;
+/// See the `chip-s3` definition above.
+#[cfg(feature = "chip-c3")]
+const THIS_CHIP: ChipDto = ChipDto::Esp32C3;
+
+/// Everything the diagnostics screen reads.
+///
+/// **Assembled here rather than in [`crate::diag`]**, which is where it started
+/// and where it did not belong: that module is included by path into the
+/// `tx-check` bring-up harness, which takes `logln!` and has neither a host name
+/// nor a painted stack, so a `SystemDto` built there referred to three things
+/// that do not exist. Composing the DTO is an API concern and this is the API.
+///
+/// Every term is a global [`crate::diag`] or [`crate::heap`] owns, and none is
+/// behind [`crate::rpc`]: nothing here touches the store, the registry, the
+/// transmit queue or the frame channel, so a request for it cannot make the
+/// state task wait. That is the same separation rule `crate::api`'s module docs
+/// state, kept by there being nothing shared rather than by a lock.
+fn system() -> SystemDto {
+    let mut firmware = heapless::String::new();
+    // Cannot fail: `MAX_VERSION_LEN` is 16 and this crate's version is `0.1.0`.
+    // Truncation would be silent, so it is checked at compile time instead.
+    let _ = firmware.push_str(env!("CARGO_PKG_VERSION"));
+    let mut host = heapless::String::new();
+    // Cannot fail: `identity::hostname` is `somfy-` plus twelve hex digits,
+    // which is `somfy_api::MAX_HOST_LEN` exactly.
+    let _ = host.push_str(crate::identity::hostname().as_str());
+
+    SystemDto {
+        chip: THIS_CHIP,
+        firmware,
+        host,
+        uptime_s: crate::diag::uptime_s(),
+        reset_reason: crate::diag::reset_reason(),
+        stack: StackDto {
+            available: crate::stack_available() as u32,
+            required: crate::heap::REQUIRED_STACK_BYTES as u32,
+            // Zero is `crate::stack_used`'s "could not measure" — the paint
+            // covers `PAINT_HEADROOM_BYTES` at minimum on any boot that
+            // happened at all — so it becomes an absent field rather than a
+            // number claiming the stack was untouched.
+            used: match crate::stack_used() {
+                0 => None,
+                used => Some(used as u32),
+            },
+        },
+        heap: HeapDto {
+            size: crate::heap::size_bytes() as u32,
+            used: crate::heap::used_bytes() as u32,
+            peak: crate::heap::peak_bytes() as u32,
+        },
+        log: crate::diag::log_stats(),
+        last_panic: crate::diag::last_panic(),
+    }
+}
+
+const _: () = assert!(
+    env!("CARGO_PKG_VERSION").len() <= somfy_api::MAX_VERSION_LEN,
+    "this crate's version does not fit somfy_api::MAX_VERSION_LEN, and a truncated \
+     version string on a diagnostics screen is worse than none",
+);
+
+/// `GET /api/v1/system` — what the device knows about itself.
+///
+/// **Not behind [`crate::rpc`]**, unlike every other read in this file, and the
+/// difference is worth naming rather than looking like an oversight: every term
+/// in the answer is a global that [`crate::diag`] or [`crate::heap`] owns, and
+/// none of them is the registry, the store, the transmit queue or the frame
+/// channel. There is nothing here for the state task to contend for, so a
+/// request for it cannot make the state task wait — which is the property the
+/// seam exists to provide, arrived at by there being nothing shared rather than
+/// by a rendezvous.
+async fn get_system(_from_this_device: FromThisDevice) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        JsonBody::<_, { somfy_api::SYSTEM_JSON_MAX_BYTES }>(system()),
+    )
+}
+
+/// `GET /api/v1/system/log` — the ring, oldest line first.
+async fn get_log(_from_this_device: FromThisDevice) -> impl IntoResponse {
+    ChunkedResponse::new(LogText)
+}
+
+/// `DELETE /api/v1/system` — forget the panic record and empty the log.
+///
+/// **One action rather than two, and the coupling is the point**: both are what
+/// this device remembers about its own past, and an operator who has read a
+/// panic and wants the screen to stop showing it wants the lines that produced
+/// it gone too. Splitting them would also have cost a third route, which is not
+/// free — see [`crate::heap::DRAM_FOR_STACK_AND_HEAP`] for what a route costs in
+/// the connection task futures and which chip pays for it.
+///
+/// `204` and not `404` when there was nothing to forget: the request is
+/// idempotent and its postcondition — this device remembers nothing from before
+/// now — holds either way. A client that deletes twice has not made a mistake.
+async fn forget_the_past(_from_this_device: FromThisDevice) -> impl IntoResponse {
+    crate::diag::forget();
+    (StatusCode::NO_CONTENT, NoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Backup and restore
+// ---------------------------------------------------------------------------
+
+/// The `Content-Disposition` an export answers with.
+///
+/// Fixed rather than built from the host name, and the reason is the one
+/// [`location_of`] gives: `picoserve` takes headers as `&str` borrowed for the
+/// response, so a `heapless::String` built in a handler would be gone by the
+/// time the header was written. A table of every possible name is not an option
+/// here — there are 2^48 host names — so the name is constant and the device it
+/// came from is inside the file.
+///
+/// The extension is the container magic, lower-cased. It is deliberately not a
+/// name a firmware image could have: uploading one file to the other's route is
+/// the mistake both routes spend a refusal code on, and a file picker showing
+/// `.rtsb` next to `.bin` is the cheapest place to prevent it.
+const BACKUP_FILENAME: &str = "attachment; filename=\"somfy-rs.rtsb\"";
+
+/// `GET /api/v1/system/backup` — this device's configuration, as a file.
+///
+/// Chunked, and streamed out of flash sixty-four bytes at a time through
+/// [`crate::rpc`]. Nothing four kilobytes long exists anywhere on this path:
+/// `crate::restore::export_chunk` is where each chunk is assembled, and
+/// `somfy_backup` is what is in the file and what is deliberately not.
+struct BackupFile;
+
+impl Chunks for BackupFile {
+    fn content_type(&self) -> &'static str {
+        // Not JSON and not text: it is two flash records, a code block and a
+        // checksum, and a browser that tried to display it would show mojibake.
+        // `octet-stream` plus the disposition header is what makes it save.
+        "application/octet-stream"
+    }
+
+    async fn write_chunks<W: Write>(
+        self,
+        mut writer: ChunkWriter<W>,
+    ) -> Result<ChunksWritten, W::Error> {
+        let mut at = 0u32;
+        loop {
+            match RPC.call(Rpc::BackupChunk { at }).await {
+                Some(Reply::BackupChunk { len: 0, .. }) => break,
+                Some(Reply::BackupChunk { len, bytes }) => {
+                    let len = usize::from(len).min(bytes.len());
+                    writer.write_chunk(&bytes[..len]).await?;
+                    at += len as u32;
+                }
+                // A refusal or a state task that did not answer ends the body
+                // here. **A truncated backup is not a valid one** — the
+                // container's length field and its checksum both cover it — so
+                // what the client gets is a file `somfy_backup::decode` refuses,
+                // which is honest and better than a response that never
+                // terminates.
+                _ => {
+                    crate::logln!(
+                        "backup: the export stopped after {} bytes — the file will not check out",
+                        at,
+                    );
+                    break;
+                }
+            }
+        }
+        writer.finalize().await
+    }
+}
+
+async fn get_backup(_from_this_device: FromThisDevice) -> impl IntoResponse {
+    // `into_response().with_headers(..)` rather than the `(status, header,
+    // content)` tuple every other handler here returns: those tuple impls
+    // require the body to be `Content`, which a chunked body is not — it is a
+    // `Body` that writes itself. This is `picoserve`'s own way of adding a
+    // header to one.
+    ChunkedResponse::new(BackupFile)
+        .into_response()
+        .with_headers([("Content-Disposition", BACKUP_FILENAME)])
+}
+
+/// `GET /api/v1/system/restore` — what the last upload did.
+///
+/// **Not behind [`crate::rpc`]**, for the reason `crate::diag::system` gives:
+/// the report is a value the state task settles once at boot and once per
+/// upload, and a poll for it must not be able to make that task wait. See
+/// `crate::restore::report`.
+async fn get_restore(_from_this_device: FromThisDevice) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        JsonBody::<_, { somfy_api::RESTORE_JSON_MAX_BYTES }>(crate::restore::report()),
+    )
+}
+
+/// `POST /api/v1/system/backup` — a backup, staged for the next boot.
+///
+/// A `RequestHandlerService` for the reason [`OtaUpload`] is: the body is a
+/// file, and every `picoserve` body extractor produces the body as a *value*
+/// that has to fit the 1,536-byte request buffer. So it keeps by hand the two
+/// things a handler function gets for free, in this order:
+///
+/// 1. **The `Origin`/`Host` check**, as its first statement, before the session
+///    lock and before a byte of the body is read.
+/// 2. **The session lock**, which is [`crate::ota::take`] — *the same lock a
+///    firmware upload takes*. Not reuse for its own sake: both stream a file to
+///    flash through one page buffer, so two at once would interleave their
+///    pages, and one lock makes that inexpressible rather than checked. A
+///    second upload of either kind is refused with
+///    [`ApiErrorCode::UpdateInProgress`].
+///
+/// # What a failure leaves behind
+///
+/// Nothing that will be applied. The staged bytes are only reachable through a
+/// state record that says `Staged`, and that record is the last thing written —
+/// so a partial upload, a refused file and a dropped socket all leave a region
+/// full of bytes nothing will ever read.
+struct RestoreUpload;
+
+impl picoserve::routing::RequestHandlerService<(), ()> for RestoreUpload {
+    async fn call_request_handler_service<R: Read, W: ResponseWriter<Error = R::Error>>(
+        &self,
+        state: &(),
+        (): (),
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<ResponseSent, W::Error> {
+        use picoserve::extract::FromRequestParts;
+
+        // One exit, for the reason [`OtaUpload`] records: written as four
+        // `finalize().write_to()` pairs, that handler's `select` frame grew by
+        // 14,672 bytes, because each pair is inlined into the poll with its own
+        // response writer beneath it.
+        let answer: Result<(StatusCode, NoContent), Result<Refusal, Unavailable>> = 'answer: {
+            if let Err(refusal) = FromThisDevice::from_request_parts(state, &request.parts).await {
+                break 'answer Err(Ok(refusal));
+            }
+
+            let declared = request.body_connection.content_length();
+            let Some(mut upload) = crate::ota::take() else {
+                break 'answer Err(Ok(refuse(ApiErrorCode::UpdateInProgress)));
+            };
+
+            let outcome = receive_backup(&mut request, &mut upload, declared).await?;
+            // Dropped before the response is written, so a client that
+            // immediately retries a refused upload is not told the device is
+            // busy with itself.
+            drop(upload);
+
+            match outcome {
+                Ok(()) => {
+                    crate::logln!(
+                        "restore: staged — restarting to apply it. Nothing has been validated \
+                         yet; the next boot reads it, and GET /api/v1/system/restore is where it \
+                         says what it did."
+                    );
+                    RESTART.signal(());
+                    Ok((StatusCode::ACCEPTED, NoContent))
+                }
+                Err(Some(code)) => Err(Ok(Refusal(code))),
+                Err(None) => Err(Err(Unavailable)),
+            }
+        };
+
+        answer
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await
+    }
+}
+
+/// Stream the body to the state task, one page at a time.
+///
+/// The same shape as [`receive`], which is the firmware-image half, sharing its
+/// page channel and its read timeout. Two differences: four different requests,
+/// and one rule it does not need — a backup is at most sixteen kilobytes into an
+/// already-erased region, so there is no sector-alignment rule for a short page
+/// in the middle to break, and `crate::restore::Staging::page` rounds the last
+/// page up rather than refusing it.
+async fn receive_backup<R: Read>(
+    request: &mut picoserve::request::Request<'_, R>,
+    upload: &mut crate::ota::Upload,
+    declared: usize,
+) -> Result<Result<(), Option<ApiErrorDto>>, R::Error> {
+    let began = match RPC
+        .call(Rpc::RestoreBegin {
+            declared: declared as u32,
+        })
+        .await
+    {
+        Some(Reply::Done) => Ok(()),
+        Some(Reply::Refused(code)) => Err(Some(code)),
+        _ => Err(None),
+    };
+    if let Err(refusal) = began {
+        return Ok(Err(refusal));
+    }
+
+    let mut remaining = declared;
+    let outcome = {
+        let mut reader = request
+            .body_connection
+            .body()
+            .reader()
+            .with_different_timeout(embassy_time::Duration::from_secs(UPLOAD_READ_TIMEOUT_S));
+        loop {
+            if remaining == 0 {
+                break Ok(());
+            }
+            let want = remaining.min(crate::restore::PAGE_BYTES);
+            let Some(page) = upload.lend().await else {
+                break Err(None);
+            };
+            match reader.read_exact(&mut page.bytes[..want]).await {
+                Ok(()) => {}
+                Err(picoserve::io::ReadExactError::UnexpectedEof) => {
+                    // The client stopped sending. Nothing was marked staged, so
+                    // this is a failed upload rather than a damaged device.
+                    break Err(Some(ApiErrorDto::from(ApiErrorCode::BackupDamaged)));
+                }
+                Err(picoserve::io::ReadExactError::Other(error)) => return Err(error),
+            }
+            upload.post();
+            match RPC.call(Rpc::RestorePage { len: want as u16 }).await {
+                Some(Reply::Done) => {}
+                Some(Reply::Refused(code)) => break Err(Some(code)),
+                _ => break Err(None),
+            }
+            remaining -= want;
+        }
+    };
+
+    match outcome {
+        Ok(()) => Ok(match RPC.call(Rpc::RestoreFinish).await {
+            Some(Reply::Done) => Ok(()),
+            Some(Reply::Refused(code)) => Err(Some(code)),
+            _ => Err(None),
+        }),
+        Err(refusal) => {
+            // "Abort what you started", unconditionally, for the reason the
+            // firmware upload gives: it survives a later change to which side
+            // refuses.
+            let _ = RPC.call(Rpc::RestoreAbort).await;
+            Ok(Err(refusal))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,7 +1445,7 @@ impl picoserve::routing::RequestHandlerService<(), ()> for OtaUpload {
 
             match outcome {
                 Ok(()) => {
-                    esp_println::println!(
+                    crate::logln!(
                         "ota: update accepted — restarting into it. If it does not confirm \
                          itself, this board comes back to the image it is running now."
                     );

@@ -75,6 +75,8 @@ fn regenerate() {
         somfy_api::WifiUpdateDto::export_all().expect("export WifiUpdateDto");
         somfy_api::MqttUpdateDto::export_all().expect("export MqttUpdateDto");
         somfy_api::TrialDecisionDto::export_all().expect("export TrialDecisionDto");
+        somfy_api::SystemDto::export_all().expect("export SystemDto");
+        somfy_api::RestoreReportDto::export_all().expect("export RestoreReportDto");
     });
 }
 

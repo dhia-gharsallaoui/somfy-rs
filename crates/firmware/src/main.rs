@@ -99,6 +99,11 @@ extern crate alloc;
 mod api;
 mod chip;
 mod config;
+// **Not feature-gated**, and deliberately: the log ring and the panic record
+// are what every build records, including the radio-only one that has no way to
+// serve them. What that build gets out of it is a serial console whose lines
+// survive the reset the panic handler performs.
+mod diag;
 mod edits;
 mod estate;
 mod heap;
@@ -126,6 +131,20 @@ mod net;
 // slot, and it is the half that reads the record which notices.
 mod ota;
 mod radio;
+// **`http`-gated, unlike [`ota`], and the asymmetry is real.** The update path's
+// boot half decides whether the image that is running may stay, which has to
+// exist wherever an `otadata` region does — a board that cannot be *sent* an
+// update can still have been given one over a cable. A restore has no such
+// half: the only thing that can stage one is the web server, so a build without
+// one can never have anything staged to apply.
+//
+// The corner it leaves is worth naming. A board staged by a `ui` image and then
+// flashed with a radio-only one keeps its staged backup, unapplied, until an
+// image with a web server boots again. That is the safe direction — nothing is
+// written and nothing is lost — and it is why the state record says `staged`
+// rather than being consumed on sight.
+#[cfg(feature = "http")]
+mod restore;
 mod rpc;
 mod shades;
 #[cfg(feature = "sntp")]
@@ -282,9 +301,30 @@ static SHADE_ACKS: AckChannel = AckChannel::new();
 /// **The bring-up harnesses deliberately keep the halting handler.** They are
 /// run with a person watching the serial line, they contain no network, and
 /// there the frozen state is worth more than the recovery.
+///
+/// # What survives it
+///
+/// Resetting is what made a panic invisible to anybody without a cable, and
+/// [`diag`] is the answer: the message and the uptime go into RTC-fast memory,
+/// which esp-hal preserves across a software reset and zeroes on a power-on, so
+/// the next boot can report them at `GET /api/v1/system`. The log ring is in the
+/// same memory, so the lines *leading up to* the panic survive too — which is
+/// usually the more useful half.
+///
+/// **A power cut erases both**, and that is stated rather than worked around:
+/// the alternative is a flash erase and program from inside a handler on a board
+/// that has just been established to be in an unknown state. See [`diag`].
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    esp_println::println!("PANIC: {}", info);
+    // **The structured record first, before the serial write.** The serial
+    // write is the slow half — it spins on the UART FIFO for milliseconds — so
+    // a second fault during it would otherwise lose the record as well as the
+    // output. `crate::diag` puts it in RTC memory, which esp-hal preserves
+    // across the reset below; that is the whole reason the reset does not also
+    // erase the evidence for it. See that module for why re-entering a critical
+    // section from here is sound.
+    diag::record_panic(info);
+    crate::logln!("PANIC: {}", info);
     // **Not optional, and measured.** `esp_println` spins until the UART has
     // room for each byte, not until the line has left the shift register, so
     // resetting immediately truncates the message — observed on an ESP32-S3,
@@ -335,6 +375,40 @@ enum StartError {
         required: usize,
     },
     Spawn(SpawnError),
+}
+
+/// What a boot turned out to be.
+///
+/// Two outcomes rather than one, and the second exists for a stack reason
+/// `restore::apply` carries in full: a staged restore is applied on [`entry`]'s
+/// frame rather than beneath [`start`]'s twenty kilobytes, because the parse of
+/// a backup is a 52 KB chain and one of the two places it can go makes
+/// `heap::REQUIRED_STACK_BYTES` a figure this chip's DRAM cannot fund.
+///
+/// So `start` stops early when it finds one, hands back the two things needed to
+/// apply it, and `entry` applies it and resets.
+///
+/// `Restore` is `http`-gated with the module it names: only a web server can
+/// stage a restore, so a build without one can never reach that outcome.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the two differ by about 1,900 bytes and there is nowhere to box the \
+              larger: this firmware has an allocator for the Wi-Fi driver and for \
+              nothing else. The value lives for the length of one `match` on \
+              `entry`'s frame, which is the shallowest stack this firmware has."
+)]
+enum Booted {
+    /// The device is provisioned and ready to be handed to the network.
+    Running(Pending),
+    /// A backup is staged and nothing else has been started.
+    #[cfg(feature = "http")]
+    Restore {
+        /// The flash, which the state task never received because no state
+        /// task was spawned.
+        store: FlashStore<'static>,
+        /// The region the backup is staged in.
+        staging: restore::Staging,
+    },
 }
 
 /// What [`start`] leaves for the network, once the radio is genuinely running.
@@ -398,12 +472,31 @@ async fn entry(spawner: Spawner) {
     paint_stack();
 
     let pending = match start(spawner) {
-        Ok(pending) => pending,
+        Ok(Booted::Running(pending)) => pending,
+        #[cfg(feature = "http")]
+        // **A staged restore, applied here and nowhere else.** This is the
+        // shallowest stack this firmware has after the executor starts — the
+        // 144 bytes above `poll`, and `poll` itself — and applying a backup
+        // needs about 41 KB of it, more than any other single thing the
+        // firmware does. `restore::apply` carries the measurement and
+        // `crate::start` carries the alternative that was rejected.
+        //
+        // Then it resets, so the next boot reads the configuration this just
+        // wrote through the ordinary path rather than through a second one.
+        Ok(Booted::Restore {
+            mut store,
+            mut staging,
+        }) => {
+            restore::apply(&mut staging, &mut store);
+            crate::logln!("restore: restarting into the restored configuration");
+            drain_serial();
+            esp_hal::system::software_reset()
+        }
         Err(error) => {
             // A failure leaves nothing spawned and this message is the whole
             // report. No network is attempted, because there is no radio for
             // it to be independent of.
-            esp_println::println!("controller: failed to start: {:?}", error);
+            crate::logln!("controller: failed to start: {:?}", error);
             // **Unless this image is on trial**, in which case failing to start
             // is exactly what a bad release looks like and sitting here is a
             // brick: nothing else in the firmware will ever reset the board, and
@@ -411,7 +504,7 @@ async fn entry(spawner: Spawner) {
             // repeat forever. Resetting turns it into the second attempt, which
             // `ota::survey` reads as a roll-back. See `somfy_ota::verdict`.
             if ota::verification_pending() {
-                esp_println::println!(
+                crate::logln!(
                     "ota: this image has not been confirmed and it did not start — resetting,                      so the next boot rolls back to the image that was running before it"
                 );
                 drain_serial();
@@ -443,13 +536,23 @@ async fn entry(spawner: Spawner) {
 
     heap::report("controller started");
     report_stack_use();
-    esp_println::println!("controller: running");
+    crate::logln!("controller: running");
     // Returning is correct: the executor outlives this function and keeps
     // polling the tasks that were spawned.
 }
 
-fn start(spawner: Spawner) -> Result<Pending, StartError> {
+fn start(spawner: Spawner) -> Result<Booted, StartError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
+
+    // **First, because everything below it is a line worth keeping.** It ages
+    // the panic record — so a screen can say how many boots ago — and, when the
+    // log ring carried lines across the reset, it writes a separator so the two
+    // boots are not read as one. Both are reads and writes of RTC memory and of
+    // one register; nothing here can fail and nothing below depends on it.
+    //
+    // After `esp_hal::init` rather than before, because `diag::uptime_s` reads
+    // a counter esp-hal's own documentation calls unreliable until then.
+    diag::boot(diag::reset_reason());
 
     // Before anything else can allocate. `esp-rtos` is built with `alloc`
     // support so that the Wi-Fi driver's task stacks have somewhere to come
@@ -523,6 +626,40 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // boot.** It used to be, because nothing in the controller image wrote it;
     // the settings screen does, so the store outlives boot for exactly the
     // reason the shade table's does.
+    // **Before the configuration, the shades and the estate are read**, so
+    // that what the rest of boot loads is what a staged restore just wrote.
+    // Nothing here can stop the controller starting: a board whose partition
+    // table has no `import` region — every board flashed before this feature
+    // existed — reports that once and carries on.
+    #[cfg(feature = "http")]
+    let mut staging = report_restore(&mut store);
+
+    // **A staged restore stops boot here, and [`entry`] applies it.**
+    //
+    // Not tidiness: `restore::apply` carries a sixteen-kilobyte staged file and,
+    // beneath it, a backup parser — about 41 KB of chain, walked with
+    // `-Zemit-stack-sizes`. Under *this* function's own 20,144-byte frame that
+    // is a 61 KB chain against 66,148 bytes of stack, and it would become
+    // `heap::REQUIRED_STACK_BYTES`, which no division of this chip's DRAM can
+    // then satisfy with the margin floor intact. Returned to `entry` instead, it
+    // runs beneath nothing but the executor, and moves no constant.
+    //
+    // Nothing has been spawned, no radio has been brought up and no
+    // configuration has been read yet, which is also what makes the reset that
+    // follows cheap: there is nothing to tear down.
+    #[cfg(feature = "http")]
+    if staging
+        .as_mut()
+        .is_some_and(|staging| store.with_flash(|flash| staging.pending(flash)))
+    {
+        crate::logln!("restore: a backup is staged — applying it before anything else starts");
+        return Ok(Booted::Restore {
+            store,
+            // Cannot be `None`: the condition above was true.
+            staging: staging.expect("a staged restore implies a mounted region"),
+        });
+    }
+
     let (config_store, credentials, broker, superseded) = report_config(&mut store);
     // Read on every build, written only where there is a settings screen. Named
     // rather than left as a warning to silence: `report_config` has already
@@ -628,13 +765,13 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         // Said out loud, because a controller with nothing provisioned and a
         // broken one look identical from the serial line and from Home
         // Assistant, where both announce availability and no entity.
-        esp_println::println!(
+        crate::logln!(
             "controller: no shades provisioned — receiving and tracking only, and \
              nothing can be commanded until a shade table is flashed. Build one with \
              `cargo run -p somfy-config --example provision_shades`."
         );
     } else {
-        esp_println::println!(
+        crate::logln!(
             "controller: {} shades provisioned",
             machine.registry().shades().count(),
         );
@@ -651,7 +788,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // in a million — a coincidence, not the OUI defect, and the remedy is a
     // hand-picked address for one of them rather than a bug report. See
     // `somfy_domain::RemoteIdentity::from_mac`.
-    esp_println::println!(
+    crate::logln!(
         "pairing: this controller's remote addresses start at {:#08X}",
         RemoteIdentity::from_mac(base_mac()).base(),
     );
@@ -682,6 +819,17 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
             // second concurrent upload impossible. See `ota::upload`.
             #[cfg(feature = "http")]
             ota: ota::init(),
+            // The staging region, for the same reason `config` is here: this
+            // task owns the flash. A board with no `import` partition carries
+            // `None` and refuses a restore with a code rather than silently
+            // losing one.
+            #[cfg(feature = "http")]
+            staging,
+            // The checksum of an export in progress. A reference and a `u32`;
+            // everything else a backup is made of is read from flash as it is
+            // asked for. See `crate::restore::Export`.
+            #[cfg(feature = "http")]
+            export: restore::Export::new(),
             catalog,
             identity: RemoteIdentity::from_mac(base_mac()),
             edits: EDITS.receiver(),
@@ -711,7 +859,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     #[cfg(not(feature = "mqtt"))]
     drop((broker, superseded, survey));
 
-    Ok(Pending {
+    Ok(Booted::Running(Pending {
         wifi: peripherals.WIFI,
         credentials,
         #[cfg(feature = "mqtt")]
@@ -722,7 +870,37 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
             orphans,
             survey,
         },
-    })
+    }))
+}
+
+/// Mount the staging region, apply anything staged in it, and say what
+/// happened.
+///
+/// **Called before the three regions a restore writes are read**, so the rest
+/// of boot loads what it wrote. `crate::restore::apply` is `#[inline(never)]`
+/// for a reason that matters here specifically — it puts sixteen kilobytes on
+/// this stack — and the frame is given back before this function returns, so it
+/// is not part of the chain that materialises the state task's future.
+///
+/// **A missing region is not a failure.** Every board flashed before the
+/// `import` partition existed has one, and it receives, decodes, tracks and
+/// answers Home Assistant exactly as before; what it cannot do is stage a
+/// restore, and the settings screen is told so with a code rather than a
+/// timeout.
+#[cfg(feature = "http")]
+fn report_restore(store: &mut FlashStore<'static>) -> Option<restore::Staging> {
+    match store.with_flash(restore::Staging::mount) {
+        Ok(staging) => Some(staging),
+        Err(error) => {
+            crate::logln!(
+                "restore: no staging region ({:?}) — this board can export a backup and cannot \
+                 take one. Reflash it with this crate's partitions.csv to change that; nothing \
+                 else moves, the region is above every one a provisioned board already has.",
+                error,
+            );
+            None
+        }
+    }
 }
 
 /// Read the persisted configuration and say what was found.
@@ -760,13 +938,13 @@ fn report_config(
             // region the settings screen can read nothing and store nothing, so
             // it refuses writes rather than appearing to accept them. The radio
             // is unaffected either way.
-            esp_println::println!("config: region unavailable ({:?})", error);
+            crate::logln!("config: region unavailable ({:?})", error);
             return nothing();
         }
     };
 
     let (base, slots, slot_len) = store.geometry();
-    esp_println::println!(
+    crate::logln!(
         "config: partition '{}' at {:#010X}, {} slots of {} bytes",
         config::PARTITION_LABEL,
         base,
@@ -777,7 +955,7 @@ fn report_config(
     let (record, survey) = match flash.with_flash(|flash| store.load(flash)) {
         Ok(found) => found,
         Err(error) => {
-            esp_println::println!("config: unreadable ({:?})", error);
+            crate::logln!("config: unreadable ({:?})", error);
             // The *store* survives an unreadable scan, unlike a missing
             // partition: the region is there and a later write can still land
             // in it. Answering "nothing provisioned" is the degraded read this
@@ -787,7 +965,7 @@ fn report_config(
             return (Some(store), None, None, Vec::new());
         }
     };
-    esp_println::println!(
+    crate::logln!(
         "config: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,
         survey.valid,
@@ -799,7 +977,7 @@ fn report_config(
         // Printed because it is about to change what the device publishes: the
         // retained configs under these namespaces are cleared before the
         // current ones go out. See spec R5.
-        esp_println::println!(
+        crate::logln!(
             "config: superseded namespaces discovery_prefix='{}' state_root='{}' \
              — their retained topics will be cleared on the next fresh broker session",
             stale.discovery_prefix(),
@@ -807,7 +985,7 @@ fn report_config(
         );
     }
     if survey.superseded_truncated {
-        esp_println::println!(
+        crate::logln!(
             "config: more superseded namespaces than this build tracks ({}); \
              the oldest will not be cleared",
             config::MAX_SUPERSEDED,
@@ -822,7 +1000,7 @@ fn report_config(
         return (Some(store), None, None, survey.superseded);
     };
     if let Some(mqtt) = &record.mqtt {
-        esp_println::println!(
+        crate::logln!(
             "config: broker {}:{} ({}), discovery_prefix='{}' state_root='{}'",
             mqtt.address(),
             mqtt.port(),
@@ -853,7 +1031,7 @@ fn report_ota(flash: &mut FlashStorage<'static>) {
         Ok(boot) => {
             ota::report(flash, boot);
         }
-        Err(error) => esp_println::println!(
+        Err(error) => crate::logln!(
             "ota: no update machinery on this board ({:?}) — it runs, and it cannot be updated \
              over the network. Reflash from crates/firmware so espflash writes this crate's \
              partition table.",
@@ -908,7 +1086,7 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
     let mut shade_store = match store.with_flash(ShadeStore::mount) {
         Ok(shade_store) => shade_store,
         Err(error) => {
-            esp_println::println!(
+            crate::logln!(
                 "shades: region unavailable ({:?}) — no shades, and none can be added \
                  either. A board flashed with an older partition table has no '{}' \
                  partition; reflash it with this crate's partitions.csv.",
@@ -920,7 +1098,7 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
     };
 
     let (base, slots, slot_len) = shade_store.geometry();
-    esp_println::println!(
+    crate::logln!(
         "shades: partition '{}' at {:#010X}, {} slots of {} bytes",
         shades::PARTITION_LABEL,
         base,
@@ -946,7 +1124,7 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
     let (survey, header) = match read {
         Ok(read) => read,
         Err(error) => {
-            esp_println::println!("shades: unreadable ({:?}) — no shades", error);
+            crate::logln!("shades: unreadable ({:?}) — no shades", error);
             return (
                 Some(shade_store),
                 Shades {
@@ -960,7 +1138,7 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
     if let Some(header) = header {
         found.announced = header.announced;
     }
-    esp_println::println!(
+    crate::logln!(
         "shades: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,
         survey.valid,
@@ -973,14 +1151,14 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
         // correct — a bare damaged count leaves an operator guessing which one
         // the record refused. A refused table places **no** shades at all, on
         // purpose: see `somfy_config::ShadeRecord::for_each`.
-        esp_println::println!(
+        crate::logln!(
             "shades: a table did not decode ({:?}). If it was the newest one, no shade \
              from it was loaded — re-provision it.",
             error,
         );
     }
     if found.shades.is_empty() {
-        esp_println::println!(
+        crate::logln!(
             "shades: none provisioned — the controller receives, decodes and tracks, \
              and has nothing to command until one is added"
         );
@@ -1028,14 +1206,14 @@ impl estate::EstateVisitor for Placement<'_> {
             // two agree rather than the assumption that they do. A disagreement
             // would put every assignment on the wrong shades.
             Ok(placed) if placed == id => self.rooms += 1,
-            Ok(placed) => esp_println::println!(
+            Ok(placed) => crate::logln!(
                 "estate: room {} landed at RoomId({}) — the record and the registry \
                  disagree about ids",
                 id.0,
                 placed.0,
             ),
             Err(error) => {
-                esp_println::println!("estate: room {} refused ({:?})", id.0, error)
+                crate::logln!("estate: room {} refused ({:?})", id.0, error)
             }
         }
     }
@@ -1045,7 +1223,7 @@ impl estate::EstateVisitor for Placement<'_> {
             Ok(()) => self.assigned += 1,
             // Reached when the estate names a shade the table no longer has,
             // which is what a partly re-provisioned board looks like.
-            Err(error) => esp_println::println!(
+            Err(error) => crate::logln!(
                 "estate: ShadeId({}) could not be put in RoomId({}) ({:?})",
                 shade.0,
                 room.0,
@@ -1058,7 +1236,7 @@ impl estate::EstateVisitor for Placement<'_> {
         let placed = match self.registry.add_group(group.name.as_str()) {
             Ok(placed) if placed == id => placed,
             Ok(placed) => {
-                esp_println::println!(
+                crate::logln!(
                     "estate: group {} landed at GroupId({}) — the record and the registry \
                      disagree about ids",
                     id.0,
@@ -1067,7 +1245,7 @@ impl estate::EstateVisitor for Placement<'_> {
                 placed
             }
             Err(error) => {
-                esp_println::println!("estate: group {} refused ({:?})", id.0, error);
+                crate::logln!("estate: group {} refused ({:?})", id.0, error);
                 return;
             }
         };
@@ -1084,7 +1262,7 @@ impl estate::EstateVisitor for Placement<'_> {
         // members — so it costs nothing today, and this line exists so it is
         // not discovered later at a shade.
         if !group.code_recovered {
-            esp_println::println!(
+            crate::logln!(
                 "estate: GroupId({}) '{}' carries a placeholder rolling code, not the one \
                  the old controller used — it could not be recovered from the backup. \
                  Harmless while a group command is sent to each shade; re-pair the group \
@@ -1122,7 +1300,7 @@ fn provision_estate(registry: &mut Registry, store: &mut FlashStore<'_>) {
     let mut estate_store = match store.with_flash(EstateStore::mount) {
         Ok(estate_store) => estate_store,
         Err(error) => {
-            esp_println::println!(
+            crate::logln!(
                 "estate: region unavailable ({:?}) — no rooms and no groups. A board \
                  flashed with a partition table from before this region existed has no \
                  '{}' partition; reflash it with this crate's partitions.csv.",
@@ -1134,7 +1312,7 @@ fn provision_estate(registry: &mut Registry, store: &mut FlashStore<'_>) {
     };
 
     let (base, slots, slot_len) = estate_store.geometry();
-    esp_println::println!(
+    crate::logln!(
         "estate: partition '{}' at {:#010X}, {} slots of {} bytes",
         estate::PARTITION_LABEL,
         base,
@@ -1152,11 +1330,11 @@ fn provision_estate(registry: &mut Registry, store: &mut FlashStore<'_>) {
     let survey = match store.with_flash(|flash| estate_store.load_with(flash, &mut placement)) {
         Ok(survey) => survey,
         Err(error) => {
-            esp_println::println!("estate: unreadable ({:?}) — no rooms and no groups", error);
+            crate::logln!("estate: unreadable ({:?}) — no rooms and no groups", error);
             return;
         }
     };
-    esp_println::println!(
+    crate::logln!(
         "estate: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,
         survey.valid,
@@ -1168,19 +1346,19 @@ fn provision_estate(registry: &mut Registry, store: &mut FlashStore<'_>) {
         // Printed with the row it names, because that is the room or group to
         // re-import. A refused record places **nothing** at all, on purpose:
         // see `somfy_config::EstateRecord::for_each_room`.
-        esp_println::println!(
+        crate::logln!(
             "estate: a record did not decode ({}). If it was the newest one, nothing from \
              it was loaded — re-import it.",
             error,
         );
     }
     if placement.orphans > 0 {
-        esp_println::println!(
+        crate::logln!(
             "estate: {} group member(s) named a shade this table does not have",
             placement.orphans,
         );
     }
-    esp_println::println!(
+    crate::logln!(
         "estate: {} room(s), {} shade(s) assigned, {} group(s)",
         placement.rooms,
         placement.assigned,
@@ -1235,7 +1413,7 @@ fn provision_shades(
         // is still a shade that will accept commands and never move, and this
         // is still the only place that can say which one it is.
         if shade.config.protocol != somfy_domain::RadioProtocol::Rts {
-            esp_println::println!(
+            crate::logln!(
                 "shades: entry {} at {:#08X} speaks {:?} — this controller transmits RTS \
                  only, so it will accept commands and never move",
                 index,
@@ -1247,7 +1425,7 @@ fn provision_shades(
         let id = match registry.add_shade(shade.config) {
             Ok(id) => id,
             Err(error) => {
-                esp_println::println!(
+                crate::logln!(
                     "shades: entry {} at {:#08X} refused by the registry ({:?}) — it is not \
                      announced and cannot be commanded",
                     index,
@@ -1257,7 +1435,7 @@ fn provision_shades(
                 continue;
             }
         };
-        esp_println::println!(
+        crate::logln!(
             "shades: ShadeId({}) address {:#08X} — entry {}",
             id.0,
             address,
@@ -1282,7 +1460,7 @@ fn provision_shades(
         match registry.shade_mut(link.shade) {
             Some(shade) => match shade.link_remote(link.address) {
                 Ok(()) => linked += 1,
-                Err(error) => esp_println::println!(
+                Err(error) => crate::logln!(
                     "shades: the remote at {:#08X} could not be linked to ShadeId({}) ({:?})",
                     link.address,
                     link.shade.0,
@@ -1291,7 +1469,7 @@ fn provision_shades(
             },
             // Reachable only if the registry refused the shade above, which it
             // reported on its own line.
-            None => esp_println::println!(
+            None => crate::logln!(
                 "shades: the remote at {:#08X} names ShadeId({}), which is not in the registry",
                 link.address,
                 link.shade.0,
@@ -1299,7 +1477,7 @@ fn provision_shades(
         }
     }
     if linked > 0 {
-        esp_println::println!(
+        crate::logln!(
             "shades: {} wall remote(s) linked — their presses are what keeps a position \
              estimate honest",
             linked,
@@ -1311,7 +1489,7 @@ fn provision_shades(
     // and cleared by the broker session, which then acknowledges it.
     let orphans = catalog.orphans(registry).count();
     if orphans > 0 {
-        esp_println::println!(
+        crate::logln!(
             "shades: {} shade(s) were announced and no longer exist — their retained \
              entities will be cleared on the next broker session",
             orphans,
@@ -1324,20 +1502,20 @@ fn provision_shades(
 /// happened.
 fn seed(store: &mut FlashStore<'_>, address: u32, code: RollingCode, region: RegionState) {
     match seed_if_absent(store, address, code, region) {
-        Ok(Seeded::Kept(stored)) => esp_println::println!(
+        Ok(Seeded::Kept(stored)) => crate::logln!(
             "shades: {:#08X} keeps its stored rolling code {} — the provisioned starting \
              value {} is ignored, which is what every boot after the first looks like",
             address,
             stored.0,
             code.0,
         ),
-        Ok(Seeded::Planted(planted)) => esp_println::println!(
+        Ok(Seeded::Planted(planted)) => crate::logln!(
             "shades: {:#08X} had no stored rolling code; seeded {} from the shade record. \
              This happens once.",
             address,
             planted.0,
         ),
-        Ok(Seeded::Refused { damaged }) => esp_println::println!(
+        Ok(Seeded::Refused { damaged }) => crate::logln!(
             "shades: {:#08X} has no stored rolling code and the rolling-code region reports \
              {} damaged slot(s) — NOT seeding, because an empty read there may be a lost \
              code rather than a new shade. This shade will refuse to transmit until the \
@@ -1345,7 +1523,7 @@ fn seed(store: &mut FlashStore<'_>, address: u32, code: RollingCode, region: Reg
             address,
             damaged,
         ),
-        Err(error) => esp_println::println!(
+        Err(error) => crate::logln!(
             "shades: {:#08X} could not be seeded ({:?}) — it will refuse to transmit",
             address,
             error,
@@ -1389,7 +1567,7 @@ fn seed(store: &mut FlashStore<'_>, address: u32, code: RollingCode, region: Reg
 #[inline(never)]
 fn start_network(spawner: Spawner, pending: Pending) {
     let Some(credentials) = pending.credentials else {
-        esp_println::println!(
+        crate::logln!(
             "network: no credentials provisioned — running radio-only. \
              This board still receives and decodes; see docs/hardware-checklist.md \
              to provision one."
@@ -1404,7 +1582,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
     let stack = match net::start(spawner, pending.wifi, &credentials) {
         Ok(stack) => stack,
         Err(error) => {
-            esp_println::println!(
+            crate::logln!(
                 "network: failed to start ({:?}) — running radio-only, which is unaffected",
                 error,
             );
@@ -1426,7 +1604,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
     // depend on anything MQTT does.
     #[cfg(feature = "http")]
     if let Err(error) = api::start(spawner, stack) {
-        esp_println::println!(
+        crate::logln!(
             "api: failed to start ({:?}) — running without a web UI, which leaves the radio \
              and the broker unaffected",
             error,
@@ -1441,7 +1619,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
     // person is most likely to be looking for it.
     #[cfg(feature = "mdns")]
     if let Err(error) = mdns::start(spawner, stack) {
-        esp_println::println!(
+        crate::logln!(
             "mdns: failed to start ({:?}) — the UI is still reachable by address, and the \
              radio and the broker are unaffected",
             error,
@@ -1452,7 +1630,7 @@ fn start_network(spawner: Spawner, pending: Pending) {
     // is structural rather than a promise.
     #[cfg(feature = "sntp")]
     if let Err(error) = sntp::start(spawner, stack) {
-        esp_println::println!(
+        crate::logln!(
             "sntp: failed to start ({:?}) — running with no wall clock, which is the \
              ordinary state of this device until a server answers",
             error,
@@ -1488,7 +1666,7 @@ fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBo
         survey,
     } = boot;
     let Some(settings) = settings else {
-        esp_println::println!(
+        crate::logln!(
             "mqtt: no broker provisioned — the controller runs without one. \
              It still receives, decodes and tracks."
         );
@@ -1503,7 +1681,7 @@ fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBo
         // the requirements were written from. Anyone reading this line has the
         // two commands that clear it by hand.
         for stale in &superseded {
-            esp_println::println!(
+            crate::logln!(
                 "mqtt: retained topics under discovery_prefix='{}' state_root='{}' \
                  CANNOT be cleared without a broker — they will outlive this device. \
                  Clear them with: mosquitto_sub -t '{}/+/+/+/config' -v --retained-only, \
@@ -1520,7 +1698,7 @@ fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBo
     let deltas = match DELTAS.subscriber() {
         Ok(deltas) => deltas,
         Err(error) => {
-            esp_println::println!("mqtt: no delta subscription available ({:?})", error);
+            crate::logln!("mqtt: no delta subscription available ({:?})", error);
             return;
         }
     };
@@ -1538,7 +1716,7 @@ fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBo
         SHADE_EVENTS.receiver(),
         SHADE_ACKS.sender(),
     ) {
-        esp_println::println!(
+        crate::logln!(
             "mqtt: failed to start ({:?}) — running without a broker, \
              which leaves the radio unaffected",
             error,
@@ -1561,7 +1739,7 @@ fn start_mqtt(spawner: Spawner, stack: embassy_net::Stack<'static>, boot: MqttBo
 /// Home Assistant.
 fn report_store(store: &mut FlashStore<'_>) -> Result<store::Survey, StartError> {
     let (base, slots, slot_len) = store.geometry();
-    esp_println::println!(
+    crate::logln!(
         "store: partition '{}' at {:#010X}, {} slots of {} bytes",
         store::PARTITION_LABEL,
         base,
@@ -1570,7 +1748,7 @@ fn report_store(store: &mut FlashStore<'_>) -> Result<store::Survey, StartError>
     );
 
     let survey = store.survey().map_err(StartError::Store)?;
-    esp_println::println!(
+    crate::logln!(
         "store: survey slots={} valid={} blank={} damaged={} newest_seq={:?} addresses={}",
         survey.slots,
         survey.valid,
@@ -1708,6 +1886,26 @@ fn stack_used() -> usize {
     top - at
 }
 
+/// Bytes the linker left for the main stack.
+///
+/// The same subtraction [`check_stack_headroom`] prints at boot, extracted so
+/// that the diagnostics screen and the serial line report one figure rather
+/// than two that could drift. Zero when the region cannot be located, which is
+/// the same "could not measure" [`stack_used`] reports.
+#[cfg_attr(
+    not(feature = "http"),
+    allow(
+        dead_code,
+        reason = "the diagnostics document is the only reader, and it needs a web server"
+    )
+)]
+fn stack_available() -> usize {
+    let Some((bottom, _, top)) = stack_region() else {
+        return 0;
+    };
+    top.saturating_sub(bottom)
+}
+
 /// Refuse to start if the main stack is smaller than the deepest chain needs.
 ///
 /// See [`heap::REQUIRED_STACK_BYTES`] for why this is a runtime check rather
@@ -1721,14 +1919,14 @@ fn check_stack_headroom() -> Result<(), StartError> {
         // Not a failure to start: the check could not be performed, which is a
         // different thing from failing it, and the controller has no business
         // refusing to receive over a diagnostic it could not take.
-        esp_println::println!(
+        crate::logln!(
             "stack: cannot locate the main stack region — headroom unchecked. \
              This build's linker layout is not the one crate::stack_region assumes."
         );
         return Ok(());
     };
     let available = top.saturating_sub(bottom);
-    esp_println::println!(
+    crate::logln!(
         "stack: {} bytes available, {} required",
         available,
         heap::REQUIRED_STACK_BYTES,
@@ -1757,7 +1955,7 @@ fn check_stack_headroom() -> Result<(), StartError> {
 fn report_stack_use() {
     let used = stack_used();
     let headroom = heap::REQUIRED_STACK_BYTES.saturating_sub(used);
-    esp_println::println!(
+    crate::logln!(
         "stack: {} bytes used at the deepest point of boot, of {} required — \
          {} bytes of the requirement unspent",
         used,
@@ -1770,7 +1968,7 @@ fn report_stack_use() {
         // `crate::heap` are now describing a different program from this one,
         // which is exactly the state that produced a boot loop last time and
         // said nothing.
-        esp_println::println!(
+        crate::logln!(
             "stack: THE REQUIREMENT IS STALE — this boot used more than \
              heap::REQUIRED_STACK_BYTES claims is needed. Re-read the chains \
              from a linked ELF (the commands are in crates/firmware/src/heap.rs) \

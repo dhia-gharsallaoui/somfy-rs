@@ -317,7 +317,7 @@ fn read_state(flash: &mut FlashStorage<'_>, slots: Slots) -> Result<ImageState, 
         };
         let selected = ota.current_app_partition().map_err(|_| OtaError::Flash)?;
         if selected != slots.booted {
-            esp_println::println!(
+            crate::logln!(
                 "ota: otadata selects {:?} and this image is running from {:?} — the bootloader \
                  fell back, so the record is being repaired to match what actually boots",
                 selected,
@@ -386,7 +386,7 @@ fn with_ota<T>(
 /// to decide whether to arm one. Diverges — resets the board — when the verdict
 /// is a roll-back, because there is nothing this image should go on to do.
 pub fn report(flash: &mut FlashStorage<'_>, boot: Boot) -> bool {
-    esp_println::println!(
+    crate::logln!(
         "ota: running from {:?} (updates would write {:?} at {:#010X}, {} bytes), \
          otadata says {:?}",
         boot.slots.booted,
@@ -398,7 +398,7 @@ pub fn report(flash: &mut FlashStorage<'_>, boot: Boot) -> bool {
     match boot.verdict {
         BootVerdict::Settled => {
             if matches!(boot.state, ImageState::Invalid | ImageState::Aborted) {
-                esp_println::println!(
+                crate::logln!(
                     "ota: this image's own record says {:?} and the switch away from it has \
                      already been tried once since the last power-on — running it anyway \
                      rather than resetting again. Reach it over the network and upload a \
@@ -409,7 +409,7 @@ pub fn report(flash: &mut FlashStorage<'_>, boot: Boot) -> bool {
             false
         }
         BootVerdict::Verify => {
-            esp_println::println!(
+            crate::logln!(
                 "ota: this image has not been confirmed — running the self-test, and marking \
                  the slot valid in {} s if the radio, the stores and the network bring-up all \
                  answer. A crash before then rolls back on the next boot.",
@@ -419,7 +419,7 @@ pub fn report(flash: &mut FlashStorage<'_>, boot: Boot) -> bool {
             true
         }
         BootVerdict::RollBack(reason) => {
-            esp_println::println!(
+            crate::logln!(
                 "ota: rolling back to {:?} — {}. This image started {} time(s) since the last \
                  power-on without confirming itself.",
                 boot.slots.target,
@@ -433,8 +433,8 @@ pub fn report(flash: &mut FlashStorage<'_>, boot: Boot) -> bool {
                 boot.attempts_before.saturating_add(1),
             );
             match switch_back(flash, boot.slots) {
-                Ok(()) => esp_println::println!("ota: otadata now selects {:?}", boot.slots.target),
-                Err(error) => esp_println::println!(
+                Ok(()) => crate::logln!("ota: otadata now selects {:?}", boot.slots.target),
+                Err(error) => crate::logln!(
                     "ota: could not write otadata ({:?}) — resetting anyway, which will land \
                      back here and try once more before settling",
                     error,
@@ -494,7 +494,7 @@ pub fn radio_leg(passed: bool) {
     #[cfg(feature = "bad-image-selftest")]
     let passed = {
         let _ = passed;
-        esp_println::println!(
+        crate::logln!(
             "ota: THIS IMAGE IS DELIBERATELY BROKEN — built with `bad-image-selftest`, which \
              reports the radio leg as failed however the radio answered. If it arrived over the \
              air it should roll back within {} s. Never flash it as a keeper.",
@@ -633,7 +633,7 @@ pub fn tick_self_test(store: &mut FlashStore<'static>, now_ms: u64) -> Step {
     match legs.poll(elapsed) {
         SelfTestOutcome::Waiting => Step::Waiting,
         SelfTestOutcome::Pass { associated } => {
-            esp_println::println!(
+            crate::logln!(
                 "ota: self-test passed after {} s — radio SPI answered, the stores read back, \
                  the network {}. Marking this image valid. It does NOT establish that anything \
                  radiates: see somfy_ota::selftest::Leg::Radio.",
@@ -646,11 +646,11 @@ pub fn tick_self_test(store: &mut FlashStore<'static>, now_ms: u64) -> Step {
             );
             PENDING.lock(|cell| cell.set(false));
             match confirm(store) {
-                Ok(()) => esp_println::println!("ota: this image is now the one a reset boots"),
+                Ok(()) => crate::logln!("ota: this image is now the one a reset boots"),
                 // Left unconfirmed on purpose: the next reset reads that as a
                 // verification that never finished and rolls back, which is the
                 // safe direction to fail in.
-                Err(error) => esp_println::println!(
+                Err(error) => crate::logln!(
                     "ota: could not mark this image valid ({:?}) — it stays unconfirmed, and the \
                      next reset will roll it back",
                     error,
@@ -659,7 +659,7 @@ pub fn tick_self_test(store: &mut FlashStore<'static>, now_ms: u64) -> Step {
             Step::Confirmed
         }
         SelfTestOutcome::Fail(leg) => {
-            esp_println::println!(
+            crate::logln!(
                 "ota: self-test FAILED on {:?} after {} s — rolling back to the image that was \
                  running before this update",
                 leg,
@@ -667,7 +667,7 @@ pub fn tick_self_test(store: &mut FlashStore<'static>, now_ms: u64) -> Step {
             );
             PENDING.lock(|cell| cell.set(false));
             if let Err(error) = roll_back(store) {
-                esp_println::println!(
+                crate::logln!(
                     "ota: could not switch back ({:?}) — resetting anyway, which lands back here \
                      and tries again",
                     error,
@@ -716,4 +716,4 @@ pub fn roll_back(store: &mut FlashStore<'static>) -> Result<(), OtaError> {
 mod upload;
 
 #[cfg(feature = "http")]
-pub use upload::{abort, begin, finish, init, page, take, Pages, Upload, PAGE_BYTES};
+pub use upload::{abort, begin, finish, init, page, take, with_page, Pages, Upload, PAGE_BYTES};

@@ -214,7 +214,7 @@ pub fn unix_seconds() -> Option<u64> {
 pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> {
     let token = client(stack)?;
     spawner.spawn(token);
-    esp_println::println!(
+    crate::logln!(
         "sntp: asking {} for the time, then every {} s. Nothing here affects the radio.",
         SERVER,
         RESYNC_INTERVAL_S,
@@ -248,7 +248,7 @@ async fn client(stack: Stack<'static>) -> ! {
                 // already carries the argument about what a log line costs a
                 // cooperative executor.
                 if first {
-                    esp_println::println!(
+                    crate::logln!(
                         "sntp: wall clock set — {} seconds since the UNIX epoch. \
                          Monotonic uptime is unaffected and remains what the store, \
                          the debounce and the position estimator run on.",
@@ -260,7 +260,7 @@ async fn client(stack: Stack<'static>) -> ! {
             }
             Err(reason) => {
                 let waiting = backoff.fail();
-                esp_println::println!(
+                crate::logln!(
                     "sntp: no time this round ({}) — retrying in {} ms. \
                      The controller is unaffected.",
                     reason,

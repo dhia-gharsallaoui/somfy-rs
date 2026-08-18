@@ -391,6 +391,33 @@ impl ShadeStore {
         Ok(())
     }
 
+    /// Where the newest readable record is, in absolute flash bytes.
+    ///
+    /// **For the backup export, and for nothing else.** A backup carries the
+    /// shade table record *verbatim*, so that the decoder reading it back is the
+    /// same one the boot path already uses rather than a second reader that
+    /// could disagree — and copying it verbatim means reading its bytes, not
+    /// its fields. `crate::restore` streams them out sixty-four at a time.
+    ///
+    /// `None` is a region with nothing readable in it, which is an ordinary
+    /// state for a board that has never been provisioned.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(
+            dead_code,
+            reason = "only a restore and an export reach this, and both need a web \
+                      server; a radio-only image has neither"
+        )
+    )]
+    pub fn newest_offset(
+        &mut self,
+        flash: &mut FlashStorage<'_>,
+    ) -> Result<Option<u32>, ShadeStoreError> {
+        let mut buffer = Slot([0u8; SHADE_RECORD_LEN]);
+        let scan = self.scan(flash, &mut buffer)?;
+        scan.newest.map(|(slot, _)| self.offset(slot)).transpose()
+    }
+
     /// Read every slot's header: which is newest, which are erased, and a tally.
     ///
     /// Headers only. Which slot wins is a question about four sequence numbers,

@@ -31,6 +31,12 @@ mod chip;
 // — keeps a heap present before the scheduler starts. It is a reserve rather
 // than a measured requirement, and `heap::SCHEDULER_HEAP_BYTES` says so, at
 // length, including why it cannot be measured from *this* binary.
+// `heap` logs through `crate::logln!`, which is `crate::diag`'s macro, so this
+// harness carries the log ring too. That is not incidental cost: it is 4 KiB of
+// RTC-fast memory rather than DRAM, and it means a transmit bring-up run whose
+// board resets still has its last lines on the next boot.
+#[path = "../diag.rs"]
+mod diag;
 #[path = "../heap.rs"]
 mod heap;
 // Only the transmit half of `radio`, pulled in directly rather than through

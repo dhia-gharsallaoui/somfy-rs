@@ -223,6 +223,52 @@ pub enum Request {
     /// Give up on an upload, leaving the running image untouched.
     #[cfg(feature = "http")]
     OtaAbort,
+
+    // -----------------------------------------------------------------------
+    // Backup and restore
+    //
+    // The same shape as the four above and for the same reason — the flash has
+    // one owner and it is the state task — with one difference worth naming:
+    // **an export travels *back* through this seam**, which the update path
+    // never needed. [`Reply::BackupChunk`] is therefore the one reply variant
+    // that carries bulk, and it is sixty-four bytes because that is what sizes
+    // the `Signal` static every reply shares. `crate::restore::EXPORT_CHUNK_BYTES`
+    // carries that arithmetic and the structural reason for the same figure.
+    //
+    // A *restore* travels the other way and carries nothing here: its pages go
+    // through `crate::ota`'s zero-copy channel, because an upload is an upload
+    // and a second channel would be a second page buffer out of the DRAM the
+    // Wi-Fi driver's heap is carved from.
+    // -----------------------------------------------------------------------
+    /// The next sixty-four bytes of this device's own backup, from `at`.
+    ///
+    /// Must be asked for in order: the checksum is accumulated as the bytes go
+    /// past, so a gap would make it quietly wrong — and a backup whose checksum
+    /// is wrong is one that is refused on the way back in with nothing saying
+    /// why.
+    #[cfg(feature = "http")]
+    BackupChunk {
+        /// How far into the container.
+        at: u32,
+    },
+    /// Start staging a backup of this many bytes.
+    #[cfg(feature = "http")]
+    RestoreBegin {
+        /// The request's `Content-Length`.
+        declared: u32,
+    },
+    /// The page channel holds this many bytes; write them.
+    #[cfg(feature = "http")]
+    RestorePage {
+        /// How much of the lent page is the file's.
+        len: u16,
+    },
+    /// Every byte has arrived. Mark the restore staged for the next boot.
+    #[cfg(feature = "http")]
+    RestoreFinish,
+    /// Give up on an upload, leaving nothing staged.
+    #[cfg(feature = "http")]
+    RestoreAbort,
 }
 
 /// What the state task answers.
@@ -268,6 +314,19 @@ pub enum Reply {
     /// [`somfy_api::SettingsDto`] has a field it could be written into.
     #[cfg(feature = "http")]
     WifiCandidate(WifiCredentials),
+    /// Bytes of a backup, and how many of them are real.
+    ///
+    /// A short chunk is the last one; `len == 0` is the end. **The only reply
+    /// here that carries bulk**, and the reason [`Rpc`]'s reply `Signal` is
+    /// sixty-four bytes wider than it would otherwise be — see
+    /// [`Request::BackupChunk`].
+    #[cfg(feature = "http")]
+    BackupChunk {
+        /// How many of [`bytes`](Reply::BackupChunk::bytes) are the file's.
+        len: u8,
+        /// The bytes.
+        bytes: [u8; crate::restore::EXPORT_CHUNK_BYTES],
+    },
 }
 
 /// The one seam, as a single static.
@@ -332,7 +391,7 @@ impl Rpc {
                 // Unreachable: the queue is as deep as the number of tasks that
                 // can ask. Reported rather than `expect`ed, because a panic
                 // here reboots the board over one request.
-                esp_println::println!("api: the request queue is full, which should be impossible");
+                crate::logln!("api: the request queue is full, which should be impossible");
                 return None;
             }
         };
@@ -346,7 +405,7 @@ impl Rpc {
         match with_timeout(Duration::from_secs(REPLY_TIMEOUT_S), self.reply.wait()).await {
             Ok(reply) => Some(reply),
             Err(_) => {
-                esp_println::println!(
+                crate::logln!(
                     "api: the state task did not answer in {}s — reporting the request \
                      unavailable rather than waiting for it",
                     REPLY_TIMEOUT_S,

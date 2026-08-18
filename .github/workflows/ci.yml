@@ -40,11 +40,33 @@ jobs:
           cargo build -p somfy-tasks --target thumbv7em-none-eabihf
           cargo build -p somfy-mqtt --target thumbv7em-none-eabihf
           cargo build -p somfy-config --target thumbv7em-none-eabihf
+          # A second row for the same crate, because `migrate` is off by
+          # default and the row above therefore builds none of
+          # `somfy_config::import` — the backup importer the firmware runs at
+          # boot. Without this line the module's `no_std`-ness is asserted and
+          # not checked, which is how a `std` type gets in and is only found by
+          # the firmware build.
+          cargo build -p somfy-config --features migrate --target thumbv7em-none-eabihf
           cargo build -p somfy-ota --target thumbv7em-none-eabihf
+          # The backup container. It links into the firmware, so it has to build
+          # bare-metal like every other library here — and it is the one crate in
+          # this list whose *reason* is a file format rather than a device: a
+          # `std`-only container would be a format the device could write and
+          # not read back.
+          cargo build -p somfy-backup --target thumbv7em-none-eabihf
       - name: docs (deny broken intra-doc links)
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
-        run: cargo doc --workspace --no-deps
+        run: |
+          cargo doc --workspace --no-deps
+          # `cargo doc` builds no dev targets, so nothing turns on
+          # somfy-config's non-default `migrate` feature for it — and the line
+          # above therefore documents, and link-checks, none of
+          # `somfy_config::import`. The clippy and test rows already reach it
+          # (the crate dev-depends on itself with the feature on); this is the
+          # one job that does not, so it gets its own invocation rather than a
+          # module whose doc links nothing checks.
+          cargo doc -p somfy-config --features migrate --no-deps
 
   # The UI half of the wire contract. The `host` job proves the committed
   # bindings match the Rust DTOs; this job proves the UI and its mock still

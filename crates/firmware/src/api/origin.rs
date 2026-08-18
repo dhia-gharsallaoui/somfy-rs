@@ -110,7 +110,7 @@ impl<'r> FromRequestParts<'r, ()> for FromThisDevice {
         // Said out loud, because this is the one refusal on the device that
         // means somebody else's page is talking to it, and a console line is the
         // only way an operator finds out that it happened at all.
-        esp_println::println!(
+        crate::logln!(
             "api: refusing {} {} — {:?}. This device answers to its own address and to \
              {}.local; a request naming anything else was addressed elsewhere, or was made \
              by a page this device did not serve. See somfy_api::origin.",

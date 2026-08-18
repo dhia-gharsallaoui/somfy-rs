@@ -84,6 +84,19 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 
 [dependencies]
 esp-hal = { version = "1.1.1", features = ["unstable"] }
+# The lock the log ring and the panic record are read and written under. Already
+# in this image several times over — `esp-hal`, `esp-println` and `esp-storage`
+# each take one — so this declares a dependency that was always linked rather
+# than adding one. Named directly because `crate::diag` calls
+# `critical_section::with` itself, and reaching it through another crate's
+# re-export would tie this module to whichever version that crate resolved.
+critical-section = "1.2"
+# The checksum on both RTC-memory records. `CRC_32_ISO_HDLC`, which is what all
+# four flash records already use, so a reader meets one algorithm in this
+# codebase rather than two. Already in the dependency graph through
+# `somfy-store` and `somfy-config`; `crate::diag` uses its `NoTable` variant, so
+# this adds no second 1 KiB lookup table to the image.
+crc = "3"
 esp-println = { version = "0.13", features = ["log"] }
 heapless = "0.8"
 embedded-hal = "1.0"
@@ -114,7 +127,23 @@ somfy-tasks = { path = "../somfy-tasks" }
 # The persisted Wi-Fi credentials: validation and the record's bytes, host-
 # tested. This crate keeps only the flash I/O, exactly as it does for
 # `somfy-store`.
-somfy-config = { path = "../somfy-config" }
+somfy-config = { path = "../somfy-config", features = ["migrate"] }
+# The `RTSB` container this device exports and reads back: what is in it, what
+# is deliberately not (the two secrets), and the checksum. Everything decided
+# there is host-tested there; what is left here is streaming it out of flash and
+# writing it back in.
+somfy-backup = { path = "../somfy-backup" }
+# The C++ ESPSomfy-RTS backup parser, reached through `somfy-config`'s `migrate`
+# feature above — and named here for one type, `MigrateError`, which
+# `crate::restore` matches on to tell "a version this build does not read" from
+# "not a backup at all".
+#
+# **This is new, and it is a reversal.** That crate's manifest used to say the
+# device had no reason to carry a parser for a file it will never see. It does
+# now: a restore stages a backup in flash and the boot path reads it, because
+# boot is the only place on this device with sixteen kilobytes of stack free to
+# parse one in. See `crate::restore`.
+somfy-migrate = { path = "../somfy-migrate" }
 # What an update decides: whether an upload is a firmware image for this chip,
 # what to do about the `otadata` state this image booted with, and which
 # self-test legs may refuse a release. All host-tested there; what is left here

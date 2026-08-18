@@ -1,17 +1,34 @@
-//! Tests for [`super`]: what an import carries across, the three things it
-//! reports rather than applies silently, and every refusal.
+//! Tests for [`somfy_config::import`]: what an import carries across, the
+//! things it reports rather than applies silently, and every refusal.
 //!
-//! A separate file rather than an inline `#[cfg(test)] mod`, for one reason:
-//! together they run past what this project keeps in a single file. `#[path]`
-//! in `import.rs` attaches it. It is a module of the example, not an example of
-//! its own — cargo discovers examples as `examples/*.rs` and
-//! `examples/*/main.rs`, so a second file in this directory is never built as a
-//! binary.
+//! An integration test rather than a `#[cfg(test)] mod` inside the module, for
+//! two reasons. Together these run past what this project keeps in a single
+//! file — `import.rs` is already long — and, more usefully, an integration test
+//! can only reach the crate's **public** surface, so anything the firmware
+//! cannot call these tests cannot call either. They used to live beside the
+//! module as `examples/provision_shades/import_tests.rs`, attached with
+//! `#[path]`, when the importer was a module of that example.
+//!
+//! The whole file is gated on the `migrate` feature, because without it there
+//! is no module to test. Nothing is *skipped* by that in practice: the crate
+//! dev-depends on itself with the feature on, so `cargo test -p somfy-config`
+//! builds and runs all of this — see its `Cargo.toml`, which says why a
+//! `required-features` gate was rejected instead.
+#![cfg(feature = "migrate")]
 
-use super::*;
-use somfy_config::{Announced, MAX_LINKS};
-use somfy_domain::RoomId;
-use somfy_migrate::{MigratedGroup, MigratedRoom, MigratedShade};
+use somfy_config::import::{
+    import, import_with, read_backup, read_backup_with, Caveat, Clash, Refusal, Subject, Warning,
+    CAVEATS_PER_SHADE, MAX_WARNINGS, NAME_LEN, PARSED_GROUPS, PARSED_GROUP_MEMBERS, PARSED_SHADES,
+    TRANSMITTED_PROTOCOL,
+};
+use somfy_config::{
+    Announced, EstateRecord, LinkedRemote, ShadeError, ShadeRecord, TravelField,
+    MAX_LINKED_REMOTES, MAX_LINKS, SHADE_TABLE_CAPACITY,
+};
+use somfy_domain::{DomainError, FrameWidth, RoomId, ShadeId, ShadeKind, TiltMode};
+use somfy_migrate::{
+    MigrateError, MigratedGroup, MigratedRoom, MigratedShade, MigrationData, MIN_SUPPORTED_VERSION,
+};
 use somfy_rts::RollingCode;
 
 /// A shade as the backup parser hands it over, with everything valid. Tests
@@ -134,8 +151,6 @@ fn the_table_is_in_the_backups_order_and_renumbered_from_zero() {
 /// The table the tool writes has to be one the device will accept.
 #[test]
 fn an_imported_table_survives_the_records_own_decode() {
-    use somfy_config::ShadeRecord;
-
     let import = import(&data(&[
         migrated("Kitchen", 0x00_1001),
         migrated("Salon", 0x00_1002),
@@ -164,10 +179,10 @@ fn an_unmodelled_shade_kind_becomes_a_roller_and_is_warned_about() {
     assert_eq!(import.shades.len(), 1, "the shade is kept");
     assert_eq!(import.shades[0].config.kind, ShadeKind::Roller);
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Shade(0),
-            name: "Garage".to_string(),
+            name: hstr("Garage"),
             caveat: Caveat::Kind(0x05),
         }]
     );
@@ -181,10 +196,10 @@ fn an_unmodelled_tilt_mode_becomes_none_and_is_warned_about() {
     let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
     assert_eq!(import.shades[0].config.tilt_mode, TiltMode::None);
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Shade(0),
-            name: "Store".to_string(),
+            name: hstr("Store"),
             caveat: Caveat::TiltMode(0x09),
         }]
     );
@@ -217,6 +232,232 @@ fn a_shade_needing_every_caveat_is_warned_about_for_each() {
             Caveat::FrameWidth(42),
             Caveat::Protocol(0x09),
         ],
+    );
+}
+
+// -- the size of the warning buffer, which is now a fixed one -------------
+//
+// `Import::warnings` is a `heapless::Vec` with no overflow path, so its length
+// is a claim about the backup format rather than a convenience. These three
+// tests are what stop that claim drifting away from the code: one pins the
+// per-shade figure, one pins the parser capacities it is multiplied by, and
+// one builds the worst case and checks it lands exactly on the bound.
+
+/// [`CAVEATS_PER_SHADE`] is five and not four, and this is the shade that shows
+/// why: the fourth test above stops at the protocol because its fixture is in
+/// no room, and [`Caveat::UnknownRoom`] is decided from a different field at
+/// the end of the same loop body. Nothing rules it out alongside the other
+/// four, so the buffer has to be sized for all five.
+#[test]
+fn every_per_shade_caveat_can_fire_on_one_shade() {
+    let mut shade = migrated("Gate", 0x00_1001);
+    shade.kind_raw = 0x0B;
+    shade.tilt_mode_raw = 0xFF;
+    shade.bit_length = 42;
+    shade.proto_raw = 0x09;
+    // A room `data()` does not carry, which is the fifth.
+    shade.room_id = 9;
+
+    let import = import(&data(&[shade])).expect("the shade is imported");
+    assert_eq!(
+        import
+            .warnings
+            .iter()
+            .map(|warning| warning.caveat)
+            .collect::<Vec<_>>(),
+        vec![
+            Caveat::Kind(0x0B),
+            Caveat::TiltMode(0xFF),
+            Caveat::FrameWidth(42),
+            Caveat::Protocol(0x09),
+            Caveat::UnknownRoom(9),
+        ],
+    );
+    assert_eq!(
+        import.warnings.len(),
+        CAVEATS_PER_SHADE,
+        "one shade raised a different number of caveats than MAX_WARNINGS is sized from"
+    );
+}
+
+/// The three capacities [`MAX_WARNINGS`] is multiplied out of are private to
+/// `somfy-migrate`, so they are restated in this crate — and a restated
+/// constant is one that can go quiet on the day the other one moves. This
+/// reads them off the real fields instead.
+#[test]
+fn the_parsers_capacities_are_the_ones_the_warning_buffer_is_sized_from() {
+    let parsed = data(&[migrated("Kitchen", 0x00_1001)]);
+    let one_group = group(1, "Whole House", &[]);
+
+    assert_eq!(parsed.shades.capacity(), PARSED_SHADES);
+    assert_eq!(parsed.groups.capacity(), PARSED_GROUPS);
+    assert_eq!(one_group.member_shade_ids.capacity(), PARSED_GROUP_MEMBERS);
+    // The figure the module docs quote, so the prose and the constant cannot
+    // drift apart either.
+    assert_eq!(MAX_WARNINGS, 688);
+}
+
+/// The worst import the format can describe: every shade needing every caveat,
+/// and every group at a version with no rolling code listing a full complement
+/// of members that no longer exist.
+fn worst_case() -> MigrationData {
+    let mut worst = data(&[]);
+    // Below `GROUP_CODE_MIN_VERSION`, so every group is warned about as well
+    // as every one of its members.
+    worst.version = 19;
+    for n in 0..PARSED_SHADES {
+        let mut shade = migrated("Shade", 0x00_1000 + n as u32);
+        shade.kind_raw = 0x0B;
+        shade.tilt_mode_raw = 0xFF;
+        shade.bit_length = 42;
+        shade.proto_raw = 0x09;
+        shade.room_id = 9;
+        worst
+            .shades
+            .push(shade)
+            .expect("the parser holds this many");
+    }
+    for index in 0..PARSED_GROUPS {
+        // Ids no shade in the table answers to — every fixture shade is id 7 —
+        // so each one is a `MissingMember`.
+        let dangling: Vec<u8> = (0..PARSED_GROUP_MEMBERS).map(|m| 100 + m as u8).collect();
+        let mut one = group(index as u8, "Group", &dangling);
+        one.address = 0x00_9000 + index as u32;
+        worst.groups.push(one).expect("the parser holds this many");
+    }
+    worst
+}
+
+/// And the whole claim end to end: [`worst_case`] fills the buffer to the last
+/// slot and does not need one more.
+#[test]
+fn the_worst_case_the_format_can_produce_fills_the_buffer_exactly() {
+    let import = import(&worst_case()).expect("every one of these is a caveat, not a refusal");
+    assert_eq!(
+        import.warnings.len(),
+        MAX_WARNINGS,
+        "the worst case no longer lands on the bound the buffer is sized to"
+    );
+}
+
+// -- the two forms of one traversal ---------------------------------------
+//
+// `import` collects and `import_with` streams; they are one function with two
+// sinks. These hold that to an assertion rather than to the argument, because
+// the failure it guards against is silent: a device that logged a different set
+// of warnings from the one its provisioning tool printed would look correct
+// from either side alone.
+
+/// Every caveat the collecting form keeps is one the streaming form raised, in
+/// the same order and with the same contents — on a backup that raises several
+/// kinds at once, so ordering within a shade *and* between shades and groups
+/// both have to hold.
+#[test]
+fn the_streaming_form_raises_exactly_what_the_collecting_form_keeps() {
+    let mut shade = migrated("Gate", 0x00_1001);
+    shade.kind_raw = 0x0B;
+    shade.tilt_mode_raw = 0xFF;
+    shade.bit_length = 42;
+    shade.proto_raw = 0x09;
+    shade.room_id = 9;
+    let mut several = data(&[shade, migrated("Kitchen", 0x00_1002)]);
+    // Version 19, so the group draws a fabricated-code caveat as well as one
+    // for the member that does not exist.
+    several.version = 19;
+    several
+        .groups
+        .push(group(1, "Whole House", &[7, 31]))
+        .expect("fits");
+
+    let collected = import(&several).expect("valid");
+    let mut streamed: Vec<Warning> = Vec::new();
+    let table = import_with(&several, &mut |warning| streamed.push(warning.clone()))
+        .expect("the same data is equally valid to the streaming form");
+
+    assert_eq!(
+        streamed.as_slice(),
+        collected.warnings.as_slice(),
+        "the two forms disagree about what this backup contains"
+    );
+    // The count the streaming form reports is the length of the list the
+    // collecting form kept — which is what a device reports in place of it.
+    assert_eq!(table.warnings, collected.warnings.len());
+    // And everything else is the same import, field for field.
+    assert_eq!(table.shades, collected.shades);
+    assert_eq!(table.links, collected.links);
+    assert_eq!(table.estate, collected.estate);
+    assert_eq!(table.skipped_resyncs, collected.skipped_resyncs);
+    assert_eq!(table.version, collected.version);
+    assert_eq!(table.favourites, collected.favourites);
+    assert_eq!(table.misaligned(), collected.misaligned());
+}
+
+/// The same equality at the bound, which is where a divergence would be easiest
+/// to hide: 688 warnings, and the streaming form must raise every one.
+#[test]
+fn the_two_forms_agree_at_the_worst_case_too() {
+    let worst = worst_case();
+
+    let collected = import(&worst).expect("valid");
+    let mut streamed: Vec<Warning> = Vec::new();
+    let table = import_with(&worst, &mut |warning| streamed.push(warning.clone())).expect("valid");
+
+    assert_eq!(table.warnings, MAX_WARNINGS);
+    assert_eq!(streamed.len(), MAX_WARNINGS);
+    assert_eq!(streamed.as_slice(), collected.warnings.as_slice());
+}
+
+/// A refusal refuses both forms identically, and the streaming caller is not
+/// left having logged warnings that describe an import which never happened.
+#[test]
+fn a_refusal_refuses_both_forms_identically() {
+    let refused = data(&[
+        migrated("Kitchen", 0x00_1001),
+        migrated("Broken", 0),
+        migrated("Salon", 0x00_1002),
+    ]);
+
+    let mut streamed: Vec<Warning> = Vec::new();
+    let streaming = import_with(&refused, &mut |warning| streamed.push(warning.clone()));
+
+    assert_eq!(streaming.err(), import(&refused).err());
+    assert!(
+        streamed.is_empty(),
+        "nothing before the refused shade raised a caveat, so nothing should have been sent"
+    );
+}
+
+/// And the same pairing one level up, so `read_backup_with` is not merely
+/// assumed to be `read_backup`'s twin.
+#[test]
+fn the_two_byte_level_entry_points_agree() {
+    let bytes = backup(25, &[shade_fields("Kitchen", 0x00_1001, 41)]);
+
+    let collected = read_backup(&bytes).expect("a well-formed backup");
+    let mut streamed: Vec<Warning> = Vec::new();
+    let table = read_backup_with(&bytes, &mut |warning| streamed.push(warning.clone()))
+        .expect("a well-formed backup");
+
+    assert_eq!(streamed.as_slice(), collected.warnings.as_slice());
+    assert_eq!(table.warnings, collected.warnings.len());
+    assert_eq!(table.shades, collected.shades);
+    assert_eq!(table.version, collected.version);
+}
+
+/// A name is copied from a `heapless::String<32>` into a `heapless::String<32>`
+/// on the way into a warning, which is why nothing on that path handles
+/// truncation. This is the boundary where an off-by-one would show.
+#[test]
+fn a_name_at_the_domains_limit_survives_a_warning() {
+    let full = "A".repeat(NAME_LEN);
+    let mut shade = migrated(&full, 0x00_1001);
+    shade.kind_raw = 0x05;
+
+    let import = import(&data(&[shade])).expect("a 32-byte name is one the domain accepts");
+    assert_eq!(
+        import.warnings[0].name.as_str(),
+        full,
+        "a name at the limit was not carried into the warning whole"
     );
 }
 
@@ -259,10 +500,10 @@ fn a_bit_length_that_is_not_a_frame_width_is_warned_about() {
 
     let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Shade(0),
-            name: "Awning".to_string(),
+            name: hstr("Awning"),
             caveat: Caveat::FrameWidth(42),
         }]
     );
@@ -279,10 +520,10 @@ fn a_shade_using_another_radio_protocol_is_warned_about() {
 
     let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Shade(0),
-            name: "Relay".to_string(),
+            name: hstr("Relay"),
             caveat: Caveat::Protocol(0x08),
         }]
     );
@@ -306,7 +547,7 @@ fn a_warning_names_the_shade_it_is_about() {
     let import = import(&data(&[good, odd])).expect("both shades import");
     assert_eq!(import.warnings.len(), 1);
     assert_eq!(import.warnings[0].subject, Subject::Shade(1));
-    assert_eq!(import.warnings[0].name, "Garage");
+    assert_eq!(import.warnings[0].name.as_str(), "Garage");
 }
 
 // -- obligation 2: misalignment reaches the caller ------------------------
@@ -346,13 +587,11 @@ fn a_shade_with_no_name_is_refused() {
 /// device would refuse rather than a rule restated here.
 #[test]
 fn a_shade_at_a_sentinel_address_is_refused_and_named() {
-    use somfy_domain::DomainError;
-
     assert_eq!(
         import(&data(&[migrated("Kitchen", 0)])),
         Err(Refusal::Shade {
             index: 0,
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             error: ShadeError::Domain(DomainError::InvalidAddress),
         }),
     );
@@ -360,8 +599,6 @@ fn a_shade_at_a_sentinel_address_is_refused_and_named() {
 
 #[test]
 fn a_shade_with_a_zero_travel_time_is_refused_and_named() {
-    use somfy_config::TravelField;
-
     let mut shade = migrated("Kitchen", 0x00_1001);
     shade.down_time_ms = 0;
 
@@ -369,7 +606,7 @@ fn a_shade_with_a_zero_travel_time_is_refused_and_named() {
         import(&data(&[shade])),
         Err(Refusal::Shade {
             index: 0,
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             error: ShadeError::TravelTimeZero {
                 field: TravelField::Down,
             },
@@ -389,7 +626,7 @@ fn two_shades_at_one_address_are_refused() {
         Err(Refusal::DuplicateAddress {
             index: 1,
             first: 0,
-            name: "Salon".to_string(),
+            name: hstr("Salon"),
             address: 0x00_1001,
         }),
     );
@@ -452,13 +689,13 @@ fn every_refusal_says_something() {
         Refusal::Unnamed { index: 0 },
         Refusal::Shade {
             index: 0,
-            name: "Kitchen".to_string(),
-            error: ShadeError::Domain(somfy_domain::DomainError::NameTooLong),
+            name: hstr("Kitchen"),
+            error: ShadeError::Domain(DomainError::NameTooLong),
         },
         Refusal::DuplicateAddress {
             index: 1,
             first: 0,
-            name: "Salon".to_string(),
+            name: hstr("Salon"),
             address: 0x00_1001,
         },
         Refusal::TooManyLinks {
@@ -467,35 +704,35 @@ fn every_refusal_says_something() {
         },
         Refusal::Link {
             index: 0,
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             address: 0x00_1001,
-            error: somfy_domain::DomainError::DuplicateAddress,
+            error: DomainError::DuplicateAddress,
         },
         Refusal::DuplicateRoomId {
             index: 1,
-            name: "Salon".to_string(),
+            name: hstr("Salon"),
             room_id: 3,
         },
         Refusal::GroupAddress {
             index: 0,
-            name: "Whole House".to_string(),
+            name: hstr("Whole House"),
             address: 0,
         },
         Refusal::GroupAddressClash {
             index: 0,
-            name: "Whole House".to_string(),
+            name: hstr("Whole House"),
             address: 0x00_1001,
             with: Clash::Shade(0),
         },
         Refusal::GroupAddressClash {
             index: 1,
-            name: "Upstairs".to_string(),
+            name: hstr("Upstairs"),
             address: 0x00_9001,
             with: Clash::Group(0),
         },
         Refusal::GroupAddressClash {
             index: 0,
-            name: "Upstairs".to_string(),
+            name: hstr("Upstairs"),
             address: 0x00_2001,
             with: Clash::LinkedRemote(0),
         },
@@ -578,8 +815,6 @@ fn linked_remotes_are_written_and_are_still_not_shades() {
 /// through the record, so the device gets what the tool showed.
 #[test]
 fn imported_links_survive_the_records_round_trip() {
-    use somfy_config::ShadeRecord;
-
     let mut first = migrated("Kitchen", 0x00_1001);
     first.linked_addresses = hvec(&[0x00_2001]);
     let mut second = migrated("Salon", 0x00_1002);
@@ -606,7 +841,7 @@ fn a_remote_at_the_shades_own_address_is_refused() {
         import(&data(&[shade])),
         Err(Refusal::Link {
             index: 0,
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             address: 0x00_1001,
             error: DomainError::DuplicateAddress,
         }),
@@ -624,7 +859,7 @@ fn a_sentinel_linked_address_is_refused() {
         import(&data(&[shade])),
         Err(Refusal::Link {
             index: 0,
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             address: 0,
             error: DomainError::InvalidAddress,
         }),
@@ -639,7 +874,7 @@ fn a_sentinel_linked_address_is_refused() {
 fn more_links_than_the_record_holds_are_refused_rather_than_dropped() {
     // Seven remotes each is the domain's per-shade limit, so this fills the
     // shared pool without ever breaking the per-shade one.
-    let mut shades = std::vec::Vec::new();
+    let mut shades = Vec::new();
     let mut address = 0x00_2000u32;
     for index in 0..(MAX_LINKS / MAX_LINKED_REMOTES + 1) {
         let mut shade = migrated("Shade", 0x00_1001 + index as u32);
@@ -840,7 +1075,7 @@ fn a_stored_last_sent_code_reaches_the_record_as_the_next_one() {
     // out of the image at the position the record's own docs give it:
     // entry 0 starts after the 20-byte header, and the code is 4 bytes into an
     // entry, after the address.
-    let image = somfy_config::ShadeRecord {
+    let image = ShadeRecord {
         seq: 0,
         announced: Announced::NONE,
         links: heapless::Vec::new(),
@@ -855,8 +1090,6 @@ fn a_stored_last_sent_code_reaches_the_record_as_the_next_one() {
 /// seed of 0 has to survive being written and read back like any other.
 #[test]
 fn a_code_that_wrapped_past_the_last_one_arrives_as_zero() {
-    use somfy_config::ShadeRecord;
-
     let bytes = backup(25, &[shade_fields("Kitchen", 0x00_1001, u16::MAX)]);
     let import = read_backup(&bytes).expect("a well-formed backup");
     assert_eq!(import.shades[0].initial_code, RollingCode(0));
@@ -915,8 +1148,6 @@ fn a_record_that_did_not_align_arrives_flagged_rather_than_refused() {
 /// *formatted* from this crate's constant — this can.
 #[test]
 fn a_backup_of_exactly_the_table_capacity_imports_whole() {
-    use somfy_config::ShadeRecord;
-
     let shades: Vec<Vec<String>> = (0..SHADE_TABLE_CAPACITY)
         .map(|n| shade_fields("Shade", 0x00_1000 + n as u32, n as u16))
         .collect();
@@ -995,7 +1226,7 @@ fn something_that_is_not_a_backup_at_all_is_refused() {
 /// `#[ignore]`d for the same reason `somfy-migrate`'s golden test is: the
 /// file is a real installation's radio addresses and rolling codes, so it
 /// is gitignored and simply absent on most machines. Run it with
-/// `cargo test -p somfy-config --example provision_shades -- --ignored`
+/// `cargo test -p somfy-config --features migrate --test import -- --ignored`
 /// after placing one at the path below — see
 /// `crates/somfy-migrate/tests/fixtures/README.md`.
 ///
@@ -1006,7 +1237,6 @@ fn something_that_is_not_a_backup_at_all_is_refused() {
 #[test]
 #[ignore = "requires a real device backup — see somfy-migrate's fixtures README"]
 fn a_real_backup_imports_to_the_shape_the_parser_reports() {
-    use somfy_config::ShadeRecord;
     use somfy_migrate::parse_backup;
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1176,10 +1406,10 @@ fn a_group_from_an_old_backup_is_warned_about_and_flagged_in_the_record() {
 
         let import = import(&old).expect("valid");
         assert_eq!(
-            import.warnings,
-            vec![Warning {
+            import.warnings.as_slice(),
+            &[Warning {
                 subject: Subject::Group(0),
-                name: "Whole House".to_string(),
+                name: hstr("Whole House"),
                 caveat: Caveat::FabricatedGroupCode { version },
             }],
             "version {version}"
@@ -1228,10 +1458,10 @@ fn a_group_member_the_backup_does_not_carry_is_dropped_and_reported() {
 
     let import = import(&backup).expect("the import is not refused");
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Group(0),
-            name: "Whole House".to_string(),
+            name: hstr("Whole House"),
             caveat: Caveat::MissingMember(31),
         }]
     );
@@ -1253,10 +1483,10 @@ fn a_shade_in_a_room_the_backup_does_not_carry_is_reported() {
 
     let import = import(&backup).expect("the shade is still imported");
     assert_eq!(
-        import.warnings,
-        vec![Warning {
+        import.warnings.as_slice(),
+        &[Warning {
             subject: Subject::Shade(0),
-            name: "Kitchen".to_string(),
+            name: hstr("Kitchen"),
             caveat: Caveat::UnknownRoom(9),
         }]
     );
@@ -1416,12 +1646,12 @@ fn an_imported_estate_survives_the_record_it_is_written_to() {
     let import = import(&backup).expect("valid");
     let bytes = import.estate.encode();
     assert_eq!(
-        somfy_config::EstateRecord::decode(&bytes),
+        EstateRecord::decode(&bytes),
         Ok(import.estate.clone()),
         "an estate this tool writes must be one the device can read"
     );
     // And the references still point where the import put them.
-    let decoded = somfy_config::EstateRecord::decode(&bytes).expect("decodes");
+    let decoded = EstateRecord::decode(&bytes).expect("decodes");
     assert_eq!(decoded.room_of[0], Some(RoomId(0)));
     assert_eq!(decoded.room_of[1], Some(RoomId(0)));
     assert_eq!(
@@ -1438,7 +1668,7 @@ fn a_backup_with_no_estate_still_produces_an_empty_one() {
     let import = import(&data(&[migrated("Kitchen", 0x00_1001)])).expect("valid");
     assert!(import.estate.is_empty());
     assert_eq!(
-        somfy_config::EstateRecord::decode(&import.estate.encode()),
+        EstateRecord::decode(&import.estate.encode()),
         Ok(import.estate.clone())
     );
 }

@@ -39,7 +39,7 @@ use esp_bootloader_esp_idf::partitions::{self, PartitionType};
 use esp_storage::{FlashStorage, FlashStorageError};
 use somfy_config::{EstateRecord, EstateRecordError, StoredGroup, StoredRoom, ESTATE_RECORD_LEN};
 use somfy_domain::{GroupId, RoomId, ShadeId};
-use somfy_store::{newest_slot, SectorRing};
+use somfy_store::{newest_slot, SectorRing, SlotWrite};
 
 /// Partition holding the estate ring. Looked up by label for the same reason
 /// the other three regions are: a compiled-in offset keeps working right up
@@ -74,6 +74,22 @@ const _: () = assert!(
     "an estate record must be a whole number of flash read units"
 );
 
+/// Bytes compared at a time when reading a written record back.
+///
+/// The same figure and the same argument as `crate::shades`: 256 is one SPI NOR
+/// page, it tiles a 2 KiB record exactly, and comparing the whole record at once
+/// would need a second 2 KiB buffer on a stack that has one.
+const VERIFY_WINDOW: usize = 256;
+
+// The verification window has to tile the record and stay aligned, or the last
+// comparison would run past the slot and `esp-storage` would answer an unaligned
+// read by copying through a 4 KB buffer on this stack.
+const _: () = assert!(
+    ESTATE_RECORD_LEN.is_multiple_of(VERIFY_WINDOW)
+        && VERIFY_WINDOW.is_multiple_of(<FlashStorage as ReadNorFlash>::READ_SIZE),
+    "the read-back window must tile a record and be a whole number of read units"
+);
+
 /// Why the estate store could not do what was asked.
 ///
 /// Each payload exists to be printed, and rustc's dead-code analysis
@@ -94,6 +110,18 @@ pub enum EstateStoreError {
     /// ring itself — but an error rather than a panic, because a panic here
     /// would take the radio off the air over a list of room names.
     SlotOutOfRange { slot: usize },
+    /// The ring holds readable records and cannot say which is newest, so a
+    /// write would have to restart the sequence counter from zero next to
+    /// records numbered far higher — and `newest_slot`'s wrapping comparison
+    /// would then rank the estate just written as the oldest thing in the
+    /// region. The same refusal the other three regions make, for the same
+    /// reason.
+    Unstable { valid: usize },
+    /// The bytes read back are not the bytes written. Not retried: an estate
+    /// the flash did not take is one the caller has to be told about, because
+    /// the alternative is a restore that reports success and leaves the rooms
+    /// and groups as they were.
+    NotDurable,
 }
 
 impl From<FlashStorageError> for EstateStoreError {
@@ -126,6 +154,18 @@ pub struct EstateSurvey {
 /// detouring through a 4 KB temporary on this stack.
 #[repr(C, align(4))]
 struct Slot([u8; ESTATE_RECORD_LEN]);
+
+/// One read-back window, aligned for the same reason [`Slot`] is.
+#[repr(C, align(4))]
+#[cfg_attr(
+    not(feature = "http"),
+    allow(
+        dead_code,
+        reason = "only a restore and an export reach this, and both need a web \
+                  server; a radio-only image has neither"
+    )
+)]
+struct Window([u8; VERIFY_WINDOW]);
 
 /// The flash-backed estate: where the ring is, and how it is carved up.
 ///
@@ -249,6 +289,135 @@ impl EstateStore {
         Ok(survey)
     }
 
+    /// Append `record` to the ring and prove the bytes landed.
+    ///
+    /// **The firmware did not write this region until a restore could.** Until
+    /// then the host tool was the only writer, because an estate names shades by
+    /// *row of the shade table* and one written beside a different table points
+    /// at the wrong shades — so the two have always had to be written together,
+    /// and the only thing that wrote both was `provision_shades`. A restore is
+    /// the second thing that writes both, in the same order and from the same
+    /// import, which is why this could be added without breaking that coupling.
+    ///
+    /// The sequence number is **this store's**, not the caller's: it comes from
+    /// the ring's own `next_write`, so a caller cannot hand back a stale one and
+    /// have a later record rank as older than the one it replaces. Whatever
+    /// `record.seq` held is overwritten. `crate::shades::ShadeStore::store`
+    /// carries the same rule and the same argument for it.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(
+            dead_code,
+            reason = "only a restore and an export reach this, and both need a web \
+                      server; a radio-only image has neither"
+        )
+    )]
+    pub fn store(
+        &mut self,
+        flash: &mut FlashStorage<'_>,
+        record: &EstateRecord,
+    ) -> Result<u32, EstateStoreError> {
+        let mut buffer = Slot([0u8; ESTATE_RECORD_LEN]);
+        let scan = self.scan(flash, &mut buffer)?;
+
+        // A write may not proceed on a ring that holds readable records and
+        // cannot name a newest one. `crate::config::ConfigStore::store` carries
+        // the full argument and it is the same one here: `next_write(None)` aims
+        // at slot 0 with sequence 0, erasing a sector that may hold the only
+        // readable estate and then writing a record every later scan will rank
+        // as ancient.
+        if scan.newest.is_none() && scan.valid > 0 {
+            return Err(EstateStoreError::Unstable { valid: scan.valid });
+        }
+
+        let newest = scan.newest.map(|(slot, seq)| SlotWrite { slot, seq });
+        let aim = self.ring.layout().next_write(newest);
+        let slot_count = self.ring.layout().slot_count();
+        let slot = self
+            .ring
+            .write_slot(aim.slot, &scan.free[..slot_count])
+            .ok_or(EstateStoreError::SlotOutOfRange { slot: aim.slot })?;
+
+        let stamped = EstateRecord {
+            seq: aim.seq,
+            rooms: record.rooms.clone(),
+            room_of: record.room_of,
+            groups: record.groups.clone(),
+        };
+        self.append(flash, slot, &stamped)?;
+        Ok(aim.seq)
+    }
+
+    /// Append `record` at `slot`, erasing that slot's sector first if it starts
+    /// one, then prove the bytes landed.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(
+            dead_code,
+            reason = "only a restore and an export reach this, and both need a web \
+                      server; a radio-only image has neither"
+        )
+    )]
+    fn append(
+        &mut self,
+        flash: &mut FlashStorage<'_>,
+        slot: usize,
+        record: &EstateRecord,
+    ) -> Result<(), EstateStoreError> {
+        let offset = self.offset(slot)?;
+
+        if let Some(sector) = self.ring.erase_before(slot) {
+            let from = self.base + sector as u32;
+            flash.erase(from, from + SECTOR as u32)?;
+        }
+
+        // Through `Slot` rather than straight from `encode`: a bare `[u8; N]` is
+        // byte-aligned, and `esp-storage` answers an unaligned buffer by copying
+        // it through a 4 KB sector buffer on this stack.
+        let bytes = Slot(record.encode());
+        flash.write(offset, &bytes.0)?;
+
+        // Durability verified rather than assumed, and verified against the
+        // *bytes* — which the format makes possible by guaranteeing that equal
+        // records encode identically. Decoding the read-back instead would
+        // compare two records and miss a padding byte the flash did not take.
+        let mut window = Window([0u8; VERIFY_WINDOW]);
+        for at in (0..ESTATE_RECORD_LEN).step_by(VERIFY_WINDOW) {
+            flash.read(offset + at as u32, &mut window.0)?;
+            if window.0 != bytes.0[at..at + VERIFY_WINDOW] {
+                return Err(EstateStoreError::NotDurable);
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the newest readable record is, in absolute flash bytes.
+    ///
+    /// **For the backup export, and for nothing else.** A backup carries the
+    /// estate record *verbatim*, so that the decoder reading it back is the
+    /// same one the boot path already uses rather than a second reader that
+    /// could disagree — and copying it verbatim means reading its bytes, not
+    /// its fields. `crate::restore` streams them out sixty-four at a time.
+    ///
+    /// `None` is a region with nothing readable in it, which is an ordinary
+    /// state for a board that has never been provisioned.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(
+            dead_code,
+            reason = "only a restore and an export reach this, and both need a web \
+                      server; a radio-only image has neither"
+        )
+    )]
+    pub fn newest_offset(
+        &mut self,
+        flash: &mut FlashStorage<'_>,
+    ) -> Result<Option<u32>, EstateStoreError> {
+        let mut buffer = Slot([0u8; ESTATE_RECORD_LEN]);
+        let scan = self.scan(flash, &mut buffer)?;
+        scan.newest.map(|(slot, _)| self.offset(slot)).transpose()
+    }
+
     /// Read every slot's header: which is newest, which are erased, and a tally.
     ///
     /// Headers only. Which slot wins is a question about four sequence numbers,
@@ -261,6 +430,7 @@ impl EstateStore {
     ) -> Result<Scan, EstateStoreError> {
         let slot_count = self.ring.layout().slot_count();
         let mut sequences = [None; MAX_SLOTS];
+        let mut free = [false; MAX_SLOTS];
         let (mut valid, mut blank, mut damaged) = (0, 0, 0);
         let mut first_error = None;
 
@@ -277,7 +447,10 @@ impl EstateStore {
                     *sequence = Some(header.seq);
                     valid += 1;
                 }
-                Err(EstateRecordError::Blank) => blank += 1,
+                Err(EstateRecordError::Blank) => {
+                    blank += 1;
+                    free[slot] = true;
+                }
                 Err(error) => {
                     damaged += 1;
                     first_error = first_error.or(Some(error));
@@ -291,6 +464,7 @@ impl EstateStore {
             .and_then(|slot| sequences[slot].map(|seq| (slot, seq)));
         Ok(Scan {
             newest,
+            free,
             valid,
             blank,
             damaged,
@@ -328,6 +502,18 @@ pub trait EstateVisitor {
 /// What one pass over the ring's headers found.
 struct Scan {
     newest: Option<(usize, u32)>,
+    /// Which slots are erased, so a write can step over the wreckage a torn
+    /// write leaves rather than programming into it. `SectorRing::write_slot`
+    /// carries the argument, and it is the reason a single power cut cannot
+    /// wedge the ring permanently.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(
+            dead_code,
+            reason = "read only by `store`, which exists for the restore path"
+        )
+    )]
+    free: [bool; MAX_SLOTS],
     valid: usize,
     blank: usize,
     damaged: usize,

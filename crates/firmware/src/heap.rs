@@ -157,6 +157,10 @@
 //         --target xtensa-esp32s3-none-elf --bin firmware
 //     # frame sizes: a 4-byte address then a ULEB128 size, one entry per function
 //     readelf -x .stack_sizes target/xtensa-esp32s3-none-elf/release/firmware
+//     # ...which is a hex dump, so `stacksizes.py` beside this crate decodes it
+//     # and sorts by frame, largest first:
+//     python3 stacksizes.py \
+//       target/xtensa-esp32s3-none-elf/release/firmware firmware::restore
 //     # the chain they sit on: who calls whom
 //     xtensa-esp32s3-elf-objdump -d -C target/xtensa-esp32s3-none-elf/release/firmware
 //     # what the linker actually left, which is the boot line's own figure
@@ -302,6 +306,33 @@
 ///   instead. See [`DRAM_FOR_STACK_AND_HEAP`].
 ///
 /// The constant takes the larger of the two chips, as it always has: **55,408**.
+///
+/// **Re-read 2026-08-18 for the diagnostics and backup screens, and it had gone
+/// stale again — by 224 bytes, in the direction that boot-loops.** That is the
+/// fourth time, and it was caught only because the same walk was being done for
+/// [`RESTORE_CHAIN_BYTES`]; nothing else would have said so. Walked on the
+/// ESP32-S3 with the commands at the top of this file:
+///
+/// | | before | after |
+/// |---|---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 | 144 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 | 3,856 |
+/// | [`crate::start`] | 20,096 | 20,160 |
+/// | [`crate::tasks::state`] | 15,648 | 15,728 |
+/// | `UninitCell::write_in_place` | 15,664 | 15,744 |
+/// | **total** | **55,408** | **55,632** |
+///
+/// The 64 bytes on `start` are the staging region and the early return that
+/// carries it; the 80 on each state-task frame are `crate::tasks::Table`'s two
+/// new fields — the staging region and an export's checksum. Both are small
+/// because they were *made* small: the restore's real cost is on a chain of its
+/// own ([`RESTORE_CHAIN_BYTES`]) and an export's whole state is a reference and
+/// a `u32`.
+///
+/// It is raised rather than left, unlike the 2026-08-18 re-measurement above:
+/// that one found the chain *shallower* than the constant, where this one finds
+/// it deeper, and this constant is an upper bound the board refuses to boot
+/// below.
 /// The ESP32-C3 is still not walked — see the note above — and the inference
 /// that it sits below the Xtensa figures is unchanged.
 ///
@@ -312,7 +343,7 @@
 /// are a record of measurements that were taken, not a claim about what is
 /// built today — and because the repeated finding they carry is that this row
 /// goes stale, which is about the reading rather than about the chip.
-const BOOT_CHAIN_BYTES: usize = 55_408;
+const BOOT_CHAIN_BYTES: usize = 55_632;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
 ///
@@ -465,7 +496,7 @@ const INTERRUPT_FRAMES_BYTES: usize = 1_712;
 /// of being re-derived by hand.
 ///
 /// Today, on every configuration in the matrix, [`BOOT_CHAIN_BYTES`] wins:
-/// 54,080 + 1,712 = **55,792**.
+/// 55,632 + 1,712 = **57,344**.
 ///
 /// Checked at run time by `crate::check_stack_headroom` rather than asserted at
 /// compile time, because the quantity it is checked *against* cannot be a
@@ -479,8 +510,70 @@ pub const REQUIRED_STACK_BYTES: usize = larger(
         larger(BOOT_CHAIN_BYTES, NETWORK_CHAIN_BYTES),
         REQUEST_CHAIN_BYTES,
     ),
-    SERVICE_CHAIN_BYTES,
+    larger(SERVICE_CHAIN_BYTES, RESTORE_CHAIN_BYTES),
 ) + INTERRUPT_FRAMES_BYTES;
+
+/// The chain that applies a staged configuration restore.
+///
+/// **The deepest single thing this firmware does that is not the boot chain**,
+/// and the only one whose depth is chosen rather than emergent: sixteen
+/// kilobytes of it is `crate::restore::STAGE_MAX_BYTES`, the staged file, read
+/// onto the stack because `somfy_migrate::parse_backup` takes one contiguous
+/// slice and there is no resumable form of it.
+///
+/// Walked 2026-08-18 on the ESP32-S3 with the commands at the top of this file,
+/// down the C++-backup branch, which is the deeper of the two:
+///
+/// | | bytes |
+/// |---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 |
+/// | `crate::restore::apply` | 16,704 |
+/// | `crate::restore::read_foreign` | 7,968 |
+/// | `crate::restore::parse_foreign` | 11,408 |
+/// | `crate::restore::map_migration` | 12,448 |
+/// | **total** | **52,528** |
+///
+/// The other branch — this firmware's own `RTSB` container — is 46,416 through
+/// `read_own`, `write_regions` and `crate::shades::ShadeStore::store`.
+///
+/// # Four things had to be true for this to fit, and each was measured
+///
+/// It began at **149,888 bytes** in one frame and came down in four steps, none
+/// of which changed what the code does:
+///
+/// 1. **It is called from `crate::entry`, not from `crate::start`.** `start`'s
+///    own frame is 20,144 and it is *live* while it calls anything, so a
+///    restore under it was a 73 KB chain against 66 KB of stack. `start` returns
+///    `Booted::Restore` instead, and `entry` applies it and resets — which also
+///    means the boot that follows reads the new configuration through the
+///    ordinary path rather than a second one.
+/// 2. **Both format readers are `#[inline(never)]`**, so `apply` holds one at a
+///    time rather than the sum.
+/// 3. **The parse and the mapping are `#[inline(never)]` and separate.** A
+///    `somfy_migrate::MigrationData` is ~5.6 KB and the importer's room-index
+///    table is 2 KB more; composed in one frame they were live together for no
+///    reason but the absence of a seam. Worth about twelve kilobytes.
+/// 4. **The importer is called through its warning *sink*.**
+///    `somfy_config::import::Import` is 36,976 bytes, of which 33,024 is a
+///    `heapless::Vec<Warning, 688>`; `ImportedTable` is **3,952**, measured the
+///    same way against `thumbv7em-none-eabihf`. The device logs each warning as
+///    it is raised and reports a count, so it never needs the list.
+///
+/// It is a term in the `max` above rather than a comment for the reason
+/// [`REQUEST_CHAIN_BYTES`] is: it is the one that moves when the backup format
+/// or the importer changes, and the `max` is what notices. It sits **2,880
+/// bytes below** [`BOOT_CHAIN_BYTES`], so it does not set the requirement today
+/// — and if it ever does, `crate::restore::STAGE_MAX_BYTES` is the dial, at the
+/// cost of refusing larger backups with a code that names the number.
+///
+/// Zero without a web server: nothing can stage a restore in that image, so
+/// nothing can apply one.
+#[cfg(feature = "http")]
+const RESTORE_CHAIN_BYTES: usize = 52_528;
+/// See the `http` definition above.
+#[cfg(not(feature = "http"))]
+const RESTORE_CHAIN_BYTES: usize = 0;
 
 /// The deepest chain through the mDNS responder and the SNTP client, measured
 /// the same way as the others — 5,456 bytes, far below [`BOOT_CHAIN_BYTES`], so
@@ -544,8 +637,8 @@ const fn larger(left: usize, right: usize) -> usize {
 /// **The figure is kept unchanged anyway, and that is a judgement rather than an
 /// oversight.** Lowering it is the only direction that would buy anything — more
 /// heap on both remaining chips — and there is almost nothing there to buy:
-/// [`REQUIRED_STACK_BYTES`] is 57,120 and [`STACK_MARGIN_FLOOR_BYTES`] is 8,192,
-/// so the floor on this budget is 65,312 and the whole available move is **968
+/// [`REQUIRED_STACK_BYTES`] is 57,344 and [`STACK_MARGIN_FLOOR_BYTES`] is 8,192,
+/// so the floor on this budget is 65,536 and the whole available move is **744
 /// bytes**, which does not cross the whole-KiB boundary the division rounds on
 /// for either chip. It would change no heap by a byte while pinning a number
 /// that a growing call graph moves. Every heap figure ever measured against
@@ -553,7 +646,7 @@ const fn larger(left: usize, right: usize) -> usize {
 ///
 /// ### What the difference buys
 ///
-/// 66,280 − [`REQUIRED_STACK_BYTES`] = 9,160 bytes, and
+/// 66,280 − [`REQUIRED_STACK_BYTES`] = 8,936 bytes, and
 /// [`STACK_MARGIN_FLOOR_BYTES`] is the least of it this division may leave.
 pub const STACK_BUDGET_BYTES: usize = 66_280;
 
@@ -567,7 +660,7 @@ pub const STACK_BUDGET_BYTES: usize = 66_280;
 /// measurement, and 8 KiB is chosen as roughly five times the entry cost
 /// [`INTERRUPT_FRAMES_BYTES`] does account for.
 ///
-/// The actual margin today is 9,160, so this floor is 968 bytes of slack
+/// The actual margin today is 8,936, so this floor is 744 bytes of slack
 /// before the build stops. That is deliberate: it is a *gate*, not a target, and
 /// it exists so that the failure of a growing call graph is a build error naming
 /// two numbers rather than a device that passes its own boot check and then
@@ -864,10 +957,10 @@ const _: () = assert!(
 /// not the same as knowing. Watch `heap: session announced` on that board before
 /// trusting any of this.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 132_260;
+const DRAM_FOR_STACK_AND_HEAP: usize = 129_324;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 126_864;
+const DRAM_FOR_STACK_AND_HEAP: usize = 123_872;
 
 // **The ESP32-C3 does not have the DRAM for the mDNS responder or the SNTP
 // client on top of the web server, and these say so at compile time.**
@@ -925,8 +1018,35 @@ compile_error!(
 ///
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] | vs [`WIFI_PEAK_BYTES`] |
 /// |---|---|---|---|---|---|
-/// | ESP32-S3 | 132,260 | 64 KiB = 65,536 | 66,724 | 9,604 | +10,916 |
-/// | ESP32-C3 | 126,864 | 59 KiB = 60,416 | 66,448 | 9,328 | +5,796 |
+/// | ESP32-S3 | 129,324 | 61 KiB = 62,464 | 66,860 | 9,740 | +7,844 |
+/// | ESP32-C3 | 123,872 | 56 KiB = 57,344 | 66,528 | 9,408 | +2,724 |
+///
+/// **Re-measured 2026-08-18 for the diagnostics and backup screens, and this is
+/// the row going stale being caught rather than found later.** Both figures fell
+/// — the ESP32-S3 by 2,936 and the ESP32-C3 by 2,992 — and the cause is entirely
+/// the connection task futures: four new routes, two new response buffers, and
+/// `crate::restore`'s share of the same futures. Nothing of the two screens'
+/// own state is in DRAM at all: `crate::diag`'s log ring and panic record are
+/// 4,308 bytes of **RTC-fast** memory, which the linker gives its own 8 KiB
+/// region outside `dram_seg`, and the staged-restore buffer is boot stack.
+///
+/// **It would have been worse by 4,096 and the ESP32-C3 would not have shipped.**
+/// `api::TCP_RX_BYTES` and `api::TCP_TX_BYTES` were halved to pay for the two
+/// screens, which is where that 4,096 came from; without it the C3's heap lands
+/// at 53,248, *below* the announcement peak. That constant carries the trade and
+/// what it costs in round trips.
+///
+/// **The ESP32-C3 is now the tightest row this matrix has ever shipped**, at
+/// +2,724 against a peak whose own boot-to-boot spread is about 2,000. Three
+/// things are worth saying about that figure rather than one:
+///
+/// - It is **above** the spread, where the plain ESP32 was dropped at +1,700,
+///   which is inside it.
+/// - [`WIFI_PEAK_BYTES`] is an **ESP32-S3** measurement taken on a build with
+///   `mdns` and `sntp` in it, and the C3 refuses both. Its own peak has never
+///   been observed because no C3 has ever booted this firmware.
+/// - [`warn_if_tight`] prints the comparison at boot, so the first person to
+///   boot a C3 settles it in one line rather than in an argument.
 ///
 /// **Both rows moved on 2026-08-18**, and for different reasons. The ESP32-S3's
 /// is the same image it has always been, re-read after the ESP32 was dropped and
@@ -1072,7 +1192,7 @@ pub const WIFI_PEAK_BYTES: usize = 54_620;
 #[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
 pub fn warn_if_undersized() {
     if RADIO_HEAP_BYTES < WIFI_WORKING_SET_BYTES {
-        esp_println::println!(
+        crate::logln!(
             "heap: {} bytes is below the {} the Wi-Fi driver was measured to \
              hold at rest — this chip has too little DRAM for the radio and a \
              bootable stack at once, and association is expected to end in a \
@@ -1137,7 +1257,7 @@ fn warn_if_tight() {
     // that is provably safe: the guard above is the only thing making it safe,
     // and a later edit to the guard would put the same landmine back.
     if RADIO_HEAP_BYTES < WIFI_PEAK_BYTES {
-        esp_println::println!(
+        crate::logln!(
             "heap: {} bytes is {} BELOW the worst announcement peak ever measured ({}), \
              though still {} above the driver's resting working set. This board is expected \
              to associate and to connect to a broker; what is in doubt is the burst of \
@@ -1152,7 +1272,7 @@ fn warn_if_tight() {
         );
         return;
     }
-    esp_println::println!(
+    crate::logln!(
         "heap: {} bytes leaves {} above the worst announcement peak ever measured \
          ({}), which is inside the {}-byte spread that peak showed between boots. \
          Watch `heap: session announced` on this board — if it lands near the \
@@ -1258,7 +1378,7 @@ pub fn install_scheduler_only() {
 )]
 pub fn report(when: &str) {
     let stats = esp_alloc::HEAP.stats();
-    esp_println::println!(
+    crate::logln!(
         "heap: {} — {} of {} bytes used, peak {}",
         when,
         stats.current_usage,
@@ -1279,6 +1399,33 @@ pub fn report(when: &str) {
 pub fn free_bytes() -> usize {
     let stats = esp_alloc::HEAP.stats();
     stats.size.saturating_sub(stats.current_usage)
+}
+
+/// The heap the allocator actually installed, in bytes.
+///
+/// [`RADIO_HEAP_BYTES`] is what this build asked for and this is what it got.
+/// They agree today; reporting the measured one means a diagnostics screen
+/// cannot disagree with a serial console, and means the day they stop agreeing
+/// is visible rather than inferred.
+#[allow(
+    dead_code,
+    reason = "not called by every binary that includes this file by path"
+)]
+pub fn size_bytes() -> usize {
+    esp_alloc::HEAP.stats().size
+}
+
+/// Bytes of heap currently allocated.
+///
+/// The complement of [`free_bytes`], from the same counters, because a screen
+/// reads better as "used of size" than as "free of size" and computing one from
+/// the other at the call site is where an off-by-one lives.
+#[allow(
+    dead_code,
+    reason = "not called by every binary that includes this file by path"
+)]
+pub fn used_bytes() -> usize {
+    esp_alloc::HEAP.stats().current_usage
 }
 
 /// The largest the heap has been since boot.

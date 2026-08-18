@@ -179,7 +179,7 @@ pub async fn radio(mut radio: Radio) -> ! {
             RadioEvent::Undecodable { bit_length } => {
                 undecodable = undecodable.saturating_add(1);
                 if worth_reporting(undecodable) {
-                    esp_println::println!(
+                    crate::logln!(
                         "radio: undecodable {}-bit burst ({} so far)",
                         bit_length,
                         undecodable,
@@ -189,7 +189,7 @@ pub async fn radio(mut radio: Radio) -> ! {
             RadioEvent::ReceiveQueueFull(frame) => {
                 dropped = dropped.saturating_add(1);
                 if worth_reporting(dropped) {
-                    esp_println::println!(
+                    crate::logln!(
                         "radio: dropped a frame for {:#08X} — state task is behind ({} so far)",
                         frame.address,
                         dropped,
@@ -200,23 +200,23 @@ pub async fn radio(mut radio: Radio) -> ! {
                 // Not a shutdown: transmission carries on. Worth one line
                 // because from here on the controller is deaf, and a deaf
                 // controller looks exactly like a quiet house.
-                esp_println::println!("radio: receiver stopped — transmit only from here");
+                crate::logln!("radio: receiver stopped — transmit only from here");
             }
             RadioEvent::Transmitted {
                 rolling_code,
                 frames,
             } => {
-                esp_println::println!(
+                crate::logln!(
                     "radio: sent {} frame(s), rolling_code={}",
                     frames,
                     rolling_code,
                 );
             }
             RadioEvent::TransmitFailed(error) => {
-                esp_println::println!("radio: transmit failed: {:?}", error);
+                crate::logln!("radio: transmit failed: {:?}", error);
             }
             RadioEvent::Unencodable(error) => {
-                esp_println::println!("radio: request could not be encoded: {:?}", error);
+                crate::logln!("radio: request could not be encoded: {:?}", error);
             }
         }
     }
@@ -255,6 +255,10 @@ pub async fn state(
         ref config,
         #[cfg(feature = "http")]
         ref mut ota,
+        #[cfg(feature = "http")]
+        ref mut staging,
+        #[cfg(feature = "http")]
+        ref mut export,
         ref mut catalog,
         identity,
         edits,
@@ -356,6 +360,10 @@ pub async fn state(
                 config,
                 #[cfg(feature = "http")]
                 ota,
+                #[cfg(feature = "http")]
+                staging,
+                #[cfg(feature = "http")]
+                export,
                 &mut queue,
                 catalog,
                 &identity,
@@ -374,7 +382,7 @@ pub async fn state(
                 false
             }
             Either4::Third(frame) => {
-                esp_println::println!(
+                crate::logln!(
                     "state: heard {:?} from {:#08X} (code {})",
                     frame.command,
                     frame.address,
@@ -459,6 +467,22 @@ pub struct Table {
     /// happen — [`crate::ota::init`] fails only on a second call.
     #[cfg(feature = "http")]
     pub ota: Option<crate::ota::Pages>,
+    /// The staging region a restore is uploaded into.
+    ///
+    /// Here for the reason `config` and `ota` are: this task owns the flash.
+    /// `None` is a board whose partition table has no `import` region — every
+    /// board flashed before this feature existed — and a restore is refused with
+    /// a code there rather than silently lost.
+    #[cfg(feature = "http")]
+    pub staging: Option<crate::restore::Staging>,
+    /// The checksum of a backup being streamed out.
+    ///
+    /// A reference and a `u32`, and it is *all* the state an export has:
+    /// everything else is read from flash as the client asks for it, which is
+    /// what lets a four-kilobyte file leave this device without four kilobytes
+    /// existing anywhere. See `crate::restore::Export`.
+    #[cfg(feature = "http")]
+    pub export: crate::restore::Export,
     /// The table as the controller believes it, plus the debounce.
     pub catalog: Catalog,
     /// This controller's virtual-remote identity, which is what a new shade's
@@ -524,7 +548,7 @@ fn run_command(
             // delay in it, because this is the one refusal an operator may meet
             // without having done anything wrong — a console showing it is
             // showing the shape of whatever is looping.
-            esp_println::println!(
+            crate::logln!(
                 "state: {:?} refused for {} ms — this shade has been commanded too often. \
                  Every command commits a rolling code to flash before it transmits, so a loop \
                  wears the region out; see somfy_tasks::REFILL_INTERVAL_MS.",
@@ -534,7 +558,7 @@ fn run_command(
             Err(Refused::TooSoon(too_soon))
         }
         Err(error) => {
-            esp_println::println!("state: {:?} rejected: {:?}", command, error);
+            crate::logln!("state: {:?} rejected: {:?}", command, error);
             Err(error)
         }
     }
@@ -560,6 +584,8 @@ fn serve_request(
     store: &mut FlashStore<'static>,
     #[cfg(feature = "http")] config: &Option<crate::config::ConfigStore>,
     #[cfg(feature = "http")] ota: &mut Option<crate::ota::Pages>,
+    #[cfg(feature = "http")] staging: &mut Option<crate::restore::Staging>,
+    #[cfg(feature = "http")] export: &mut crate::restore::Export,
     queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
     catalog: &mut Catalog,
     identity: &RemoteIdentity,
@@ -673,7 +699,7 @@ fn serve_request(
                     machine
                         .finish_calibration(id, now_ms, emitted)
                         .map(|measured| {
-                            esp_println::println!(
+                            crate::logln!(
                                 "calibrate: ShadeId({}) {:?} leg measured {} ms, lag {:?}, band {:?}",
                                 id.0,
                                 measured.leg,
@@ -707,7 +733,7 @@ fn serve_request(
                     // marks leaving no travel between them. Reported as one
                     // code, because the operator's next action is the same for
                     // all of them: run it again and watch the shade.
-                    esp_println::println!("calibrate: ShadeId({}) refused: {:?}", id.0, error);
+                    crate::logln!("calibrate: ShadeId({}) refused: {:?}", id.0, error);
                     (
                         rpc::Reply::Refused(ApiErrorCode::CalibrationImplausible.into()),
                         false,
@@ -829,6 +855,73 @@ fn serve_request(
             }),
             false,
         ),
+
+        // -------------------------------------------------------------------
+        // Backup and restore
+        //
+        // An export reads three regions and the registry; a restore writes a
+        // fourth. Both are here for the reason everything else in this block is
+        // — the flash has one owner — and neither dispatches a transmission.
+        //
+        // **A restore's pages reuse the update path's channel**, which is why
+        // `RestorePage` reaches `crate::ota::lent` for the bytes and
+        // `crate::restore` for what to do with them: an upload is an upload,
+        // and a second channel would be a second page buffer out of the DRAM
+        // the Wi-Fi driver's heap is carved from.
+        // -------------------------------------------------------------------
+        #[cfg(feature = "http")]
+        rpc::Request::BackupChunk { at } => (
+            match crate::restore::export_chunk(
+                export,
+                at as usize,
+                store,
+                config,
+                machine.registry(),
+            ) {
+                Ok(chunk) => rpc::Reply::BackupChunk {
+                    len: chunk.len as u8,
+                    bytes: chunk.bytes,
+                },
+                Err(code) => rpc::Reply::Refused(code.into()),
+            },
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::RestoreBegin { declared } => (
+            staging_reply(staging, |region| {
+                store.with_flash(|flash| region.begin(flash, declared))
+            }),
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::RestorePage { len } => (
+            match ota.as_mut().and_then(|pages| {
+                crate::ota::with_page(pages, usize::from(len), |bytes| {
+                    staging_reply(staging, |region| {
+                        store.with_flash(|flash| region.page(flash, bytes))
+                    })
+                })
+            }) {
+                Some(reply) => reply,
+                None => rpc::Reply::Refused(ApiErrorCode::BackupUnwritable.into()),
+            },
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::RestoreFinish => (
+            staging_reply(staging, |region| {
+                store.with_flash(|flash| region.finish(flash))
+            }),
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::RestoreAbort => (
+            staging_reply(staging, |region| {
+                store.with_flash(|flash| region.abort(flash));
+                Ok(())
+            }),
+            false,
+        ),
     };
     rpc::RPC.answer(reply);
     dispatched
@@ -845,10 +938,34 @@ fn ota_reply(
     f: impl FnOnce(&mut crate::ota::Pages) -> Result<(), ApiErrorCode>,
 ) -> rpc::Reply {
     let Some(pages) = ota.as_mut() else {
-        esp_println::println!("ota: this build has no page channel, so no update can be received");
+        crate::logln!("ota: this build has no page channel, so no update can be received");
         return rpc::Reply::Refused(ApiErrorCode::UpdateUnwritable.into());
     };
     match f(pages) {
+        Ok(()) => rpc::Reply::Done,
+        Err(code) => rpc::Reply::Refused(code.into()),
+    }
+}
+
+/// Run one step of a restore against the staging region, or say there is none.
+///
+/// The `None` arm is a board whose partition table has no `import` region —
+/// every board flashed before this feature existed — and it is a refusal with a
+/// code rather than a silent no-op, because an operator who uploaded a backup
+/// and was told nothing would reasonably believe it had landed.
+#[cfg(feature = "http")]
+fn staging_reply(
+    staging: &mut Option<crate::restore::Staging>,
+    f: impl FnOnce(&mut crate::restore::Staging) -> Result<(), ApiErrorCode>,
+) -> rpc::Reply {
+    let Some(region) = staging.as_mut() else {
+        crate::logln!(
+            "restore: this board has no staging region, so a backup cannot be taken. Reflash \
+             with this crate's partitions.csv."
+        );
+        return rpc::Reply::Refused(ApiErrorCode::BackupUnwritable.into());
+    };
+    match f(region) {
         Ok(()) => rpc::Reply::Done,
         Err(code) => rpc::Reply::Refused(code.into()),
     }
@@ -874,7 +991,7 @@ fn read_config(
     match store.with_flash(|flash| config.load(flash)) {
         Ok((record, _survey)) => Ok(record),
         Err(error) => {
-            esp_println::println!("config: could not be read ({:?})", error);
+            crate::logln!("config: could not be read ({:?})", error);
             Err(())
         }
     }
@@ -910,18 +1027,16 @@ fn write_config(
     change: ConfigChange,
 ) -> rpc::Reply {
     let Some(config) = config else {
-        esp_println::println!(
-            "config: no `wificfg` partition on this board — settings cannot be stored"
-        );
+        crate::logln!("config: no `wificfg` partition on this board — settings cannot be stored");
         return rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into());
     };
     match store.with_flash(|flash| config.amend(flash, change)) {
         Ok(()) => {
-            esp_println::println!("config: stored");
+            crate::logln!("config: stored");
             rpc::Reply::Done
         }
         Err(error) => {
-            esp_println::println!("config: refused the write ({:?})", error);
+            crate::logln!("config: refused the write ({:?})", error);
             rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into())
         }
     }
@@ -1058,7 +1173,7 @@ fn apply_edit(
                             // allocator probes one more candidate than the
                             // registry can hold. Reported rather than
                             // `expect`ed, because a panic reboots the board.
-                            esp_println::println!("shades: allocator refused ({error:?})");
+                            crate::logln!("shades: allocator refused ({error:?})");
                             ApiErrorCode::InvalidAddress
                         }
                     })?;
@@ -1081,7 +1196,7 @@ fn apply_edit(
             let seed = RollingCode(1);
             match seed_if_absent(store, address, seed, RegionState::Intact) {
                 Ok(Seeded::Planted(code)) => {
-                    esp_println::println!(
+                    crate::logln!(
                         "shades: ShadeId({}) '{}' allocated {:#08X}, rolling code seeded at {}",
                         id.0,
                         name,
@@ -1094,7 +1209,7 @@ fn apply_edit(
                     // ignored, because the two ways it could happen — an
                     // address the allocator handed out twice, or a store that
                     // remembers one it should not — are both worth knowing.
-                    esp_println::println!(
+                    crate::logln!(
                         "shades: ShadeId({}) allocated {:#08X} and the store answered {:?}",
                         id.0,
                         address,
@@ -1106,7 +1221,7 @@ fn apply_edit(
                     // rather than rolled back: removing it would burn the
                     // address, and a shade that reports `NoStoredCode` is
                     // recoverable by a person who is told.
-                    esp_println::println!(
+                    crate::logln!(
                         "shades: ShadeId({}) at {:#08X} has no rolling code ({:?}) — it will \
                          refuse to transmit until the region is repaired",
                         id.0,
@@ -1136,7 +1251,7 @@ fn apply_edit(
                 .confirm_pairing(registry, id, now_ms)
                 .map_err(catalog_refusal)?;
             if changed {
-                esp_println::println!(
+                crate::logln!(
                     "shades: ShadeId({}) confirmed working by the operator — announcing its \
                      entities",
                     id.0,
@@ -1164,7 +1279,7 @@ fn apply_edit(
             catalog
                 .reconfigure(registry, id, next, now_ms)
                 .map_err(catalog_refusal)?;
-            esp_println::println!("shades: ShadeId({}) reconfigured as '{}'", id.0, name);
+            crate::logln!("shades: ShadeId({}) reconfigured as '{}'", id.0, name);
             // Gated like every other announcement: a shade nobody has reported
             // working must not acquire entities by being renamed. `reconfigure`
             // cannot move the pairing state either — `Shade::reconfigure`
@@ -1187,14 +1302,14 @@ fn apply_edit(
             catalog
                 .remove(registry, id, now_ms)
                 .map_err(catalog_refusal)?;
-            esp_println::println!("shades: ShadeId({}) removed", id.0);
+            crate::logln!("shades: ShadeId({}) removed", id.0);
             if announced {
                 announce(events, ShadeEvent::Removed { id });
             } else {
                 // An abandoned setup. Said out loud because "nothing was
                 // published" is the claim being made, and a silent path is one
                 // nobody can check from a serial console.
-                esp_println::println!(
+                crate::logln!(
                     "shades: ShadeId({}) had never been confirmed, so it had no entities and \
                      nothing was published to clear",
                     id.0,
@@ -1219,7 +1334,7 @@ fn apply_edit(
             catalog
                 .link(registry, id, address, now_ms)
                 .map_err(catalog_refusal)?;
-            esp_println::println!(
+            crate::logln!(
                 "shades: ShadeId({}) now follows the remote at {:#08X}",
                 id.0,
                 address,
@@ -1230,7 +1345,7 @@ fn apply_edit(
             catalog
                 .unlink(registry, id, address, now_ms)
                 .map_err(catalog_refusal)?;
-            esp_println::println!(
+            crate::logln!(
                 "shades: ShadeId({}) no longer follows the remote at {:#08X}",
                 id.0,
                 address,
@@ -1253,7 +1368,7 @@ fn catalog_refusal(error: CatalogError) -> ApiErrorCode {
         CatalogError::Domain(DomainError::RegistryFull) => ApiErrorCode::RegistryFull,
         CatalogError::Domain(DomainError::NameTooLong) => ApiErrorCode::NameTooLong,
         other => {
-            esp_println::println!("shades: the table refused a change ({other})");
+            crate::logln!("shades: the table refused a change ({other})");
             ApiErrorCode::InvalidAddress
         }
     }
@@ -1304,7 +1419,7 @@ fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
                 },
             );
         } else {
-            esp_println::println!(
+            crate::logln!(
                 "shades: ShadeId({}) is not announced — nobody has reported it working yet, so \
                  it has no Home Assistant entities. Finish its setup from the device page in \
                  Home Assistant, which links to this controller's setup assistant.",
@@ -1339,7 +1454,7 @@ fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
 /// recovered by the next full announcement, which is built from the table.
 fn announce(events: &EventSender, event: ShadeEvent) {
     if events.try_send(event).is_err() {
-        esp_println::println!(
+        crate::logln!(
             "shades: nothing is listening for entity changes — the broker will catch up on \
              its next session"
         );
@@ -1361,15 +1476,13 @@ fn persist_table(
     // controller keeps working; `written` is called anyway so the deadline does
     // not fire again every debounce for a region that is not coming back.
     let Some(shades) = shades.as_mut() else {
-        esp_println::println!(
-            "shades: there is no shade region, so this change will not survive a reboot"
-        );
+        crate::logln!("shades: there is no shade region, so this change will not survive a reboot");
         catalog.written();
         return;
     };
     let (record, dropped) = catalog.record(registry);
     if dropped.links > 0 {
-        esp_println::println!(
+        crate::logln!(
             "shades: {} linked remote(s) did not fit the record's pool and will not survive \
              the next boot",
             dropped.links,
@@ -1380,7 +1493,7 @@ fn persist_table(
         // a zero seed is ignored while the rolling-code region holds a code for
         // that address, and planted the moment that region is lost — at which
         // point the motor stops obeying and only a walk to it fixes that.
-        esp_println::println!(
+        crate::logln!(
             "shades: {} shade(s) were written with a rolling-code seed of 0 because this \
              table holds none for them. That is a bug, and it costs a re-pairing if the \
              rolling-code region is ever lost.",
@@ -1393,7 +1506,7 @@ fn persist_table(
     match store.with_flash(|flash| shades.store(flash, &record)) {
         Ok(seq) => {
             catalog.written();
-            esp_println::println!(
+            crate::logln!(
                 "shades: table written (seq {}, {} shade(s), {} link(s))",
                 seq,
                 shade_count,
@@ -1403,7 +1516,7 @@ fn persist_table(
         // Left dirty on purpose: the next deadline retries. A controller that
         // believed in a table the flash refused would lose every shade at the
         // next boot with nothing to say why.
-        Err(error) => esp_println::println!(
+        Err(error) => crate::logln!(
             "shades: the table could not be written ({:?}) — it will be retried",
             error,
         ),
@@ -1413,7 +1526,7 @@ fn persist_table(
 /// Log whatever went wrong, and report whether anything reached the radio.
 fn report(dispatch: &Dispatch<StoreError, somfy_tasks::QueueFull>) -> bool {
     if let Some(error) = &dispatch.first_error {
-        esp_println::println!(
+        crate::logln!(
             "state: {} of {} planned frame(s) sent; first failure: {:?}",
             dispatch.sent,
             dispatch.planned,

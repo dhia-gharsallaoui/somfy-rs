@@ -14,6 +14,7 @@ export const fr: Record<MessageKey, string> = {
   'app.name': 'somfy-rs',
 
   'nav.settings': 'Réglages',
+  'nav.backup': 'Sauvegarde',
   'nav.diagnostics': 'Diagnostics',
   'nav.language': 'Langue',
 
@@ -339,6 +340,18 @@ export const fr: Record<MessageKey, string> = {
   'error.updateUnwritable':
     'l’appareil n’a pas pu enregistrer la mise à jour — il fonctionne toujours avec le micrologiciel qu’il avait',
 
+  'error.backupNotRecognised':
+    'ce fichier n’est pas une sauvegarde que cet appareil sache lire — une sauvegarde est le fichier qu’il produit lui-même, ou celui du contrôleur qu’il remplace',
+  'error.backupTooLarge': 'cette sauvegarde dépasse la place dont dispose l’appareil pour la vérifier',
+  'error.backupDamaged':
+    'la sauvegarde n’est pas arrivée intacte — sa somme de contrôle ne correspond pas, et rien n’a été restauré',
+  'error.backupUnsupportedVersion':
+    'cette sauvegarde est écrite dans un format que ce micrologiciel ne sait pas lire',
+  'error.restoreInProgress': 'une restauration est déjà en cours',
+  'error.backupUnwritable':
+    'l’appareil n’a pas pu enregistrer la configuration restaurée — il conserve celle qu’il avait',
+  'error.addressInUse': 'un volet de ce contrôleur possède déjà cette adresse de télécommande',
+
   'settings.title': 'Réglages',
   'settings.loading': 'Lecture des réglages de l’appareil…',
   'settings.unreachable': 'Appareil injoignable : {detail}',
@@ -407,11 +420,200 @@ export const fr: Record<MessageKey, string> = {
     'L’appareil redémarre. Cette page reviendra d’elle-même dans quelques secondes.',
   'settings.failed': 'Refusé : {reason}',
 
+  'diag.title': 'Diagnostics',
+  'diag.intro':
+    'Ce que l’appareil peut dire de lui-même. En cas de problème, le journal et la panique ci-dessous sont les pièces à conviction — copiez-les avant d’effacer quoi que ce soit.',
+  'diag.loading': 'Lecture de l’appareil…',
+  'diag.unreachable': 'Appareil injoignable : {detail}',
+  'diag.retry': 'Réessayer',
+  'diag.refresh': 'Actualiser',
+  'diag.refreshing': 'Lecture…',
+
+  'diag.identityTitle': 'Cet appareil',
+  'diag.firmware': 'Micrologiciel',
+  'diag.chip': 'Puce',
+  'diag.host': 'Nom',
+  'diag.uptime': 'En marche depuis',
+  'diag.resetReason': 'Démarré par',
+
+  'diag.resetPowerOn': 'La mise sous tension',
+  'diag.resetPowerOnNote':
+    'Le courant a été coupé puis rétabli, ou quelqu’un a branché l’appareil. Tout ce qu’il gardait en mémoire d’une panique a été effacé avec.',
+  'diag.resetSoftware': 'Le micrologiciel lui-même',
+  'diag.resetSoftwareNote':
+    'L’appareil a demandé ce redémarrage. Enregistrer des réglages le fait, et se relever d’une panique aussi.',
+  'diag.resetWatchdog': 'Le chien de garde',
+  'diag.resetWatchdogNote':
+    'Quelque chose a cessé de répondre assez longtemps pour paraître bloqué, et le matériel a redémarré la carte. C’est une anomalie, pas une routine — la cause se trouve dans le journal ci-dessous, si elle a eu le temps d’être écrite.',
+  'diag.resetBrownout': 'Une baisse de tension',
+  'diag.resetBrownoutNote':
+    'La tension d’alimentation est descendue sous ce dont la puce a besoin. C’est presque toujours l’alimentation ou le câble, pas le micrologiciel — et cela se reproduira tant que l’alimentation ne changera pas.',
+  'diag.resetDebugger': 'Un débogueur',
+  'diag.resetDebuggerNote': 'Un débogueur ou un outil de flashage l’a redémarré.',
+  'diag.resetOther': 'Autre chose',
+  'diag.resetOtherNote':
+    'La puce a signalé une cause à laquelle ce micrologiciel ne sait pas donner de nom. Assez rare pour mériter d’être mentionné dans un rapport d’anomalie.',
+
+  'diag.panicTitle': 'L’appareil s’est effondré',
+  'diag.panicWhat': 'Ce qu’il a dit',
+  'diag.panicThisBoot':
+    'Ce démarrage-ci est celui qu’a provoqué la panique. L’appareil s’est redémarré tout seul et est revenu sous la forme que vous avez sous les yeux — ce qui l’a causée s’est donc produit quelques minutes, voire quelques secondes, avant l’ouverture de cette page.',
+  'diag.panicBootsSinceOne': 'Il y a un redémarrage.',
+  'diag.panicBootsSince': 'Il y a {boots} redémarrages.',
+  'diag.panicWhen': 'Il fonctionnait depuis {uptime} au moment des faits.',
+  'diag.panicLoop':
+    'Il s’est effondré quelques secondes après un démarrage, et celui auquel vous parlez est celui qu’a produit ce redémarrage. C’est la forme d’une boucle de démarrage : l’appareil repart, atteint le même point et s’effondre de nouveau. Surveillez la durée de marche ci-dessus — si elle ne dépasse jamais une minute, c’est bien ce qui se passe, et personne n’aura le temps de changer quoi que ce soit.',
+  'diag.panicTruncated':
+    'Ce texte est tronqué — l’appareil n’en conserve que le début. Le message complet est parti dans le journal ci-dessous et sur la liaison série, si quelque chose écoutait.',
+  'diag.panicVolatile':
+    'Cet enregistrement réside dans une mémoire que la puce conserve d’un redémarrage à l’autre et vide à la coupure du courant : débrancher l’appareil l’efface. Copiez-le avant.',
+  'diag.panicNoneTitle': 'Aucune panique enregistrée',
+  'diag.panicNone':
+    'Soit l’appareil ne s’est pas effondré, soit il a été débranché depuis — l’enregistrement ne survit pas à une coupure de courant, seulement à un redémarrage.',
+
+  'diag.memoryTitle': 'Mémoire',
+  'diag.stackTitle': 'Pile',
+  'diag.stackLine':
+    '{used} octets utilisés au point le plus profond de ce démarrage, sur {required} requis — {unspent} inutilisés.',
+  'diag.stackAvailable': 'L’éditeur de liens lui a réservé {available} octets.',
+  'diag.stackUnmeasured':
+    'Pas encore mesuré sur ce démarrage. La valeur se lit sur une pile peinte, une fois le contrôleur en marche.',
+  'diag.stackWhy':
+    'Seul « utilisés » a été mesuré ; les deux autres sont inscrits dans la compilation. L’écart entre les deux premiers est tout l’intérêt de cette ligne — une exigence devenue caduque ne dit rien du tout tant qu’un démarrage ne la contredit pas.',
+  'diag.stackStale':
+    'Ce démarrage a consommé plus que ce que la compilation déclare nécessaire : l’exigence est caduque. C’est exactement l’état qui a produit ici, une fois, une boucle de démarrage silencieuse. À signaler.',
+
+  'diag.heapTitle': 'Tas',
+  'diag.heapPeak': '{peak} octets au maximum depuis le démarrage, sur {size}.',
+  'diag.heapUsed': '{used} octets utilisés en ce moment.',
+  'diag.heapWhy':
+    'Le tas existe pour le pilote Wi-Fi ; rien d’autre dans ce micrologiciel n’alloue, si bien que ce maximum mesure le code de quelqu’un d’autre. Une carte qui redémarre quelques secondes après chaque démarrage, avec un maximum proche de la totalité du tas, en a manqué — et cela ressemble en tout point à un mauvais point d’accès tant que ces deux nombres ne sont pas vus côte à côte.',
+
+  'diag.logTitle': 'Journal',
+  'diag.logRing': '{bytes} octets sur {capacity}, {lines} lignes.',
+  'diag.logIntact':
+    'Rien n’a été jeté : voici donc tout ce qui s’est écrit depuis le dernier vidage.',
+  'diag.logDropped':
+    '{dropped} lignes ont été jetées pour faire place aux suivantes. Les plus anciennes sont perdues — et les plus anciennes, ce sont celles du démarrage, généralement les plus intéressantes. Si vous signalez une anomalie, dites-le : cela veut dire que cette mémoire tampon est trop petite.',
+  'diag.logEmpty': 'Le journal est vide.',
+  'diag.logLoading': 'Lecture du journal…',
+  'diag.logFailed': 'Lecture du journal impossible : {detail}',
+  'diag.logCopy': 'Copier le journal et ces informations',
+  'diag.logCopied': 'Copié — toute la page sous forme de texte, prête à être collée dans un rapport.',
+  'diag.logCopyFailed':
+    'Ce navigateur refuse à la page l’accès au presse-papiers. Une desserte en HTTP simple suffit à ce que certains navigateurs le retirent. Sélectionnez le texte ci-dessus et copiez-le à la main.',
+
+  'diag.forgetTitle': 'Oublier',
+  'diag.forget': 'Oublier la panique et vider le journal',
+  'diag.forgetWarning':
+    'Une seule action, parce qu’il s’agit d’une seule chose : l’enregistrement de la panique et chaque ligne du journal sont ce que cet appareil garde de son propre passé, et les deux s’en vont. Rien n’en est conservé ailleurs — ni en mémoire flash, ni dans une sauvegarde. Si vous n’avez pas copié le journal, il est perdu. À faire après avoir signalé une anomalie, pas avant.',
+  'diag.forgetConfirm': 'Oui, oublier',
+  'diag.forgetCancel': 'Conserver',
+  'diag.forgetting': 'Effacement…',
+  'diag.forgetDone': 'Oublié. L’enregistrement de la panique est effacé et le journal est vide.',
+  'diag.forgetFailed': 'L’appareil a refusé : {reason}',
+
+  'diag.durationSeconds': '{seconds} s',
+  'diag.durationMinutes': '{minutes} min',
+  'diag.durationHours': '{hours} h {minutes} min',
+  'diag.durationDay': '1 jour, {hours} h',
+  'diag.durationDays': '{days} jours, {hours} h',
+
+  'backup.title': 'Sauvegarde et restauration',
+  'backup.intro':
+    'Une sauvegarde contient la table des volets, les pièces, les groupes — et les codes tournants, qui en sont toute la raison d’être. Un moteur n’obéit qu’à une télécommande dont il reconnaît le compteur : un code tournant perdu, et il faut retourner à chaque fenêtre réappairer chaque moteur. Tout le reste de cette page se ressaisit en quelques minutes ; cela, non.',
+  'backup.loading': 'Lecture de l’appareil…',
+  'backup.unreachable': 'Appareil injoignable : {detail}',
+  'backup.retry': 'Réessayer',
+  'backup.refresh': 'Actualiser',
+  'backup.refreshing': 'Lecture…',
+
+  'backup.exportTitle': 'Enregistrer une sauvegarde',
+  'backup.exportWhat':
+    'Le fichier fait environ quatre kilo-octets : la table des volets, les pièces, les groupes, et le code tournant de chaque volet. L’appareil le nomme somfy-rs.rtsb en l’envoyant.',
+  'backup.exportNotSecrets':
+    'Il ne contient délibérément ni la phrase secrète Wi-Fi ni le mot de passe du courtier. Rien sur cet appareil ne demande qui vous êtes : n’importe quoi sur le réseau peut donc réclamer ce fichier, et un export contenant des secrets reviendrait à pouvoir lire la phrase secrète de l’appareil depuis le réseau local. Ce qu’il conserve en revanche, c’est le nom du réseau et l’adresse du courtier — ainsi la personne qui restaure sur une carte neuve sait exactement quelles deux valeurs ressaisir, au lieu de devoir deviner sur quel réseau se trouvait l’ancienne.',
+  'backup.exportWhen':
+    'Reprenez-en une après avoir ajouté ou réappairé un volet. Les codes tournants avancent à chaque commande, et un fichier du mois dernier installe les codes du mois dernier sur une carte qui n’en a aucun — ce qu’un moteur rejette comme un rejeu.',
+  'backup.export': 'Télécharger la sauvegarde',
+
+  'backup.importTitle': 'Restaurer depuis un fichier',
+  'backup.importWhat':
+    'Deux types de fichiers sont acceptés : le .rtsb que cet appareil produit, et le .backup qu’exporte un contrôleur ESPSomfy-RTS. Le second est la façon dont une installation existante est reprise sans rien réappairer.',
+  'backup.importStaged':
+    'L’envoi ne restaure rien sur-le-champ. L’appareil met le fichier de côté, redémarre, et le lit en revenant — cette page perd donc sa connexion quelques secondes, et la réponse arrive ensuite. Tant que ce démarrage ne l’a pas lu, rien n’a été vérifié et rien n’a été écrit.',
+  'backup.importCodes':
+    'Une restauration ne peut pas faire reculer un code tournant. L’appareil n’installe un code que pour une adresse qui n’en a aucun : restaurer une vieille sauvegarde sur la carte dont elle provient ne change donc aucun code, et peut être tenté sans risque. C’est la restauration sur une carte neuve qui les installe, et c’est à cela qu’une sauvegarde sert.',
+  'backup.importWhole':
+    'Un fichier est appliqué en entier ou pas du tout. Un seul enregistrement que l’appareil refuse fait refuser l’ensemble, et la carte conserve la configuration qu’elle avait déjà.',
+  'backup.file': 'Fichier de sauvegarde',
+  'backup.anyFile': 'Afficher tous les fichiers, pas seulement .rtsb et .backup',
+  'backup.fileHint':
+    'L’extension ne fait que déterminer ce que le sélecteur propose : c’est en regardant les premiers octets que l’appareil tranche, et il refuse avant de le ranger tout fichier qu’il ne reconnaît pas. Désactivez le filtre si le fichier voulu a été renommé.',
+  'backup.chosen': '{name} — {bytes} octets',
+  'backup.upload': 'Envoyer et redémarrer',
+  'backup.uploading': 'Envoi…',
+  'backup.uploadRefused':
+    'L’appareil a refusé le fichier : {reason}. Rien n’a été mis de côté et rien n’a changé.',
+  'backup.waiting':
+    'Accepté. L’appareil redémarre pour lire le fichier — il sera injoignable quelques secondes, et cette page dira ce qui s’est passé dès qu’il répondra de nouveau.',
+  'backup.lost':
+    'L’appareil n’a pas répondu depuis un moment. Il démarre peut-être encore, ou il est revenu sur une autre adresse. Rouvrez cette page dès que vous pourrez le joindre : le fichier est mis de côté, et le démarrage qui le lira consignera ce qu’il en a fait.',
+  'backup.checkAgain': 'Vérifier de nouveau',
+
+  'backup.reportTitle': 'La dernière restauration',
+  'backup.outcomeNoneTitle': 'Aucune restauration',
+  'backup.outcomeNone':
+    'Aucune sauvegarde n’a jamais été envoyée à cet appareil. Tout ce qu’il contient a été configuré ici.',
+  'backup.outcomeStagedTitle': 'Une sauvegarde attend d’être appliquée',
+  'backup.outcomeStaged':
+    'Un fichier est mis de côté et sera lu au prochain démarrage. Rien n’a encore été vérifié, et ce qui tourne en ce moment est la configuration que l’appareil avait déjà.',
+  'backup.outcomeAppliedTitle': 'Restauré',
+  'backup.appliedShades': 'Volets écrits',
+  'backup.appliedRooms': 'Pièces écrites',
+  'backup.appliedGroups': 'Groupes écrits',
+  'backup.outcomeRefusedTitle': 'La sauvegarde a été refusée',
+  'backup.refusedWhy': 'L’appareil l’a refusée : {reason}.',
+  'backup.refusedNothing':
+    'Rien n’a été écrit. L’appareil fonctionne avec la configuration qu’il avait avant l’envoi.',
+  'backup.refusedRow':
+    'Le refus vient de l’enregistrement {row} du fichier, les volets étant comptés à partir de zéro.',
+  'backup.refusedFile':
+    'Le refus porte sur le fichier lui-même, et non sur l’un de ses enregistrements.',
+
+  'backup.format': 'Lu comme {format}.',
+  'backup.formatSomfyRs': 'une sauvegarde issue d’un appareil somfy-rs',
+  'backup.formatEspSomfyRts': 'une sauvegarde issue d’un contrôleur ESPSomfy-RTS',
+
+  'backup.warningsNone': 'Chaque enregistrement a été repris exactement tel quel.',
+  'backup.warningsOne':
+    'Un enregistrement a été accepté sous réserve — un type de volet inconnu lu comme un enrouleur, un groupe dont l’ancien contrôleur n’a jamais écrit le code tournant, un membre désignant un volet qui n’existe plus. C’est une ligne du journal, avec l’enregistrement et la raison.',
+  'backup.warnings':
+    '{warnings} enregistrements ont été acceptés sous réserve — un type de volet inconnu lu comme un enrouleur, un groupe dont l’ancien contrôleur n’a jamais écrit le code tournant, un membre désignant un volet qui n’existe plus. Chacun est une ligne du journal, avec l’enregistrement et la raison.',
+  'backup.warningsLink': 'Consulter le journal',
+
+  'backup.retypeTitle': 'Ce qu’il vous reste à ressaisir',
+  'backup.retypeWhy':
+    'Une sauvegarde ne transporte aucun secret : voici donc les valeurs que la restauration n’a pas pu remettre en place à votre place.',
+  'backup.retypeSsid':
+    'L’appareil dont provient ce fichier était sur {ssid}. Ressaisissez la phrase secrète de ce réseau dans les réglages.',
+  'backup.retypeSsidOpen':
+    'L’appareil dont provient ce fichier était sur {ssid}, un réseau ouvert — il n’y a aucune phrase secrète à ressaisir.',
+  'backup.retypeNoSsid':
+    'Il n’avait aucun réseau enregistré : rien à ressaisir du côté Wi-Fi.',
+  'backup.retypeBroker':
+    'Il publiait vers le courtier {broker}. Ressaisissez le mot de passe de ce courtier dans les réglages.',
+  'backup.retypeBrokerOpen':
+    'Il publiait vers le courtier {broker}, qui ne demandait aucun mot de passe.',
+  'backup.retypeNoBroker': 'Il n’avait aucun courtier configuré.',
+  'backup.retypeUnknown':
+    'Une sauvegarde issue d’un contrôleur ESPSomfy-RTS conserve ses identifiants réseau hors du fichier : elle ne dit donc rien du réseau ni du courtier qu’utilisait cet appareil. Consultez son propre écran de réglages tant qu’il fonctionne encore, si c’est possible.',
+  'backup.retypeLink': 'Ouvrir les réglages',
+
   'stub.heading': '{screen}',
   'stub.body': 'Cet écran n’est pas encore implémenté.',
   'stub.settings': 'Réglages',
   'stub.backup': 'Sauvegarde et restauration',
-  'stub.diagnostics': 'Diagnostics',
   'stub.onboarding': 'Configuration',
 
   'route.notFound': 'Cette page n’existe pas.',

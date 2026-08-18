@@ -10,7 +10,9 @@
 import { LocationProvider, Route, Router, useLocation, useRoute } from 'preact-iso/router';
 
 import { useI18n, LOCALES, LOCALE_NAMES, type Locale } from './i18n';
+import { Backup } from './routes/backup';
 import { Dashboard } from './routes/dashboard';
+import { Diagnostics } from './routes/diagnostics';
 import { Settings } from './routes/settings';
 import { ShadeDetail } from './routes/shade-detail';
 import { ShadeNew } from './routes/shade-new';
@@ -40,6 +42,15 @@ function Shell() {
           <a class="link" href="/settings">
             {t('nav.settings')}
           </a>
+          {/*
+            Backup sits in the top bar rather than under settings because the
+            one moment it is most needed is the one where nothing else on the
+            device is working — and because the export is the mitigation for
+            losing a rolling code, which costs a walk to every window.
+          */}
+          <a class="link" href="/backup">
+            {t('nav.backup')}
+          </a>
           <a class="link" href="/diagnostics">
             {t('nav.diagnostics')}
           </a>
@@ -60,8 +71,8 @@ function Shell() {
           <Route path="/shades/:id/pair" component={ShadePairRoute} device={device} />
           <Route path="/shades/:id" component={ShadeRoute} device={device} />
           <Route path="/settings" component={Settings} />
-          <Route path="/backup" component={Stub} screen="stub.backup" />
-          <Route path="/diagnostics" component={Stub} screen="stub.diagnostics" />
+          <Route path="/backup" component={Backup} />
+          <Route path="/diagnostics" component={Diagnostics} />
           <Route path="/onboarding" component={Stub} screen="stub.onboarding" />
           <Route default component={NotFound} />
         </Router>

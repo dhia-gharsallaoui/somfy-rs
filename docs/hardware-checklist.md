@@ -1270,19 +1270,47 @@ costs one command.
 | `shades` | data, 0x204000, 8 KB | **unchanged** |
 | `otadata` | — | **new**, data/ota, 0x206000, 8 KB |
 | `estate` | — | **new**, data/undefined, 0x208000, 8 KB |
+| `import` | — | **new**, data/undefined, 0x20A000, 20 KB |
 | `ota_1` | — | **new**, app, 0x210000, 0x1F0000 |
 
 The app slot did not move and did not change size, so the image lands on the
 same sectors it already occupied. The three older data regions did not move, so
 every byte a provisioned board is carrying stays where the firmware looks for
-it. `estate` is purely additive — it sits above all of them, in space the table
-had already set aside — and arrives blank, which the firmware reads as no rooms
-and no groups. `crates/firmware/partitions.csv` carries the derivation;
+it. `estate` and `import` are purely additive — both sit above all of them, in
+space the table had already set aside — and both arrive blank, which the
+firmware reads as no rooms and no groups, and nothing staged.
+`crates/firmware/partitions.csv` carries the derivation;
 `crates/firmware/build.rs` fails the build if a later edit moves any of the
-four.
+five.
+
+**`import` is what a restore is staged in**, and it is the last thing that
+reserve can hold: 4 KB is left after it, and every data region here is at least
+two sectors, so the next one needs a layout change rather than a line. Its first
+sector is a 128-byte record saying what the last upload was and what the boot
+path did about it; the four after it are the staged file, 16 KB, which is
+`firmware::restore::STAGE_MAX_BYTES` and also the size of the buffer the boot
+path parses a backup in.
 
 The table now ends at 0x400000 exactly, so it still fits a 4 MB board — which
 matters because only the ESP32-S3 here is known to carry 8 MB.
+
+### What a board that is *not* reflashed does
+
+It keeps working, and it cannot take a restore. `firmware::restore::Staging::mount`
+reports the missing region once at boot —
+
+```text
+restore: no staging region (PartitionMissing) — this board can export a backup
+and cannot take one. Reflash it with this crate's partitions.csv to change that;
+nothing else moves, the region is above every one a provisioned board already
+has.
+```
+
+— and everything else runs unchanged. A `POST /api/v1/system/backup` is refused
+with `backupUnwritable` rather than timing out. **Exporting a backup still
+works**, because an export reads regions that board already has, which is the
+right way round: the board that most needs its configuration captured is the one
+that has not been reflashed yet.
 
 ### 1. Back up the rolling codes anyway
 
@@ -1816,3 +1844,198 @@ espflash flash --port /dev/ttyUSB0 --erase-parts otadata \
 - **Anything about the ESP32-C3.** It has the web server, the upload route and
   the boot-side roll-back, and no hardware. (The ESP32, which had the roll-back
   and no way to be sent an update over the network, was dropped on 2026-08-18.)
+
+---
+
+## Diagnostics and backup
+
+The two screens design spec §8 asks for, and **what only a flash can confirm
+about them**. Every claim below is untested on silicon: the host tests cover the
+formats and the refusals, and CI covers seven build configurations, but nothing
+in this repository has ever run this code on a board.
+
+### What is untested, in order of how much it would cost to be wrong
+
+1. **The panic record.** `crate::diag::record_panic` runs inside a panic handler,
+   takes a critical section that the panicking code may already hold, and writes
+   RTC-fast memory that `esp_hal::system::software_reset` then has to preserve.
+   The re-entrancy is sound by inspection — `esp-sync-0.2.1/src/lib.rs:262`
+   checks `token.is_reentry()` and does nothing for a nested acquisition, and
+   `esp_println` already relies on it in the same handler — but **a panic path
+   cannot be trusted until it has actually panicked on silicon.** The procedure
+   is below.
+2. **The staged restore, applied at boot.** It writes the shade table and the
+   estate. If it is wrong in the direction that writes a bad table, the
+   consequence is a controller that will not move a shade until it is
+   reprovisioned. If it is wrong in the direction that writes a bad *rolling
+   code*, the consequence is a physical re-pairing at every motor — except that
+   it cannot be: every code goes through `somfy_store::seed_if_absent`, which
+   cannot express an overwrite. That is the one property here that is structural
+   rather than tested-on-hardware.
+3. **The 52,528-byte boot stack chain a C++ backup parse runs.** Walked from a
+   linked ELF and 2,880 bytes under the boot chain, so it changes no constant —
+   but a stack figure read off an ELF is a claim about what the compiler emitted,
+   and `crate::stack_used` printing a smaller number than
+   `REQUIRED_STACK_BYTES` on the boot *after* a restore is the only thing that
+   confirms it.
+4. **The ESP32-C3's Wi-Fi heap.** 57,344 bytes against a 54,620-byte peak
+   measured on a different chip. See `heap::DRAM_FOR_STACK_AND_HEAP`.
+
+### 1. Prove the panic record survives
+
+Add a deliberate panic to a **throwaway** build — not committed, like the
+`rx_raw` diagnostics before it — after the controller is running:
+
+```rust
+// in `entry`, after `start_network`
+embassy_time::Timer::after(embassy_time::Duration::from_secs(20)).await;
+panic!("deliberate: proving the panic record survives the reset");
+```
+
+Flash it (step 0 — **identify the board** — applies), watch the serial line, and
+expect:
+
+```text
+controller: running
+PANIC: panicked at src/main.rs:NNN:M:
+deliberate: proving the panic record survives the reset
+rst:0x3 (RTC_SW_SYS_RST)
+...
+---- reset (Software) — everything above is from before it ----
+```
+
+That last line is the evidence: it is written by `diag::boot` **only when the
+log ring came through the reset with lines in it**, so seeing it means the ring
+survived. Then, from a browser or `curl`:
+
+```bash
+curl -s http://<board>/api/v1/system | python3 -m json.tool
+```
+
+`lastPanic` must be present, `text` must contain the message, `bootsSince` must
+be `0` on the boot the panic caused and `1` after one more reset, and
+`resetReason` must be `software`.
+
+Then **power-cycle** the board and repeat the `curl`. `lastPanic` must be
+`null`: RTC memory is zeroed on a power-on reset, and that limit is stated in
+`crate::diag` rather than worked around.
+
+### 2. Prove the log ring is big enough — or that it is not
+
+This is the measurement `RING_BYTES` is waiting for, and it takes one request:
+
+```bash
+curl -s http://<board>/api/v1/system | python3 -c "import json,sys; print(json.load(sys.stdin)['log'])"
+```
+
+On the **first** boot after a power cycle, `dropped` must be `0`. A non-zero
+`dropped` there means the boot output does not fit 4,096 bytes and the lines a
+diagnostics screen most wants — the `stack:` and `heap:` lines — are the ones
+that were evicted. RTC-fast memory has room to roughly double the ring
+(`diag::RTC_FAST_RESERVE_BYTES` is what stands in the way, and it is a policy
+figure), so the fix is one constant.
+
+### 3. Export a backup, and read it back on the host
+
+```bash
+curl -s -o board.rtsb http://<board>/api/v1/system/backup
+ls -l board.rtsb           # must be exactly 4420 bytes
+head -c 4 board.rtsb       # must be RTSB
+```
+
+Then check it against the shade table the board reports, which is the only thing
+that establishes the *contents* rather than the shape:
+
+```bash
+curl -s http://<board>/api/v1/shades | python3 -m json.tool
+```
+
+The count in the file's embedded `RTSS` record must match, and the rolling codes
+in the code block must be **ahead of** the seeds in that record for any shade
+that has ever been commanded — that difference is the whole reason the block
+exists.
+
+**Do not commit the file.** It carries this installation's radio addresses and
+rolling codes, which is exactly what `crates/somfy-migrate/tests/fixtures/README.md`
+says about the C++ backup: treat it like a key.
+
+### 4. Restore it onto the board it came from
+
+The safe direction, and the one to try first: every address already has a code,
+so `seed_if_absent` plants nothing and the shade table is rewritten with the
+same values.
+
+```bash
+curl -s -X POST --data-binary @board.rtsb \
+  -H 'Content-Type: application/octet-stream' \
+  -w '%{http_code}\n' http://<board>/api/v1/system/backup
+```
+
+Expect `202`, then the board restarts. On the serial line:
+
+```text
+restore: a backup is staged — applying it before anything else starts
+restore: a 4420 byte backup is staged — reading it before anything else is loaded
+restore: applied — N shades, N rooms, N groups, 0 warnings. Rolling codes were
+seeded through seed_if_absent, so every address this board already had a code
+for kept the one it had.
+restore: restarting into the restored configuration
+```
+
+Then `curl -s http://<board>/api/v1/system/restore` must report
+`"outcome": "applied"` with the counts, and **every shade must still move** —
+which is the only test that matters and needs a person at a window.
+
+### 5. Prove a refusal is a refusal
+
+Upload something that is not a backup and confirm nothing changed:
+
+```bash
+head -c 500 /dev/urandom > junk.bin
+curl -s -X POST --data-binary @junk.bin -w '%{http_code}\n' \
+  http://<board>/api/v1/system/backup
+```
+
+Expect `400` with `{"code":"backupNotRecognised"}` — **immediately, with no
+restart**, because that check happens on the first page of the body. Then flip
+one byte of a real backup and upload it: expect `202`, a restart, and
+`"outcome": "refused"` with `"code": "backupDamaged"`, with the shade table
+unchanged.
+
+### 6. Import a C++ ESPSomfy-RTS backup
+
+The path that removes the last reason to own a checkout. Export a backup from
+the C++ controller through its own web UI, then:
+
+```bash
+curl -s -X POST --data-binary @espsomfy.backup -w '%{http_code}\n' \
+  http://<board>/api/v1/system/backup
+```
+
+Expect `202` and a restart. Then read the log — this is the half that is *not*
+in the report:
+
+```bash
+curl -s http://<board>/api/v1/system/log
+```
+
+Every caveat is a `restore: !!` line naming the shade or group and what could
+not be carried across. **A `restore: !!` line about records not aligning is the
+one to stop at**: it means a value in the imported table may be wrong,
+*including a rolling code*, and the host tool refuses to write such a table
+without an operator typing `yes`. The boot path applies it and says so loudly,
+because there is nobody at a terminal — so the check is yours, at the shades.
+
+### What this procedure does not establish
+
+- **That a backup larger than 16,384 bytes is refused rather than truncated.**
+  It needs an installation with roughly twenty or more shades to produce one,
+  and the check is `Content-Length` against a constant, before any flash is
+  touched.
+- **That the boot-time parse fits on a chip other than the ESP32-S3.** The
+  52,528-byte chain was walked on Xtensa. The ESP32-C3's frames are
+  `addi sp, sp, -N` rather than `entry a1, N` and were not read; the inference
+  that they are no deeper is the same one `heap::BOOT_CHAIN_BYTES` already
+  makes, and it is an inference.
+- **Anything at all about the ESP32-C3.** Both screens build for it and no
+  ESP32-C3 has ever run this firmware.

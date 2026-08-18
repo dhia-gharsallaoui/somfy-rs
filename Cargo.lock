@@ -483,6 +483,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "somfy-backup"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "heapless 0.8.0",
+ "somfy-config",
+ "somfy-domain",
+ "somfy-rts",
+]
+
+[[package]]
 name = "somfy-cc1101"
 version = "0.1.0"
 dependencies = [
@@ -496,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "crc",
  "heapless 0.8.0",
+ "somfy-config",
  "somfy-domain",
  "somfy-migrate",
  "somfy-mqtt",

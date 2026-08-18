@@ -37,7 +37,7 @@ pub fn base() -> Router<impl PathRouter> {
 /// Say at boot that there is no UI, so an operator pointing a browser at this
 /// device and getting `404` has already been told why.
 pub fn report() {
-    esp_println::println!(
+    crate::logln!(
         "api: no web UI in this image (built without the `ui` feature) — /api/v1 is served, \
          everything else answers 404"
     );

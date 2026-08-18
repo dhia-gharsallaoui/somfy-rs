@@ -60,7 +60,8 @@
 //! Which is the argument for `--from-backup`: the controller being replaced
 //! already knows that number, and its exported backup carries it. Everything
 //! about the import path — what it refuses, and what it makes a person confirm
-//! — follows from that one field, and lives in [`import`].
+//! — follows from that one field, and lives in `somfy_config::import`, which
+//! this tool and the firmware both read a backup through.
 //!
 //! At the prompts, two rules follow instead, and this tool states both:
 //!
@@ -86,49 +87,23 @@
 //! silently undid. See `somfy_config::shade`'s module docs for the order the
 //! two halves have to land in.
 
-mod import;
-
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
+// The import lives in the library now, behind its `migrate` feature, because
+// the firmware reads a backup at boot as well — so this example and the device
+// share one set of refusal rules rather than two that can drift. It used to be
+// `mod import;` beside this file; `provisioned_pairing_state` went with it,
+// because it is the rule that decides a shade's pairing state from its
+// address, and both paths below need the same answer.
+use somfy_config::import::{self, provisioned_pairing_state};
 use somfy_config::{
     Announced, EstateRecord, ShadeError, ShadeRecord, StoredShade, ESTATE_RECORD_LEN,
     SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
 };
-use somfy_domain::{PairingState, RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
+use somfy_domain::{RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
-
-/// Whether a provisioned shade starts out needing to be paired, decided by the
-/// one thing that actually answers the question: **where its address came
-/// from.**
-///
-/// An address this controller's allocator produced is one **no motor has ever
-/// heard**, so the shade will not move until somebody stands at it with a
-/// working remote — it is awaiting confirmation, and the device offers to walk
-/// them through it. An address that came from anywhere else — a backup, or a
-/// number the operator read off the controller being replaced — is one a motor
-/// already obeys, so the setup was completed on that other controller and there
-/// is nothing here to finish.
-///
-/// The alternative was asking. It was rejected because the honest form of the
-/// question is "has a motor been taught this address?", the tool has just
-/// finished telling the operator the answer, and a prompt whose right answer is
-/// already on screen is a prompt people get wrong.
-///
-/// **The error direction, since both are reachable**: called wrongly
-/// `AwaitingConfirmation`, an imported shade appears under "finish setting up"
-/// and one press of *it already works* clears it. Called wrongly
-/// `ConfirmedByOperator`, a freshly allocated shade is announced to Home
-/// Assistant and silently obeys nothing, which is the failure this whole flow
-/// exists to end. So the test is the one that cannot get the second case wrong.
-fn provisioned_pairing_state(address: u32) -> PairingState {
-    if RemoteIdentity::is_allocated(address) {
-        PairingState::AwaitingConfirmation
-    } else {
-        PairingState::ConfirmedByOperator
-    }
-}
 
 /// Factory-default travel times, the same ones `ShadeConfig::new` applies.
 /// Offered as defaults rather than demanded because a measured value is
