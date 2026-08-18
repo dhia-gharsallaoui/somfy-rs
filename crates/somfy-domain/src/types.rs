@@ -1,4 +1,5 @@
 use heapless::String;
+use somfy_rts::Command;
 
 /// Fixed-point shade position in hundredths of a percent.
 /// 0 = fully up/open, 10000 = fully closed. Deployed controllers track
@@ -109,6 +110,10 @@ impl TiltMode {
 /// 80-bit device is deaf to every 56-bit frame, and a controller that sends the
 /// wrong one produces a shade that imports looking healthy and never moves.
 ///
+/// It travels with every frame the domain plans — [`PlannedTx::width`](crate::PlannedTx)
+/// — so the width a shade is driven at is the width its own record names, and
+/// there is no controller-wide setting for it to disagree with.
+///
 /// Discriminants are the bit counts themselves, which is also the byte deployed
 /// device backups store, so a migrated width needs no translation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +137,26 @@ impl FrameWidth {
             56 => Some(FrameWidth::Bits56),
             80 => Some(FrameWidth::Bits80),
             _ => None,
+        }
+    }
+
+    /// Whether a frame of this width can carry `command` on the wire at all.
+    ///
+    /// The three extended commands — `StepUp`, `Favorite`, `Stop` — do not have
+    /// a 4-bit command field to live in. Their identity is in the extended
+    /// frame's un-obfuscated tail, and the nibble a narrow frame *would* carry
+    /// is their base command's, which for `StepUp` is `StepDown`: the opposite
+    /// direction. So a narrow frame cannot express them, and encoding one
+    /// narrow is not a degraded send but a different command — which is why
+    /// `somfy_rts::encode56` refuses rather than truncates.
+    ///
+    /// This is the whole rule, in one place, so that the guard which stops such
+    /// a command being planned and the encoder which would refuse it cannot
+    /// drift apart.
+    pub fn carries(self, command: Command) -> bool {
+        match self {
+            FrameWidth::Bits80 => true,
+            FrameWidth::Bits56 => !command.is_extended(),
         }
     }
 }
@@ -424,6 +449,26 @@ pub enum DomainError {
     /// silently: a shade that closed fully and never vented is a shade somebody
     /// has to go and open.
     TooManySequences,
+    /// A command was asked for on a shade whose paired frame width has no way
+    /// to express it. Today that is [`ShadeCommand`](crate::ShadeCommand)`::StepUp`
+    /// on a 56-bit shade, and only that.
+    ///
+    /// Raised by [`Controller::command_shade`](crate::Controller::command_shade)
+    /// **before anything is planned**, and by
+    /// [`Controller::command_group`](crate::Controller::command_group) across
+    /// the whole group before any member moves.
+    ///
+    /// The narrow frame has one 4-bit field for the command, and `StepUp` has no
+    /// value in it — the nibble it would occupy is `StepDown`'s. So there is no
+    /// degraded send available here, only a different command, in the opposite
+    /// direction, with the estimate moving the way that was asked for and the
+    /// motor moving the other. Refused rather than approximated, and refused in
+    /// the domain rather than at the encoder so that the position estimate does
+    /// not move either: a silently-inverted step is worse than a step that did
+    /// not happen, and a step the estimate believes in is worse than both.
+    ///
+    /// See [`FrameWidth::carries`].
+    CommandNotAtThisWidth,
 }
 
 /// The travel-time defaults a shade is created with, which are also the ones
@@ -604,20 +649,26 @@ pub struct ShadeConfig {
     pub close_band_ms: u16,
     /// The frame width the motor behind this shade was paired as.
     ///
-    /// **Carried, not yet honoured on the wire.** The transmit width is still
-    /// per-controller (`somfy_tasks::TxProfile`), so a shade whose width
-    /// differs from the controller's is one the controller cannot drive. That
-    /// is the state this field exists to make *visible*: before it, the width
-    /// was read out of a backup, reported once, and dropped, so the shade
-    /// imported looking healthy and never moved.
+    /// **Honoured on the wire.** Every frame this shade plans carries it
+    /// ([`PlannedTx::width`](crate::PlannedTx)), and the radio encodes to it, so
+    /// an installation may mix widths and each motor hears the one it was
+    /// paired at. There is no controller-wide width to disagree with — the
+    /// record is the only thing that decides.
+    ///
+    /// It also decides which commands are available: the extended commands live
+    /// only in the wide frame, so [`FrameWidth::carries`] is what stops a
+    /// `StepUp` being planned for a narrow shade, where the nibble it would
+    /// occupy means `StepDown`.
     pub frame_width: FrameWidth,
     /// The radio protocol this shade speaks.
     ///
-    /// Carried for the same reason as [`ShadeConfig::frame_width`], and with a
-    /// sharper edge: `somfy-rts` implements [`RadioProtocol::Rts`] and nothing
-    /// else, so a shade set to any other value cannot be driven at all by any
-    /// configuration of this firmware. Storing it is what lets the device say
-    /// so instead of transmitting frames the motor is not listening for.
+    /// **Carried, not honoured — and unlike [`ShadeConfig::frame_width`] it
+    /// cannot be**, which is why the two fields part company here. `somfy-rts`
+    /// encodes [`RadioProtocol::Rts`] and has no byte layout for the others at
+    /// either width, so a shade set to any other value is one no configuration
+    /// of this firmware can drive. Storing it is what lets the device name that
+    /// shade at boot instead of transmitting frames its motor is not listening
+    /// for.
     pub protocol: RadioProtocol,
     /// Whether an operator has reported this shade working. See
     /// [`PairingState`] — it is **not** a claim that the motor was paired, and

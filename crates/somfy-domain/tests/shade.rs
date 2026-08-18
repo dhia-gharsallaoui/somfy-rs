@@ -1,9 +1,21 @@
 use heapless::Vec;
-use somfy_domain::{Direction, PlannedTx, Pos, Shade, ShadeCommand, ShadeConfig};
-use somfy_rts::Command;
+use somfy_domain::{Direction, FrameWidth, PlannedTx, Pos, Shade, ShadeCommand, ShadeConfig};
+use somfy_rts::{encode56, Command, Frame};
 
 fn shade() -> Shade {
     Shade::new(ShadeConfig::new("Test", 0x123456).unwrap())
+}
+
+/// A shade whose motor was paired as an 80-bit device.
+///
+/// The extended commands live only in the wide frame, so this is the shade any
+/// test about them has to be about: `ShadeConfig::new` produces the narrow
+/// width, which is what every motor this project has driven uses and which has
+/// no field for `StepUp` to occupy.
+fn wide_shade() -> Shade {
+    let mut config = ShadeConfig::new("Test", 0x123456).unwrap();
+    config.frame_width = FrameWidth::Bits80;
+    Shade::new(config)
 }
 
 fn tx(out: &Vec<PlannedTx, 4>) -> std::vec::Vec<Command> {
@@ -118,7 +130,7 @@ fn step_commands_nudge_target_and_emit_extended_commands() {
 
 #[test]
 fn step_up_nudges_toward_open_and_clamps_at_zero() {
-    let mut s = shade();
+    let mut s = wide_shade();
     let mut out = Vec::new();
     s.handle(ShadeCommand::GoTo(Pos::from_percent(50)), 0, &mut out);
     s.tick(5_000, &mut out);
@@ -130,12 +142,113 @@ fn step_up_nudges_toward_open_and_clamps_at_zero() {
 
     // At the hard limit deployed firmware still transmits the step frame
     // unconditionally, but the position cannot move past the limit.
-    let mut s = shade(); // fresh shade at ZERO
+    let mut s = wide_shade(); // fresh shade at ZERO
     out.clear();
     s.handle(ShadeCommand::StepUp, 0, &mut out);
     assert_eq!(tx(&out), [Command::StepUp]);
     assert_eq!(s.pos(), Pos::ZERO);
     assert_eq!(s.direction(), Direction::Idle);
+}
+
+/// A shade paired at the narrow width has no frame that means "step up": the
+/// command field is four bits, `StepUp`'s identity lives in the extended
+/// frame's tail, and the nibble a narrow frame would carry for it is
+/// `StepDown`'s — the opposite direction.
+///
+/// So the estimate must not move either. That is the whole of the trap: a
+/// controller that nudged its estimate up and put a down-step on the air would
+/// be wrong twice over, and nothing in a one-way protocol would report it.
+#[test]
+fn a_narrow_shade_neither_sends_nor_believes_a_step_up() {
+    let mut s = shade();
+    let mut out = Vec::new();
+    s.handle(ShadeCommand::GoTo(Pos::from_percent(50)), 0, &mut out);
+    s.tick(5_000, &mut out);
+    out.clear();
+
+    s.handle(ShadeCommand::StepUp, 5_000, &mut out);
+
+    assert!(out.is_empty(), "no frame a narrow shade cannot carry");
+    let snap = s.tick(20_000, &mut out);
+    assert_eq!(
+        snap.pos,
+        Pos::from_percent(50),
+        "the estimate must not move"
+    );
+}
+
+/// Its mirror does go out, because `StepDown` is a base command with a nibble
+/// of its own — the asymmetry is in the protocol, not in this crate.
+#[test]
+fn a_narrow_shade_still_steps_down() {
+    let mut s = shade();
+    let mut out = Vec::new();
+    s.handle(ShadeCommand::StepDown, 0, &mut out);
+    assert_eq!(tx(&out), [Command::StepDown]);
+}
+
+/// The guard above names one command, and this is what says the naming is
+/// complete: every command, at both widths, and nothing planned may be
+/// something its own width cannot carry. A fourth extended command, or an
+/// existing command rerouted onto one, fails here rather than on a motor.
+///
+/// **It asks the encoder, not the rule.** `FrameWidth::carries` is the rule
+/// this crate applies, so a sweep that checked against it would agree with
+/// itself no matter what the rule said — verified by breaking `carries` and
+/// watching this pass. `somfy_rts::encode56` is the ground truth: it is the
+/// function that will actually be asked to build the frame, and it refuses an
+/// extended command whatever anything here believes.
+#[test]
+fn nothing_planned_is_ever_wider_than_the_shade_that_planned_it() {
+    let commands = [
+        ShadeCommand::Up,
+        ShadeCommand::Down,
+        ShadeCommand::My,
+        ShadeCommand::StepUp,
+        ShadeCommand::StepDown,
+        ShadeCommand::GoTo(Pos::from_percent(37)),
+        ShadeCommand::SetMy(Some(Pos::from_percent(20))),
+        ShadeCommand::Vent,
+        ShadeCommand::Pair,
+    ];
+    for width in [FrameWidth::Bits56, FrameWidth::Bits80] {
+        for command in commands {
+            let mut config = ShadeConfig::new("Test", 0x123456).unwrap();
+            config.frame_width = width;
+            // A measured band, so `Vent` plans its legs instead of being a
+            // shade the caller would have refused before it got here.
+            config.vent_band_ms = 4_000;
+            let mut s = Shade::new(config);
+            let mut out = Vec::new();
+            // Driven past a command and a whole traverse, so the frames a tick
+            // plans on its own — the mid-range arrival stop, a vent's later
+            // legs — are covered as well as the command's own.
+            s.handle(command, 0, &mut out);
+            for now in [1_000, 5_000, 11_000, 21_000, 31_000] {
+                s.tick(now, &mut out);
+            }
+            for planned in &out {
+                assert_eq!(planned.width, width, "a frame must carry its own width");
+                let wire = Frame {
+                    key: 0xA0,
+                    command: planned.command,
+                    rolling_code: 1,
+                    address: planned.address,
+                };
+                let encodable = match planned.width {
+                    // `encode80` is infallible, so the wide width has nothing
+                    // to prove here beyond carrying its own name.
+                    FrameWidth::Bits80 => Ok(()),
+                    FrameWidth::Bits56 => encode56(&wire).map(|_| ()),
+                };
+                assert!(
+                    encodable.is_ok(),
+                    "{command:?} at {width:?} planned {:?}, which has no frame at that width",
+                    planned.command
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -7,8 +7,8 @@
 
 use core::cell::RefCell;
 use somfy_domain::{
-    Direction, DomainError, GroupId, Pos, ShadeCommand, ShadeConfig, ShadeId, StateDelta,
-    DELTA_CAPACITY, PAIR_REPEATS,
+    Direction, DomainError, FrameWidth, GroupId, Pos, ShadeCommand, ShadeConfig, ShadeId,
+    StateDelta, DELTA_CAPACITY, PAIR_REPEATS,
 };
 use somfy_rts::{Command, Frame};
 use somfy_store::{FrameBits, TransmitError};
@@ -22,6 +22,17 @@ const B: u32 = 0x00_1102;
 
 fn deltas() -> heapless::Vec<StateDelta, DELTA_CAPACITY> {
     heapless::Vec::new()
+}
+
+/// A shade whose motor was paired as an 80-bit device.
+///
+/// Built by hand rather than migrated, because the width is what is under test:
+/// `ShadeConfig::new` produces the narrow width every shade this project has
+/// ever driven uses, and the interesting case is the one it does not produce.
+fn wide(name: &str, address: u32) -> ShadeConfig {
+    let mut config = ShadeConfig::new(name, address).unwrap();
+    config.frame_width = FrameWidth::Bits80;
+    config
 }
 
 /// One shade at address `A`, with a code already in the store.
@@ -153,19 +164,17 @@ fn a_queued_frame_carries_the_command_and_the_profile() {
     assert_eq!(request.repeats, somfy_tasks::TxProfile::default().repeats);
 }
 
+/// The shade's own record chooses the width; the controller's profile chooses
+/// only the redundancy. A shade paired as an 80-bit device is deaf to every
+/// 56-bit frame, so a width taken from anywhere but that shade's record is a
+/// shade that accepts commands and never moves.
 #[test]
-fn the_profile_chooses_the_frame_width_and_repeat_count() {
+fn the_shades_record_chooses_the_frame_width_and_the_profile_only_the_repeats() {
     let log = RefCell::new(Vec::new());
     let mut store = MockStore::new(&log, &[(A, 1)]);
     let mut queue = MockQueue::new(&log);
-    let mut state = StateMachine::new(TxProfile {
-        bits: FrameBits::Bits80,
-        repeats: 6,
-    });
-    let id = state
-        .registry_mut()
-        .add_shade(ShadeConfig::new("A", A).unwrap())
-        .unwrap();
+    let mut state = StateMachine::new(TxProfile { repeats: 6 });
+    let id = state.registry_mut().add_shade(wide("A", A)).unwrap();
 
     state
         .command_shade(
@@ -180,6 +189,131 @@ fn the_profile_chooses_the_frame_width_and_repeat_count() {
 
     assert_eq!(queue.sent[0].bits, FrameBits::Bits80);
     assert_eq!(queue.sent[0].repeats, 6);
+}
+
+/// The case the per-shade width exists for, and the one a controller-wide
+/// setting cannot express: two shades, two widths, one group command. Each
+/// motor must hear the width it was paired at.
+#[test]
+fn a_mixed_width_group_sends_each_shade_the_width_it_was_paired_at() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 1), (B, 2)]);
+    let mut queue = MockQueue::new(&log);
+    let mut state = StateMachine::new(TxProfile::default());
+    state
+        .registry_mut()
+        .add_shade(ShadeConfig::new("narrow", A).unwrap())
+        .unwrap();
+    state.registry_mut().add_shade(wide("wide", B)).unwrap();
+    let group = state.registry_mut().add_group("All").unwrap();
+    for id in [ShadeId(0), ShadeId(1)] {
+        state.registry_mut().group_add_shade(group, id).unwrap();
+    }
+
+    state
+        .command_group(
+            &mut store,
+            &mut queue,
+            group,
+            ShadeCommand::Up,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    let widths: Vec<(u32, FrameBits)> = queue
+        .sent
+        .iter()
+        .map(|request| (request.frame.address, request.bits))
+        .collect();
+    assert_eq!(widths, [(A, FrameBits::Bits56), (B, FrameBits::Bits80)]);
+}
+
+/// A `StepUp` has no command field to occupy in a narrow frame, so a shade
+/// paired at 56 bits refuses it — and refuses it before anything is committed,
+/// so no rolling code is spent on a frame that could never have been encoded.
+#[test]
+fn a_narrow_shade_refuses_a_step_up_without_spending_a_code() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let (mut state, id) = one_shade();
+
+    let refused = state.command_shade(
+        &mut store,
+        &mut queue,
+        id,
+        ShadeCommand::StepUp,
+        0,
+        &mut deltas(),
+    );
+
+    assert_eq!(refused, Err(DomainError::CommandNotAtThisWidth));
+    assert!(queue.sent.is_empty());
+    assert_eq!(store.code(A), Some(42), "no code may be spent on a refusal");
+    assert!(log.borrow().is_empty(), "the store was not even read");
+}
+
+/// A group is refused across the whole of itself, before any member moves.
+///
+/// The wide shade could have taken the step; the narrow one could not, and it is
+/// listed second, so a check made member by member would have stepped the first
+/// and refused the second. Half a group stepped is a group somebody has to
+/// inspect shade by shade to find out what it did.
+#[test]
+fn a_mixed_width_group_refuses_a_step_up_before_any_member_moves() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 1), (B, 2)]);
+    let mut queue = MockQueue::new(&log);
+    let mut state = StateMachine::new(TxProfile::default());
+    state.registry_mut().add_shade(wide("wide", A)).unwrap();
+    state
+        .registry_mut()
+        .add_shade(ShadeConfig::new("narrow", B).unwrap())
+        .unwrap();
+    let group = state.registry_mut().add_group("All").unwrap();
+    for id in [ShadeId(0), ShadeId(1)] {
+        state.registry_mut().group_add_shade(group, id).unwrap();
+    }
+
+    let refused = state.command_group(
+        &mut store,
+        &mut queue,
+        group,
+        ShadeCommand::StepUp,
+        0,
+        &mut deltas(),
+    );
+
+    assert_eq!(refused, Err(DomainError::CommandNotAtThisWidth));
+    assert!(queue.sent.is_empty(), "no member may move");
+    assert!(log.borrow().is_empty(), "and no code may be spent");
+}
+
+/// The same command on a shade paired at the wide width is an ordinary
+/// transmission, at that width, carrying the extended command itself.
+#[test]
+fn a_wide_shade_steps_up_as_an_extended_frame() {
+    let log = RefCell::new(Vec::new());
+    let mut store = MockStore::new(&log, &[(A, 42)]);
+    let mut queue = MockQueue::new(&log);
+    let mut state = StateMachine::new(TxProfile::default());
+    let id = state.registry_mut().add_shade(wide("A", A)).unwrap();
+
+    state
+        .command_shade(
+            &mut store,
+            &mut queue,
+            id,
+            ShadeCommand::StepUp,
+            0,
+            &mut deltas(),
+        )
+        .unwrap();
+
+    assert_eq!(queue.sent.len(), 1);
+    assert_eq!(queue.sent[0].frame.command, Command::StepUp);
+    assert_eq!(queue.sent[0].bits, FrameBits::Bits80);
 }
 
 #[test]
@@ -619,10 +753,7 @@ fn a_store_failure_does_not_stop_the_dispatch() {
 /// One shade at address `A`, on a controller configured to repeat generously —
 /// the setting an operator reaches for on a weak RF path.
 fn one_shade_repeating(repeats: u8) -> (StateMachine, ShadeId) {
-    let mut state = StateMachine::new(TxProfile {
-        bits: FrameBits::Bits56,
-        repeats,
-    });
+    let mut state = StateMachine::new(TxProfile { repeats });
     let id = state
         .registry_mut()
         .add_shade(ShadeConfig::new("A", A).unwrap())
