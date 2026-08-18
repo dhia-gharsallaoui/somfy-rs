@@ -21,7 +21,7 @@
 use crate::motion::{Motion, MotionSnapshot};
 use crate::pairing::PAIR_REPEATS;
 use crate::types::{round_dead_band_ms, round_start_lag_ms, CalibrationSource};
-use crate::{Direction, DomainError, Pos, ShadeConfig};
+use crate::{Direction, DomainError, FrameWidth, Pos, ShadeConfig};
 use heapless::Vec;
 use somfy_rts::Command;
 
@@ -152,11 +152,25 @@ impl Repeats {
 /// Rolling-code state is owned by the radio/persistence layer
 /// (`somfy_rts::RollingCode`) — never by the domain. So is the repeat count the
 /// [`Repeats`] policy resolves against.
+///
+/// # The width is a value, not a policy
+///
+/// [`Repeats`] is a policy because the domain does not know what an ordinary
+/// press is worth on this installation's RF path — that is a radio setting.
+/// The width is the opposite kind of thing: a motor was paired at one width and
+/// answers nothing else, so there is exactly one right answer per shade and it
+/// is in that shade's own record. Nothing downstream may override it, and there
+/// is no controller-wide width for it to be reconciled against — which is the
+/// whole of the defect this field closed. A shade the previous controller drove
+/// with wide frames used to import looking healthy and never move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedTx {
     pub address: u32,
     pub command: Command,
     pub repeats: Repeats,
+    /// The width this frame must go out at — the paired width of the motor at
+    /// [`PlannedTx::address`], copied from its [`ShadeConfig::frame_width`].
+    pub width: FrameWidth,
 }
 
 /// A high-level shade command from the API / UI / automation layer.
@@ -1213,8 +1227,11 @@ impl Shade {
     /// We transmit whenever `step_target` applied the nudge (i.e. travel
     /// time is non-zero) — even if clamping meant the position ends up
     /// unchanged, the button press itself is still a real physical event
-    /// that must go out on the radio. Only a genuinely zero travel time
-    /// (motor not configured) skips the transmission entirely.
+    /// that must go out on the radio. Two things skip it entirely: a genuinely
+    /// zero travel time (motor not configured), which moves the estimate no
+    /// more than it moves the shade, and a `StepUp` on a shade paired at the
+    /// narrow frame width, which has no wire representation at all — see the
+    /// body.
     ///
     /// NOTE (deliberate): a Step arriving mid-GoTo clears `stop_on_arrival`,
     /// so it abandons the pending mid-range My stop of the in-flight seek.
@@ -1222,16 +1239,30 @@ impl Shade {
     /// was already armed: a stray Step should not leave a phantom My
     /// scheduled against a target the step has just moved past.
     fn step(&mut self, dir: Direction, now_ms: u64, out: &mut Vec<PlannedTx, 4>) {
+        let command = match dir {
+            Direction::Up => Command::StepUp,
+            _ => Command::StepDown,
+        };
+        // Checked before anything moves, including the estimate. `StepUp` is an
+        // extended command and a narrow frame has no field for it — the nibble
+        // it would occupy is `StepDown`'s — so on a shade paired at that width
+        // there is no frame to send, and moving the estimate one step up for a
+        // frame that never went out would leave this controller believing a
+        // position the motor never reached.
+        //
+        // `Controller::command_shade` refuses the same case with
+        // `DomainError::CommandNotAtThisWidth` so the operator is told; this is
+        // the same rule stated where the frame is actually built, so a caller
+        // holding a `Shade` directly cannot plan one either.
+        if !self.config.frame_width.carries(command) {
+            return;
+        }
         // Before the target moves, not after: `abandon` charges the distance the
         // seek being given up still had to run, and reading that against the
         // step's own new target would charge one step instead of the whole
         // abandoned move.
         self.abandon(now_ms);
         if self.step_target(dir, now_ms) {
-            let command = match dir {
-                Direction::Up => Command::StepUp,
-                _ => Command::StepDown,
-            };
             self.push(out, command);
         }
     }
@@ -1288,10 +1319,19 @@ impl Shade {
     /// between calls; the frame is dropped rather than panicking on-device,
     /// but debug builds assert.
     fn push_with(&self, out: &mut Vec<PlannedTx, 4>, command: Command, repeats: Repeats) {
+        debug_assert!(
+            self.config.frame_width.carries(command),
+            "planned a command the shade's own frame width cannot carry"
+        );
         let pushed = out.push(PlannedTx {
             address: self.config.address,
             command,
             repeats,
+            // The shade's own width, never a caller's: the motor at this
+            // address answers one width and this record is the only thing that
+            // knows which. Read here rather than at the radio so that a frame
+            // and the width it must go out at cannot be separated.
+            width: self.config.frame_width,
         });
         debug_assert!(pushed.is_ok(), "PlannedTx buffer overflow: out not drained");
     }

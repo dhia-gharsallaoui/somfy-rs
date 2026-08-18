@@ -5,10 +5,17 @@ use somfy_rts::{Command, Frame};
 
 /// Which RTS frame width a request is to be sent as.
 ///
-/// Not derivable from the command alone: extended commands
-/// ([`Command::is_extended`]) force 80 bits, but a base command may be sent
-/// either way depending on what the motor was paired as. The caller decides;
-/// the radio task is told.
+/// **Not derivable from the command**, and the arrow points the other way from
+/// how it first reads: a motor was paired at one width and answers nothing
+/// else, so the width is a fact about the shade and it is the width that limits
+/// which commands are available — not the command that selects a width. A base
+/// command goes out either way; an extended command ([`Command::is_extended`])
+/// has no field to occupy in the narrow frame and so simply cannot be sent to a
+/// narrow shade, which is why [`encode56`](somfy_rts::encode56) refuses one
+/// rather than truncating it to its base nibble.
+///
+/// The caller decides, from that shade's own record
+/// (`somfy_domain::ShadeConfig::frame_width`); the radio task is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBits {
     /// 7-byte frame — [`somfy_rts::encode56`].

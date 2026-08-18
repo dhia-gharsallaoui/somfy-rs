@@ -163,3 +163,185 @@ fn pulse_layer_uses_80_bit_sync_counts_and_no_gap() {
     // the long INTER_FRAME_GAP silence a 56-bit frame ends with.
     assert_ne!(repeat.last().unwrap().micros, TIMINGS::INTER_FRAME_GAP);
 }
+
+// ---------------------------------------------------------------------------
+// A whole burst, on the air and back
+// ---------------------------------------------------------------------------
+
+/// Render one burst exactly as the radio task drives it: a first frame and then
+/// `repeats` repeats, each **re-encoded at its own repeat index**, concatenated
+/// back to back with no gap between them — which for this width is not an
+/// omission, it is what `render_pulses` does.
+///
+/// This is the transmit path's shape stated once so the tests below can assert
+/// against a receiver rather than against the encoder they came from. A
+/// transmitter reporting its own success proves nothing.
+fn burst(f: &Frame, repeats: u8) -> std::vec::Vec<Pulse> {
+    let mut air = std::vec::Vec::new();
+    for repeat in 0..=repeats {
+        let kind = if repeat == 0 {
+            FrameKind::First
+        } else {
+            FrameKind::Repeat
+        };
+        let mut frame: Vec<Pulse, 320> = Vec::new();
+        render_pulses(&encode80(f, repeat), kind, &mut frame);
+        air.extend(frame.iter().copied());
+    }
+    air
+}
+
+/// Feed a pulse stream to one long-lived decoder and collect every frame it
+/// completes — the same decoder the radio task keeps for the life of the task,
+/// deliberately never reset between frames.
+fn decode_air(air: &[Pulse]) -> std::vec::Vec<(u8, std::vec::Vec<u8>)> {
+    let mut rx = RxDecoder::new();
+    let mut out = std::vec::Vec::new();
+    for pulse in air {
+        if let Some(frame) = rx.push(*pulse) {
+            out.push((frame.bit_length, frame.bytes.as_slice().to_vec()));
+        }
+    }
+    out
+}
+
+/// The whole 80-bit burst comes back off the air, frame by frame.
+///
+/// This is the closest a host can get to the claim that matters: an 80-bit
+/// shade is driven by a *burst*, not by one frame, and every one of its frames
+/// has to survive on its own. It ties three things together that are otherwise
+/// only checked in isolation — the sync counts (12 on the first frame, 6 on a
+/// repeat) are what tell the receiver this is an 80-bit transmission at all, the
+/// suppressed inter-frame gap is what lets the frames run back to back, and the
+/// per-repeat tail is what distinguishes one frame of the burst from the next.
+/// Break any of the three and this fails.
+#[test]
+fn an_80_bit_burst_decodes_frame_by_frame_off_the_air() {
+    let f = frame(Command::StepUp);
+    let repeats = 2u8;
+
+    let decoded = decode_air(&burst(&f, repeats));
+
+    assert_eq!(
+        decoded.len(),
+        repeats as usize + 1,
+        "total frames = repeats + 1"
+    );
+    for (index, (bit_length, bytes)) in decoded.iter().enumerate() {
+        assert_eq!(*bit_length, 80, "frame {index} must be read as 80-bit");
+        assert_eq!(
+            bytes.as_slice(),
+            &encode80(&f, index as u8)[..],
+            "frame {index} must arrive as its own repeat index encodes it"
+        );
+        let back = decode80(bytes.as_slice().try_into().unwrap()).expect("decode");
+        assert_eq!(back, f, "frame {index} must decode to what was sent");
+    }
+}
+
+/// The repeat index reaches the air, rather than being an encoder detail that
+/// the pulse layer flattens.
+///
+/// `Favorite` is the command that shows it: its byte 7 is 196 on the first frame
+/// and 132 on every repeat. A transmitter that encoded once and resent the same
+/// bytes would produce three identical frames here, and nothing on air would
+/// report it — the command still decodes, so only the bytes can tell.
+#[test]
+fn the_repeat_index_survives_the_pulse_train() {
+    let f = frame(Command::Favorite);
+
+    let decoded = decode_air(&burst(&f, 2));
+
+    let tails: std::vec::Vec<u8> = decoded
+        .iter()
+        .map(|(_, bytes)| {
+            let mut raw: [u8; 10] = bytes.as_slice().try_into().unwrap();
+            deobfuscate_for_test(&mut raw);
+            raw[7]
+        })
+        .collect();
+    assert_eq!(tails, [196, 132, 132]);
+    // ...and all three are still the same command at the same address, so the
+    // difference above is the repeat index and nothing else.
+    for (_, bytes) in &decoded {
+        let back = decode80(bytes.as_slice().try_into().unwrap()).expect("decode");
+        assert_eq!(back, f);
+    }
+}
+
+/// The sync counts, counted on the burst rather than on a single frame.
+///
+/// A hardware sync is one HIGH half plus one LOW half, so a frame's count is
+/// half the run of `HW_SYNC_HALF` pulses that opens it. 12 then 6 is what makes
+/// `RxDecoder::detect_bit_length` answer 80; the narrow width's 2 then 7 would
+/// make it answer 56 and every frame above would fail to decode.
+#[test]
+fn an_80_bit_burst_opens_each_frame_with_the_right_sync_run() {
+    let air = burst(&frame(Command::Stop), 2);
+
+    // Runs of hardware-sync half-pulses, in order.
+    let mut runs = std::vec::Vec::new();
+    let mut run = 0usize;
+    for pulse in &air {
+        if pulse.micros == TIMINGS::HW_SYNC_HALF {
+            run += 1;
+        } else if run > 0 {
+            runs.push(run / 2);
+            run = 0;
+        }
+    }
+    assert_eq!(run, 0, "a burst does not end mid-sync");
+    assert_eq!(runs, [12, 6, 6]);
+
+    // And nothing in the burst is the 56-bit inter-frame silence: an 80-bit
+    // frame runs straight into the next one, which is what lets the decoder
+    // pick the next sync run up without re-acquiring from noise.
+    assert!(air.iter().all(|p| p.micros != TIMINGS::INTER_FRAME_GAP));
+}
+
+/// A long burst still decodes, and byte 7 wraps rather than saturating.
+///
+/// Sixteen repeats crosses the point where `196 + 4 * repeat` would exceed 255,
+/// which is where the progression cycles by -15 instead. That arithmetic is
+/// already pinned against the encoder; this is it surviving the air.
+#[test]
+fn a_long_burst_wraps_byte_seven_and_still_decodes() {
+    let f = frame(Command::Down);
+
+    let decoded = decode_air(&burst(&f, 16));
+
+    assert_eq!(decoded.len(), 17);
+    let tails: std::vec::Vec<u8> = decoded
+        .iter()
+        .map(|(_, bytes)| {
+            let mut raw: [u8; 10] = bytes.as_slice().try_into().unwrap();
+            deobfuscate_for_test(&mut raw);
+            raw[7]
+        })
+        .collect();
+    assert_eq!(tails[0], 196);
+    assert_eq!(tails[14], 252);
+    assert_eq!(tails[15], 196, "repeat 15 wraps rather than overflowing");
+    assert_eq!(tails[16], 200);
+    for (index, (bit_length, bytes)) in decoded.iter().enumerate() {
+        assert_eq!(*bit_length, 80, "frame {index}");
+        assert_eq!(
+            decode80(bytes.as_slice().try_into().unwrap()).expect("decode"),
+            f
+        );
+    }
+}
+
+/// The narrow width has no frame for an extended command, which is the fact the
+/// domain's `FrameWidth::carries` rule is about — stated here, at the encoder,
+/// because this is where it is true.
+#[test]
+fn the_narrow_encoder_refuses_every_extended_command() {
+    for cmd in [Command::StepUp, Command::Favorite, Command::Stop] {
+        assert_eq!(
+            somfy_rts::encode56(&frame(cmd)),
+            Err(somfy_rts::FrameError::ExtendedCommand),
+            "{cmd:?} has no 56-bit frame"
+        );
+    }
+}
