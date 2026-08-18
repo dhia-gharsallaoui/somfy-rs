@@ -230,7 +230,43 @@
 /// number that moves with the optimiser's inlining decisions rather than with
 /// this firmware's code. The measurement is recorded so the next reader knows it
 /// was taken.
-const BOOT_CHAIN_BYTES: usize = 54_080;
+///
+/// **Re-measured 2026-08-18 for over-the-air updates, and it had gone stale
+/// again — on `main`, before that work, in the direction that boot-loops.**
+/// Both Xtensa chips were walked with the commands at the top of this file, and
+/// the same worktree was built twice with the change out and in so the two
+/// causes could be separated:
+///
+/// | | ESP32, before | ESP32, after | ESP32-S3, before | ESP32-S3, after |
+/// |---|---|---|---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 | 144 | 144 | 144 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 | 3,856 | 48 | 3,856 |
+/// | [`crate::start`] | 20,320 | 20,320 | 21,680 (inlined) | 20,096 |
+/// | [`crate::tasks::state`] | 15,248 | 15,248 | 15,280 | 15,648 |
+/// | `UninitCell::write_in_place` | 15,264 | 15,264 | 15,296 | 15,664 |
+/// | **total** | **54,832** | **54,832** | **52,448** | **55,408** |
+///
+/// Two separate findings, and only one of them belongs to the change:
+///
+/// - **The ESP32 column does not move at all**, and it already read 54,832
+///   against a constant of 54,080. So this row was **stale by 752 bytes on
+///   `main`** — the shortfall existed before the update path was written and
+///   nothing was going to say so. That is the third time, and it is the reason
+///   `crate::stack_used` prints a measurement beside the claim on every boot.
+/// - **The ESP32-S3 column moves by 2,960**, and most of it is the optimiser
+///   rather than this firmware: [`crate::start`] stopped being inlined into the
+///   task closure, which moved 21,680 bytes out of a `poll` frame that
+///   correspondingly grew from 48 to 3,856. The part that is genuinely new is
+///   **368 bytes** on each of the two state-task frames, which is
+///   `crate::tasks::Table`'s new `ota` field — the upload session and its image
+///   verifier, put on this stack deliberately rather than in a `static`,
+///   because the `static` would have come out of the Wi-Fi driver's heap
+///   instead. See [`DRAM_FOR_STACK_AND_HEAP`].
+///
+/// The constant takes the larger of the two chips, as it always has: **55,408**.
+/// The ESP32-C3 is still not walked — see the note above — and the inference
+/// that it sits below the Xtensa figures is unchanged.
+const BOOT_CHAIN_BYTES: usize = 55_408;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
 ///
@@ -313,7 +349,36 @@ const NETWORK_CHAIN_BYTES: usize = 14_416;
 /// derivation necessary:** an extractor that reads a body, buffers a header, or
 /// calls into `crate::rpc` — any of which would put a real frame on this chain
 /// rather than a leaf.
-const REQUEST_CHAIN_BYTES: usize = 33_504;
+///
+/// **Re-derived 2026-08-18 for the firmware-upload route, which is exactly the
+/// change the paragraph above warns about — and this one did move the chain.**
+/// `POST /api/v1/ota` is a `RequestHandlerService` rather than a handler
+/// function, so it is inlined into the connection's `select` with a streaming
+/// read and four `crate::rpc` calls inside it, and the select frame grew from
+/// **10,000 to 24,672 bytes**. Walked again, same worktree built twice:
+///
+/// | | bytes |
+/// |---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 |
+/// | `TaskStorage<connection>::poll` | 2,064 |
+/// | the connection's `select` | 20,864 |
+/// | the deepest `Route<&str, MethodRouter<…>>` | 7,648 |
+/// | `ChunkedResponse<Collection>` | 3,696 |
+/// | `Refusal::write_to` | 1,392 |
+/// | **total** | **35,808** |
+///
+/// **20,864 rather than 24,672 because 3,808 of it was given back**, and how is
+/// worth recording: the handler was written first with a `finalize().write_to()`
+/// pair per outcome — four of them, which is what a service handler invites —
+/// and each pair is inlined into the poll with its own response writer beneath
+/// it. Collapsing them into the single `Result<_, Result<Refusal, Unavailable>>`
+/// that every other handler in `api::routes` already returns recovered that much
+/// with no change in behaviour. The remaining ~10,900 over the previous figure
+/// is the streaming read and the request/reply values of four `crate::rpc`
+/// round trips, and it is affordable because this chain sits **19,600 bytes
+/// below** [`BOOT_CHAIN_BYTES`] — which is what the `max` in
+/// [`REQUIRED_STACK_BYTES`] is for.
+const REQUEST_CHAIN_BYTES: usize = 35_808;
 /// See the `http` definition above.
 #[cfg(not(feature = "http"))]
 const REQUEST_CHAIN_BYTES: usize = 0;
@@ -657,14 +722,67 @@ const _: () = assert!(
 /// milliseconds the ESP32 measured 66,140 bytes of `.stack` against a
 /// 66,280-byte budget, which rounds its heap down to 55 KiB; at `u32` seconds it
 /// measures 66,396 and keeps 56 KiB. See `somfy_tasks::CommandLimiter`.
+///
+/// **Re-measured 2026-08-18 for over-the-air updates, and this is the largest
+/// single bill any change has presented to this row.** Measured the documented
+/// way, one worktree built twice:
+///
+/// | chip | before | after | delta |
+/// |---|---|---|---|
+/// | ESP32 (`mqtt`) | 123,732 | 123,284 | −448 |
+/// | ESP32-S3 (all) | 135,060 | 132,260 | −2,800 |
+/// | ESP32-C3 (all) | 121,848 | 119,064 | −2,784 |
+///
+/// Attributed against the linked images rather than estimated:
+///
+/// - **1,440 bytes** in `firmware::api::connection::POOL`, 68,224 → 69,664 —
+///   360 per connection task, for the `POST /api/v1/ota` route. `picoserve`'s
+///   router is a type per route, so every path is a variant of the future each
+///   of the four tasks holds statically. This is the unavoidable half.
+/// - **264 bytes** for `firmware::ota::upload::PAGES`, the one page buffer the
+///   megabyte crosses tasks in. Deliberately 256 bytes rather than 512 or 4,096
+///   — see `crate::ota::PAGE_BYTES`, which argues the size against *this* row.
+/// - **368 bytes** in `firmware::tasks::state::POOL`, 15,936 → 16,304, for the
+///   upload session and its image verifier. That one is a choice: it could have
+///   been a `static`, which would have cost the same bytes *here* instead of on
+///   a stack that has room.
+/// - The rest — about 720 on the two chips with a web server, and all 432 of
+///   the ESP32's — is small statics and constant anchors, the same residue the
+///   `Origin`/`Host` row above describes. The `ota` module's own statics total
+///   **eleven bytes**, and its attempt counter is in RTC memory rather than
+///   DRAM, so it costs this row nothing at all.
+///
+/// **864 bytes were given back before this was accepted**, and the shape of it
+/// is worth keeping: the boot self-test was first written as an
+/// `#[embassy_executor::task]`, whose future is a `static` sized whether or not
+/// it is ever spawned. Almost all of it was the `crate::rpc::Request` its
+/// confirm call held. Driving it from the state task's existing ticker instead
+/// costs the executor's stack for the length of a call and nothing when it is
+/// not running — see `crate::ota::tick_self_test`.
+///
+/// **What this costs, chip by chip, and the ESP32-C3 is the one to read.** With
+/// the division applied, [`RADIO_HEAP_BYTES`] becomes 56,320 on the ESP32,
+/// 65,536 on the ESP32-S3 and **52,224 on the ESP32-C3** — which is 2,396 bytes
+/// **below** [`WIFI_PEAK_BYTES`], and the first time any chip in this matrix has
+/// been. It clears [`WIFI_WORKING_SET_BYTES`] by 4,760, so association is not in
+/// question; what is in question is the retained-discovery burst on a full
+/// installation. [`warn_if_tight`] says so at boot, in as many words, and the
+/// ESP32 now trips the softer half of the same warning at 1,700 above the peak.
+///
+/// Neither figure is a refusal, for the reason that function gives: a
+/// compile-time refusal would take the affected chip out of the matrix at the
+/// moment the matrix is what would catch the problem. **The lever, if the C3
+/// ever runs and the warning turns out to be real, is to gate the upload route
+/// behind a feature the way `http` is gated off for the ESP32** — the boot-side
+/// roll-back costs 432 bytes and would stay.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 123_732;
+const DRAM_FOR_STACK_AND_HEAP: usize = 123_284;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 135_060;
+const DRAM_FOR_STACK_AND_HEAP: usize = 132_260;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 121_848;
+const DRAM_FOR_STACK_AND_HEAP: usize = 119_064;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
@@ -888,21 +1006,50 @@ pub fn warn_if_undersized() {
 fn warn_if_tight() {
     // Only when the heap clears the resting set, so this never doubles up on
     // the harder line above.
-    if RADIO_HEAP_BYTES >= WIFI_WORKING_SET_BYTES
-        && RADIO_HEAP_BYTES < WIFI_PEAK_BYTES + PEAK_NOISE_BYTES
+    if RADIO_HEAP_BYTES < WIFI_WORKING_SET_BYTES
+        || RADIO_HEAP_BYTES >= WIFI_PEAK_BYTES + PEAK_NOISE_BYTES
     {
-        esp_println::println!(
-            "heap: {} bytes leaves {} above the worst announcement peak ever measured \
-             ({}), which is inside the {}-byte spread that peak showed between boots. \
-             Watch `heap: session announced` on this board — if it lands near the \
-             total, an announcement can exhaust the heap and reset it. See \
-             crates/firmware/src/heap.rs.",
-            RADIO_HEAP_BYTES,
-            RADIO_HEAP_BYTES - WIFI_PEAK_BYTES,
-            WIFI_PEAK_BYTES,
-            PEAK_NOISE_BYTES,
-        );
+        return;
     }
+    // **Two lines rather than one, because the subtraction changes sign.** A
+    // heap below the peak used to be unrepresentable here and the message
+    // computed `RADIO_HEAP_BYTES - WIFI_PEAK_BYTES` unguarded. On the ESP32-C3,
+    // once the firmware-upload route landed, that became a `usize` underflow —
+    // and both operands are `const`, so the compiler evaluated it and refused
+    // the build outright with `attempt to compute 52224_usize - 54620_usize`.
+    // The condition this line reports is exactly the one it would not compile
+    // for, which is a good way round for it to have been found.
+    //
+    // `saturating_sub` on both branches rather than a plain `-` on the branch
+    // that is provably safe: the guard above is the only thing making it safe,
+    // and a later edit to the guard would put the same landmine back.
+    if RADIO_HEAP_BYTES < WIFI_PEAK_BYTES {
+        esp_println::println!(
+            "heap: {} bytes is {} BELOW the worst announcement peak ever measured ({}), \
+             though still {} above the driver's resting working set. This board is expected \
+             to associate and to connect to a broker; what is in doubt is the burst of \
+             retained discovery configs, which is where the peak was measured. Watch \
+             `heap: session announced` — if it approaches the total, an announcement can \
+             exhaust the heap and reset the board. The peak is an ESP32-S3 measurement and \
+             has never been taken on this chip. See crates/firmware/src/heap.rs.",
+            RADIO_HEAP_BYTES,
+            WIFI_PEAK_BYTES.saturating_sub(RADIO_HEAP_BYTES),
+            WIFI_PEAK_BYTES,
+            RADIO_HEAP_BYTES.saturating_sub(WIFI_WORKING_SET_BYTES),
+        );
+        return;
+    }
+    esp_println::println!(
+        "heap: {} bytes leaves {} above the worst announcement peak ever measured \
+         ({}), which is inside the {}-byte spread that peak showed between boots. \
+         Watch `heap: session announced` on this board — if it lands near the \
+         total, an announcement can exhaust the heap and reset it. See \
+         crates/firmware/src/heap.rs.",
+        RADIO_HEAP_BYTES,
+        RADIO_HEAP_BYTES.saturating_sub(WIFI_PEAK_BYTES),
+        WIFI_PEAK_BYTES,
+        PEAK_NOISE_BYTES,
+    );
 }
 
 /// How much [`WIFI_PEAK_BYTES`] moved between boots of one unchanged image.

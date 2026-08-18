@@ -328,6 +328,16 @@ export const fr: Record<MessageKey, string> = {
     'l’appareil n’est pas encore sur le nouveau réseau : impossible de confirmer',
   'error.settingsUnwritable':
     'l’appareil n’a pas pu enregistrer les réglages — rien n’a été modifié',
+  'error.imageNotFirmware':
+    'ce fichier n’est pas une image de micrologiciel pour cet appareil — créez-en une avec « espflash save-image »',
+  'error.imageForAnotherChip': 'ce micrologiciel a été compilé pour une autre puce',
+  'error.imageTooLarge':
+    'ce micrologiciel dépasse l’espace réservé à une mise à jour',
+  'error.imageDamaged':
+    'l’envoi n’est pas arrivé intact — rien n’a été modifié, réessayez',
+  'error.updateInProgress': 'une mise à jour est déjà en cours d’envoi',
+  'error.updateUnwritable':
+    'l’appareil n’a pas pu enregistrer la mise à jour — il fonctionne toujours avec le micrologiciel qu’il avait',
 
   'settings.title': 'Réglages',
   'settings.loading': 'Lecture des réglages de l’appareil…',

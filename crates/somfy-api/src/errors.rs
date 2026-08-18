@@ -273,6 +273,68 @@ pub enum ApiErrorCode {
     /// fine, the device could not carry it out, and there is nothing the caller
     /// could send instead.
     SettingsUnwritable,
+
+    // -----------------------------------------------------------------------
+    // Firmware updates
+    //
+    // Four refusals about the *file* and two about the device's state. The
+    // split matters because they call for different actions: the first four
+    // mean "upload something else", and no amount of retrying the same bytes
+    // will help.
+    //
+    // They are deliberately coarser than the errors `somfy_ota::image`
+    // produces, which name the byte, the chip id and the checksum. Those go to
+    // the console, where a developer is; these go to a person holding a file,
+    // and three codes that share an action would be three translations sharing
+    // a sentence.
+    // -----------------------------------------------------------------------
+    /// The upload is not an ESP-IDF application image.
+    ///
+    /// Overwhelmingly the most likely cause is the wrong file: `cargo build`
+    /// leaves an **ELF** in `target/`, and the thing a device can run is what
+    /// `espflash save-image` makes out of it. A bootloader binary and a
+    /// partition table reach this too — they are images, and they carry no
+    /// application descriptor.
+    ImageNotFirmware,
+    /// The upload is a firmware image for a different chip.
+    ///
+    /// This project builds for three, into three adjacent target directories,
+    /// and writing an ESP32 image to an ESP32-S3 would produce a board that
+    /// takes the update, reboots, and does not come back. It is refused before
+    /// a byte reaches the inactive slot.
+    ImageForAnotherChip,
+    /// The upload is larger than the slot it would be written to.
+    ///
+    /// Settled from `Content-Length` before any flash is touched. The action is
+    /// to build a smaller image; there is no partition layout that would help,
+    /// because the two slots must stay the same size — an image that fits one
+    /// and not the other is a device that bricks on the *following* update.
+    ImageTooLarge,
+    /// The upload did not arrive intact — short, long, or corrupt.
+    ///
+    /// One code for three causes because the action is the same: upload it
+    /// again. Nothing was marked bootable, so the device is still running what
+    /// it was running.
+    ImageDamaged,
+    /// An update is already being uploaded.
+    ///
+    /// Refused rather than queued: two uploads would be two writers to one
+    /// inactive slot, and the second would interleave its pages with the
+    /// first's. 409 for the same reason [`TrialInProgress`](ApiErrorCode::TrialInProgress)
+    /// is — the request is well formed and what makes it inapplicable is the
+    /// state of the device.
+    UpdateInProgress,
+    /// The device could not write the update.
+    ///
+    /// A flash write that did not read back, a partition table with no
+    /// `otadata` region, or an `otadata` record that could not be rewritten.
+    /// **In every case the running image is untouched**, which is the property
+    /// worth stating: this is a failed update, not a damaged device.
+    ///
+    /// 500 for the same reason [`SettingsUnwritable`](ApiErrorCode::SettingsUnwritable)
+    /// is: the request was fine and there is nothing the caller could send
+    /// instead.
+    UpdateUnwritable,
 }
 
 /// Which configured value a settings rejection is about.
@@ -366,7 +428,12 @@ impl ApiErrorCode {
             | ApiErrorCode::TopicEmptySegment
             | ApiErrorCode::TopicIllegalCharacter
             | ApiErrorCode::NamespacesOverlap
-            | ApiErrorCode::SecretNotSet => 400,
+            | ApiErrorCode::SecretNotSet
+            // The three that are about the *file*: what was sent cannot be run
+            // here, and no state on the device would change that.
+            | ApiErrorCode::ImageNotFirmware
+            | ApiErrorCode::ImageForAnotherChip
+            | ApiErrorCode::ImageDamaged => 400,
             ApiErrorCode::NotFound => 404,
             ApiErrorCode::RegistryFull
             | ApiErrorCode::AddressNotAllocated
@@ -379,7 +446,13 @@ impl ApiErrorCode {
             // trial is running or that this one has not associated yet.
             | ApiErrorCode::NoTrialInProgress
             | ApiErrorCode::TrialInProgress
-            | ApiErrorCode::TrialNotAssociated => 409,
+            | ApiErrorCode::TrialNotAssociated
+            | ApiErrorCode::UpdateInProgress => 409,
+            // The one 413 here, and the only status in this table that says
+            // something about the *size* of a request rather than its content.
+            // A generic 400 would have been true and would have sent the
+            // operator looking at the file's contents instead of its length.
+            ApiErrorCode::ImageTooLarge => 413,
             // 403 rather than 401: there is no credential that would make the
             // request acceptable, so `WWW-Authenticate` would be a lie and a
             // browser prompting for a password over it would be worse than the
@@ -391,7 +464,9 @@ impl ApiErrorCode {
             // now", which is exactly true and is what stops a client treating a
             // rate limit as a permanent refusal and giving up.
             ApiErrorCode::CommandRateLimited => 429,
-            ApiErrorCode::InvalidAddress | ApiErrorCode::SettingsUnwritable => 500,
+            ApiErrorCode::InvalidAddress
+            | ApiErrorCode::SettingsUnwritable
+            | ApiErrorCode::UpdateUnwritable => 500,
         }
     }
 }

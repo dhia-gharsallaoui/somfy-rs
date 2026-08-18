@@ -532,6 +532,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "somfy-ota"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "somfy-rmt"
 version = "0.1.0"
 dependencies = [

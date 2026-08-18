@@ -314,6 +314,14 @@ export const en = {
   'error.trialInProgress': 'a network test is already running — finish or cancel it first',
   'error.trialNotAssociated': 'the device is not on the new network yet, so it cannot be confirmed',
   'error.settingsUnwritable': 'the device could not store the settings — nothing was changed',
+  'error.imageNotFirmware':
+    'that file is not a firmware image for this device — build one with `espflash save-image`',
+  'error.imageForAnotherChip': 'that firmware was built for a different chip',
+  'error.imageTooLarge': 'that firmware is larger than the space reserved for an update',
+  'error.imageDamaged': 'the upload did not arrive intact — nothing was changed, try again',
+  'error.updateInProgress': 'an update is already being uploaded',
+  'error.updateUnwritable':
+    'the device could not store the update — it is still running the firmware it had',
 
   'settings.title': 'Settings',
   'settings.loading': 'Reading the device’s settings…',

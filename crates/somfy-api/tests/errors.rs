@@ -52,7 +52,13 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::NoTrialInProgress
         | ApiErrorCode::TrialInProgress
         | ApiErrorCode::TrialNotAssociated
-        | ApiErrorCode::SettingsUnwritable => true,
+        | ApiErrorCode::SettingsUnwritable
+        | ApiErrorCode::ImageNotFirmware
+        | ApiErrorCode::ImageForAnotherChip
+        | ApiErrorCode::ImageTooLarge
+        | ApiErrorCode::ImageDamaged
+        | ApiErrorCode::UpdateInProgress
+        | ApiErrorCode::UpdateUnwritable => true,
     }
 }
 
@@ -129,6 +135,16 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
     (ApiErrorCode::TrialInProgress, "trialInProgress", 409),
     (ApiErrorCode::TrialNotAssociated, "trialNotAssociated", 409),
     (ApiErrorCode::SettingsUnwritable, "settingsUnwritable", 500),
+    (ApiErrorCode::ImageNotFirmware, "imageNotFirmware", 400),
+    (
+        ApiErrorCode::ImageForAnotherChip,
+        "imageForAnotherChip",
+        400,
+    ),
+    (ApiErrorCode::ImageTooLarge, "imageTooLarge", 413),
+    (ApiErrorCode::ImageDamaged, "imageDamaged", 400),
+    (ApiErrorCode::UpdateInProgress, "updateInProgress", 409),
+    (ApiErrorCode::UpdateUnwritable, "updateUnwritable", 500),
 ];
 
 #[test]

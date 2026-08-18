@@ -141,6 +141,12 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   trialInProgress: 409,
   trialNotAssociated: 409,
   settingsUnwritable: 500,
+  imageNotFirmware: 400,
+  imageForAnotherChip: 400,
+  imageTooLarge: 413,
+  imageDamaged: 400,
+  updateInProgress: 409,
+  updateUnwritable: 500,
 };
 
 export function mockApi(): Plugin {

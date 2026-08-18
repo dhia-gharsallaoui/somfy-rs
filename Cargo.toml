@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/somfy-rts", "crates/somfy-domain", "crates/somfy-api", "crates/somfy-migrate", "crates/somfy-rmt", "crates/somfy-cc1101", "crates/somfy-store", "crates/somfy-tasks", "crates/somfy-mqtt", "crates/somfy-config"]
+members = ["crates/somfy-rts", "crates/somfy-domain", "crates/somfy-api", "crates/somfy-migrate", "crates/somfy-rmt", "crates/somfy-cc1101", "crates/somfy-store", "crates/somfy-tasks", "crates/somfy-mqtt", "crates/somfy-config", "crates/somfy-ota"]
 exclude = ["crates/firmware"]
 
 [workspace.package]

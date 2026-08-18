@@ -253,6 +253,8 @@ pub async fn state(
         ref mut shades,
         #[cfg(feature = "http")]
         ref config,
+        #[cfg(feature = "http")]
+        ref mut ota,
         ref mut catalog,
         identity,
         edits,
@@ -352,6 +354,8 @@ pub async fn state(
                 &mut store,
                 #[cfg(feature = "http")]
                 config,
+                #[cfg(feature = "http")]
+                ota,
                 &mut queue,
                 catalog,
                 &identity,
@@ -380,6 +384,16 @@ pub async fn state(
                 false
             }
             Either4::Fourth(Timed::Tick) => {
+                // **Before the domain's own tick**, and the ordering is the
+                // argument: a roll-back is a reset, and there is nothing to be
+                // gained by planning an arrival stop the board will not live to
+                // transmit. It is a no-op on every boot that did not just take
+                // an update — one `Cell` read — so the ordinary path pays a
+                // branch. See `crate::ota::tick_self_test`.
+                if crate::ota::tick_self_test(&mut store, now_ms) == crate::ota::Step::RollBack {
+                    crate::drain_serial();
+                    esp_hal::system::software_reset()
+                }
                 let dispatch = machine.tick(&mut store, &mut queue, now_ms, &mut emitted);
                 report(&dispatch)
             }
@@ -432,6 +446,19 @@ pub struct Table {
     /// writes it, so a build without one hands the store back to be dropped.
     #[cfg(feature = "http")]
     pub config: Option<crate::config::ConfigStore>,
+    /// The receiving end of a firmware upload.
+    ///
+    /// Here for the same reason `config` is — this task owns the flash — and
+    /// carried in the task's future rather than in a `static` for a reason the
+    /// other two do not have: the session holds a page-sized staging buffer and
+    /// an image verifier, and a `static` would put both in the DRAM
+    /// `crate::heap` carves the Wi-Fi driver's heap out of. Stack is the
+    /// resource with room here; see `crate::ota`.
+    ///
+    /// `None` is a build that could not create the channel, which cannot
+    /// happen — [`crate::ota::init`] fails only on a second call.
+    #[cfg(feature = "http")]
+    pub ota: Option<crate::ota::Pages>,
     /// The table as the controller believes it, plus the debounce.
     pub catalog: Catalog,
     /// This controller's virtual-remote identity, which is what a new shade's
@@ -532,6 +559,7 @@ fn serve_request(
     machine: &mut StateMachine,
     store: &mut FlashStore<'static>,
     #[cfg(feature = "http")] config: &Option<crate::config::ConfigStore>,
+    #[cfg(feature = "http")] ota: &mut Option<crate::ota::Pages>,
     queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
     catalog: &mut Catalog,
     identity: &RemoteIdentity,
@@ -764,9 +792,66 @@ fn serve_request(
         ),
         #[cfg(feature = "http")]
         rpc::Request::ClearMqtt => (write_config(store, config, ConfigChange::Mqtt(None)), false),
+
+        // -------------------------------------------------------------------
+        // Firmware updates
+        //
+        // The bulk of an update arrives here, one page at a time, because this
+        // task owns the flash. Everything decided about the bytes is
+        // `somfy_ota`, and everything these arms do is call into
+        // `crate::ota` — which is why they are three lines each despite being
+        // the path a megabyte travels down.
+        //
+        // A board with no page channel — `crate::ota::init` returning `None`,
+        // which cannot happen — refuses rather than silently doing nothing.
+        // None of them dispatches a transmission.
+        // -------------------------------------------------------------------
+        #[cfg(feature = "http")]
+        rpc::Request::OtaBegin { declared } => (
+            ota_reply(ota, |pages| crate::ota::begin(pages, store, declared)),
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::OtaPage { len } => (
+            ota_reply(ota, |pages| crate::ota::page(pages, store, len as usize)),
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::OtaFinish => (
+            ota_reply(ota, |pages| crate::ota::finish(pages, store)),
+            false,
+        ),
+        #[cfg(feature = "http")]
+        rpc::Request::OtaAbort => (
+            ota_reply(ota, |pages| {
+                crate::ota::abort(pages);
+                Ok(())
+            }),
+            false,
+        ),
     };
     rpc::RPC.answer(reply);
     dispatched
+}
+
+/// Run one step of an upload against the page channel, or say there is none.
+///
+/// The `None` arm is unreachable — `crate::ota::init` is called once at boot
+/// and only fails on a second call — and it is answered rather than asserted
+/// because a panic here would reboot the board over a request.
+#[cfg(feature = "http")]
+fn ota_reply(
+    ota: &mut Option<crate::ota::Pages>,
+    f: impl FnOnce(&mut crate::ota::Pages) -> Result<(), ApiErrorCode>,
+) -> rpc::Reply {
+    let Some(pages) = ota.as_mut() else {
+        esp_println::println!("ota: this build has no page channel, so no update can be received");
+        return rpc::Reply::Refused(ApiErrorCode::UpdateUnwritable.into());
+    };
+    match f(pages) {
+        Ok(()) => rpc::Reply::Done,
+        Err(code) => rpc::Reply::Refused(code.into()),
+    }
 }
 
 /// Read the newest configuration record, or report that the region could not
