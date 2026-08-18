@@ -658,13 +658,13 @@ const _: () = assert!(
 /// 66,280-byte budget, which rounds its heap down to 55 KiB; at `u32` seconds it
 /// measures 66,396 and keeps 56 KiB. See `somfy_tasks::CommandLimiter`.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 123_740;
+const DRAM_FOR_STACK_AND_HEAP: usize = 123_732;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 135_068;
+const DRAM_FOR_STACK_AND_HEAP: usize = 135_060;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 121_856;
+const DRAM_FOR_STACK_AND_HEAP: usize = 121_848;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
