@@ -476,7 +476,9 @@ dependencies = [
  "heapless 0.8.0",
  "serde",
  "serde_json",
+ "somfy-config",
  "somfy-domain",
+ "somfy-mqtt",
  "ts-rs",
 ]
 

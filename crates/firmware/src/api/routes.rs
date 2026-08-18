@@ -61,6 +61,8 @@
 //! would be a bookmark that stopped working one release after somebody added a
 //! screen.
 
+use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use picoserve::extract::Json;
 use picoserve::io::{Read, Write};
 use picoserve::response::chunked::{ChunkWriter, ChunkedResponse, Chunks, ChunksWritten};
@@ -69,7 +71,8 @@ use picoserve::routing::{get, parse_path_segment, post, PathRouter};
 use picoserve::{ResponseSent, Router};
 use serde::Serialize;
 use somfy_api::{
-    ApiErrorCode, ApiErrorDto, CalibrationStepDto, CommandDto, CreateShadeDto, PatchShadeDto,
+    ApiErrorCode, ApiErrorDto, CalibrationStepDto, CommandDto, CreateShadeDto, MqttUpdateDto,
+    PatchShadeDto, SettingsDto, WifiUpdateDto,
 };
 use somfy_domain::{GroupId, ShadeId};
 use somfy_tasks::ControlCommand;
@@ -167,6 +170,22 @@ fn router() -> Router<impl PathRouter> {
             post(command_group),
         )
         .route("/api/v1/rooms", get(list_rooms))
+        // Settings. Every one is a plain literal path — the same
+        // monomorphisation family `/api/v1/shades`, `/api/v1/groups` and
+        // `/api/v1/rooms` are already in — so none of them deepens
+        // `crate::heap::REQUEST_CHAIN_BYTES`. That is a deliberate choice of URL
+        // shape and not a happy accident; see the note on that constant.
+        .route("/api/v1/settings", get(get_settings))
+        .route(
+            "/api/v1/settings/wifi",
+            picoserve::routing::put(start_wifi_trial),
+        )
+        .route("/api/v1/settings/wifi/confirm", post(confirm_wifi_trial))
+        .route("/api/v1/settings/wifi/cancel", post(cancel_wifi_trial))
+        .route(
+            "/api/v1/settings/mqtt",
+            picoserve::routing::put(save_mqtt).delete(clear_mqtt),
+        )
         .route("/api/v1/events", get(events))
 }
 
@@ -226,7 +245,13 @@ impl<T: Serialize> Content for JsonBody<T> {
 /// The status is not chosen here — [`ApiErrorCode::http_status`] decides it,
 /// beside the variant it describes, so that a code added in `somfy-api` cannot
 /// reach this router without somebody having said what it means over HTTP.
-struct Refusal(ApiErrorCode);
+///
+/// It carries the whole [`ApiErrorDto`] rather than the bare code, because a
+/// settings rejection also names the field it is about — `ApiErrorDto::field`
+/// — and that field is what lets the settings form highlight the input the
+/// operator has to fix. `From<ApiErrorCode>` fills it in as absent, so every
+/// other refusal is written exactly as it was.
+struct Refusal(ApiErrorDto);
 
 impl IntoResponse for Refusal {
     async fn write_to<R: Read, W: ResponseWriter<Error = R::Error>>(
@@ -235,12 +260,17 @@ impl IntoResponse for Refusal {
         response_writer: W,
     ) -> Result<ResponseSent, W::Error> {
         (
-            StatusCode::new(self.0.http_status()),
-            JsonBody(ApiErrorDto::from(self.0)),
+            StatusCode::new(self.0.code.http_status()),
+            JsonBody(self.0),
         )
             .write_to(connection, response_writer)
             .await
     }
+}
+
+/// A refusal from a bare code, which is what every non-settings path has.
+fn refuse(code: ApiErrorCode) -> Refusal {
+    Refusal(ApiErrorDto::from(code))
 }
 
 /// The state task did not answer.
@@ -392,8 +422,8 @@ async fn list_rooms() -> impl IntoResponse {
 async fn get_shade(id: u8) -> impl IntoResponse {
     match RPC.call(Rpc::Shade(ShadeId(id))).await {
         Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
-        Some(Reply::Shade(None)) => Err(Ok(Refusal(ApiErrorCode::NotFound))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::NotFound))),
+        Some(Reply::Shade(None)) => Err(Ok(refuse(ApiErrorCode::NotFound))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::NotFound))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -414,10 +444,10 @@ async fn create_shade(Json(request): Json<CreateShadeDto>) -> impl IntoResponse 
             // The shade was created and then could not be read back, which
             // means something removed it in between. Reported as created but
             // missing rather than as a failure, because it *was* created.
-            _ => Err(Ok(Refusal(ApiErrorCode::NotFound))),
+            _ => Err(Ok(refuse(ApiErrorCode::NotFound))),
         },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -436,10 +466,10 @@ async fn patch_shade(id: u8, Json(patch): Json<PatchShadeDto>) -> impl IntoRespo
     {
         Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
             Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
-            _ => Err(Ok(Refusal(ApiErrorCode::NotFound))),
+            _ => Err(Ok(refuse(ApiErrorCode::NotFound))),
         },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -451,7 +481,7 @@ async fn delete_shade(id: u8) -> impl IntoResponse {
     {
         Some(Reply::Done) => Ok((StatusCode::NO_CONTENT, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -467,7 +497,7 @@ async fn pair_shade(id: u8) -> impl IntoResponse {
     match RPC.call(Rpc::Pair(ShadeId(id))).await {
         Some(Reply::Done) => Ok((StatusCode::ACCEPTED, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -506,10 +536,10 @@ async fn confirm_pairing(id: u8) -> impl IntoResponse {
     match RPC.call(Rpc::Edit(ShadeEdit::ConfirmPairing { id })).await {
         Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
             Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
-            _ => Err(Ok(Refusal(ApiErrorCode::NotFound))),
+            _ => Err(Ok(refuse(ApiErrorCode::NotFound))),
         },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -557,7 +587,7 @@ async fn calibrate_shade(id: u8, Json(step): Json<CalibrationStepDto>) -> impl I
     match RPC.call(Rpc::Calibrate(ShadeId(id), step)).await {
         Some(Reply::Done) => Ok((StatusCode::NO_CONTENT, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -575,7 +605,7 @@ async fn dispatch(
     match RPC.call(Rpc::Command(command)).await {
         Some(Reply::Done) => Ok((StatusCode::NO_CONTENT, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(Refusal(ApiErrorCode::InvalidAddress))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::InvalidAddress))),
         None => Err(Err(Unavailable)),
     }
 }
@@ -609,6 +639,185 @@ async fn events(upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
             ))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+//
+// # The one thing to keep in mind reading these
+//
+// **No handler here holds a secret and none can send one.** The write-only rule
+// is `somfy_api`'s, carried by the types: nothing in `SettingsDto` has a field a
+// passphrase could be written into, and a `SecretDto::Keep` is resolved against
+// flash by the state task rather than by anything on this side of the seam. The
+// one exception is deliberate and goes the other way — `Reply::WifiCandidate`
+// carries a resolved passphrase *inbound* from the state task to the radio,
+// because that is where a credential has to end up to be tried.
+// ---------------------------------------------------------------------------
+
+/// What the device is provisioned with, minus every secret.
+///
+/// The trial half is read here rather than asked of the state task: a live trial
+/// is not in flash, it belongs to `crate::trial`, and the state task has no
+/// business knowing about the radio.
+async fn get_settings() -> impl IntoResponse {
+    match RPC.call(Rpc::Settings).await {
+        Some(Reply::Settings(wifi, mqtt)) => Ok((
+            StatusCode::OK,
+            JsonBody(SettingsDto {
+                wifi,
+                mqtt,
+                wifi_trial: crate::trial::status(Instant::now().as_millis()),
+            }),
+        )),
+        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
+        None => Err(Err(Unavailable)),
+    }
+}
+
+/// Try a candidate Wi-Fi credential without storing it.
+///
+/// `202`, never `200` or `204`, and the distinction is the whole design: what
+/// has happened when this returns is that a trial has been *accepted*, not that
+/// a credential has been changed. The device is about to leave the network this
+/// request arrived over, and whether the change sticks depends on somebody
+/// reaching it on the other one and confirming — see `crate::trial`, and
+/// `somfy_config::WifiTrial` for why that and not association is the test.
+///
+/// The candidate is validated **before** the radio is touched, so an SSID one
+/// byte too long costs no connection at all.
+async fn start_wifi_trial(Json(update): Json<WifiUpdateDto>) -> impl IntoResponse {
+    let candidate = match RPC.call(Rpc::PrepareWifi(update)).await {
+        Some(Reply::WifiCandidate(candidate)) => candidate,
+        Some(Reply::Refused(code)) => return Err(Ok(Refusal(code))),
+        Some(_) => return Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
+        None => return Err(Err(Unavailable)),
+    };
+    match crate::trial::request(candidate) {
+        Ok(()) => Ok((StatusCode::ACCEPTED, NoContent)),
+        Err(code) => Err(Ok(refuse(code))),
+    }
+}
+
+
+/// The operator reached the device on the candidate network. Store it.
+///
+/// This is the only path on which a Wi-Fi credential reaches flash, and the
+/// order is what makes it safe: the trial is asked whether it has been proved
+/// **first**, the write happens second, and the trial is forgotten only once the
+/// write has been acknowledged. A trial cleared before the write landed would
+/// leave the device running on a credential it would not come back to after a
+/// power cut.
+async fn confirm_wifi_trial() -> impl IntoResponse {
+    let candidate = match crate::trial::commit(Instant::now().as_millis()) {
+        Ok(candidate) => candidate,
+        Err(code) => return Err(Ok(refuse(code))),
+    };
+    match RPC.call(Rpc::SaveWifi(candidate)).await {
+        Some(Reply::Done) => {
+            crate::trial::end();
+            Ok((StatusCode::NO_CONTENT, NoContent))
+        }
+        // The trial is deliberately **left running**: the credential is proved
+        // and only the write failed, so the operator can retry the confirmation
+        // rather than having to run the whole trial again. If they do not, the
+        // confirmation deadline reverts the device as it always would.
+        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
+        None => Err(Err(Unavailable)),
+    }
+}
+
+/// Put the previous credential back now rather than waiting out the deadline.
+///
+/// `202`: what happens next is a restart onto the stored credential, which this
+/// response cannot outlive by much. See `crate::trial` for why a revert is a
+/// reboot.
+async fn cancel_wifi_trial() -> impl IntoResponse {
+    match crate::trial::cancel() {
+        Ok(()) => Ok((StatusCode::ACCEPTED, NoContent)),
+        Err(code) => Err(Ok::<Refusal, Unavailable>(refuse(code))),
+    }
+}
+
+/// Store broker settings and restart onto them.
+///
+/// `202`, because the settings are stored and then the device restarts, and the
+/// restart is not optional — see [`restart_for_mqtt`].
+async fn save_mqtt(Json(update): Json<MqttUpdateDto>) -> impl IntoResponse {
+    apply_mqtt(Rpc::SaveMqtt(update)).await
+}
+
+/// Run without a broker, and restart.
+///
+/// A device with no broker still receives, decodes and tracks; it just publishes
+/// nothing. That is a configuration an operator can mean, which is why it is a
+/// `DELETE` on the resource rather than a `PUT` of something empty.
+async fn clear_mqtt() -> impl IntoResponse {
+    apply_mqtt(Rpc::ClearMqtt).await
+}
+
+/// The half `save_mqtt` and `clear_mqtt` share.
+async fn apply_mqtt(request: Rpc) -> Result<(StatusCode, NoContent), Result<Refusal, Unavailable>> {
+    match RPC.call(request).await {
+        Some(Reply::Done) => {
+            restart_for_mqtt();
+            Ok((StatusCode::ACCEPTED, NoContent))
+        }
+        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+        Some(_) => Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
+        None => Err(Err(Unavailable)),
+    }
+}
+
+/// Restart, shortly, so the new broker settings take effect.
+///
+/// # Why a restart and not a reconfiguration in place
+///
+/// Not laziness — it is the only path on which R5 is already true. Changing
+/// `state_root` or `discovery_prefix` requires the retained discovery configs
+/// published under the **old** namespaces to be deleted before the new ones go
+/// out, and the only record of those old values is the older records still
+/// readable in the configuration ring. `crate::config::ConfigStore::load`
+/// computes exactly that set at boot, `crate::mqtt::start` turns each pair into
+/// a configuration whose retained topics are cleared first, and
+/// `somfy_mqtt::reconfigure` is the only way to obtain the two halves together
+/// and emits them in that order.
+///
+/// Reconfiguring the live session would mean recomputing the superseded set on a
+/// second code path, in a task holding a broker connection, with the ordering
+/// rule restated rather than reused. The boot path is already hardware-proven
+/// and its retirement is idempotent, so this reaches it by the front door.
+///
+/// The cost is a few seconds of radio downtime on an operator-initiated action.
+/// Rolling codes, the shade table and the announced set are all in flash and
+/// survive it.
+fn restart_for_mqtt() {
+    esp_println::println!(
+        "config: broker settings stored — restarting so the retained topics of the \
+         superseded namespaces are cleared before the new ones are published"
+    );
+    // Not immediate: the `202` has to leave the socket first, and this
+    // connection is not going to be re-established. The Wi-Fi trial's settle
+    // delay exists for the same reason and is the same figure.
+    RESTART.signal(());
+}
+
+/// Raised when a settings change needs a restart, and awaited by [`restarter`].
+///
+/// A signal and a task rather than a call to `software_reset` inside the
+/// handler, because the handler has not written its response yet: resetting
+/// there would answer the operator's save with a dropped connection, which is
+/// indistinguishable from the save having failed.
+static RESTART: Signal<crate::tasks::Mutex, ()> = Signal::new();
+
+/// Restart once a settings change has asked for one and its response has left.
+#[embassy_executor::task]
+pub async fn restarter() -> ! {
+    RESTART.wait().await;
+    embassy_time::Timer::after(crate::trial::settle()).await;
+    esp_hal::system::software_reset();
 }
 
 // ---------------------------------------------------------------------------

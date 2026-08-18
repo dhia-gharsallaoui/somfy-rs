@@ -290,6 +290,105 @@ export const fr: Record<MessageKey, string> = {
     'l’appareil refuse ces valeurs — une course nulle, ou de plus de trois minutes, ou des appuis ne laissant aucune course entre eux',
   'error.unknown': 'l’appareil n’en a pas donné la raison',
 
+
+  'error.valueEmpty': '{field} ne doit pas être vide',
+  'error.valueTooLong': '{field} dépasse ce que l’appareil peut enregistrer',
+  'error.valueTooShort':
+    '{field} est trop court — une phrase secrète Wi-Fi demande au moins 8 caractères',
+  'error.valueInteriorNul':
+    '{field} contient un caractère NUL, que MQTT n’autorise pas dans une chaîne',
+  'error.brokerAddressMalformed':
+    '{field} doit être quatre nombres séparés par des points, comme 192.168.1.10',
+  'error.brokerAddressUnroutable':
+    '{field} est une adresse qu’aucune connexion ne peut atteindre — ni 0.0.0.0, ni une boucle locale, ni une adresse de multidiffusion ou de diffusion',
+  'error.brokerPortZero': '{field} ne doit pas être zéro',
+  'error.passwordWithoutUsername': 'un mot de passe de courtier exige un {field}',
+  'error.topicWildcard':
+    '{field} ne doit pas contenir # ni +, qui n’ont leur place que dans un abonnement',
+  'error.topicLeadingSlash': '{field} ne doit pas commencer par /',
+  'error.topicTrailingSlash': '{field} ne doit pas se terminer par /',
+  'error.topicEmptySegment': '{field} ne doit pas contenir //',
+  'error.topicIllegalCharacter':
+    '{field} ne peut contenir que des lettres, des chiffres, _, - et / comme séparateur',
+  'error.namespacesOverlap':
+    '{field} ne doit pas être identique au préfixe de découverte ni se trouver à l’intérieur — l’appareil publierait sa disponibilité sur le sujet propre à Home Assistant',
+  'error.secretNotSet':
+    'aucun {field} n’est enregistré à conserver — saisissez-en un, ou choisissez de ne pas en avoir',
+  'error.noTrialInProgress': 'ce test de réseau est déjà terminé',
+  'error.trialInProgress': 'un test de réseau est déjà en cours — terminez-le ou annulez-le d’abord',
+  'error.trialNotAssociated':
+    'l’appareil n’est pas encore sur le nouveau réseau : impossible de confirmer',
+  'error.settingsUnwritable':
+    'l’appareil n’a pas pu enregistrer les réglages — rien n’a été modifié',
+
+  'settings.title': 'Réglages',
+  'settings.loading': 'Lecture des réglages de l’appareil…',
+  'settings.unreachable': 'Appareil injoignable : {detail}',
+  'settings.retry': 'Réessayer',
+
+  'settings.wifiTitle': 'Wi-Fi',
+  'settings.wifiIntro':
+    'L’appareil rejoint ce réseau à chaque démarrage. Le changer se fait sous forme d’un test que vous devez confirmer depuis le nouveau réseau — voir ci-dessous.',
+  'settings.wifiNone': 'Aucun réseau enregistré. Cet appareil a été configuré par USB.',
+  'settings.wifiSsid': 'nom du réseau',
+  'settings.wifiPsk': 'phrase secrète',
+  'settings.wifiPskStored': 'Une phrase secrète est enregistrée.',
+  'settings.wifiPskOpen': 'Aucune phrase secrète — réseau ouvert.',
+  'settings.secretKeep': 'Conserver celle enregistrée',
+  'settings.secretSet': 'En saisir une nouvelle',
+  'settings.secretClear': 'Il ne doit pas y en avoir',
+  'settings.wifiWarn':
+    'L’appareil va quitter ce réseau pour essayer {ssid}. Rejoignez {ssid} vous-même et rouvrez cette page dans les {minutes} minutes pour le conserver. Si personne ne le fait, l’appareil redémarre sur {current} et rien n’est enregistré.',
+  'settings.wifiWarnNoCurrent':
+    'L’appareil va quitter ce réseau pour essayer {ssid}. Rejoignez {ssid} vous-même et rouvrez cette page dans les {minutes} minutes pour le conserver. Si personne ne le fait, l’appareil redémarre et rien n’est enregistré.',
+  'settings.wifiSubmit': 'Tester ce réseau',
+  'settings.wifiSubmitting': 'Démarrage du test…',
+
+  'settings.trialTitle': 'Test de {ssid}',
+  'settings.trialAssociating':
+    'L’appareil rejoint {ssid}. Il a quitté le réseau sur lequel vous étiez.',
+  'settings.trialAwaiting':
+    'L’appareil est sur {ssid} et a reçu une adresse. Confirmez dans les {seconds} s pour le conserver.',
+  'settings.trialLeft':
+    'L’appareil a quitté ce réseau. Rejoignez {ssid}, rouvrez cette page et confirmez — sinon il redémarrera de lui-même sur le réseau enregistré.',
+  'settings.trialRemaining': '{seconds} s restantes',
+  'settings.trialConfirm': 'Je l’atteins — conserver ce réseau',
+  'settings.trialConfirming': 'Enregistrement…',
+  'settings.trialCancel': 'Annuler et revenir en arrière',
+  'settings.trialCancelled':
+    'Retour au réseau enregistré. L’appareil redémarre.',
+  'settings.trialSaved': 'Enregistré. C’est désormais le réseau de l’appareil.',
+
+  'settings.mqttTitle': 'Courtier Home Assistant (MQTT)',
+  'settings.mqttIntro':
+    'Facultatif. Sans courtier, l’appareil continue de recevoir, décoder et suivre chaque store — il ne publie simplement rien.',
+  'settings.mqttNone': 'Aucun courtier configuré.',
+  'settings.mqttAddress': 'adresse du courtier',
+  'settings.mqttPort': 'port du courtier',
+  'settings.mqttUsername': 'identifiant du courtier',
+  'settings.mqttUsernameHint': 'Laisser vide pour une connexion anonyme.',
+  'settings.mqttPassword': 'mot de passe du courtier',
+  'settings.mqttPasswordStored': 'Un mot de passe est enregistré.',
+  'settings.mqttPasswordNone': 'Aucun mot de passe — la connexion est anonyme.',
+  'settings.mqttDiscoveryPrefix': 'préfixe de découverte',
+  'settings.mqttDiscoveryPrefixHint':
+    'Là où Home Assistant cherche les configurations d’appareils. Global à tout votre Home Assistant — laissez homeassistant sauf si vous savez qu’il a été changé.',
+  'settings.mqttStateRoot': 'racine des sujets d’état',
+  'settings.mqttStateRootHint':
+    'Là où cet appareil publie ses propres sujets. Elle ne doit pas être le préfixe de découverte, ni se trouver à l’intérieur.',
+  'settings.mqttWarn':
+    'Enregistrer redémarre l’appareil. C’est ce qui efface les entités Home Assistant retenues publiées sous les anciens sujets, avant que les nouvelles ne partent.',
+  'settings.mqttSubmit': 'Enregistrer et redémarrer',
+  'settings.mqttSubmitting': 'Enregistrement…',
+  'settings.mqttClear': 'Fonctionner sans courtier',
+  'settings.mqttClearing': 'Suppression…',
+  'settings.mqttConfirmClear': 'Supprimer le courtier et redémarrer ?',
+  'settings.mqttCleared': 'Enregistré. L’appareil redémarre sans courtier.',
+  'settings.mqttSaved': 'Enregistré. L’appareil redémarre.',
+  'settings.restarting':
+    'L’appareil redémarre. Cette page reviendra d’elle-même dans quelques secondes.',
+  'settings.failed': 'Refusé : {reason}',
+
   'stub.heading': '{screen}',
   'stub.body': 'Cet écran n’est pas encore implémenté.',
   'stub.settings': 'Réglages',

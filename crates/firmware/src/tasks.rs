@@ -38,8 +38,10 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
 use heapless::{String, Vec};
-use somfy_api::{ApiErrorCode, CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
-use somfy_config::{Catalog, CatalogError};
+use somfy_api::{
+    ApiErrorCode, CalibrationStepDto, GroupDto, MqttSettingsDto, RoomDto, ShadeDto, WifiSettingsDto,
+};
+use somfy_config::{Catalog, CatalogError, ConfigRecord};
 use somfy_domain::{
     allocate_with, AllocateError, DomainError, GroupId, Registry, RemoteIdentity, RoomId,
     ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY,
@@ -52,6 +54,7 @@ use somfy_tasks::{
     TRANSMIT_QUEUE_DEPTH,
 };
 
+use crate::config::ConfigChange;
 use crate::edits::{AckReceiver, EditReceiver, EventSender, ShadeAck, ShadeEdit, ShadeEvent};
 use crate::radio::{air::Air, rmt_rx::RmtPulseSource};
 use crate::rpc;
@@ -245,6 +248,7 @@ pub async fn state(
 ) -> ! {
     let Table {
         ref mut shades,
+        ref config,
         ref mut catalog,
         identity,
         edits,
@@ -342,6 +346,7 @@ pub async fn state(
                 request,
                 &mut machine,
                 &mut store,
+                config,
                 &mut queue,
                 catalog,
                 &identity,
@@ -408,6 +413,15 @@ pub async fn state(
 pub struct Table {
     /// The flash region, if the partition table has one.
     pub shades: Option<ShadeStore>,
+    /// The *configuration* region, if the partition table has one.
+    ///
+    /// A second region on the same chip, and it is here for the same reason
+    /// `shades` is: the settings screen writes it at runtime, and everything
+    /// that writes flash goes through this task because that is what keeps a
+    /// write off the radio's back. `None` is a board whose partition table has
+    /// no `wificfg` — it runs, and settings changes are refused rather than
+    /// silently lost.
+    pub config: Option<crate::config::ConfigStore>,
     /// The table as the controller believes it, plus the debounce.
     pub catalog: Catalog,
     /// This controller's virtual-remote identity, which is what a new shade's
@@ -476,6 +490,7 @@ fn serve_request(
     request: rpc::Request,
     machine: &mut StateMachine,
     store: &mut FlashStore<'static>,
+    config: &Option<crate::config::ConfigStore>,
     queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
     catalog: &mut Catalog,
     identity: &RemoteIdentity,
@@ -515,12 +530,12 @@ fn serve_request(
                 // slat-separation band has never been measured. Anything else is
                 // this device's fault and has just been logged by
                 // `run_command`.
-                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false),
                 Err(DomainError::VentBandNotMeasured) => (
-                    rpc::Reply::Refused(ApiErrorCode::VentBandNotMeasured),
+                    rpc::Reply::Refused(ApiErrorCode::VentBandNotMeasured.into()),
                     false,
                 ),
-                Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress), false),
+                Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()), false),
             }
         }
         // **The one rule that lives here.** A `Prog` burst at an address this
@@ -531,9 +546,9 @@ fn serve_request(
         // never giving such a shade a pairing button (`Inventory::snapshot`);
         // HTTP has no button to withhold, so it refuses instead.
         rpc::Request::Pair(id) => match machine.registry().shade(id) {
-            None => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+            None => (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false),
             Some(shade) if !RemoteIdentity::is_allocated(shade.config.address) => (
-                rpc::Reply::Refused(ApiErrorCode::AddressNotAllocated),
+                rpc::Reply::Refused(ApiErrorCode::AddressNotAllocated.into()),
                 false,
             ),
             Some(_) => {
@@ -543,7 +558,7 @@ fn serve_request(
                 };
                 match run_command(machine, store, queue, command, now_ms, emitted) {
                     Ok(dispatched) => (rpc::Reply::Done, dispatched),
-                    Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress), false),
+                    Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()), false),
                 }
             }
         },
@@ -584,9 +599,9 @@ fn serve_request(
             };
             match outcome {
                 Ok(dispatched) => (rpc::Reply::Done, dispatched),
-                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound), false),
+                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false),
                 Err(DomainError::NotCalibrating) => {
-                    (rpc::Reply::Refused(ApiErrorCode::NotCalibrating), false)
+                    (rpc::Reply::Refused(ApiErrorCode::NotCalibrating.into()), false)
                 }
                 Err(error) => {
                     // Everything left is a run whose numbers this device will
@@ -596,7 +611,7 @@ fn serve_request(
                     // all of them: run it again and watch the shade.
                     esp_println::println!("calibrate: ShadeId({}) refused: {:?}", id.0, error);
                     (
-                        rpc::Reply::Refused(ApiErrorCode::CalibrationImplausible),
+                        rpc::Reply::Refused(ApiErrorCode::CalibrationImplausible.into()),
                         false,
                     )
                 }
@@ -614,13 +629,143 @@ fn serve_request(
             ) {
                 Ok(Applied::Added(id)) => rpc::Reply::Created(id),
                 Ok(Applied::Changed) => rpc::Reply::Done,
-                Err(code) => rpc::Reply::Refused(code),
+                Err(code) => rpc::Reply::Refused(code.into()),
             },
+            false,
+        ),
+
+        // -------------------------------------------------------------------
+        // Settings
+        //
+        // Every one of these reads the configuration region before it decides
+        // anything, because the stored value is what a "keep what you have"
+        // secret resolves to and what the untouched half of an amendment is
+        // carried from. None of them dispatches a transmission, so all four
+        // answer `false`.
+        // -------------------------------------------------------------------
+        rpc::Request::Settings => (
+            match read_config(store, config) {
+                Ok(record) => {
+                    let (wifi, mqtt) = split(record.as_ref());
+                    rpc::Reply::Settings(wifi, mqtt)
+                }
+                // A region that cannot be read answers "nothing provisioned",
+                // exactly as boot does — see `crate::config`'s module docs for
+                // why this region degrades where the rolling-code one refuses.
+                Err(()) => rpc::Reply::Settings(None, None),
+            },
+            false,
+        ),
+        rpc::Request::PrepareWifi(update) => (
+            match read_config(store, config) {
+                Ok(record) => {
+                    let stored = record.as_ref().and_then(|record| record.wifi.as_ref());
+                    match update.to_credentials(stored) {
+                        Ok(candidate) => rpc::Reply::WifiCandidate(candidate),
+                        Err(refusal) => rpc::Reply::Refused(refusal),
+                    }
+                }
+                Err(()) => rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into()),
+            },
+            false,
+        ),
+        rpc::Request::SaveWifi(credentials) => (
+            write_config(store, config, ConfigChange::Wifi(credentials)),
+            false,
+        ),
+        rpc::Request::SaveMqtt(update) => (
+            match read_config(store, config) {
+                Ok(record) => {
+                    let stored = record.as_ref().and_then(|record| record.mqtt.as_ref());
+                    match update.to_settings(stored) {
+                        Ok(settings) => {
+                            write_config(store, config, ConfigChange::Mqtt(Some(settings)))
+                        }
+                        Err(refusal) => rpc::Reply::Refused(refusal),
+                    }
+                }
+                Err(()) => rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into()),
+            },
+            false,
+        ),
+        rpc::Request::ClearMqtt => (
+            write_config(store, config, ConfigChange::Mqtt(None)),
             false,
         ),
     };
     rpc::RPC.answer(reply);
     dispatched
+}
+
+/// Read the newest configuration record, or report that the region could not
+/// be.
+///
+/// `Ok(None)` is a board with nothing provisioned, which is an ordinary state.
+/// `Err(())` is a region that is missing or unreadable, and the caller decides
+/// what that means — a *read* degrades to "nothing provisioned", a *write* is
+/// refused, because writing over a region that cannot be read is how a working
+/// credential gets lost.
+fn read_config(
+    store: &mut FlashStore<'static>,
+    config: &Option<crate::config::ConfigStore>,
+) -> Result<Option<ConfigRecord>, ()> {
+    let Some(config) = config else {
+        return Err(());
+    };
+    match store.with_flash(|flash| config.load(flash)) {
+        Ok((record, _survey)) => Ok(record),
+        Err(error) => {
+            esp_println::println!("config: could not be read ({:?})", error);
+            Err(())
+        }
+    }
+}
+
+/// Split a record into the two halves the settings screen sees, secrets
+/// stripped.
+///
+/// The stripping is [`WifiSettingsDto`]'s and [`MqttSettingsDto`]'s, not this
+/// function's: neither type has a field a secret could go into. See
+/// `somfy_api`'s settings module.
+fn split(
+    record: Option<&ConfigRecord>,
+) -> (Option<WifiSettingsDto>, Option<MqttSettingsDto>) {
+    match record {
+        None => (None, None),
+        Some(record) => (
+            record.wifi.as_ref().map(WifiSettingsDto::of),
+            record.mqtt.as_ref().map(MqttSettingsDto::of),
+        ),
+    }
+}
+
+/// Apply one change to the configuration region and say what happened.
+///
+/// A region that is absent or that refuses the write is
+/// [`ApiErrorCode::SettingsUnwritable`], and the settings were **not** stored —
+/// the device carries on with what it had, which is the degradable behaviour
+/// this region is allowed and the rolling-code one is not.
+fn write_config(
+    store: &mut FlashStore<'static>,
+    config: &Option<crate::config::ConfigStore>,
+    change: ConfigChange,
+) -> rpc::Reply {
+    let Some(config) = config else {
+        esp_println::println!(
+            "config: no `wificfg` partition on this board — settings cannot be stored"
+        );
+        return rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into());
+    };
+    match store.with_flash(|flash| config.amend(flash, change)) {
+        Ok(()) => {
+            esp_println::println!("config: stored");
+            rpc::Reply::Done
+        }
+        Err(error) => {
+            esp_println::println!("config: refused the write ({:?})", error);
+            rpc::Reply::Refused(ApiErrorCode::SettingsUnwritable.into())
+        }
+    }
 }
 
 /// The first group at or after `slot`, as a wire DTO.

@@ -20,6 +20,7 @@
  */
 import type { MessageKey } from '../i18n/en';
 import type { ApiErrorCode } from './generated/ApiErrorCode';
+import type { SettingsFieldDto } from './generated/SettingsFieldDto';
 
 export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   nameEmpty: 'error.nameEmpty',
@@ -35,6 +36,49 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   ventBandNotMeasured: 'error.ventBandNotMeasured',
   notCalibrating: 'error.notCalibrating',
   calibrationImplausible: 'error.calibrationImplausible',
+  // Settings. Each of these is a *rule*; the field it broke arrives beside it
+  // as `ApiErrorDto.field`, so the sentences below are written to read with a
+  // field name interpolated into them — `{field}` — and the form highlights the
+  // input at the same time. See `crates/somfy-api/src/errors.rs` for why the
+  // two are separate axes.
+  valueEmpty: 'error.valueEmpty',
+  valueTooLong: 'error.valueTooLong',
+  valueTooShort: 'error.valueTooShort',
+  valueInteriorNul: 'error.valueInteriorNul',
+  brokerAddressMalformed: 'error.brokerAddressMalformed',
+  brokerAddressUnroutable: 'error.brokerAddressUnroutable',
+  brokerPortZero: 'error.brokerPortZero',
+  passwordWithoutUsername: 'error.passwordWithoutUsername',
+  topicWildcard: 'error.topicWildcard',
+  topicLeadingSlash: 'error.topicLeadingSlash',
+  topicTrailingSlash: 'error.topicTrailingSlash',
+  topicEmptySegment: 'error.topicEmptySegment',
+  topicIllegalCharacter: 'error.topicIllegalCharacter',
+  namespacesOverlap: 'error.namespacesOverlap',
+  secretNotSet: 'error.secretNotSet',
+  noTrialInProgress: 'error.noTrialInProgress',
+  trialInProgress: 'error.trialInProgress',
+  trialNotAssociated: 'error.trialNotAssociated',
+  settingsUnwritable: 'error.settingsUnwritable',
+};
+
+/**
+ * The operator-facing name of each settings field.
+ *
+ * Total over the generated {@link SettingsFieldDto}, so a field added in Rust
+ * fails `tsc` here rather than rendering as a blank in the middle of a
+ * sentence. The same keys label the inputs on the settings screen, so the
+ * message and the field it points at cannot disagree.
+ */
+export const FIELD_LABEL: Record<SettingsFieldDto, MessageKey> = {
+  ssid: 'settings.wifiSsid',
+  psk: 'settings.wifiPsk',
+  brokerAddress: 'settings.mqttAddress',
+  brokerPort: 'settings.mqttPort',
+  brokerUsername: 'settings.mqttUsername',
+  brokerPassword: 'settings.mqttPassword',
+  discoveryPrefix: 'settings.mqttDiscoveryPrefix',
+  stateRoot: 'settings.mqttStateRoot',
 };
 
 /**
@@ -47,6 +91,16 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
  */
 export class ApiError extends Error {
   readonly code: ApiErrorCode | undefined;
+  /**
+   * Which settings value the rejection is about, when it is about one.
+   *
+   * Absent for every rejection that names no field, which is all of them
+   * outside the settings screen. A form uses it to highlight the input the
+   * operator has to fix — spec R3 asks that an invalid value be refused "with
+   * the field named", and pointing at it is that requirement kept rather than
+   * described.
+   */
+  readonly field: SettingsFieldDto | undefined;
 
   constructor(
     readonly status: number,
@@ -56,6 +110,7 @@ export class ApiError extends Error {
     super(`${path} failed (${status}): ${detail}`);
     this.name = 'ApiError';
     this.code = parseApiErrorCode(detail);
+    this.field = parseApiErrorField(detail);
   }
 }
 
@@ -78,6 +133,25 @@ export function parseApiErrorCode(body: string): ApiErrorCode | undefined {
   const code = (value as { code?: unknown }).code;
   if (typeof code !== 'string' || !(code in ERROR_MESSAGE)) return undefined;
   return code as ApiErrorCode;
+}
+
+/**
+ * Pull the settings field out of an error body.
+ *
+ * As forgiving as {@link parseApiErrorCode}, and for the same reason: a body
+ * that does not name a field is the ordinary case, not a fault.
+ */
+export function parseApiErrorField(body: string): SettingsFieldDto | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  const field = (value as { field?: unknown }).field;
+  if (typeof field !== 'string' || !(field in FIELD_LABEL)) return undefined;
+  return field as SettingsFieldDto;
 }
 
 /**

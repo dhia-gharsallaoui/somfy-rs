@@ -283,6 +283,97 @@ export const en = {
     'the device will not store those numbers — a travel of zero, or longer than three minutes, or taps that leave no travel between them',
   'error.unknown': 'the device did not say why',
 
+
+  'error.valueEmpty': '{field} must not be empty',
+  'error.valueTooLong': '{field} is longer than the device can store',
+  'error.valueTooShort': '{field} is too short — a Wi-Fi passphrase needs at least 8 characters',
+  'error.valueInteriorNul':
+    '{field} contains a NUL character, which MQTT does not allow in a string',
+  'error.brokerAddressMalformed': '{field} must be four numbers separated by dots, like 192.168.1.10',
+  'error.brokerAddressUnroutable':
+    '{field} is an address no connection can reach — not 0.0.0.0, not a loopback, not a multicast or broadcast address',
+  'error.brokerPortZero': '{field} must not be zero',
+  'error.passwordWithoutUsername': 'a broker password needs a {field} to go with it',
+  'error.topicWildcard': '{field} must not contain # or +, which belong in subscriptions',
+  'error.topicLeadingSlash': '{field} must not start with /',
+  'error.topicTrailingSlash': '{field} must not end with /',
+  'error.topicEmptySegment': '{field} must not contain //',
+  'error.topicIllegalCharacter': '{field} may only contain letters, digits, _, - and / as a separator',
+  'error.namespacesOverlap':
+    '{field} must not be the same as the discovery prefix, or sit inside it — the device would publish its availability onto Home Assistant’s own topic',
+  'error.secretNotSet': 'there is no stored {field} to keep — type one, or choose to have none',
+  'error.noTrialInProgress': 'that network test has already finished',
+  'error.trialInProgress': 'a network test is already running — finish or cancel it first',
+  'error.trialNotAssociated': 'the device is not on the new network yet, so it cannot be confirmed',
+  'error.settingsUnwritable': 'the device could not store the settings — nothing was changed',
+
+  'settings.title': 'Settings',
+  'settings.loading': 'Reading the device’s settings…',
+  'settings.unreachable': 'Could not reach the device: {detail}',
+  'settings.retry': 'Try again',
+
+  'settings.wifiTitle': 'Wi-Fi',
+  'settings.wifiIntro':
+    'The device joins this network on every boot. Changing it is done as a test you have to confirm from the new network — see below.',
+  'settings.wifiNone': 'No network is stored. This device was provisioned over USB.',
+  'settings.wifiSsid': 'network name',
+  'settings.wifiPsk': 'passphrase',
+  'settings.wifiPskStored': 'A passphrase is stored.',
+  'settings.wifiPskOpen': 'No passphrase — this is an open network.',
+  'settings.secretKeep': 'Keep the stored one',
+  'settings.secretSet': 'Type a new one',
+  'settings.secretClear': 'There should not be one',
+  'settings.wifiWarn':
+    'The device will leave this network to try {ssid}. Join {ssid} yourself and open this page again within {minutes} minutes to keep it. If nobody does, the device restarts onto {current} and nothing is stored.',
+  'settings.wifiWarnNoCurrent':
+    'The device will leave this network to try {ssid}. Join {ssid} yourself and open this page again within {minutes} minutes to keep it. If nobody does, the device restarts and nothing is stored.',
+  'settings.wifiSubmit': 'Test this network',
+  'settings.wifiSubmitting': 'Starting the test…',
+
+  'settings.trialTitle': 'Testing {ssid}',
+  'settings.trialAssociating':
+    'The device is joining {ssid}. It has left the network you were on.',
+  'settings.trialAwaiting':
+    'The device is on {ssid} and has an address. Confirm within {seconds} s to keep it.',
+  'settings.trialLeft':
+    'The device has left this network. Join {ssid}, open this page again, and confirm — otherwise it restarts onto the stored network on its own.',
+  'settings.trialRemaining': '{seconds} s left',
+  'settings.trialConfirm': 'I can reach it — keep this network',
+  'settings.trialConfirming': 'Storing…',
+  'settings.trialCancel': 'Cancel and go back',
+  'settings.trialCancelled': 'Going back to the stored network. The device is restarting.',
+  'settings.trialSaved': 'Stored. This is the device’s network now.',
+
+  'settings.mqttTitle': 'Home Assistant broker (MQTT)',
+  'settings.mqttIntro':
+    'Optional. Without a broker the device still receives, decodes and tracks every shade — it just publishes nothing.',
+  'settings.mqttNone': 'No broker is configured.',
+  'settings.mqttAddress': 'broker address',
+  'settings.mqttPort': 'broker port',
+  'settings.mqttUsername': 'broker username',
+  'settings.mqttUsernameHint': 'Leave empty for an anonymous connection.',
+  'settings.mqttPassword': 'broker password',
+  'settings.mqttPasswordStored': 'A password is stored.',
+  'settings.mqttPasswordNone': 'No password — the connection is anonymous.',
+  'settings.mqttDiscoveryPrefix': 'discovery prefix',
+  'settings.mqttDiscoveryPrefixHint':
+    'Where Home Assistant looks for device configs. Global to your whole Home Assistant — leave it at homeassistant unless you know it was changed.',
+  'settings.mqttStateRoot': 'state topic root',
+  'settings.mqttStateRootHint':
+    'Where this device publishes its own topics. It must not be the discovery prefix, or sit inside it.',
+  'settings.mqttWarn':
+    'Saving restarts the device. That is what clears the retained Home Assistant entities published under the previous topics, before the new ones go out.',
+  'settings.mqttSubmit': 'Save and restart',
+  'settings.mqttSubmitting': 'Saving…',
+  'settings.mqttClear': 'Run without a broker',
+  'settings.mqttClearing': 'Clearing…',
+  'settings.mqttConfirmClear': 'Remove the broker and restart?',
+  'settings.mqttCleared': 'Stored. The device is restarting without a broker.',
+  'settings.mqttSaved': 'Stored. The device is restarting.',
+  'settings.restarting':
+    'The device is restarting. This page will come back on its own in a few seconds.',
+  'settings.failed': 'Refused: {reason}',
+
   'stub.heading': '{screen}',
   'stub.body': 'This screen is not built yet.',
   'stub.settings': 'Settings',

@@ -68,7 +68,11 @@
 use embassy_sync::semaphore::{FairSemaphore, Semaphore as _};
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration};
-use somfy_api::{CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
+use somfy_api::{
+    ApiErrorDto, CalibrationStepDto, GroupDto, MqttSettingsDto, MqttUpdateDto, RoomDto, ShadeDto,
+    WifiSettingsDto, WifiUpdateDto,
+};
+use somfy_config::WifiCredentials;
 use somfy_domain::ShadeId;
 use somfy_tasks::ControlCommand;
 
@@ -128,6 +132,39 @@ pub enum Request {
     Calibrate(ShadeId, CalibrationStepDto),
     /// Change the table.
     Edit(ShadeEdit),
+
+    // -----------------------------------------------------------------------
+    // Settings
+    //
+    // These reach the *configuration* region rather than the shade table, and
+    // they come here for the same reason everything else does: the flash
+    // peripheral has one owner and it is this task. See `crate::config`.
+    //
+    // **The resolution of a write-only secret happens on the far side of this
+    // seam, not on this one.** A `SecretDto::Keep` is resolved against the
+    // stored value by the state task, which is the only thing that can read it,
+    // so a passphrase is never carried in this direction — the web server sends
+    // the *instruction*, not the secret it stands in for.
+    // -----------------------------------------------------------------------
+    /// What the device is provisioned with, minus every secret.
+    Settings,
+    /// Validate a candidate credential against what is stored, without applying
+    /// or storing anything.
+    ///
+    /// Separate from [`Request::SaveWifi`] because it runs *before* the radio is
+    /// touched: an SSID one byte too long must cost no connection at all. It is
+    /// also where a `psk` of "keep what you have" becomes the stored
+    /// passphrase, which nothing outside the state task can do.
+    PrepareWifi(WifiUpdateDto),
+    /// Store a credential a trial has proved. See `crate::trial`.
+    SaveWifi(WifiCredentials),
+    /// Validate and store broker settings, resolving the password against what
+    /// is stored.
+    SaveMqtt(MqttUpdateDto),
+    /// Run without a broker. Not an absence — a device with no broker still
+    /// receives, decodes and tracks — so it is its own request rather than an
+    /// empty [`Request::SaveMqtt`].
+    ClearMqtt,
 }
 
 /// What the state task answers.
@@ -153,8 +190,22 @@ pub enum Reply {
     Created(ShadeId),
     /// It was done, and there is nothing to say about it.
     Done,
-    /// It was refused, in the vocabulary the UI translates.
-    Refused(somfy_api::ApiErrorCode),
+    /// It was refused, in the vocabulary the UI translates — with the settings
+    /// field it is about, when it is about one.
+    Refused(ApiErrorDto),
+    /// What the device is provisioned with. The trial half of
+    /// [`somfy_api::SettingsDto`] is not here: it belongs to `crate::trial`,
+    /// which the web server reads directly, because it is not in flash and this
+    /// task has no business knowing about the radio.
+    Settings(Option<WifiSettingsDto>, Option<MqttSettingsDto>),
+    /// A candidate credential, validated and with its passphrase resolved.
+    ///
+    /// **Carries a passphrase**, and it is the one reply here that does. It has
+    /// to: the web server hands it to `crate::trial`, which hands it to the
+    /// Wi-Fi task, which puts it on the radio — the same passphrase the driver
+    /// already holds. What it does not do is reach a socket; nothing in
+    /// [`somfy_api::SettingsDto`] has a field it could be written into.
+    WifiCandidate(WifiCredentials),
 }
 
 /// The one seam, as a single static.

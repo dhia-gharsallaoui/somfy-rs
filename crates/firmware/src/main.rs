@@ -117,6 +117,7 @@ mod shades;
 mod sntp;
 mod store;
 mod tasks;
+mod trial;
 
 use embassy_executor::{SpawnError, Spawner};
 use embassy_futures::yield_now;
@@ -438,26 +439,27 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let pins = crate::cc1101_pins!(peripherals);
     check_pin_map(&pins)?;
 
-    // One flash peripheral, two regions, read one after the other. The config
-    // store is mounted through a reborrow and dropped before the rolling-code
-    // store takes the singleton for good — the configuration is read once at
-    // boot and never again, so nothing needs to hold it open, and the store
-    // that *is* held open is the one a running controller writes to.
-    let mut flash = peripherals.FLASH;
-    let (credentials, broker, superseded) = report_config(FlashStorage::new(flash.reborrow()));
-
+    // One flash peripheral, three regions, one owner. `FlashStore` takes the
+    // singleton for the life of the program — a rolling code has to be
+    // committed before every transmission and the store that does that cannot
+    // be handed around — and the other two regions borrow it back through
+    // `FlashStore::with_flash`. That borrow is what makes "a settings write and
+    // a rolling-code commit are never in flight together" a property of the
+    // types rather than of anyone's care.
+    //
     // Mounted here rather than inside the state task: `mount` wants roughly
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
-    //
-    // **Before the shade table now, where it used to be after it.** The shade
-    // region is written at runtime, so it can no longer read through a
-    // temporary reborrow that ends at boot: it borrows the flash from this
-    // store, which owns the peripheral for the life of the program. See
-    // `FlashStore::with_flash`.
-    let mut store = FlashStore::mount(FlashStorage::new(flash)).map_err(StartError::Store)?;
+    let mut store = FlashStore::mount(FlashStorage::new(peripherals.FLASH))
+        .map_err(StartError::Store)?;
     let survey = report_store(&mut store)?;
+
+    // **The configuration is no longer read through a reborrow that ends at
+    // boot.** It used to be, because nothing in the controller image wrote it;
+    // the settings screen does, so the store outlives boot for exactly the
+    // reason the shade table's does.
+    let (config_store, credentials, broker, superseded) = report_config(&mut store);
 
     let (shade_store, shades) = report_shades(&mut store);
 
@@ -587,6 +589,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         store,
         tasks::Table {
             shades: shade_store,
+            config: config_store,
             catalog,
             identity: RemoteIdentity::from_mac(base_mac()),
             edits: EDITS.receiver(),
@@ -645,22 +648,26 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
 /// receives and decodes.
 #[allow(
     clippy::type_complexity,
-    reason = "three independent halves of one \
-    read, and a struct for them would be a type used exactly once between two \
-    adjacent lines"
+    reason = "the store plus three independent halves of one read, and a struct \
+    for them would be a type used exactly once between two adjacent lines"
 )]
 fn report_config(
-    flash: FlashStorage<'_>,
+    flash: &mut FlashStore<'static>,
 ) -> (
+    Option<ConfigStore>,
     Option<WifiCredentials>,
     Option<MqttSettings>,
     Vec<Namespaces, { config::MAX_SUPERSEDED }>,
 ) {
-    let nothing = || (None, None, Vec::new());
+    let nothing = || (None, None, None, Vec::new());
 
-    let mut store = match ConfigStore::mount(flash) {
+    let store = match flash.with_flash(ConfigStore::mount) {
         Ok(store) => store,
         Err(error) => {
+            // Not fatal, and now it costs more than it used to: without this
+            // region the settings screen can read nothing and store nothing, so
+            // it refuses writes rather than appearing to accept them. The radio
+            // is unaffected either way.
             esp_println::println!("config: region unavailable ({:?})", error);
             return nothing();
         }
@@ -675,11 +682,17 @@ fn report_config(
         slot_len,
     );
 
-    let (record, survey) = match store.load() {
+    let (record, survey) = match flash.with_flash(|flash| store.load(flash)) {
         Ok(found) => found,
         Err(error) => {
             esp_println::println!("config: unreadable ({:?})", error);
-            return nothing();
+            // The *store* survives an unreadable scan, unlike a missing
+            // partition: the region is there and a later write can still land
+            // in it. Answering "nothing provisioned" is the degraded read this
+            // region is allowed; refusing to keep the store would turn a bad
+            // scan into a device that could never be reconfigured over the
+            // network again.
+            return (Some(store), None, None, Vec::new());
         }
     };
     esp_println::println!(
@@ -714,7 +727,7 @@ fn report_config(
     // the access point several times a second; neither secret leaves flash
     // except into the driver or the broker.
     let Some(record) = record else {
-        return (None, None, survey.superseded);
+        return (Some(store), None, None, survey.superseded);
     };
     if let Some(mqtt) = &record.mqtt {
         esp_println::println!(
@@ -730,7 +743,7 @@ fn report_config(
             mqtt.state_root(),
         );
     }
-    (record.wifi, record.mqtt, survey.superseded)
+    (Some(store), record.wifi, record.mqtt, survey.superseded)
 }
 
 /// The shades a boot found, in the order their registry ids will follow, plus

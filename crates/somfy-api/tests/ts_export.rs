@@ -71,6 +71,9 @@ fn regenerate() {
         somfy_api::PatchShadeDto::export_all().expect("export PatchShadeDto");
         somfy_api::ApiErrorDto::export_all().expect("export ApiErrorDto");
         somfy_api::CalibrationStepDto::export_all().expect("export CalibrationStepDto");
+        somfy_api::SettingsDto::export_all().expect("export SettingsDto");
+        somfy_api::WifiUpdateDto::export_all().expect("export WifiUpdateDto");
+        somfy_api::MqttUpdateDto::export_all().expect("export MqttUpdateDto");
     });
 }
 
@@ -276,6 +279,11 @@ fn api_error_is_a_code_the_ui_can_translate() {
         r#""registryFull""#,
         r#""notFound""#,
         r#""addressNotAllocated""#,
+        r#""valueTooLong""#,
+        r#""namespacesOverlap""#,
+        r#""secretNotSet""#,
+        r#""trialNotAssociated""#,
+        r#""settingsUnwritable""#,
     ] {
         assert!(
             code.contains(variant),
@@ -402,4 +410,82 @@ fn entities_use_camelcase_and_heapless_overrides() {
     // heapless `Vec<u8, 32>` override -> `number[]`, field renamed to camelCase.
     assert!(group.contains("shadeIds: number[]"), "{group}");
     assert!(room.contains("shadeIds: number[]"), "{room}");
+}
+
+#[test]
+fn no_settings_type_the_device_sends_has_a_field_a_secret_could_go_in() {
+    regenerate();
+
+    // The type-level half of `tests/settings.rs`'s byte-level check. That one
+    // proves this build does not send a secret; this one proves the *shape*
+    // cannot, so a field added later is caught in the generated contract the UI
+    // compiles against rather than only in a serialisation assertion.
+    for name in [
+        "SettingsDto.ts",
+        "WifiSettingsDto.ts",
+        "MqttSettingsDto.ts",
+        "WifiTrialDto.ts",
+    ] {
+        let ts = declaration(name);
+        for forbidden in ["psk", "password", "passphrase", "secret"] {
+            assert!(
+                !ts.to_lowercase().contains(forbidden),
+                "{name} has a `{forbidden}` field; nothing the device sends may:\n{ts}"
+            );
+        }
+    }
+
+    // What replaces them.
+    let wifi = read("WifiSettingsDto.ts");
+    assert!(wifi.contains("pskSet: boolean"), "{wifi}");
+    let mqtt = read("MqttSettingsDto.ts");
+    assert!(mqtt.contains("passwordSet: boolean"), "{mqtt}");
+}
+
+#[test]
+fn a_secret_update_is_tagged_so_the_ui_must_say_which_of_the_three_it_means() {
+    regenerate();
+    let ts = read("SecretDto.ts");
+    assert!(ts.contains(r#"{ "secret": "keep" }"#), "{ts}");
+    assert!(ts.contains(r#"{ "secret": "clear" }"#), "{ts}");
+    assert!(
+        ts.contains(r#"{ "secret": "set", value: string, }"#),
+        "{ts}"
+    );
+}
+
+#[test]
+fn a_settings_rejection_carries_an_optional_field_the_form_can_highlight() {
+    regenerate();
+    let dto = read("ApiErrorDto.ts");
+    assert!(dto.contains("field?: SettingsFieldDto"), "{dto}");
+
+    let field = read("SettingsFieldDto.ts");
+    for variant in [
+        r#""ssid""#,
+        r#""psk""#,
+        r#""brokerAddress""#,
+        r#""brokerPort""#,
+        r#""brokerUsername""#,
+        r#""brokerPassword""#,
+        r#""discoveryPrefix""#,
+        r#""stateRoot""#,
+    ] {
+        assert!(
+            field.contains(variant),
+            "SettingsFieldDto lost {variant}:\n{field}"
+        );
+    }
+}
+
+#[test]
+fn the_three_settings_halves_are_nullable_because_none_is_a_value() {
+    regenerate();
+    let ts = read("SettingsDto.ts");
+    // Not `ts(optional)`: a device with no broker must say so, and an absent
+    // key would be indistinguishable from a firmware that did not know about
+    // brokers.
+    assert!(ts.contains("wifi: WifiSettingsDto | null"), "{ts}");
+    assert!(ts.contains("mqtt: MqttSettingsDto | null"), "{ts}");
+    assert!(ts.contains("wifiTrial: WifiTrialDto | null"), "{ts}");
 }

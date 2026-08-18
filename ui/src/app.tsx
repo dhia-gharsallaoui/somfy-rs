@@ -11,6 +11,7 @@ import { LocationProvider, Route, Router, useLocation, useRoute } from 'preact-i
 
 import { useI18n, LOCALES, LOCALE_NAMES, type Locale } from './i18n';
 import { Dashboard } from './routes/dashboard';
+import { Settings } from './routes/settings';
 import { ShadeDetail } from './routes/shade-detail';
 import { ShadeNew } from './routes/shade-new';
 import { ShadePair } from './routes/shade-pair';
@@ -58,7 +59,7 @@ function Shell() {
           <Route path="/shades/new" component={ShadeNew} device={device} />
           <Route path="/shades/:id/pair" component={ShadePairRoute} device={device} />
           <Route path="/shades/:id" component={ShadeRoute} device={device} />
-          <Route path="/settings" component={Stub} screen="stub.settings" />
+          <Route path="/settings" component={Settings} />
           <Route path="/backup" component={Stub} screen="stub.backup" />
           <Route path="/diagnostics" component={Stub} screen="stub.diagnostics" />
           <Route path="/onboarding" component={Stub} screen="stub.onboarding" />

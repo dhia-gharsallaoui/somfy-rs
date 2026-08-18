@@ -113,6 +113,134 @@ pub enum ApiErrorCode {
     /// traverse of zero or past three minutes, or marks that leave no travel
     /// between them. Nothing is stored and the shade is left as it was.
     CalibrationImplausible,
+
+    // -----------------------------------------------------------------------
+    // Settings
+    //
+    // These are the *rules*; which value broke one is [`ApiErrorDto::field`].
+    // Splitting the two apart is what keeps this list from growing to one
+    // variant per (field × rule) pair — eight settings fields against a dozen
+    // rules is ninety-six codes and ninety-six translations, most of which
+    // would read identically in both languages.
+    //
+    // It also gives the settings screen something a flat code cannot: the field
+    // to point at. `docs/specs/2026-08-15-mqtt-ha-discovery-requirements.md` R3
+    // asks that an invalid value be refused "with the field named", and a form
+    // that highlights the offending input is that requirement done properly
+    // rather than restated in a sentence.
+    // -----------------------------------------------------------------------
+    /// A required settings value was empty.
+    ValueEmpty,
+    /// A settings value is longer than the storage reserved for it. Counted in
+    /// **bytes**, like [`ApiErrorCode::NameTooLong`] and for the same reason.
+    ValueTooLong,
+    /// A settings value is shorter than its minimum. Only the Wi-Fi passphrase
+    /// has one — WPA2 requires eight characters — and an empty passphrase is
+    /// not short, it is an open network.
+    ValueTooShort,
+    /// A settings value contains a NUL byte. Refused rather than truncated:
+    /// MQTT forbids U+0000 in a string, and a broker is entitled to close the
+    /// connection over it, which reads from the device as bad credentials.
+    ValueInteriorNul,
+    /// The broker address is not four dot-separated decimal octets. Distinct
+    /// from [`ApiErrorCode::BrokerAddressUnroutable`], which is about a
+    /// well-formed address that no connection could reach.
+    BrokerAddressMalformed,
+    /// The broker address is unspecified, loopback, multicast or broadcast —
+    /// well-formed and unreachable.
+    BrokerAddressUnroutable,
+    /// The broker port is zero, which addresses nothing.
+    BrokerPortZero,
+    /// A broker password was given with no username. MQTT permits it and no
+    /// broker this device will meet does anything useful with it.
+    PasswordWithoutUsername,
+    /// A namespace contains an MQTT wildcard (`#` or `+`). Wildcards belong in
+    /// subscriptions, never in a topic something publishes to.
+    TopicWildcard,
+    /// A namespace starts with `/`, which creates an empty leading segment. The
+    /// second of the three failures that made discovery unusable on the C++
+    /// build: the payload said `/shades/1` while the publisher wrote
+    /// `shades/1`, and every entity was permanently unavailable.
+    TopicLeadingSlash,
+    /// A namespace ends with `/`, which would produce an empty final segment.
+    TopicTrailingSlash,
+    /// A namespace contains `//`, an empty interior segment. The third of the
+    /// three: `homeassistant//cover/1/config` is ignored outright.
+    TopicEmptySegment,
+    /// A namespace contains a character no topic segment may carry. The
+    /// permitted set is `[a-zA-Z0-9_-]`, plus `/` as a separator.
+    TopicIllegalCharacter,
+    /// `state_root` and `discovery_prefix` name the same namespace, or one sits
+    /// inside the other. The one rejection that belongs to a *pair* of values:
+    /// both can be individually valid and still put this device's availability
+    /// on Home Assistant's own birth topic, which marks it available while it is
+    /// offline.
+    NamespacesOverlap,
+    /// A secret was to be kept and there is none stored to keep. Reached by
+    /// configuring a broker for the first time without supplying a password
+    /// while asking for the existing one — there is no existing one.
+    ///
+    /// It exists because the alternative is to treat "keep what you have" as
+    /// "have nothing", which would silently configure an anonymous broker
+    /// connection under an operator who thought they had set a password.
+    SecretNotSet,
+    /// A Wi-Fi trial was confirmed or cancelled and none is running. Usually a
+    /// stale browser tab: the trial already ended, one way or the other.
+    NoTrialInProgress,
+    /// A second Wi-Fi trial was started while one was already in flight.
+    ///
+    /// Refused rather than queued or replaced: two candidates would mean two
+    /// deadlines and a confirmation that could not say which credential it was
+    /// confirming — and whoever started the second one has, by definition, not
+    /// yet found out whether the first worked.
+    TrialInProgress,
+    /// A Wi-Fi trial was confirmed while the station has not associated with
+    /// the candidate network. Confirming means "I reached the device on the new
+    /// network", and this device is not on it, so the claim cannot be true.
+    TrialNotAssociated,
+    /// The configuration region refused the write. The settings were **not**
+    /// stored and the device is running on what it had before.
+    ///
+    /// The one 5xx here, and for the same reason
+    /// [`InvalidAddress`](ApiErrorCode::InvalidAddress) is: the request was
+    /// fine, the device could not carry it out, and there is nothing the caller
+    /// could send instead.
+    SettingsUnwritable,
+}
+
+/// Which configured value a settings rejection is about.
+///
+/// Carried beside [`ApiErrorCode`] rather than folded into it — see the block
+/// comment on the settings codes above. Absent for every rejection that is not
+/// about a value the operator typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        rename_all = "camelCase"
+    )
+)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsFieldDto {
+    /// The Wi-Fi network name.
+    Ssid,
+    /// The Wi-Fi passphrase.
+    Psk,
+    /// The broker's IPv4 address.
+    BrokerAddress,
+    /// The broker's TCP port.
+    BrokerPort,
+    /// The broker username, empty for an anonymous connection.
+    BrokerUsername,
+    /// The broker password.
+    BrokerPassword,
+    /// Where Home Assistant looks for discovery configs.
+    DiscoveryPrefix,
+    /// Where this device's own state and command topics live.
+    StateRoot,
 }
 
 impl ApiErrorCode {
@@ -156,13 +284,35 @@ impl ApiErrorCode {
             | ApiErrorCode::InvalidTiltMode
             | ApiErrorCode::TravelTimeZero
             | ApiErrorCode::InvalidDeadBand
-            | ApiErrorCode::CalibrationImplausible => 400,
+            | ApiErrorCode::CalibrationImplausible
+            | ApiErrorCode::ValueEmpty
+            | ApiErrorCode::ValueTooLong
+            | ApiErrorCode::ValueTooShort
+            | ApiErrorCode::ValueInteriorNul
+            | ApiErrorCode::BrokerAddressMalformed
+            | ApiErrorCode::BrokerAddressUnroutable
+            | ApiErrorCode::BrokerPortZero
+            | ApiErrorCode::PasswordWithoutUsername
+            | ApiErrorCode::TopicWildcard
+            | ApiErrorCode::TopicLeadingSlash
+            | ApiErrorCode::TopicTrailingSlash
+            | ApiErrorCode::TopicEmptySegment
+            | ApiErrorCode::TopicIllegalCharacter
+            | ApiErrorCode::NamespacesOverlap
+            | ApiErrorCode::SecretNotSet => 400,
             ApiErrorCode::NotFound => 404,
             ApiErrorCode::RegistryFull
             | ApiErrorCode::AddressNotAllocated
             | ApiErrorCode::VentBandNotMeasured
-            | ApiErrorCode::NotCalibrating => 409,
-            ApiErrorCode::InvalidAddress => 500,
+            | ApiErrorCode::NotCalibrating
+            // Both are conflicts with the state of a trial rather than
+            // malformed requests: the body was fine and there was nothing else
+            // the caller could have sent, because what is wrong is that no
+            // trial is running or that this one has not associated yet.
+            | ApiErrorCode::NoTrialInProgress
+            | ApiErrorCode::TrialInProgress
+            | ApiErrorCode::TrialNotAssociated => 409,
+            ApiErrorCode::InvalidAddress | ApiErrorCode::SettingsUnwritable => 500,
         }
     }
 }
@@ -182,10 +332,31 @@ impl ApiErrorCode {
 #[serde(rename_all = "camelCase")]
 pub struct ApiErrorDto {
     pub code: ApiErrorCode,
+    /// Which settings value the rejection is about, when it is about one.
+    ///
+    /// **Omitted from the wire entirely when absent**, so every response this
+    /// crate produced before settings existed is byte-identical to what it
+    /// produces now — `{"code":"nameTooLong"}`, not
+    /// `{"code":"nameTooLong","field":null}`. The `skip_serializing_if` is what
+    /// buys that; without it the `Refusal` writer's measured content length
+    /// would move for every existing endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub field: Option<SettingsFieldDto>,
+}
+
+impl ApiErrorDto {
+    /// A rejection that names the value it is about.
+    pub const fn field(code: ApiErrorCode, field: SettingsFieldDto) -> ApiErrorDto {
+        ApiErrorDto {
+            code,
+            field: Some(field),
+        }
+    }
 }
 
 impl From<ApiErrorCode> for ApiErrorDto {
     fn from(code: ApiErrorCode) -> ApiErrorDto {
-        ApiErrorDto { code }
+        ApiErrorDto { code, field: None }
     }
 }

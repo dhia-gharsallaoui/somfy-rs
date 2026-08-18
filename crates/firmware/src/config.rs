@@ -32,6 +32,29 @@
 //! miniature: an unreadable config region must leave the radio working. What
 //! it must **not** do is stay quiet about it, so [`ConfigStore::load`] hands
 //! back a [`ConfigSurvey`] whose `damaged` count the caller prints either way.
+//!
+//! ## This region is written from the network path now
+//!
+//! It was read-only in the controller image until the settings screen existed;
+//! only `config-check` wrote it, over USB. Two things follow, and both are
+//! structural rather than matters of care.
+//!
+//! **This store holds no flash.** There is one flash peripheral and
+//! [`crate::store::FlashStore`] owns it for the life of the program, because a
+//! rolling code must be committed before every transmission. So this store is
+//! geometry — where the ring is and how it is carved up — and every operation
+//! borrows the flash from that owner through
+//! [`FlashStore::with_flash`](crate::store::FlashStore::with_flash). The `&mut`
+//! that borrow needs is the same `&mut` a rolling-code commit needs, so a
+//! settings write and a commit cannot be in flight together. That is exactly
+//! the arrangement [`crate::shades::ShadeStore`] already uses, and it is copied
+//! rather than reinvented.
+//!
+//! **Only one half moves at a time.** [`ConfigStore::amend`] takes a
+//! [`ConfigChange`] naming one half and carries the other across from the
+//! newest readable record, so "save the broker" cannot erase the Wi-Fi
+//! credential by omission. [`ConfigStore::store`] — which takes both — stays
+//! for the provisioning tool, where supplying both is the whole point.
 
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_bootloader_esp_idf::partitions::{self, PartitionType};
@@ -167,26 +190,51 @@ pub struct ConfigSurvey {
 #[repr(C, align(4))]
 struct Slot([u8; CONFIG_RECORD_LEN]);
 
-/// The flash-backed configuration store.
-pub struct ConfigStore<'d> {
-    flash: FlashStorage<'d>,
+/// Which half of the record a runtime write is changing.
+///
+/// The other half is carried across from the newest readable record, so the
+/// caller cannot silently drop it. There is no variant that changes both:
+/// nothing in the running controller ever means to, and a variant that could
+/// would be the mistake this type exists to make inexpressible.
+#[allow(
+    dead_code,
+    reason = "constructed by the state task, which serves the settings screen; \
+              `config-check` includes this file by path and writes both halves \
+              at once through `store` instead"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigChange {
+    /// A Wi-Fi credential the operator has proved they can still reach the
+    /// device through. See [`somfy_config::WifiTrial`] for what "proved" means.
+    Wifi(WifiCredentials),
+    /// Broker settings, or `None` to run without a broker — which is a
+    /// configuration an operator can mean and not an absence.
+    Mqtt(Option<MqttSettings>),
+}
+
+/// The flash-backed configuration store: where the ring is, and how it is
+/// carved up.
+///
+/// Holds no flash — see this module's docs for why one owner lends it rather
+/// than two owning it.
+pub struct ConfigStore {
     /// Absolute flash offset of the partition.
     base: u32,
     ring: SectorRing,
 }
 
-impl<'d> ConfigStore<'d> {
-    /// Find the config partition and take ownership of the flash.
+impl ConfigStore {
+    /// Find the config partition.
     ///
     /// **Call this from `main`, not from a task**, for the same reason
     /// [`crate::store::FlashStore::mount`] says so: the partition table costs
     /// about 1 KB of stack here plus `esp-storage`'s 4 KB sector buffer on the
     /// unaligned read path.
-    pub fn mount(mut flash: FlashStorage<'d>) -> Result<Self, ConfigError> {
+    pub fn mount(flash: &mut FlashStorage<'_>) -> Result<Self, ConfigError> {
         let capacity = flash.capacity() as u64;
         let (base, len) = {
             let mut buffer = [0u8; PARTITION_TABLE_BYTES];
-            let table = partitions::read_partition_table(&mut flash, &mut buffer)
+            let table = partitions::read_partition_table(flash, &mut buffer)
                 .map_err(ConfigError::PartitionTable)?;
             let entry = table
                 .iter()
@@ -215,7 +263,7 @@ impl<'d> ConfigStore<'d> {
             return Err(geometry());
         }
 
-        Ok(Self { flash, base, ring })
+        Ok(Self { base, ring })
     }
 
     /// Where the ring lives and how it is carved up: offset, slots, slot bytes.
@@ -233,8 +281,11 @@ impl<'d> ConfigStore<'d> {
     /// rolling-code store that is **not** refused even when `survey.damaged`
     /// is non-zero: see this module's docs for why the two stores answer
     /// damage differently. The count is returned so the caller can say so.
-    pub fn load(&mut self) -> Result<(Option<ConfigRecord>, ConfigSurvey), ConfigError> {
-        let mut scan = self.scan()?;
+    pub fn load(
+        &self,
+        flash: &mut FlashStorage<'_>,
+    ) -> Result<(Option<ConfigRecord>, ConfigSurvey), ConfigError> {
+        let mut scan = self.scan(flash)?;
         let current = scan
             .newest
             .as_ref()
@@ -264,15 +315,17 @@ impl<'d> ConfigStore<'d> {
     /// [`somfy_config::ConfigRecord`].
     #[allow(
         dead_code,
-        reason = "the controller only reads this region; `config-check` includes \
-                  this file by path and is the binary that writes it"
+        reason = "the controller amends one half at a time through `amend`; \
+                  `config-check` includes this file by path and is the binary \
+                  that sets both at once"
     )]
     pub fn store(
-        &mut self,
+        &self,
+        flash: &mut FlashStorage<'_>,
         wifi: Option<WifiCredentials>,
         mqtt: Option<MqttSettings>,
     ) -> Result<(), ConfigError> {
-        let scan = self.scan()?;
+        let scan = self.scan(flash)?;
 
         // A write may not proceed on a ring that holds readable records but
         // could not name a newest one. `scan` reaches that state when the
@@ -319,12 +372,44 @@ impl<'d> ConfigStore<'d> {
             wifi,
             mqtt,
         };
-        self.append(slot, &record)
+        self.append(flash, slot, &record)
+    }
+
+    /// Change one half of the record and carry the other across unchanged.
+    ///
+    /// This is the runtime write path: what the settings screen reaches through
+    /// the state task. It goes through [`ConfigStore::store`] rather than around
+    /// it, so the `Unstable` refusal and the torn-slot handling are the same
+    /// ones the provisioning tool gets — there is one writer, not one per
+    /// caller.
+    ///
+    /// The half that is *not* named comes from the newest readable record, or
+    /// is `None` when there is none. That second case is worth stating: on a
+    /// board whose region is blank or unreadable, amending the broker writes a
+    /// record with no Wi-Fi credential, because there is no credential to carry
+    /// across. It cannot lose one that was there — an unreadable region is
+    /// exactly the state in which nothing was there to read.
+    #[allow(
+        dead_code,
+        reason = "the caller is the state task, which the `http` feature gates; \
+                  a build with no web server has nothing that changes settings"
+    )]
+    pub fn amend(
+        &self,
+        flash: &mut FlashStorage<'_>,
+        change: ConfigChange,
+    ) -> Result<(), ConfigError> {
+        let (current, _) = self.load(flash)?;
+        let (wifi, mqtt) = match change {
+            ConfigChange::Wifi(wifi) => (Some(wifi), current.and_then(|record| record.mqtt)),
+            ConfigChange::Mqtt(mqtt) => (current.and_then(|record| record.wifi), mqtt),
+        };
+        self.store(flash, wifi, mqtt)
     }
 
     /// Read every slot: the newest valid record, which slots are erased, and a
     /// tally of what each one held.
-    fn scan(&mut self) -> Result<Scan, ConfigError> {
+    fn scan(&self, flash: &mut FlashStorage<'_>) -> Result<Scan, ConfigError> {
         let slot_count = self.ring.layout().slot_count();
         let mut sequences = [None; MAX_SLOTS];
         let mut free = [false; MAX_SLOTS];
@@ -333,7 +418,7 @@ impl<'d> ConfigStore<'d> {
         let mut namespaces_truncated = false;
 
         for slot in 0..slot_count {
-            match self.read_slot(slot)? {
+            match self.read_slot(flash, slot)? {
                 Ok(record) => {
                     sequences[slot] = Some(record.seq);
                     valid += 1;
@@ -371,7 +456,10 @@ impl<'d> ConfigStore<'d> {
         // contradiction is exactly the thing to look at.
         let newest = match newest_slot(&sequences[..slot_count]) {
             None => None,
-            Some(slot) => self.read_slot(slot)?.ok().map(|record| (slot, record)),
+            Some(slot) => self
+                .read_slot(flash, slot)?
+                .ok()
+                .map(|record| (slot, record)),
         };
         Ok(Scan {
             newest,
@@ -391,34 +479,39 @@ impl<'d> ConfigStore<'d> {
     /// flash transactions costs nothing that matters, and a single 256-byte
     /// buffer is a smaller thing to hold on the stack of a `main` that has
     /// already paid for the partition table.
-    fn read_slot(&mut self, slot: usize) -> Result<Result<ConfigRecord, RecordError>, ConfigError> {
+    fn read_slot(
+        &self,
+        flash: &mut FlashStorage<'_>,
+        slot: usize,
+    ) -> Result<Result<ConfigRecord, RecordError>, ConfigError> {
         let offset = self.offset(slot)?;
         let mut buffer = Slot([0u8; CONFIG_RECORD_LEN]);
-        self.flash.read(offset, &mut buffer.0)?;
+        flash.read(offset, &mut buffer.0)?;
         Ok(ConfigRecord::decode(&buffer.0))
     }
 
     /// Append `record` at `slot`, erasing that slot's sector first if it starts
     /// one, then prove the bytes landed.
-    #[allow(
-        dead_code,
-        reason = "reachable only through `store`; see the allow there"
-    )]
-    fn append(&mut self, slot: usize, record: &ConfigRecord) -> Result<(), ConfigError> {
+    fn append(
+        &self,
+        flash: &mut FlashStorage<'_>,
+        slot: usize,
+        record: &ConfigRecord,
+    ) -> Result<(), ConfigError> {
         let offset = self.offset(slot)?;
 
         if let Some(sector) = self.ring.erase_before(slot) {
             let from = self.base + sector as u32;
-            self.flash.erase(from, from + SECTOR as u32)?;
+            flash.erase(from, from + SECTOR as u32)?;
         }
 
         // Through `Slot` rather than straight from `encode`: a bare `[u8; N]`
         // is byte-aligned, and `esp-storage` answers an unaligned buffer by
         // copying it through a 4 KB sector buffer on this stack.
         let bytes = Slot(record.encode());
-        self.flash.write(offset, &bytes.0)?;
+        flash.write(offset, &bytes.0)?;
 
-        match self.read_slot(slot)? {
+        match self.read_slot(flash, slot)? {
             Ok(written) if written == *record => Ok(()),
             _ => Err(ConfigError::NotDurable),
         }
@@ -440,7 +533,6 @@ struct Scan {
     newest: Option<(usize, ConfigRecord)>,
     /// `free[i]` — slot `i` is erased, so a record can be written into it
     /// without erasing anything first. Indices past the ring stay false.
-    #[allow(dead_code, reason = "read only by `store`; see the allow there")]
     free: [bool; MAX_SLOTS],
     /// Slots holding a record that passed its checksum.
     valid: usize,

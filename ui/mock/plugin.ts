@@ -39,7 +39,11 @@ import type { ApiErrorDto } from '../src/api/generated/ApiErrorDto.ts';
 import type { CalibrationStepDto } from '../src/api/generated/CalibrationStepDto.ts';
 import type { CommandDto } from '../src/api/generated/CommandDto.ts';
 import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
+import type { MqttUpdateDto } from '../src/api/generated/MqttUpdateDto.ts';
 import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
+import type { SecretDto } from '../src/api/generated/SecretDto.ts';
+import type { WifiUpdateDto } from '../src/api/generated/WifiUpdateDto.ts';
+import { Settings, type Rejection } from './settings.ts';
 import { World } from './world.ts';
 
 const API_PREFIX = '/api/v1';
@@ -101,13 +105,36 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   ventBandNotMeasured: 409,
   notCalibrating: 409,
   calibrationImplausible: 400,
+  // Settings. Every validation refusal is a 400 and the two trial-state ones
+  // are 409, matching `ApiErrorCode::http_status` — the argument for each is
+  // there, beside the variant.
+  valueEmpty: 400,
+  valueTooLong: 400,
+  valueTooShort: 400,
+  valueInteriorNul: 400,
+  brokerAddressMalformed: 400,
+  brokerAddressUnroutable: 400,
+  brokerPortZero: 400,
+  passwordWithoutUsername: 400,
+  topicWildcard: 400,
+  topicLeadingSlash: 400,
+  topicTrailingSlash: 400,
+  topicEmptySegment: 400,
+  topicIllegalCharacter: 400,
+  namespacesOverlap: 400,
+  secretNotSet: 400,
+  noTrialInProgress: 409,
+  trialInProgress: 409,
+  trialNotAssociated: 409,
+  settingsUnwritable: 500,
 };
 
 export function mockApi(): Plugin {
   const world = new World();
+  const settings = new Settings();
 
   const attach = (server: ViteDevServer | PreviewServer) => {
-    server.middlewares.use(restMiddleware(world));
+    server.middlewares.use(restMiddleware(world, settings));
     server.httpServer?.on('upgrade', upgradeHandler(world));
   };
 
@@ -123,7 +150,7 @@ export function mockApi(): Plugin {
 // REST
 // ---------------------------------------------------------------------------
 
-function restMiddleware(world: World): Connect.NextHandleFunction {
+function restMiddleware(world: World, settings: Settings): Connect.NextHandleFunction {
   return (request, response, next) => {
     const url = new URL(request.url ?? '/', 'http://device.invalid');
     if (!url.pathname.startsWith(API_PREFIX) || url.pathname === EVENTS_PATH) {
@@ -132,7 +159,7 @@ function restMiddleware(world: World): Connect.NextHandleFunction {
     }
 
     const segments = url.pathname.slice(API_PREFIX.length).split('/').filter(Boolean);
-    handle(world, request, response, segments).catch((error: unknown) => {
+    handle(world, settings, request, response, segments).catch((error: unknown) => {
       sendJson(response, 500, { error: String(error) });
     });
   };
@@ -140,12 +167,17 @@ function restMiddleware(world: World): Connect.NextHandleFunction {
 
 async function handle(
   world: World,
+  settings: Settings,
   request: IncomingMessage,
   response: ServerResponse,
   segments: string[],
 ): Promise<void> {
   const [collection, rawId, action] = segments;
   const method = request.method ?? 'GET';
+
+  if (collection === 'settings') {
+    return handleSettings(settings, request, response, segments, method);
+  }
 
   if (segments.length === 1 && collection === 'shades' && method === 'POST') {
     const body = parseCreateShade(await readJson(request));
@@ -258,6 +290,119 @@ async function handle(
   }
 
   return sendJson(response, 404, { error: 'no such route' });
+}
+
+/**
+ * The settings surface: four paths, all plain literals, exactly as the
+ * firmware's router declares them.
+ *
+ * Answers `202` where the device answers `202`, and the distinction carries
+ * meaning on both: a Wi-Fi trial has been *accepted*, not applied, and a broker
+ * save is followed by a restart. A mock that answered `200` would let a screen
+ * ship that treated either as finished.
+ */
+async function handleSettings(
+  settings: Settings,
+  request: IncomingMessage,
+  response: ServerResponse,
+  segments: string[],
+  method: string,
+): Promise<void> {
+  const [, half, action] = segments;
+
+  if (segments.length === 1 && method === 'GET') {
+    return sendJson(response, 200, settings.read());
+  }
+
+  if (half === 'wifi' && action === undefined && method === 'PUT') {
+    const body = parseWifiUpdate(await readJson(request));
+    if (!body) return sendJson(response, 400, { error: 'malformed body' });
+    return settle(response, settings.startWifiTrial(body), 202);
+  }
+
+  if (half === 'wifi' && action === 'confirm' && method === 'POST') {
+    return settle(response, settings.confirmWifi(), 204);
+  }
+
+  if (half === 'wifi' && action === 'cancel' && method === 'POST') {
+    return settle(response, settings.cancelWifiTrial(), 202);
+  }
+
+  if (half === 'mqtt' && action === undefined && method === 'PUT') {
+    const body = parseMqttUpdate(await readJson(request));
+    if (!body) return sendJson(response, 400, { error: 'malformed body' });
+    return settle(response, settings.saveMqtt(body), 202);
+  }
+
+  if (half === 'mqtt' && action === undefined && method === 'DELETE') {
+    return settle(response, settings.clearMqtt(), 202);
+  }
+
+  return sendJson(response, 404, { error: 'no such route' });
+}
+
+/** A settings outcome, as a response. */
+function settle(
+  response: ServerResponse,
+  outcome: { ok: true } | Rejection,
+  status: number,
+): void {
+  if ('error' in outcome) return sendRejection(response, outcome);
+  response.statusCode = status;
+  return void response.end();
+}
+
+/**
+ * Read a write-only secret.
+ *
+ * An **absent** `secret` is a malformed body rather than a guess, exactly as
+ * `somfy_api::SecretDto`'s hand-written `Deserialize` treats it: "keep" and
+ * "clear" are the two things an omission might have meant, and picking between
+ * them silently is the whole thing this type exists to prevent.
+ */
+function parseSecret(value: unknown): SecretDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { secret, value: text } = value as { secret?: unknown; value?: unknown };
+  switch (secret) {
+    case 'keep':
+      return { secret: 'keep' };
+    case 'clear':
+      return { secret: 'clear' };
+    case 'set':
+      return typeof text === 'string' ? { secret: 'set', value: text } : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function parseWifiUpdate(value: unknown): WifiUpdateDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { ssid, psk } = value as { ssid?: unknown; psk?: unknown };
+  if (typeof ssid !== 'string') return undefined;
+  const secret = parseSecret(psk);
+  return secret ? { ssid, psk: secret } : undefined;
+}
+
+function parseMqttUpdate(value: unknown): MqttUpdateDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const body = value as Record<string, unknown>;
+  const { address, port, username, discoveryPrefix, stateRoot } = body;
+  if (
+    typeof address !== 'string' ||
+    typeof port !== 'number' ||
+    !Number.isInteger(port) ||
+    port < 0 ||
+    port > 65535 ||
+    typeof username !== 'string' ||
+    typeof discoveryPrefix !== 'string' ||
+    typeof stateRoot !== 'string'
+  ) {
+    return undefined;
+  }
+  const password = parseSecret(body['password']);
+  return password
+    ? { address, port, username, password, discoveryPrefix, stateRoot }
+    : undefined;
 }
 
 /**
@@ -415,6 +560,20 @@ function sendNoContent(response: ServerResponse): void {
 function sendError(response: ServerResponse, code: ApiErrorCode): void {
   const body: ApiErrorDto = { code };
   sendJson(response, ERROR_STATUS[code], body);
+}
+
+/**
+ * The same, plus the settings field it is about.
+ *
+ * The field is **omitted** when there is none rather than sent as `null`, which
+ * is what `#[serde(skip_serializing_if)]` does on the device — so the bytes a
+ * screen parses are the same from both.
+ */
+function sendRejection(response: ServerResponse, rejection: Rejection): void {
+  const body: ApiErrorDto = rejection.field
+    ? { code: rejection.error, field: rejection.field }
+    : { code: rejection.error };
+  sendJson(response, ERROR_STATUS[rejection.error], body);
 }
 
 // ---------------------------------------------------------------------------

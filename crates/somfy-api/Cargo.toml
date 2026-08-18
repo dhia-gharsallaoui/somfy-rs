@@ -14,6 +14,15 @@ std = []
 serde = { version = "1", default-features = false, features = ["derive"] }
 heapless = { version = "0.8", features = ["serde"] }
 somfy-domain = { path = "../somfy-domain" }
+# The settings DTOs convert straight into the validated types the flash record
+# is decoded through, so a value this API accepts is one the region can hold.
+# Doing that here rather than in the firmware is what makes the R3 rejection
+# rules — "refused at the point of entry with the field named" — testable on the
+# host, which is where every other rule in this workspace is checked.
+somfy-config = { path = "../somfy-config" }
+# Only for the namespace rules' error type, which `somfy-config` re-raises
+# rather than flattens; `topic_rejection` matches it exhaustively.
+somfy-mqtt = { path = "../somfy-mqtt" }
 ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
