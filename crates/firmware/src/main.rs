@@ -117,6 +117,14 @@ mod mdns;
 #[cfg(feature = "mqtt")]
 mod mqtt;
 mod net;
+// **Not feature-gated, unlike every other module above**, and the split is
+// inside it rather than here. Its upload half *is* gated — `ota::upload` needs
+// a web server and a page buffer, and the ESP32 has neither — but its boot half
+// decides whether the image that is running may stay, and that has to exist
+// wherever an `otadata` region does. A board that cannot be sent an update over
+// the network can still have been given one by a serial flash into the other
+// slot, and it is the half that reads the record which notices.
+mod ota;
 mod radio;
 mod rpc;
 mod shades;
@@ -285,8 +293,19 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // cost of a panic. 100 ms is roughly three times what a long message needs
     // at 115200 baud, and it doubles as a floor on how fast a deterministic
     // panic can cycle the board.
-    Delay::new().delay_millis(PANIC_DRAIN_MS);
+    drain_serial();
     esp_hal::system::software_reset()
+}
+
+/// Wait for the serial line to empty before resetting.
+///
+/// Extracted from the handler above because [`ota`] resets for its own reasons
+/// and needs exactly the same thing for exactly the same reason. Every reset
+/// this firmware performs at the moment it has something to say goes through
+/// here; `api::routes::restarter` and [`trial`] do not, because both already
+/// wait far longer than this for reasons of their own.
+fn drain_serial() {
+    Delay::new().delay_millis(PANIC_DRAIN_MS);
 }
 
 /// Anything that can stop the controller starting, reported rather than
@@ -385,6 +404,19 @@ async fn entry(spawner: Spawner) {
             // report. No network is attempted, because there is no radio for
             // it to be independent of.
             esp_println::println!("controller: failed to start: {:?}", error);
+            // **Unless this image is on trial**, in which case failing to start
+            // is exactly what a bad release looks like and sitting here is a
+            // brick: nothing else in the firmware will ever reset the board, and
+            // a power cycle clears the attempt count, so the same failure would
+            // repeat forever. Resetting turns it into the second attempt, which
+            // `ota::survey` reads as a roll-back. See `somfy_ota::verdict`.
+            if ota::verification_pending() {
+                esp_println::println!(
+                    "ota: this image has not been confirmed and it did not start — resetting,                      so the next boot rolls back to the image that was running before it"
+                );
+                drain_serial();
+                esp_hal::system::software_reset()
+            }
             return;
         }
     };
@@ -408,6 +440,7 @@ async fn entry(spawner: Spawner) {
     yield_now().await;
 
     start_network(spawner, pending);
+
     heap::report("controller started");
     report_stack_use();
     esp_println::println!("controller: running");
@@ -442,6 +475,22 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     let software = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timers.timer0, software.software_interrupt0);
 
+    // **The flash comes up before anything that can refuse to start, and the
+    // reason is the roll-back.** Every check below this line is one a bad
+    // release can fail — a deeper call chain fails `check_stack_headroom`, a
+    // changed pin map fails `check_pin_map`, a changed SPI configuration fails
+    // `Cc1101::init` — and a board that has just taken an update has to be able
+    // to *undo* it when one of them does. Reading `otadata` first is what makes
+    // that possible: `entry` resets on any failure while a verification is
+    // pending, and the next boot's attempt count turns that into a roll-back.
+    //
+    // It costs a kilobyte of stack for the partition table, ahead of the check
+    // that guards the stack. That is deliberate and it is the *small* half of
+    // the mount: `FlashStore::mount` wants about five, and it stays below the
+    // check where it was.
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    report_ota(&mut flash);
+
     check_stack_headroom()?;
 
     let pins = crate::cc1101_pins!(peripherals);
@@ -459,9 +508,16 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
-    let mut store =
-        FlashStore::mount(FlashStorage::new(peripherals.FLASH)).map_err(StartError::Store)?;
+    let mut store = FlashStore::mount(flash).map_err(StartError::Store)?;
     let survey = report_store(&mut store)?;
+
+    // **The store having mounted and surveyed is the self-test's `Stores`
+    // leg.** `FlashStore::mount` returned `Ok` and `report_store` did not
+    // refuse, so the partition table parsed, the region is where it should be,
+    // and the newest record read back. A release that changed the record format
+    // or moved a region fails here rather than three boots later — and it fails
+    // through `?`, so the leg is recorded on the way past rather than after.
+    ota::stores_leg(true);
 
     // **The configuration is no longer read through a reborrow that ends at
     // boot.** It used to be, because nothing in the controller image wrote it;
@@ -499,7 +555,18 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         ExclusiveDevice::new(bus, chip_select, Delay::new()).map_err(|_| StartError::ChipSelect)?;
 
     let mut cc1101 = Cc1101::new(device);
-    cc1101.init().map_err(StartError::Radio)?;
+    // Recorded before the `?`, so a failure is a *reported* leg rather than an
+    // absent one. It matters because the two are different verdicts: `start`
+    // returning `Err` here spawns nothing at all, including the self-test, so
+    // the image would sit unconfirmed forever and roll back only on the next
+    // reset. Writing the leg first is what makes the boot-side self-test able
+    // to fail for the reason design spec §7.5 names.
+    //
+    // **What it establishes is narrow**: that a configuration register read
+    // back what was written to it, over SPI. See `somfy_ota::selftest::Leg::Radio`.
+    let radio = cc1101.init();
+    ota::radio_leg(radio.is_ok());
+    radio.map_err(StartError::Radio)?;
 
     // `into_async` converts the whole peripheral, both channels with it. The
     // receiver has to be asynchronous — a blocking receive busy-polls with no
@@ -609,6 +676,12 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
             shades: shade_store,
             #[cfg(feature = "http")]
             config: config_store,
+            // The receiving end of a firmware upload, created here and never
+            // again — the sending end goes into a `static` that the upload
+            // handler takes for the life of one session, which is what makes a
+            // second concurrent upload impossible. See `ota::upload`.
+            #[cfg(feature = "http")]
+            ota: ota::init(),
             catalog,
             identity: RemoteIdentity::from_mac(base_mac()),
             edits: EDITS.receiver(),
@@ -763,6 +836,30 @@ fn report_config(
         );
     }
     (Some(store), record.wifi, record.mqtt, survey.superseded)
+}
+
+/// Read `otadata`, say what it means, and act on it if the answer is "go back".
+///
+/// Answers nothing on a board that has no update machinery at all — espflash's
+/// built-in partition table has no `otadata` region — and that is no more an
+/// error path than a board with no Wi-Fi credentials is. Such a board receives,
+/// decodes and tracks, and cannot be updated over the network until it is
+/// reflashed from `crates/firmware`.
+///
+/// **Does not return when the verdict is a roll-back**: it rewrites `otadata`
+/// and resets, because there is nothing this image should go on to do.
+fn report_ota(flash: &mut FlashStorage<'static>) {
+    match ota::survey(flash) {
+        Ok(boot) => {
+            ota::report(flash, boot);
+        }
+        Err(error) => esp_println::println!(
+            "ota: no update machinery on this board ({:?}) — it runs, and it cannot be updated \
+             over the network. Reflash from crates/firmware so espflash writes this crate's \
+             partition table.",
+            error,
+        ),
+    }
 }
 
 /// The shades a boot found, in the order their registry ids will follow, plus
@@ -1297,6 +1394,11 @@ fn start_network(spawner: Spawner, pending: Pending) {
              This board still receives and decodes; see docs/hardware-checklist.md \
              to provision one."
         );
+        // **Skipped, not failed.** A board with nothing to connect to has no
+        // network to bring up, and refusing it an update over that would make
+        // the one configuration that needs no network the one that cannot be
+        // updated. See `somfy_ota::selftest`.
+        ota::network_leg(None);
         return;
     };
     let stack = match net::start(spawner, pending.wifi, &credentials) {
@@ -1306,9 +1408,17 @@ fn start_network(spawner: Spawner, pending: Pending) {
                 "network: failed to start ({:?}) — running radio-only, which is unaffected",
                 error,
             );
+            // **The one network failure a self-test may refuse an update over.**
+            // This is the driver rejecting a configuration or the stack failing
+            // to start, which is a property of the image; failing to *associate*
+            // is a property of the air, and this estate's access point has
+            // vanished for a stretch before now. `somfy_ota::selftest` carries
+            // the distinction and why it is the whole of it.
+            ota::network_leg(Some(false));
             return;
         }
     };
+    ota::network_leg(Some(true));
     // **Before the broker, and independent of it.** A device with no broker
     // provisioned — the ordinary state of a freshly flashed board — still needs
     // its own UI, and that UI is how somebody provisions one. Starting it after

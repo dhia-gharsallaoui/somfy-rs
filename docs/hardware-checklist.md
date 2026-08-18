@@ -5,7 +5,7 @@ Written from the first successful bring-up on 2026-08-15/16, including the
 mistakes, because most of the time here was lost to things that are obvious
 only in hindsight.
 
-Eight independent procedures, because they need different equipment and carry
+Ten independent procedures, because they need different equipment and carry
 different risk:
 
 - **[Transmit path](#transmit-path)** — needs a second radio, and puts RF on
@@ -28,6 +28,15 @@ different risk:
 - **[Partition table](#partition-table)** — what a board already in service has
   to do to move to the A/B layout, and the one way to get it wrong. **Read this
   before reflashing a board that is carrying real rolling codes.**
+- **[Name and time](#name-and-time)** — needs a second machine on the same
+  subnet; touches only the network, and both services are supposed to be
+  invisible when they fail.
+- **[Updating over the air](#updating-over-the-air)** — needs the board on the
+  network and a built image; replaces the firmware. **It is the only procedure
+  here that can leave a board running code you did not flash over a cable.**
+- **[Proving the roll-back](#proving-the-roll-back)** — deliberately uploads a
+  broken image, twice, and confirms the board comes back on its own. Run it
+  once per release of the update path, not per release of the firmware.
 
 Which binary is which matters here, because they differ in whether they key a
 transmitter:
@@ -1352,10 +1361,19 @@ Four ways, in descending order of what they cost.
     target/xtensa-esp32s3-none-elf/release/firmware
   ```
 
-  **This cannot happen yet.** Nothing in the firmware writes `otadata`, so it
-  stays blank and a blank record with no `factory` partition present means "boot
-  `ota_0`". It becomes reachable the moment Plan 6 Task 4 lands, which is why it
-  is written down now rather than then.
+  **This is now reachable, and the condition is exact.** The firmware writes
+  `otadata` at the *start of the first upload* and never before — see
+  `crates/firmware/src/ota/upload.rs::seed_otadata` — so:
+
+  | Board | `--erase-parts otadata` |
+  |---|---|
+  | Has never been sent an update | not needed; the region is still blank |
+  | Has been sent one, successful or not | **needed on every serial reflash** |
+
+  The boot line says which you have. `ota: … otadata says Absent` is a board
+  that has never been offered an update; anything else means the region has
+  been written and a plain `espflash flash` can boot the wrong slot. When in
+  doubt, pass the flag: on a blank region it does nothing.
 
 ---
 
@@ -1464,3 +1482,323 @@ it* is the failure both modules are arranged against.
 - **Anything about a second board.** The hostname is derived from the MAC, so a
   collision needs two boards with one MAC. That is the argument for not probing
   (RFC 6762 §8.1), and it is untested because it is untestable here.
+
+---
+
+## Updating over the air
+
+Replacing the firmware without a cable. **This procedure touches flash and the
+network only** — nothing goes on the 433 MHz band, and the radio keeps
+receiving throughout, including while the inactive slot is being erased.
+
+It is the only procedure in this document that can leave a board running code
+you did not put there over a cable, so read [Getting it
+wrong](#getting-it-wrong-1) before the first one.
+
+Step 0 above — **identify the board** — does not apply, and that is worth
+saying out loud: an upload goes to whichever device answers the address you
+typed. **The address is the identification here**, so check it the way you would
+check a MAC.
+
+### 1. Build the image, and build the *image*
+
+`espflash flash` turns an ELF into a device image on its way to the flash. An
+upload has nowhere to do that, so it has to be given the image:
+
+```bash
+source ~/export-esp.sh
+cd crates/firmware
+cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
+espflash save-image --chip esp32s3 \
+  target/xtensa-esp32s3-none-elf/release/firmware /tmp/firmware.bin
+ls -l /tmp/firmware.bin
+```
+
+Uploading `target/…/release/firmware` instead — the ELF — is the mistake this
+step exists to prevent, and the device refuses it by its first byte with
+`{"code":"imageNotFirmware"}`.
+
+### 2. Upload it
+
+```bash
+curl -sS -X POST --data-binary @/tmp/firmware.bin \
+  -H 'Content-Type: application/octet-stream' \
+  -w '\n%{http_code} in %{time_total}s\n' \
+  http://<the board's IP>/api/v1/ota
+```
+
+**`202` is the acceptance criterion.** The body is empty; the device has
+written the inactive slot, verified it, marked it bootable and is about to
+restart into it. Expect the whole thing to take tens of seconds — the flash
+side is a few hundred sector erases and dominates the transfer.
+
+`--data-binary` and not `-d`, because `-d` strips newlines from what it thinks
+is text and would corrupt the image; `curl` sets `Content-Length` from the file
+either way, which is what the device sizes the write against.
+
+The device's own name works too, and is the better habit:
+
+```bash
+curl -sS -X POST --data-binary @/tmp/firmware.bin \
+  -H 'Content-Type: application/octet-stream' \
+  -w '\n%{http_code}\n' http://somfy-<12 hex>.local/api/v1/ota
+```
+
+### 3. What a good update prints
+
+On the serial console, while the upload runs:
+
+```
+ota: otadata is blank — seeding it to Ota0, the slot this image runs from. From
+ here a serial reflash needs `--erase-parts otadata`; see docs/hardware-checklist.md.
+ota: accepting 1082560 bytes for Ota1 at 0x00210000 — the running slot is not touched
+ota: 1082560 bytes verified — firmware version '0.1.0', built for esp32s3. Marking Ota1 bootable.
+ota: the next boot runs Ota1. It has to pass a self-test within 90 s or the board comes back to Ota0 on its own.
+ota: update accepted — restarting into it. If it does not confirm itself, this board comes back to the image it is running now.
+```
+
+The seeding line appears **once in a board's life**, on its first update.
+
+Then the reboot, and the new image's own boot:
+
+```
+ota: running from Ota1 (updates would write Ota0 at 0x00010000, 2031616 bytes), otadata says New
+ota: this image has not been confirmed — running the self-test, and marking the slot valid in 90 s if the radio, the stores and the network bring-up all answer. A crash before then rolls back on the next boot.
+```
+
+and, ninety seconds later:
+
+```
+ota: self-test passed after 90 s — radio SPI answered, the stores read back, the network came up. Marking this image valid. It does NOT establish that anything radiates: see somfy_ota::selftest::Leg::Radio.
+ota: this image is now the one a reset boots
+```
+
+**`running from Ota1` is the proof that the update took.** The first update
+moves a board from `Ota0` to `Ota1`, the second back to `Ota0`, and so on. The
+rolling codes, the credentials, the shade table and the estate are in data
+regions that neither slot touches — the store survey lines above it are the
+evidence, and they should read exactly as they did before.
+
+### 4. Confirm it, from the other side
+
+An update that reports its own success proves nothing, which is this project's
+standing rule about transmitters and applies here for the same reason: the
+image that says it verified itself is the one that was just replaced.
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://<the board's IP>/api/v1/shades
+```
+
+A `200` after the reboot means the new image booted, brought up Wi-Fi, and is
+serving. Then run the [Transmit path](#transmit-path) and [Receive
+path](#receive-path) procedures: the self-test's radio leg proves the SPI
+control path and **nothing about GDO0, GDO2 or whether anything radiates**, so
+an update is not verified until a frame has actually moved.
+
+### 5. What a refusal looks like
+
+Every one of these leaves the board running exactly what it was running. Nothing
+is marked bootable until the last byte has arrived and been checked.
+
+| Response | Body | What happened |
+|---|---|---|
+| `400` | `{"code":"imageNotFirmware"}` | Not an ESP-IDF app image. Almost always the ELF instead of the output of `espflash save-image`. |
+| `400` | `{"code":"imageForAnotherChip"}` | An image for one of the other two chips this project builds for. |
+| `400` | `{"code":"imageDamaged"}` | The upload was short, long, or a byte of it changed on the way. Try again. |
+| `413` | `{"code":"imageTooLarge"}` | Larger than the 2,031,616-byte slot. Refused from `Content-Length`, before any flash is touched. |
+| `409` | `{"code":"updateInProgress"}` | Another upload holds the session. Wait for it, or for its socket to time out. |
+| `500` | `{"code":"updateUnwritable"}` | Flash refused, or this board has no `otadata` region. The console line says which. |
+| `403` | `{"code":"hostNotThisDevice"}` | You reached the device through a name it does not answer to. Use its address or its `.local` name. |
+
+A `curl` that dies part-way is the same as any other failure: the session lock
+is released, the half-written slot is inert because nothing points at it, and
+the next upload erases it. **Prove it if you like** — `Ctrl-C` an upload after a
+few seconds, then reset the board and confirm it comes up on the slot it was
+already running, with its survey lines unchanged.
+
+### Getting it wrong
+
+Three ways, in descending order of what they cost.
+
+- **Reflashing over serial afterwards without `--erase-parts otadata`.** The
+  board keeps its record, boots the *other* slot, and runs the older image
+  while the one you just flashed sits unused. Nothing reports a fault. See
+  [Partition table → Getting it wrong](#getting-it-wrong).
+- **Uploading to the wrong device.** There is no authentication on this
+  endpoint — the `Origin`/`Host` check establishes that the request was
+  addressed to *a* somfy-rs board, not to *this* one. The address in the `curl`
+  is the whole of the targeting.
+- **Assuming a `202` means the shades still work.** It means the image is
+  written, structurally sound and running. Step 4 is the part that establishes
+  the rest.
+
+### What this procedure does not establish
+
+- **That the update path works on the ESP32-C3.** The upload endpoint exists in
+  that build and has never run: `crates/firmware/src/heap.rs` records that the
+  route takes its Wi-Fi heap to 52,224 bytes, which is 2,396 below the worst
+  announcement peak ever measured — on a different chip. `warn_if_tight` says
+  so at boot. If a C3 ever runs this, read that line first.
+- **That an image with an appended digest that does not match is refused
+  *here*.** This firmware checks the image's own one-byte checksum, not its
+  SHA-256; a corruption that survives both TCP and that byte is caught by the
+  bootloader on the next boot, which falls back to the slot that was running.
+  That costs one reboot and is a path nobody has deliberately exercised.
+- **Anything about a hung image.** See the next section.
+
+---
+
+## Proving the roll-back
+
+**A self-test that has never failed is a self-test nobody has tested.** This
+section deliberately puts two broken images on a board and confirms it comes
+back on its own. **It touches flash and the network only** — nothing goes on
+the 433 MHz band.
+
+Run it once per change to the update path rather than per release. It takes
+about ten minutes and needs the board on the network and a serial console
+attached, because the console is where the evidence is.
+
+Both images are built from features that exist for this and nothing else, are
+not in `default`, are not in the CI matrix, and announce themselves at boot.
+
+### 1. Roll back from a failed self-test
+
+The image reports its radio leg as failed however the radio actually answered,
+so the soak concludes against it inside its own boot.
+
+```bash
+source ~/export-esp.sh
+cd crates/firmware
+cargo build --release --features chip-s3,bad-image-selftest \
+  --target xtensa-esp32s3-none-elf
+espflash save-image --chip esp32s3 \
+  target/xtensa-esp32s3-none-elf/release/firmware /tmp/bad-selftest.bin
+curl -sS -X POST --data-binary @/tmp/bad-selftest.bin \
+  -w '\n%{http_code}\n' http://<the board's IP>/api/v1/ota
+```
+
+`202`, then the reboot. What the console must print:
+
+```
+ota: THIS IMAGE IS DELIBERATELY BROKEN — built with `bad-image-selftest`, which reports the radio leg as failed however the radio answered. If it arrived over the air it should roll back within 90 s. Never flash it as a keeper.
+ota: running from Ota1 (updates would write Ota0 at 0x00010000, 2031616 bytes), otadata says New
+ota: this image has not been confirmed — running the self-test, and marking the slot valid in 90 s if the radio, the stores and the network bring-up all answer. A crash before then rolls back on the next boot.
+ota: self-test FAILED on Radio after 0 s — rolling back to the image that was running before this update
+```
+
+then a reset, and the **good** image again:
+
+```
+ota: running from Ota0 (updates would write Ota1 at 0x00210000, 2031616 bytes), otadata says Undefined
+```
+
+**`running from Ota0` with no self-test line is the acceptance criterion.** The
+board is back on the image it had, and it got there in one reboot without
+anybody touching it.
+
+`FAILED on Radio after 0 s` rather than after 90: a failed leg is acted on
+immediately, because there is nothing to be gained by soaking an image that has
+already answered.
+
+### 2. Roll back from an image that never reaches a verdict
+
+The harder case, and the one the attempt counter exists for: this image runs
+normally, looks healthy, and falls over twenty seconds into its soak. Nothing
+concludes anything — it simply resets.
+
+```bash
+cd crates/firmware
+cargo build --release --features chip-s3,bad-image-panic \
+  --target xtensa-esp32s3-none-elf
+espflash save-image --chip esp32s3 \
+  target/xtensa-esp32s3-none-elf/release/firmware /tmp/bad-panic.bin
+curl -sS -X POST --data-binary @/tmp/bad-panic.bin \
+  -w '\n%{http_code}\n' http://<the board's IP>/api/v1/ota
+```
+
+`202`, then **two** reboots. The first:
+
+```
+ota: running from Ota1 (…), otadata says New
+ota: this image has not been confirmed — running the self-test, …
+PANIC: panicked at src/ota/mod.rs:…: bad-image-panic: this image was built to fall over 20 s into its self-test, so that the roll-back on the next boot can be observed rather than argued about
+```
+
+and then the second, which is the one that matters:
+
+```
+ota: running from Ota1 (…), otadata says New
+ota: rolling back to Ota0 — it did not finish its self-test on a previous boot, which means it crashed or was reset part-way through. This image started 2 time(s) since the last power-on without confirming itself.
+ota: otadata now selects Ota0
+```
+
+then a third boot, on `Ota0`, settled.
+
+**`started 2 time(s) since the last power-on` is the acceptance criterion**, and
+it is the line that proves the counter in RTC memory survived the reset. Without
+it the board would soak, panic, soak, panic — a loop with no way out.
+
+### 3. Prove a power cut does *not* roll a good image back
+
+The counter is cleared by a power-on reset and only by one, which is a
+deliberate difference from ESP-IDF: a blip is not evidence against a release.
+
+Upload the **good** image, wait for `otadata says New`, and then — inside the
+ninety-second window — **pull the power** rather than resetting. On the next
+boot:
+
+```
+ota: running from Ota1 (…), otadata says New
+ota: this image has not been confirmed — running the self-test, …
+ota: self-test passed after 90 s — …
+```
+
+A fresh soak, not a roll-back. If this rolls back instead, the persistent
+attribute is not surviving what it is supposed to survive and
+`crates/firmware/src/ota/mod.rs::ATTEMPTS` is where to look.
+
+Pressing the reset button is **not** this test — that is a software reset, the
+counter survives it, and the board is supposed to roll back.
+
+### 4. Put the board back
+
+```bash
+cd crates/firmware
+cargo build --release --features chip-s3 --target xtensa-esp32s3-none-elf
+espflash save-image --chip esp32s3 \
+  target/xtensa-esp32s3-none-elf/release/firmware /tmp/firmware.bin
+curl -sS -X POST --data-binary @/tmp/firmware.bin \
+  -w '\n%{http_code}\n' http://<the board's IP>/api/v1/ota
+```
+
+Or over serial, in which case **the flag is not optional any more** — this board
+has taken updates:
+
+```bash
+espflash flash --port /dev/ttyUSB0 --erase-parts otadata \
+  target/xtensa-esp32s3-none-elf/release/firmware
+```
+
+### What this procedure does not establish
+
+- **That a *hung* image rolls back.** Nothing here catches an image that stops
+  making progress without panicking: it never resets, so nothing counts an
+  attempt and nothing acts. Closing that needs a hardware watchdog armed across
+  the soak, which this firmware does not have. It is the one failure mode of a
+  bad release that still needs a cable.
+- **The state a roll-back that cannot land leaves behind.** If the switch away
+  from a condemned image fails — the flash refuses it — the board tries once
+  more and then **runs the condemned image anyway rather than resetting
+  forever**, printing a line that says so and tells you to upload a known-good
+  image over the network. That is deliberate; a reset loop is a brick and this
+  is not. Producing it needs a flash that refuses a write, so it cannot be
+  staged here.
+- **That the bootloader's own roll-back is enabled.** It may or may not be —
+  `espflash` ships a prebuilt whose configuration cannot be read off the device
+  — and the design deliberately does not depend on it. If it *is* enabled it
+  agrees with everything above; `crates/somfy-ota/src/verdict.rs` carries why
+  the two readings converge.
+- **Anything about the ESP32 or the ESP32-C3.** The ESP32 cannot link the web
+  server at all, so it has the boot-side roll-back and no way to be sent an
+  update over the network; the C3 has both and no hardware.

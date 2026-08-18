@@ -1254,6 +1254,7 @@ dependencies = [
  "somfy-config",
  "somfy-domain",
  "somfy-mqtt",
+ "somfy-ota",
  "somfy-rmt",
  "somfy-rts",
  "somfy-store",
@@ -2147,6 +2148,13 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
  "somfy-domain",
+]
+
+[[package]]
+name = "somfy-ota"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
 ]
 
 [[package]]

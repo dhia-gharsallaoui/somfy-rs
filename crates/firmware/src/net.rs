@@ -714,6 +714,13 @@ async fn net_stack(mut runner: Runner<'static, Interface<'static>>) -> ! {
 async fn address_watch(stack: Stack<'static>) -> ! {
     loop {
         stack.wait_config_up().await;
+        // The one thing an over-the-air update's self-test wants from this
+        // task, and it is deliberately the *strong* predicate: `config_up`
+        // means an address, not merely an association. It is **reported and
+        // never a trigger** — a release is not refused for failing to find an
+        // access point — so this is one bit for a console line rather than a
+        // vote. See `somfy_ota::selftest`.
+        crate::ota::associated();
         match stack.config_v4() {
             Some(config) => esp_println::println!(
                 "net: address {} gateway {:?}",

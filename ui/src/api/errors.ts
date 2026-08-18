@@ -69,6 +69,12 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   trialInProgress: 'error.trialInProgress',
   trialNotAssociated: 'error.trialNotAssociated',
   settingsUnwritable: 'error.settingsUnwritable',
+  imageNotFirmware: 'error.imageNotFirmware',
+  imageForAnotherChip: 'error.imageForAnotherChip',
+  imageTooLarge: 'error.imageTooLarge',
+  imageDamaged: 'error.imageDamaged',
+  updateInProgress: 'error.updateInProgress',
+  updateUnwritable: 'error.updateUnwritable',
 };
 
 /**

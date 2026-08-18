@@ -21,6 +21,7 @@
 //! | Which status a refusal carries | `somfy_api::ApiErrorCode::http_status` | `ui/mock/plugin.ts` |
 //! | Whether a command may be sent *yet* | `somfy_tasks::CommandLimiter` via `StateMachine::apply` | the MQTT command channel |
 //! | Whether the caller may ask at all | `somfy_api::origin::admit` via [`FromThisDevice`] | — (HTTP is the only door with headers) |
+//! | Whether an uploaded image may be written and booted | `somfy_ota::image::Verifier` via `crate::ota` | — (HTTP is the only way in) |
 //!
 //! # Every handler below takes [`FromThisDevice`], and a new one must too
 //!
@@ -45,6 +46,16 @@
 //! serve the compiled UI: public bytes with nothing to disclose and nothing to
 //! actuate, and `shell::base()` is a fallback rather than a handler with a
 //! signature to extend.
+//!
+//! **One `/api/v1` route is not a handler function and so cannot take it as a
+//! parameter: [`OtaUpload`].** It is a `RequestHandlerService`, because a
+//! firmware image cannot be extracted into a value the way every `picoserve`
+//! body extractor produces one. It therefore calls
+//! `FromThisDevice::from_request_parts` itself, as its **first** statement,
+//! before the session lock and before a byte of the body is read. That is the
+//! one place in this file where the rule above is kept by hand rather than by a
+//! signature, and it is the route where it matters most — a `POST` there
+//! replaces the firmware.
 //!
 //! # The contract is `ui/mock/plugin.ts`
 //!
@@ -218,6 +229,12 @@ fn router() -> Router<impl PathRouter> {
             picoserve::routing::put(save_mqtt).delete(clear_mqtt),
         )
         .route("/api/v1/events", get(events))
+        // The one route that is a *service* rather than a handler function,
+        // because it is the one that must not have its body extracted for it.
+        // A firmware image is over a megabyte and this device's whole heap is
+        // under seventy kilobytes, so the body is streamed to flash a page at a
+        // time and never exists anywhere in one piece. See [`OtaUpload`].
+        .route("/api/v1/ota", picoserve::routing::post_service(OtaUpload))
 }
 
 // ---------------------------------------------------------------------------
@@ -910,12 +927,218 @@ fn restart_for_mqtt() {
     RESTART.signal(());
 }
 
+// ---------------------------------------------------------------------------
+// Firmware upload
+// ---------------------------------------------------------------------------
+
+/// How long the whole body may take to arrive once the first byte has.
+///
+/// **Five minutes, and it is a stall detector rather than a performance
+/// budget.** `picoserve`'s ordinary `read_request` timeout is three seconds,
+/// which is right for a request that fits in a segment and wrong for one that
+/// interleaves a megabyte of socket reads with a few hundred flash sector
+/// erases — each of which runs with interrupts disabled for tens of
+/// milliseconds, with a datasheet worst case in the hundreds. A full 2,031,616
+/// byte slot is 496 sectors, so the flash side alone can plausibly account for
+/// minutes on a part at the slow end of its specification.
+///
+/// What it bounds is the thing that actually needs bounding: a client that
+/// opens an upload and then stops sending would otherwise hold a connection
+/// task for the life of the boot. [`crate::api::REST_TASKS_RESERVED`] keeps two
+/// tasks free for REST even while one is stuck here, so the cost of a generous
+/// figure is bounded by construction rather than by the figure.
+const UPLOAD_READ_TIMEOUT_S: u64 = 300;
+
+/// `POST /api/v1/ota` — a firmware image, streamed to the inactive slot.
+///
+/// # Why this is a service and every other route is a function
+///
+/// A handler function receives its body through a `picoserve::extract::FromRequest`
+/// extractor, and every extractor `picoserve` has produces the body *as a
+/// value* — a slice, a string, a `Json<T>`. All of them need the whole body in
+/// the request buffer, which is 1,536 bytes. A firmware image is three orders
+/// of magnitude larger than that.
+///
+/// A `picoserve::routing::RequestHandlerService` is handed the raw
+/// `picoserve::request::Request` instead, which is what makes a streaming read
+/// possible at all. The cost is that the two things a handler function gets for
+/// free have to be done by hand, and both are done first, in this order:
+///
+/// 1. **The `Origin`/`Host` check.** [`FromThisDevice`] is a
+///    `FromRequestParts`, so it is *callable* here even though nothing calls it
+///    for us. This route is the most consequential one on the device — it
+///    replaces the firmware — so it is worth saying plainly that it sits behind
+///    exactly the same check as every other `/api/v1` route, and that the check
+///    happens before a byte of the body is read.
+/// 2. **The session lock.** [`crate::ota::take`] is the lock *and* the right to
+///    send pages, so a second concurrent upload is refused rather than
+///    interleaved with the first.
+///
+/// # What a failure leaves behind
+///
+/// Nothing that can run. Every path out of here that is not the happy one
+/// leaves `otadata` naming the slot this image is executing from, so a partial
+/// upload, a refused image and a dropped socket are all the same thing from the
+/// bootloader's point of view: a slot it is not asked to boot. The half-written
+/// bytes sit there until the next upload erases them.
+struct OtaUpload;
+
+impl picoserve::routing::RequestHandlerService<(), ()> for OtaUpload {
+    async fn call_request_handler_service<R: Read, W: ResponseWriter<Error = R::Error>>(
+        &self,
+        state: &(),
+        (): (),
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<ResponseSent, W::Error> {
+        use picoserve::extract::FromRequestParts;
+
+        // **One exit, and it is measured rather than tidy.** Written first with
+        // four `finalize().write_to()` pairs — one per outcome, which is what a
+        // service handler invites — the connection's `select` frame grew by
+        // **14,672 bytes**, because each pair is inlined into the poll with its
+        // own response writer beneath it and the compiler does not overlap
+        // them. Collapsing them into one `Result<_, Result<Refusal, Unavailable>>`,
+        // which is the shape every other handler in this file already returns,
+        // took most of that back. See `crate::heap::REQUEST_CHAIN_BYTES`.
+        let answer: Result<(StatusCode, NoContent), Result<Refusal, Unavailable>> = 'answer: {
+            // Point 1 above. Before the body, before the lock, before anything.
+            if let Err(refusal) = FromThisDevice::from_request_parts(state, &request.parts).await {
+                break 'answer Err(Ok(refusal));
+            }
+
+            let declared = request.body_connection.content_length();
+            let Some(mut upload) = crate::ota::take() else {
+                break 'answer Err(Ok(refuse(ApiErrorCode::UpdateInProgress)));
+            };
+
+            let outcome = receive(&mut request, &mut upload, declared).await?;
+            // Dropped explicitly rather than at the end of the block, so the
+            // session lock is released before the response is written and a
+            // client that immediately retries a refused upload is not told the
+            // device is busy with itself.
+            drop(upload);
+
+            match outcome {
+                Ok(()) => {
+                    esp_println::println!(
+                        "ota: update accepted — restarting into it. If it does not confirm \
+                         itself, this board comes back to the image it is running now."
+                    );
+                    RESTART.signal(());
+                    Ok((StatusCode::ACCEPTED, NoContent))
+                }
+                Err(Some(code)) => Err(Ok(Refusal(code))),
+                Err(None) => Err(Err(Unavailable)),
+            }
+        };
+
+        answer
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await
+    }
+}
+
+/// Stream the body to the state task, one page at a time.
+///
+/// The outer `Result` is the socket: an I/O error is not something to answer,
+/// it is a connection that has gone. The inner one is the device's answer —
+/// `Some(code)` is a refusal the client can act on, `None` is the state task
+/// not answering, which becomes a `503` for the reason [`Unavailable`] gives.
+///
+/// **Every page is filled completely except the last**, and that is not
+/// housekeeping: [`crate::ota`] writes through `NorFlash`, whose lengths must be
+/// word-aligned, and it decides where a flash sector begins from the running
+/// total. A short page in the middle would put every later page off its sector
+/// boundary and leave part of a sector unerased under a write.
+async fn receive<R: Read>(
+    request: &mut picoserve::request::Request<'_, R>,
+    upload: &mut crate::ota::Upload,
+    declared: usize,
+) -> Result<Result<(), Option<ApiErrorDto>>, R::Error> {
+    let began = match RPC
+        .call(Rpc::OtaBegin {
+            declared: declared as u32,
+        })
+        .await
+    {
+        Some(Reply::Done) => Ok(()),
+        Some(Reply::Refused(code)) => Err(Some(code)),
+        _ => Err(None),
+    };
+    if let Err(refusal) = began {
+        return Ok(Err(refusal));
+    }
+
+    let mut remaining = declared;
+    // Scoped so the reader — which borrows the body connection — is dropped
+    // before the caller finalizes that connection into a response.
+    let outcome = {
+        let mut reader = request
+            .body_connection
+            .body()
+            .reader()
+            .with_different_timeout(embassy_time::Duration::from_secs(UPLOAD_READ_TIMEOUT_S));
+        loop {
+            if remaining == 0 {
+                break Ok(());
+            }
+            let want = remaining.min(crate::ota::PAGE_BYTES);
+            // `None` is unreachable — the session lock and the sender are the
+            // same object — and it answers `503` rather than panicking, which
+            // is what every other unreachable arm on this path does.
+            let Some(page) = upload.lend().await else {
+                break Err(None);
+            };
+            match reader.read_exact(&mut page.bytes[..want]).await {
+                Ok(()) => {}
+                Err(picoserve::io::ReadExactError::UnexpectedEof) => {
+                    // The client stopped sending. Nothing was marked bootable,
+                    // so this is a failed update rather than a damaged device —
+                    // which is what the code says.
+                    break Err(Some(ApiErrorDto::from(ApiErrorCode::ImageDamaged)));
+                }
+                Err(picoserve::io::ReadExactError::Other(error)) => return Err(error),
+            }
+            upload.post();
+            match RPC.call(Rpc::OtaPage { len: want as u16 }).await {
+                Some(Reply::Done) => {}
+                Some(Reply::Refused(code)) => break Err(Some(code)),
+                _ => break Err(None),
+            }
+            remaining -= want;
+        }
+    };
+
+    match outcome {
+        Ok(()) => Ok(match RPC.call(Rpc::OtaFinish).await {
+            Some(Reply::Done) => Ok(()),
+            Some(Reply::Refused(code)) => Err(Some(code)),
+            _ => Err(None),
+        }),
+        Err(refusal) => {
+            // The state task drops its half of the session on a refusal it
+            // raised itself, so this is only strictly needed when the *client*
+            // stopped — and it is unconditional anyway, because "abort what you
+            // started" is a rule that survives a later change to which side
+            // refuses.
+            let _ = RPC.call(Rpc::OtaAbort).await;
+            Ok(Err(refusal))
+        }
+    }
+}
+
 /// Raised when a settings change needs a restart, and awaited by [`restarter`].
 ///
 /// A signal and a task rather than a call to `software_reset` inside the
 /// handler, because the handler has not written its response yet: resetting
 /// there would answer the operator's save with a dropped connection, which is
 /// indistinguishable from the save having failed.
+///
+/// The firmware upload above raises it for the same reason and gets the same
+/// settle delay: an update that takes effect on the next boot has to *have* a
+/// next boot, and an operator whose `curl` returned before the reset is an
+/// operator who knows the upload landed.
 static RESTART: Signal<crate::tasks::Mutex, ()> = Signal::new();
 
 /// Restart once a settings change has asked for one and its response has left.

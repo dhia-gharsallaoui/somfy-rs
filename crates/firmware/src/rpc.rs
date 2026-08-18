@@ -180,6 +180,49 @@ pub enum Request {
     /// empty [`Request::SaveMqtt`].
     #[cfg(feature = "http")]
     ClearMqtt,
+
+    // -----------------------------------------------------------------------
+    // Firmware updates
+    //
+    // These reach flash for the same reason the settings do — the peripheral
+    // has one owner and it is the state task — but they are unusual in one
+    // way worth naming: an upload sends one of them **per page**, a few
+    // thousand times for one image. That is affordable precisely because this
+    // seam is a rendezvous rather than a queue: each round trip is two
+    // executor polls against a flash write measured in milliseconds.
+    //
+    // The bytes do *not* travel in this enum. It lives in a `Signal`, which is
+    // a static sized to its largest variant, so a page-carrying variant would
+    // be that page of DRAM taken out of the Wi-Fi driver's heap on every boot
+    // of every board. The page travels through `crate::ota`'s zero-copy
+    // channel and this carries only its length.
+    //
+    // All four are `http`-gated because only a web server can produce one.
+    // The boot-side self-test — which exists on every chip that has an
+    // `otadata` region, including the one that cannot link a web server —
+    // deliberately does **not** come through here: it runs on the state task's
+    // own ticker and writes `otadata` directly, because that task already owns
+    // the flash and a round trip through this seam would have been the task
+    // asking itself. `crate::ota::tick_self_test` carries what that saved.
+    // -----------------------------------------------------------------------
+    /// Start writing the inactive slot, for an image of this many bytes.
+    #[cfg(feature = "http")]
+    OtaBegin {
+        /// The request's `Content-Length`.
+        declared: u32,
+    },
+    /// The page channel holds this many bytes; check them and write them.
+    #[cfg(feature = "http")]
+    OtaPage {
+        /// How much of the lent page is the image's.
+        len: u16,
+    },
+    /// Every byte has arrived. Finish the checks and mark the slot bootable.
+    #[cfg(feature = "http")]
+    OtaFinish,
+    /// Give up on an upload, leaving the running image untouched.
+    #[cfg(feature = "http")]
+    OtaAbort,
 }
 
 /// What the state task answers.

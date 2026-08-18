@@ -115,6 +115,14 @@ somfy-tasks = { path = "../somfy-tasks" }
 # tested. This crate keeps only the flash I/O, exactly as it does for
 # `somfy-store`.
 somfy-config = { path = "../somfy-config" }
+# What an update decides: whether an upload is a firmware image for this chip,
+# what to do about the `otadata` state this image booted with, and which
+# self-test legs may refuse a release. All host-tested there; what is left here
+# is flash addressing and one thirty-two byte record. Not optional and not
+# feature-gated: the *upload* half needs a web server, but the boot-side
+# roll-back is what keeps a bad release from being permanent and it belongs on
+# every chip that has an `otadata` region.
+somfy-ota = { path = "../somfy-ota" }
 # Topic construction, config validation, HA discovery payloads, and the
 # lifecycle plans this crate's broker session executes. Everything decided
 # there is host-tested there; what is left here is the transport.
@@ -350,6 +358,26 @@ sntp = [
     "embassy-net/dns",
     "embassy-net/udp",
 ]
+
+# **Two deliberately broken images, and they exist so the roll-back can be
+# proved rather than reasoned about.** `docs/plans/…-plan6-persistence-ota.md`
+# is explicit that a self-test which has never failed is a self-test nobody has
+# tested, and neither of these can be produced by any combination of the
+# features above — a sabotage that a normal build could reach by accident would
+# be worse than no test at all.
+#
+# Neither is in `default`, neither is in the CI matrix, and both say what they
+# are on the serial line at boot. `docs/hardware-checklist.md` carries the
+# procedure that uses them; `crates/firmware/src/ota/mod.rs` carries the
+# mechanism.
+#
+# **They break different halves.** `bad-image-selftest` fails a *leg*, which the
+# soak notices and acts on within its own boot. `bad-image-panic` never reaches
+# a verdict at all, which is the harder case: it is caught on the **following**
+# boot by the attempt counter in RTC memory, and it is the only way to exercise
+# that counter without a hardware fault.
+bad-image-selftest = []
+bad-image-panic = []
 
 # Three chips, two architectures, one configuration each. There is no feature
 # here that turns a part of the firmware off: every supported chip builds the

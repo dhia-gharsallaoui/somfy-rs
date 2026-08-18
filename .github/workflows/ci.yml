@@ -40,6 +40,7 @@ jobs:
           cargo build -p somfy-tasks --target thumbv7em-none-eabihf
           cargo build -p somfy-mqtt --target thumbv7em-none-eabihf
           cargo build -p somfy-config --target thumbv7em-none-eabihf
+          cargo build -p somfy-ota --target thumbv7em-none-eabihf
       - name: docs (deny broken intra-doc links)
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
