@@ -58,7 +58,7 @@ members = ["crates/somfy-rts"]
 [workspace.package]
 edition = "2021"
 license = "GPL-3.0-only"
-repository = "https://github.com/dhiagharsallaoui/somfy-rs"
+repository = "https://github.com/dhia-gharsallaoui/somfy-rs"
 ```
 
 `rust-toolchain.toml`:

@@ -998,7 +998,7 @@ const _: () = assert!(
 /// bought instead: there are now 996 bytes of slack on the ESP32-S3, which is
 /// where the next few hundred bytes should go before this is re-read.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 127_692;
+const DRAM_FOR_STACK_AND_HEAP: usize = 127_660;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
 const DRAM_FOR_STACK_AND_HEAP: usize = 122_216;
