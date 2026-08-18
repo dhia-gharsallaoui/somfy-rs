@@ -960,7 +960,7 @@ const _: () = assert!(
 const DRAM_FOR_STACK_AND_HEAP: usize = 128_020;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 122_552;
+const DRAM_FOR_STACK_AND_HEAP: usize = 122_544;
 
 // **The ESP32-C3 does not have the DRAM for the mDNS responder or the SNTP
 // client on top of the web server, and these say so at compile time.**

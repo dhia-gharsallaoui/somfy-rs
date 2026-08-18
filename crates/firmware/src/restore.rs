@@ -1267,6 +1267,37 @@ fn read_own(store: &mut crate::store::FlashStore<'_>, staged: &[u8]) -> State {
         }
     };
 
+    // **The two records are decoded by `somfy_backup`, not here**, and that is
+    // the fix for a bug a live board found: this function used to call the two
+    // decoders itself and read `Blank` as damage, so an ESP32-S3 whose estate
+    // region had never been written refused its own export. `somfy_backup::decode`
+    // could not have caught it — it checks the container, and the records inside
+    // are opaque bytes to a checksum — so the reading lives over there where a
+    // host test can run the same code this does. `Backup::tables` carries the
+    // rule and `somfy-backup/tests/container.rs` holds it.
+    let mut table = match backup.shade_table() {
+        Ok(table) => table,
+        Err(error) => {
+            crate::logln!("restore: {}", error);
+            return State {
+                format,
+                fault: Fault::Damaged,
+                ..refused()
+            };
+        }
+    };
+    let estate = match backup.estate_table() {
+        Ok(estate) => estate,
+        Err(error) => {
+            crate::logln!("restore: {}", error);
+            return State {
+                format,
+                fault: Fault::Damaged,
+                ..refused()
+            };
+        }
+    };
+
     // **The table and the codes are married here, and this is the one place
     // that does it.** The container's shade record carries each shade's *seed*
     // — the code its table was provisioned with — and the live counters travel
@@ -1278,31 +1309,6 @@ fn read_own(store: &mut crate::store::FlashStore<'_>, staged: &[u8]) -> State {
     // — which already seeds from `initial_code` through
     // `somfy_store::seed_if_absent` — is the only thing that ever plants a
     // code. One mechanism rather than two that could disagree.
-    let mut table = match somfy_config::ShadeRecord::decode(backup.shades) {
-        Ok(table) => table,
-        Err(error) => {
-            crate::logln!(
-                "restore: the backup's shade table is unreadable ({:?})",
-                error
-            );
-            return State {
-                format,
-                fault: Fault::Damaged,
-                ..refused()
-            };
-        }
-    };
-    let estate = match somfy_config::EstateRecord::decode(backup.estate) {
-        Ok(estate) => estate,
-        Err(error) => {
-            crate::logln!("restore: the backup's estate is unreadable ({:?})", error);
-            return State {
-                format,
-                fault: Fault::Damaged,
-                ..refused()
-            };
-        }
-    };
     graft_codes(&mut table, &backup.codes);
 
     let contents = Some(BackupContentsDto {

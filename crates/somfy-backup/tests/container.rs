@@ -17,7 +17,8 @@ use core::net::Ipv4Addr;
 
 use somfy_backup::{
     checksum, decode, encode, looks_like_backup, write_header, Backup, BackupError, BackupMeta,
-    Codes, MetaField, BACKUP_LEN, HEADER_LEN, MAX_CODES, OFF_CODES, OFF_ESTATE, OFF_SHADES,
+    Codes, MetaField, TableError, BACKUP_LEN, HEADER_LEN, MAX_CODES, OFF_CODES, OFF_ESTATE,
+    OFF_SHADES,
 };
 use somfy_config::{
     Announced, EstateRecord, ShadeRecord, StoredGroup, StoredRoom, StoredShade, ESTATE_RECORD_LEN,
@@ -335,6 +336,129 @@ fn a_device_with_no_codes_yet_exports_an_empty_block() {
     );
     let backup = decode(&bytes).expect("a well-formed container");
     assert!(backup.codes.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The round trip through the reader the boot path uses
+//
+// **These are the tests that were missing, and a live board found what they
+// would have caught.** Everything above exercises `decode`, which checks the
+// container and never looks inside the two records it carries — so a device
+// could produce a file the host accepted and then refuse itself. The asymmetry
+// was real: a board whose estate region has never been written exports a blank
+// estate slot, and the boot path read `Blank` as damage.
+//
+// `Backup::tables` is that reading, moved here so a host test runs the same
+// code the device does.
+// ---------------------------------------------------------------------------
+
+/// What the exporter writes into a record slot when the region it reads has
+/// nothing in it: `firmware::restore::read_region`'s `out.fill(0xFF)`.
+///
+/// Restated here rather than imported, because the firmware does not compile on
+/// a host. It is one line and it is the whole subject of these tests.
+const NEVER_WRITTEN: u8 = 0xFF;
+
+#[test]
+fn a_device_with_no_estate_can_restore_its_own_backup() {
+    // **The bug a live ESP32-S3 found.** The board had four shades and had never
+    // been given a room or a group, so its `estate` region was blank; the export
+    // was well formed, the host accepted it, and the device refused its own file
+    // as `backupDamaged`.
+    let bytes = encode(
+        &a_meta(),
+        &a_codes(),
+        &a_shade_record(),
+        &[NEVER_WRITTEN; ESTATE_RECORD_LEN],
+    );
+    let backup = decode(&bytes).expect("the container itself is well formed");
+    let shades = backup.shade_table().expect("and so are its contents");
+    let estate = backup.estate_table().expect("and so are its contents");
+
+    assert_eq!(shades.shades.len(), 2);
+    // A blank slot reads as an empty estate — the same reading the boot path
+    // gives a blank *region*, which is what that device was running.
+    assert!(estate.rooms.is_empty());
+    assert!(estate.groups.is_empty());
+}
+
+#[test]
+fn a_device_with_no_shades_can_restore_its_own_backup() {
+    // The same rule on the other record. A freshly flashed board that has been
+    // put on Wi-Fi and has no shades yet must still round-trip.
+    let bytes = encode(
+        &a_meta(),
+        &Codes::new(),
+        &[NEVER_WRITTEN; SHADE_RECORD_LEN],
+        &an_estate_record(),
+    );
+    let backup = decode(&bytes).expect("the container itself is well formed");
+    let shades = backup.shade_table().expect("and so are its contents");
+    let estate = backup.estate_table().expect("and so are its contents");
+
+    assert!(shades.shades.is_empty());
+    assert!(shades.links.is_empty());
+    assert_eq!(estate.rooms.len(), 1);
+}
+
+#[test]
+fn a_device_with_nothing_at_all_can_restore_its_own_backup() {
+    let bytes = encode(
+        &BackupMeta::default(),
+        &Codes::new(),
+        &[NEVER_WRITTEN; SHADE_RECORD_LEN],
+        &[NEVER_WRITTEN; ESTATE_RECORD_LEN],
+    );
+    let backup = decode(&bytes).expect("well formed");
+    let shades = backup.shade_table().expect("readable");
+    let estate = backup.estate_table().expect("readable");
+    assert!(shades.shades.is_empty());
+    assert!(estate.rooms.is_empty());
+}
+
+#[test]
+fn a_provisioned_device_round_trips_every_field_through_the_boot_path_reader() {
+    // The whole journey a real export makes: encoded as the device streams it,
+    // decoded as the boot path reads it, and checked on values rather than on
+    // shape.
+    let bytes = encode(
+        &a_meta(),
+        &a_codes(),
+        &a_shade_record(),
+        &an_estate_record(),
+    );
+    let backup = decode(&bytes).expect("well formed");
+    let shades = backup.shade_table().expect("readable");
+    let estate = backup.estate_table().expect("readable");
+
+    assert_eq!(shades.shades.len(), 2);
+    assert_eq!(shades.shades[0].config.address, SYNTHETIC_ADDRESS);
+    assert_eq!(shades.shades[0].config.name.as_str(), "Kitchen");
+    assert_eq!(estate.rooms.len(), 1);
+    assert_eq!(estate.groups.len(), 1);
+    assert_eq!(estate.room_of[0], Some(RoomId(0)));
+    // And the live codes, which are what a backup is worth carrying.
+    let live: heapless::Vec<(u32, u16), 4> = backup.codes.iter().collect();
+    assert_eq!(live[0], (SYNTHETIC_ADDRESS, 5_000));
+}
+
+#[test]
+fn a_record_that_is_damaged_rather_than_blank_is_still_refused() {
+    // The rule above must not have widened into "any unreadable record is an
+    // empty one". A record with a real magic and a broken checksum is damage,
+    // and damage is refused — with the field naming which of the two it was, so
+    // the log line can say.
+    let mut shades = a_shade_record();
+    shades[64] ^= 0x01;
+    let bytes = encode(&a_meta(), &a_codes(), &shades, &an_estate_record());
+    let backup = decode(&bytes).expect("the container's own checksum still covers this");
+    assert!(matches!(backup.shade_table(), Err(TableError::Shades(_))));
+
+    let mut estate = an_estate_record();
+    estate[64] ^= 0x01;
+    let bytes = encode(&a_meta(), &a_codes(), &a_shade_record(), &estate);
+    let backup = decode(&bytes).expect("well formed container");
+    assert!(matches!(backup.estate_table(), Err(TableError::Estate(_))));
 }
 
 // ---------------------------------------------------------------------------

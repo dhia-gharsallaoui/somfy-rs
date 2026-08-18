@@ -101,7 +101,10 @@
 
 use core::net::Ipv4Addr;
 
-use somfy_config::{CredentialError, Field, ESTATE_RECORD_LEN, MAX_SSID_LEN, SHADE_RECORD_LEN};
+use somfy_config::{
+    Announced, CredentialError, EstateRecord, EstateRecordError, Field, ShadeRecord,
+    ShadeRecordError, ESTATE_RECORD_LEN, MAX_SSID_LEN, SHADE_RECORD_LEN,
+};
 
 /// Longest dotted-quad IPv4 address: `255.255.255.255`.
 ///
@@ -702,4 +705,126 @@ fn read_broker(bytes: &[u8; BACKUP_LEN]) -> Result<Option<Ipv4Addr>, BackupError
         .map_err(|_| BackupError::NotUtf8(MetaField::Broker))?;
     let address: Ipv4Addr = text.parse().map_err(|_| BackupError::BrokerMalformed)?;
     Ok(Some(address))
+}
+
+// ---------------------------------------------------------------------------
+// The contents, as the boot path reads them
+// ---------------------------------------------------------------------------
+
+/// Which of the two records a container could not deliver.
+///
+/// One variant each rather than a shared error, because the two have different
+/// consequences and a log line that does not say which is a log line that does
+/// not help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableError {
+    /// The shade table is damaged.
+    Shades(ShadeRecordError),
+    /// The estate is damaged.
+    Estate(EstateRecordError),
+}
+
+impl core::fmt::Display for TableError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `{:?}` for the shade half: `ShadeRecordError` has no `Display` — it is
+        // an enum whose variants name a field and an offset, and `somfy_config`
+        // is deliberate that a sentence about one belongs where the field is.
+        // The debug form says which check failed, which is what a log line
+        // needs.
+        match self {
+            TableError::Shades(error) => {
+                write!(
+                    formatter,
+                    "the backup's shade table is unreadable: {error:?}"
+                )
+            }
+            TableError::Estate(error) => {
+                write!(formatter, "the backup's estate is unreadable: {error}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TableError {}
+
+impl Backup<'_> {
+    /// The shade table this container carries.
+    ///
+    /// # A blank record is an empty one, and a live board found out why
+    ///
+    /// **This rule is the reason these two functions exist here rather than in
+    /// the firmware.** An ESP32-S3 with four shades and no rooms or groups
+    /// exported a backup, the host accepted the file, and the device refused its
+    /// own export as damaged. That board's `estate` region had never been
+    /// written, so the exporter — which has only "the newest readable slot, if
+    /// any" — filled that 2 KiB of the container with `0xFF`, and the reader
+    /// called `EstateRecord::decode`, which answers `Blank`, and `Blank` was
+    /// being read as damage.
+    ///
+    /// [`decode`] could not have caught it: it checks the *container*, and the
+    /// records inside it are opaque bytes to a checksum. So a device could
+    /// produce a file that passed every host test and then refuse it. Moving the
+    /// reading here is what lets a host test run the same code the device does,
+    /// and `tests/container.rs` now does.
+    ///
+    /// **`Blank` therefore means "the exporting device had nothing readable in
+    /// that region", and the honest reading of that is an empty record** — which
+    /// is exactly what the boot path already does with a blank *region*, so a
+    /// restored device ends up in the state the exporting device was in.
+    ///
+    /// # The argument against, since it is real
+    ///
+    /// `ShadeRecord`'s own documentation is careful that an empty table "is not
+    /// the same fact as a blank region", and this conflates them. It also means
+    /// a backup taken from a board with no shades **deletes the shades on the
+    /// board it is restored onto** — faithful to what the file says, and a
+    /// footgun.
+    ///
+    /// It is accepted for three reasons. The alternative refuses a device its
+    /// own backup, which is the bug. The destruction is bounded: a shade's
+    /// rolling code lives in the `rollcode` region, not in this table, so
+    /// re-adding a shade at the same address resumes its counter rather than
+    /// needing a re-pairing at the motor. And the screen that uploads one
+    /// already says a restore replaces the configuration.
+    ///
+    /// A record that is *damaged* rather than blank — a real magic and a broken
+    /// checksum — is still refused, and `tests/container.rs` holds that line so
+    /// the rule cannot widen into "anything unreadable is empty".
+    ///
+    /// # Why two functions rather than one returning both
+    ///
+    /// Measured. A single `tables()` returning a struct of both cost the
+    /// firmware **192 bytes of stack it does not have**: the struct is built
+    /// inside this crate and copied into the caller's frame, where two separate
+    /// calls are each constructed in place. That took the restore's own-format
+    /// chain 192 bytes past `firmware::heap::BOOT_CHAIN_BYTES`, which is the
+    /// figure this project's whole DRAM division is balanced against.
+    pub fn shade_table(&self) -> Result<ShadeRecord, TableError> {
+        match ShadeRecord::decode(self.shades) {
+            Ok(record) => Ok(record),
+            Err(ShadeRecordError::Blank) => Ok(ShadeRecord {
+                seq: 0,
+                // Nothing has been announced for a table that does not exist.
+                // The restore overwrites this from the *target's* record anyway,
+                // so the entities of the installation being replaced can still
+                // be retired — see `firmware::restore::write_regions`.
+                announced: Announced::NONE,
+                shades: heapless::Vec::new(),
+                links: heapless::Vec::new(),
+            }),
+            Err(error) => Err(TableError::Shades(error)),
+        }
+    }
+
+    /// The estate this container carries.
+    ///
+    /// See [`Backup::shade_table`] for the blank rule, which is the same one and
+    /// is the reason both of these exist.
+    pub fn estate_table(&self) -> Result<EstateRecord, TableError> {
+        match EstateRecord::decode(self.estate) {
+            Ok(record) => Ok(record),
+            Err(EstateRecordError::Blank) => Ok(EstateRecord::empty(0)),
+            Err(error) => Err(TableError::Estate(error)),
+        }
+    }
 }
