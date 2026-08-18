@@ -301,6 +301,18 @@ const NETWORK_CHAIN_BYTES: usize = 14_416;
 /// **What the routes did cost is DRAM, not stack** — 10,664 bytes of it, in the
 /// four connection task futures. See [`DRAM_FOR_STACK_AND_HEAP`], which is where
 /// that shows up and where it was paid for.
+///
+/// **Not re-derived for the `Origin`/`Host` extractor added 2026-08-18, and
+/// here is the reasoning rather than a figure pretending to be a measurement.**
+/// What it adds to this chain is one leaf frame — `FromThisDevice::
+/// from_request_parts`, whose locals are an eighteen-byte hostname and two
+/// header slices, with no buffer and no recursion — beneath a chain that has
+/// **20,576 bytes of clearance** below [`BOOT_CHAIN_BYTES`]. A leaf that size
+/// cannot move the `max`, so [`REQUIRED_STACK_BYTES`] is unchanged and the
+/// figure stays the upper bound it already is. **What would make a real
+/// derivation necessary:** an extractor that reads a body, buffers a header, or
+/// calls into `crate::rpc` — any of which would put a real frame on this chain
+/// rather than a leaf.
 const REQUEST_CHAIN_BYTES: usize = 33_504;
 /// See the `http` definition above.
 #[cfg(not(feature = "http"))]
@@ -610,14 +622,49 @@ const _: () = assert!(
 /// which is the direction this row's rounding is chosen to fail in. The margin
 /// over [`REQUIRED_STACK_BYTES`] is ~11 KB, so the change is recorded here
 /// because the self-check above must stay exact, not because anything is tight.
+///
+/// **Re-measured 2026-08-18 for the `Origin`/`Host` check and the per-shade
+/// command limiter, and this row is the whole reason the check has the shape it
+/// has.** Measured the documented way, one worktree built twice:
+///
+/// | chip | before | after | delta |
+/// |---|---|---|---|
+/// | ESP32 (`mqtt`) | 123,996 | 123,740 | −256 |
+/// | ESP32-S3 (all) | 136,020 | 135,068 | −952 |
+/// | ESP32-C3 (all) | 122,816 | 121,856 | −960 |
+///
+/// The ESP32 has no web server, so its 256 bytes are the limiter alone — a
+/// `[u32; 32]` table in the state task's future, which the generator lays out
+/// twice. The other two pay a further ~700, spread across roughly ninety
+/// eight-byte constant anchors: one per guarded handler's rejection path, with
+/// nothing large enough to name.
+///
+/// **What this bought, and it is the measurement that chose the mechanism.**
+/// The obvious way to check every request is `picoserve::Router::layer`, which
+/// wraps the whole router and so cannot be forgotten by a route added later.
+/// Measured on the ESP32-S3, `firmware::api::connection::POOL` went from 67,840
+/// to 73,888 — **6,048 bytes**, of which 4,896 is an empty pass-through layer
+/// that does nothing at all, because `call_layer` is an `async fn` holding the
+/// entire inner router's future across its own await. The same check written as
+/// a `picoserve::extract::FromRequestParts` extractor on each handler left that
+/// figure at 67,840 exactly. 6,048 bytes would have taken the ESP32-C3's heap
+/// to 48 KiB against a 54,424-byte announcement peak — a board that panics
+/// part-way through publishing its discovery configs. `crate::api::origin`
+/// carries the table and what the shape costs in exchange.
+///
+/// **The limiter's table is 128 bytes rather than 256 for this row's sake, and
+/// it is worth one kilobyte on the chip that can least afford it.** At `u64`
+/// milliseconds the ESP32 measured 66,140 bytes of `.stack` against a
+/// 66,280-byte budget, which rounds its heap down to 55 KiB; at `u32` seconds it
+/// measures 66,396 and keeps 56 KiB. See `somfy_tasks::CommandLimiter`.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 123_996;
+const DRAM_FOR_STACK_AND_HEAP: usize = 123_740;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 136_020;
+const DRAM_FOR_STACK_AND_HEAP: usize = 135_068;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 122_816;
+const DRAM_FOR_STACK_AND_HEAP: usize = 121_856;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
@@ -660,9 +707,26 @@ compile_error!(
 ///
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] |
 /// |---|---|---|---|---|
-/// | ESP32 | 123,996 | 56 KiB = 57,344 | 66,652 | 10,860 |
-/// | ESP32-S3 | 136,020 | 68 KiB = 69,632 | 66,388 | 10,596 |
-/// | ESP32-C3 | 122,816 | 55 KiB = 56,320 | 66,496 | 10,704 |
+/// | ESP32 | 123,740 | 56 KiB = 57,344 | 66,396 | 10,604 |
+/// | ESP32-S3 | 135,068 | 67 KiB = 68,608 | 66,460 | 10,668 |
+/// | ESP32-C3 | 121,856 | 54 KiB = 55,296 | 66,560 | 10,768 |
+///
+/// **The ESP32-S3 and the ESP32-C3 each lost a kilobyte here on 2026-08-18**,
+/// to the `Origin`/`Host` check and the command limiter; the ESP32 lost none,
+/// because the rounding happened to fall the other way for it. The C3 is the one
+/// that matters and the one to watch: its heap goes 55 KiB → 54 KiB, which
+/// leaves **872 bytes** over the worst announcement peak ever measured (54,424)
+/// where it had 1,896 — and both figures are inside the ~2,000-byte spread that
+/// peak itself showed between boots, which is what [`warn_if_tight`] says at
+/// boot. **It has still never been run on hardware.**
+///
+/// The available lever, recorded rather than taken because it spends the
+/// operator's page-load time and that is not this change's to spend:
+/// `api::TCP_TX_BYTES` at 512 instead of 1,024 returns 2,048 bytes of DRAM,
+/// which would put the C3 back above where it was. Its own documentation calls
+/// it the figure to raise if the UI feels slow, so this is the trade in the
+/// other direction — roughly twenty extra round trips on a 21 KB script, once
+/// per page load and never on a reload, since the assets answer `304`.
 ///
 /// Nothing in that table is chosen; it is what the rule returns. Every `stack
 /// left` column was read back out of the linked ELF on 2026-08-18 — they are the

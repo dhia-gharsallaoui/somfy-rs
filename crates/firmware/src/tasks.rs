@@ -51,7 +51,7 @@ use somfy_domain::{
 use somfy_rts::{Frame, RollingCode};
 use somfy_store::{seed_if_absent, RegionState, Seeded};
 use somfy_tasks::{
-    ControlCommand, Dispatch, RadioEvent, RadioLoop, StateMachine, TransmitQueueHandle,
+    ControlCommand, Dispatch, RadioEvent, RadioLoop, Refused, StateMachine, TransmitQueueHandle,
     COMMAND_QUEUE_DEPTH, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS, FRAME_QUEUE_DEPTH,
     TRANSMIT_QUEUE_DEPTH,
 };
@@ -489,9 +489,23 @@ fn run_command(
     command: ControlCommand,
     now_ms: u64,
     emitted: &mut Vec<StateDelta, DELTA_CAPACITY>,
-) -> Result<bool, DomainError> {
+) -> Result<bool, Refused> {
     match machine.apply(store, queue, command, now_ms, emitted) {
         Ok(dispatch) => Ok(report(&dispatch)),
+        Err(Refused::TooSoon(too_soon)) => {
+            // Printed at a different volume from a domain refusal, and with the
+            // delay in it, because this is the one refusal an operator may meet
+            // without having done anything wrong — a console showing it is
+            // showing the shape of whatever is looping.
+            esp_println::println!(
+                "state: {:?} refused for {} ms — this shade has been commanded too often. \
+                 Every command commits a rolling code to flash before it transmits, so a loop \
+                 wears the region out; see somfy_tasks::REFILL_INTERVAL_MS.",
+                command,
+                too_soon.retry_after_ms,
+            );
+            Err(Refused::TooSoon(too_soon))
+        }
         Err(error) => {
             esp_println::println!("state: {:?} rejected: {:?}", command, error);
             Err(error)
@@ -550,6 +564,14 @@ fn serve_request(
         rpc::Request::Command(command) => {
             match run_command(machine, store, queue, command, now_ms, emitted) {
                 Ok(dispatched) => (rpc::Reply::Done, dispatched),
+                // The one refusal here that is not about the request at all —
+                // it says the request was fine and arrived too soon. `429` and
+                // its own code, so a client can tell "wait" from "never" and
+                // the UI can say so; see `somfy_api::ApiErrorCode::CommandRateLimited`.
+                Err(Refused::TooSoon(_)) => (
+                    rpc::Reply::Refused(ApiErrorCode::CommandRateLimited.into()),
+                    false,
+                ),
                 // Two refusals a movement can draw are about the *request*
                 // rather than about this device, and each needs its own code so
                 // the UI can say something a person can act on: the target is
@@ -557,10 +579,10 @@ fn serve_request(
                 // slat-separation band has never been measured. Anything else is
                 // this device's fault and has just been logged by
                 // `run_command`.
-                Err(DomainError::NotFound) => {
+                Err(Refused::Domain(DomainError::NotFound)) => {
                     (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false)
                 }
-                Err(DomainError::VentBandNotMeasured) => (
+                Err(Refused::Domain(DomainError::VentBandNotMeasured)) => (
                     rpc::Reply::Refused(ApiErrorCode::VentBandNotMeasured.into()),
                     false,
                 ),
@@ -570,7 +592,7 @@ fn serve_request(
                 // own code it fell into the catch-all below and the UI would
                 // have told the operator the device's own address allocator had
                 // gone wrong.
-                Err(DomainError::CommandNotAtThisWidth) => (
+                Err(Refused::Domain(DomainError::CommandNotAtThisWidth)) => (
                     rpc::Reply::Refused(ApiErrorCode::CommandNotAtThisWidth.into()),
                     false,
                 ),

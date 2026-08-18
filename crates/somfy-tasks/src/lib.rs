@@ -48,16 +48,18 @@
 #![cfg_attr(not(test), no_std)]
 
 mod backoff;
+mod limit;
 mod queue;
 mod radio;
 mod state;
 
 pub use backoff::Backoff;
+pub use limit::{CommandLimiter, TooSoon, BURST, REFILL_INTERVAL_MS};
 pub use queue::{
     QueueFull, TransmitChannel, TransmitQueueHandle, TransmitRequests, TRANSMIT_QUEUE_DEPTH,
 };
 pub use radio::{FrameChannel, RadioEvent, RadioLoop, Transmitter, FRAME_QUEUE_DEPTH};
 pub use state::{
-    CommandChannel, ControlCommand, DeltaChannel, Dispatch, StateMachine, TxProfile,
+    CommandChannel, ControlCommand, DeltaChannel, Dispatch, Refused, StateMachine, TxProfile,
     COMMAND_QUEUE_DEPTH, DEFAULT_REPEATS, DELTA_QUEUE_DEPTH, DELTA_SUBSCRIBERS,
 };

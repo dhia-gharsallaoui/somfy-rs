@@ -12,7 +12,7 @@ use somfy_domain::{
 };
 use somfy_rts::{Command, Frame};
 use somfy_store::{FrameBits, TransmitError};
-use somfy_tasks::{ControlCommand, StateMachine, TxProfile};
+use somfy_tasks::{ControlCommand, Refused, StateMachine, TxProfile};
 
 mod support;
 use support::{Event, MockQueue, MockStore, StoreFailed};
@@ -628,7 +628,7 @@ fn apply_reports_an_unknown_group() {
         &mut deltas(),
     );
 
-    assert_eq!(result.unwrap_err(), DomainError::NotFound);
+    assert_eq!(result.unwrap_err(), Refused::Domain(DomainError::NotFound));
     assert!(queue.sent.is_empty());
     assert!(log.borrow().is_empty());
 }

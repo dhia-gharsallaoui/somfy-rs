@@ -107,6 +107,18 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   notCalibrating: 409,
   calibrationImplausible: 400,
   commandNotAtThisWidth: 409,
+  // **429, and it is the only code here a client should retry into.** Every
+  // command commits a rolling code to flash before it transmits, so a loop is
+  // flash wear rather than mere traffic; 429 is the one status that says "this
+  // would have worked a moment from now". See `somfy_tasks`'s command limiter.
+  commandRateLimited: 429,
+  // 403 rather than 401 for both: no credential would make the request
+  // acceptable, so `WWW-Authenticate` would be a lie. The mock never produces
+  // either — it is a dev server on localhost with no device identity to check
+  // against — and they are listed because this record is total over the
+  // generated union.
+  hostNotThisDevice: 403,
+  originNotThisDevice: 403,
   // Settings. Every validation refusal is a 400 and the two trial-state ones
   // are 409, matching `ApiErrorCode::http_status` — the argument for each is
   // there, beside the variant.

@@ -102,7 +102,13 @@ mod config;
 mod edits;
 mod estate;
 mod heap;
-#[cfg(feature = "mdns")]
+// **`http` rather than `mdns`, since Plan 7's `Origin`/`Host` check.** The
+// name this module produces is now two things: what the responder advertises,
+// and one of the two names the web server will answer to — see
+// `somfy_api::origin`. `mdns` implies `http`, so this gate is the wider of the
+// two and covers both. The narrower one built every row of the matrix except
+// `http` alone, which is exactly the row that exists to catch this.
+#[cfg(feature = "http")]
 mod identity;
 #[cfg(feature = "mqtt")]
 mod inventory;

@@ -128,6 +128,58 @@ pub enum ApiErrorCode {
     /// work, and a UI that highlighted a form field over it would be pointing at
     /// nothing — the button should not be offered on that shade at all.
     CommandNotAtThisWidth,
+    /// This shade has been commanded too often, too fast.
+    ///
+    /// Not a quota and not an authentication measure — a bound on **flash
+    /// wear**. Every command commits a rolling code before it transmits,
+    /// because a code sent but not stored is one this device would repeat after
+    /// a power cut and a motor would reject as a replay. So a request loop is a
+    /// write loop against a region with a finite number of erases in it, and
+    /// past that number every paired motor has to be re-paired by hand at its
+    /// window. `somfy_tasks`'s command limiter carries the numbers.
+    ///
+    /// Applies identically to HTTP and to MQTT, because both arrive at the same
+    /// function — an automation cannot escape it by changing transport.
+    ///
+    /// The action is to wait: the allowance refills on its own, and the burst
+    /// is sized above anything a person does at one window in one go.
+    CommandRateLimited,
+
+    // -----------------------------------------------------------------------
+    // Not this device
+    //
+    // Two refusals that are about *who asked* rather than about what was
+    // asked, and the only ones here that a correctly behaving client can never
+    // provoke. They are the non-authentication half of design spec §7.3: a page
+    // in any browser tab can issue requests to a LAN address, so reachability
+    // is not membership, and these are what turn that back into a refusal
+    // without a password, a session or a login screen. `somfy_api::origin`
+    // carries the rules and the reasoning.
+    // -----------------------------------------------------------------------
+    /// The request was addressed to a name that is not this device.
+    ///
+    /// The defence against DNS rebinding, where a page keeps its own origin and
+    /// moves the name underneath it until the browser believes a request to
+    /// this device is same-origin. `Host` is what that attack cannot forge:
+    /// it names what the client dialled, and the attacker's name is not one of
+    /// this device's.
+    ///
+    /// An operator can meet it legitimately in one way — by reaching the device
+    /// through some other name, a proxy or a router alias — and the action is
+    /// to use the device's own address or its `somfy-<mac>.local` name.
+    HostNotThisDevice,
+    /// The request came from a page this device did not serve.
+    ///
+    /// `Origin` names the page that made the request; a browser sends it on
+    /// every cross-origin `fetch`, on every `POST`/`PUT`/`PATCH`/`DELETE`, and
+    /// on every WebSocket handshake, and a page can neither forge nor suppress
+    /// it. So an origin that is not this device is somebody else's page acting
+    /// on the operator's behalf without their knowledge.
+    ///
+    /// A request carrying **no** `Origin` is admitted, because a browser cannot
+    /// be made to omit it where it sends one — `curl`, a script and this
+    /// project's own test rigs keep working. See `somfy_api::origin`.
+    OriginNotThisDevice,
 
     // -----------------------------------------------------------------------
     // Settings
@@ -328,6 +380,17 @@ impl ApiErrorCode {
             | ApiErrorCode::NoTrialInProgress
             | ApiErrorCode::TrialInProgress
             | ApiErrorCode::TrialNotAssociated => 409,
+            // 403 rather than 401: there is no credential that would make the
+            // request acceptable, so `WWW-Authenticate` would be a lie and a
+            // browser prompting for a password over it would be worse than the
+            // refusal. What is wrong is who asked, and no header the caller
+            // could add changes that.
+            ApiErrorCode::HostNotThisDevice | ApiErrorCode::OriginNotThisDevice => 403,
+            // The one status here a client is expected to retry into. 429 is
+            // the only code that says "this would have worked a moment from
+            // now", which is exactly true and is what stops a client treating a
+            // rate limit as a permanent refusal and giving up.
+            ApiErrorCode::CommandRateLimited => 429,
             ApiErrorCode::InvalidAddress | ApiErrorCode::SettingsUnwritable => 500,
         }
     }

@@ -260,6 +260,39 @@ so the decision is revisited on evidence and not rediscovered:
     receiver deaf while it writes — a physical-damage path that authentication
     would not close anyway, since an authenticated client can loop too.
 
+**Both shipped 2026-08-18.** Authentication is still deferred and nothing below
+changes that; what follows is where each of the two now lives.
+
+- **Origin/Host** is `somfy_api::origin`, applied by
+  `firmware::api::origin::FromThisDevice`, an extractor every `/api/v1` handler
+  takes — including the `/api/v1/events` WebSocket upgrade, which the browser's
+  same-origin policy does *not* restrain the way it restrains `fetch`. Two
+  rules: `Host` must be an IPv4 literal or `somfy-<mac>[.local]`, and `Origin`,
+  when present, must be `http://` and the same authority the request was
+  addressed to. An **absent** header is admitted on every method, because a
+  browser cannot be made to omit one where it sends one — so absence means the
+  caller is not a browser, and the attack needs a browser. Refusals are `403`
+  with `hostNotThisDevice` / `originNotThisDevice`. The static asset routes and
+  the SPA fallback are deliberately outside it: they serve the compiled UI,
+  which discloses nothing and actuates nothing.
+- **The rate limit** is `somfy_tasks::CommandLimiter`, consulted from
+  `StateMachine::apply` — the one function an HTTP command and an MQTT command
+  both arrive at, so there is one limit rather than two that agree today. Twelve
+  commands per shade back to back, then one per twenty seconds. It is
+  deliberately *not* consulted from `StateMachine::tick`, which is where the
+  second and third frames of a vent are planned: those are due at a time the
+  clock picked, and refusing them would leave a shade closed with no vent
+  coming. Refusals are `429` with `commandRateLimited`.
+
+**What is still open, and it is the residual rather than an oversight.** The
+rolling-code region is shared by every shade, so a per-shade bound multiplies by
+the shade count: thirty-two shades driven flat out at once wear it out in days
+rather than the years one shade takes. A device-wide cap would close that and
+would also let one abused shade starve the whole house, which is the lockout
+this codebase spends `api::REST_TASKS_RESERVED` to make impossible.
+`somfy_tasks::REFILL_INTERVAL_MS` carries the arithmetic and is the place to
+reopen it.
+
 TLS was considered and declined for now: `esp-mbedtls` handshake buffers want
 32–64 KB against the S3's ~38 KB of heap headroom, it would likely end C3
 support as it already ended ESP32's, and self-signed certificates train users to
