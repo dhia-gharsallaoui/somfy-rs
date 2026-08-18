@@ -779,6 +779,53 @@ fn only_confirmed_shades_are_the_ones_anything_publishes() {
     assert_eq!(publishable, std::vec![awaiting, confirmed]);
 }
 
+/// **The complement of that gate, and it partitions.**
+///
+/// `unconfirmed_shades` exists so a device can say "a setup was started and not
+/// finished" without offering a control on a shade that would transmit and move
+/// nothing. That claim is only worth anything if the two halves are exactly the
+/// whole: a shade in neither is one nothing reports at all, and a shade in both
+/// would be counted as pending while its cover was live.
+///
+/// So this asserts the partition rather than the count — which is the thing a
+/// `count()` at a call site cannot check for itself.
+#[test]
+fn confirmed_and_unconfirmed_partition_the_registry() {
+    let mut registry = Registry::new();
+    let awaiting = registry
+        .add_shade(ShadeConfig::new("Fresh", 0x80_0001).unwrap())
+        .unwrap();
+    let confirmed = registry
+        .add_shade(ShadeConfig::new("Working", 0x80_0002).unwrap())
+        .unwrap();
+    let second_awaiting = registry
+        .add_shade(ShadeConfig::new("Also fresh", 0x80_0003).unwrap())
+        .unwrap();
+    registry.shade_mut(confirmed).unwrap().confirm_pairing();
+
+    let pending: std::vec::Vec<ShadeId> = registry.unconfirmed_shades().map(|(id, _)| id).collect();
+    assert_eq!(pending, std::vec![awaiting, second_awaiting]);
+
+    // Disjoint, and together the whole.
+    let mut both: std::vec::Vec<ShadeId> = registry
+        .confirmed_shades()
+        .chain(registry.unconfirmed_shades())
+        .map(|(id, _)| id)
+        .collect();
+    both.sort_unstable_by_key(|id| id.0);
+    let all: std::vec::Vec<ShadeId> = registry.shades().map(|(id, _)| id).collect();
+    assert_eq!(both, all, "every shade is in exactly one half");
+
+    // Confirming one moves it across, and moves nothing else.
+    registry.shade_mut(awaiting).unwrap().confirm_pairing();
+    let pending: std::vec::Vec<ShadeId> = registry.unconfirmed_shades().map(|(id, _)| id).collect();
+    assert_eq!(pending, std::vec![second_awaiting]);
+
+    // An empty registry is not a special case: nothing pending, nothing live.
+    let empty = Registry::new();
+    assert_eq!(empty.unconfirmed_shades().count(), 0);
+}
+
 /// Confirming is the operator's report, and it is news exactly once.
 #[test]
 fn confirming_is_news_once_and_then_a_no_op() {

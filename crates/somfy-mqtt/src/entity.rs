@@ -176,17 +176,48 @@ pub enum DeviceEntity {
     /// operationally important thing the controller knows about itself — and
     /// until now it was visible only on a serial cable.
     RollcodeDamaged,
+    /// Shades that exist and that nobody has reported working yet.
+    ///
+    /// # This is the one entity the adding-a-shade flow has in Home Assistant
+    ///
+    /// A shade is created before it is paired, and it acquires no entities
+    /// until an operator reports that it moved — so a setup started and left
+    /// half-way is, from Home Assistant's side, completely invisible: no cover,
+    /// no button, nothing to show that anything is pending. The web UI puts it
+    /// at the top of its dashboard, which only helps somebody who opens the web
+    /// UI, and the whole reason this number exists is the operator who does
+    /// not.
+    ///
+    /// Read with `configuration_url` — see
+    /// [`MqttConfig::with_configuration_url`](crate::MqttConfig::with_configuration_url)
+    /// — it is a complete loop without a single entity that claims something
+    /// the device does not know: Home Assistant says a setup is unfinished, and
+    /// the device page links to the assistant that finishes it.
+    ///
+    /// # Why a count and not an entity per pending shade
+    ///
+    /// Because an entity per pending shade is the thing that must not exist. A
+    /// pending shade's address has been heard by no motor, so anything that
+    /// looks like a control on it transmits and moves nothing. A number is a
+    /// fact about the controller, which is what every other variant here is,
+    /// and it makes no claim about any shade.
+    ///
+    /// Zero is the ordinary reading and is published like any other: an entity
+    /// that goes blank when nothing is wrong is one an operator cannot tell
+    /// from a broken one.
+    AwaitingSetup,
 }
 
 impl DeviceEntity {
     /// Every device-level entity. **Read by both halves of the lifecycle**, so
     /// a variant added here is announced and retired together.
-    pub const ALL: [DeviceEntity; 5] = [
+    pub const ALL: [DeviceEntity; 6] = [
         DeviceEntity::Uptime,
         DeviceEntity::WifiSignal,
         DeviceEntity::HeapFree,
         DeviceEntity::HeapPeak,
         DeviceEntity::RollcodeDamaged,
+        DeviceEntity::AwaitingSetup,
     ];
 
     /// Bytes the longest [`slug`](DeviceEntity::slug) occupies.
@@ -206,6 +237,7 @@ impl DeviceEntity {
             DeviceEntity::HeapFree => "heap_free",
             DeviceEntity::HeapPeak => "heap_peak",
             DeviceEntity::RollcodeDamaged => "rollcode_damaged",
+            DeviceEntity::AwaitingSetup => "awaiting_setup",
         }
     }
 
@@ -217,6 +249,7 @@ impl DeviceEntity {
             DeviceEntity::HeapFree => "Free heap",
             DeviceEntity::HeapPeak => "Peak heap use",
             DeviceEntity::RollcodeDamaged => "Damaged rolling-code slots",
+            DeviceEntity::AwaitingSetup => "Shades awaiting setup",
         }
     }
 
@@ -231,7 +264,8 @@ impl DeviceEntity {
             | DeviceEntity::WifiSignal
             | DeviceEntity::HeapFree
             | DeviceEntity::HeapPeak
-            | DeviceEntity::RollcodeDamaged => Component::Sensor,
+            | DeviceEntity::RollcodeDamaged
+            | DeviceEntity::AwaitingSetup => Component::Sensor,
         }
     }
 
@@ -242,10 +276,10 @@ impl DeviceEntity {
             DeviceEntity::Uptime => Some("duration"),
             DeviceEntity::WifiSignal => Some("signal_strength"),
             DeviceEntity::HeapFree | DeviceEntity::HeapPeak => Some("data_size"),
-            // A count of damaged flash slots is not one of Home Assistant's
-            // classes, and picking a near-miss would change how the number is
-            // displayed for no gain.
-            DeviceEntity::RollcodeDamaged => None,
+            // Neither a count of damaged flash slots nor a count of unfinished
+            // setups is one of Home Assistant's classes, and picking a
+            // near-miss would change how the number is displayed for no gain.
+            DeviceEntity::RollcodeDamaged | DeviceEntity::AwaitingSetup => None,
         }
     }
 
@@ -256,7 +290,7 @@ impl DeviceEntity {
             DeviceEntity::Uptime => Some("s"),
             DeviceEntity::WifiSignal => Some("dBm"),
             DeviceEntity::HeapFree | DeviceEntity::HeapPeak => Some("B"),
-            DeviceEntity::RollcodeDamaged => None,
+            DeviceEntity::RollcodeDamaged | DeviceEntity::AwaitingSetup => None,
         }
     }
 
@@ -268,7 +302,8 @@ impl DeviceEntity {
             | DeviceEntity::WifiSignal
             | DeviceEntity::HeapFree
             | DeviceEntity::HeapPeak
-            | DeviceEntity::RollcodeDamaged => Some("measurement"),
+            | DeviceEntity::RollcodeDamaged
+            | DeviceEntity::AwaitingSetup => Some("measurement"),
         }
     }
 }
@@ -498,6 +533,10 @@ pub struct CoverDiscovery<'a> {
     pub name: &'a str,
     /// The stable device identifier, for the payload's `device` block.
     pub device_id: &'a str,
+    /// Where a person goes to configure this controller, for the same block.
+    /// `None` on a build with no web server, or none this device answers to by
+    /// name — see [`crate::MqttConfig::with_configuration_url`].
+    pub configuration_url: Option<&'a str>,
     /// Whether to carry the tilt topics.
     pub has_tilt: bool,
 }
@@ -555,7 +594,7 @@ impl CoverDiscovery<'_> {
         // reporting itself inverted.
         write(out, ",\"position_open\":0,\"position_closed\":100")?;
 
-        write_device_block(out, self.device_id)?;
+        write_device_block(out, self.device_id, self.configuration_url)?;
 
         for topic in ShadeTopic::for_shade(self.has_tilt) {
             let Some(key) = topic.payload_key() else {
@@ -617,6 +656,8 @@ pub struct ButtonDiscovery<'a> {
     pub name: &'a str,
     /// The stable device identifier, for the payload's `device` block.
     pub device_id: &'a str,
+    /// Where a person goes to configure this controller, for the same block.
+    pub configuration_url: Option<&'a str>,
 }
 
 impl ButtonDiscovery<'_> {
@@ -666,7 +707,7 @@ impl ButtonDiscovery<'_> {
         // `config` files it with the device's settings instead.
         write(out, ",\"entity_category\":\"config\"")?;
 
-        write_device_block(out, self.device_id)?;
+        write_device_block(out, self.device_id, self.configuration_url)?;
 
         // Relative to `~`, from the same table the firmware's subscription is
         // built from — see [`ShadeTopic::Pair`].
@@ -702,6 +743,8 @@ pub struct DiagnosticDiscovery<'a> {
     pub unique_id: UniqueId,
     /// The stable device identifier, for the payload's `device` block.
     pub device_id: &'a str,
+    /// Where a person goes to configure this controller, for the same block.
+    pub configuration_url: Option<&'a str>,
     /// Which fact this entity reports.
     pub entity: DeviceEntity,
 }
@@ -765,7 +808,7 @@ impl DiagnosticDiscovery<'_> {
             write_json_string(out, value)?;
         }
 
-        write_device_block(out, self.device_id)?;
+        write_device_block(out, self.device_id, self.configuration_url)?;
 
         // Relative to `~`, exactly as a cover's topics are, so the round-trip
         // check resolves both the same way.
@@ -819,6 +862,16 @@ fn write_object_id(
 /// identifier is the same stable `device_id` every `unique_id` is built from,
 /// so it survives a reboot, either namespace changing, and a firmware update.
 ///
+/// `configuration_url` is here for a reason the other fields are not: it is the
+/// only thing in the whole integration that reaches **out** of Home Assistant.
+/// Adding a shade is a four-step procedure with a human in the middle of it —
+/// see [`crate::ConfigurationUrl`] — and a link to the assistant that runs it is
+/// worth more than any set of entities that reproduce the steps without the
+/// instructions. It is optional because a build with no web server has nothing
+/// to point at, and it is **omitted rather than written as `null`**: Home
+/// Assistant validates this key with `cv.configuration_url` and a value it
+/// cannot parse discards the entire payload, taking the entity with it.
+///
 /// Deliberately not here: `model` and `sw_version`. Both are knowable — the
 /// chip is a compile-time constant and the version is `CARGO_PKG_VERSION` — and
 /// neither has a consumer until there is a firmware-update entity to compare
@@ -826,6 +879,7 @@ fn write_object_id(
 fn write_device_block(
     out: &mut String<PAYLOAD_CAPACITY>,
     device_id: &str,
+    configuration_url: Option<&str>,
 ) -> Result<(), PayloadError> {
     write(out, ",\"device\":{\"identifiers\":[")?;
     write_json_string(out, device_id)?;
@@ -840,6 +894,14 @@ fn write_device_block(
     write_json_escaped(out, device_id)?;
     write(out, "\",\"manufacturer\":")?;
     write_json_string(out, MANUFACTURER)?;
+    if let Some(url) = configuration_url {
+        write(out, ",\"configuration_url\":")?;
+        // Through the escaper like everything else, though `ConfigurationUrl`
+        // admits no character that expands — see the assertion in `url.rs`,
+        // which is what lets the capacity proof below count it at one byte per
+        // byte.
+        write_json_string(out, url)?;
+    }
     write(out, "}")
 }
 
@@ -896,7 +958,7 @@ const fn hex_digit(nibble: u8) -> char {
     }
 }
 
-/// `,"device":{"identifiers":["<id>"],"name":"<prefix><id>","manufacturer":"<m>"}`
+/// `,"device":{"identifiers":["<id>"],"name":"<prefix><id>","manufacturer":"<m>","configuration_url":"<url>"}`
 /// at its widest.
 ///
 /// The device id appears twice and is counted at one byte per byte both times,
@@ -919,6 +981,12 @@ const WORST_DEVICE_BLOCK_LEN: usize =
     + 17
     // "<manufacturer>"
     + 2 + MANUFACTURER.len()
+    // ,"configuration_url":"<url>" — counted as present, because the bound has
+    // to hold for the builds that carry it. A URL is stored verbatim and every
+    // character `ConfigurationUrl` admits is one the JSON escaper leaves alone,
+    // so one byte per byte is a bound rather than an optimism; `url.rs` asserts
+    // that at compile time.
+    + 21 + 2 + crate::url::MAX_CONFIGURATION_URL_LEN
     // }
     + 1;
 

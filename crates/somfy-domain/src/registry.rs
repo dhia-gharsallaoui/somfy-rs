@@ -260,6 +260,28 @@ impl Registry {
             .filter(|(_, shade)| shade.config.pairing_state.is_confirmed())
     }
 
+    /// The complement of [`Registry::confirmed_shades`]: shades that exist and
+    /// that nobody has reported working.
+    ///
+    /// # Why the complement is worth a name of its own
+    ///
+    /// Because it is the set nothing outside this device can see. A shade in
+    /// here transmits perfectly and moves nothing — its address was invented by
+    /// this controller and no motor has heard it — so it is deliberately kept
+    /// out of every announcement, which also keeps it out of every surface an
+    /// operator might be looking at. Counting it is how a device says "a setup
+    /// was started and not finished" without offering a control on a shade that
+    /// would drive air.
+    ///
+    /// A method rather than a filter at each call site for the same reason its
+    /// complement is one: the filter is a *claim*, and two call sites that
+    /// spelled it out would be two answers the first time
+    /// [`PairingState`](crate::PairingState) grows a variant.
+    pub fn unconfirmed_shades(&self) -> impl Iterator<Item = (ShadeId, &Shade)> {
+        self.shades()
+            .filter(|(_, shade)| !shade.config.pairing_state.is_confirmed())
+    }
+
     fn named<T>(name: &str, make: impl FnOnce(String<32>) -> T) -> Result<T, DomainError> {
         let mut n: String<32> = String::new();
         n.push_str(name).map_err(|_| DomainError::NameTooLong)?;

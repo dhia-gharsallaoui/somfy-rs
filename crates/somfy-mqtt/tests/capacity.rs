@@ -9,15 +9,39 @@
 
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, ShadeTopic,
-    StateRoot, MAX_DEVICE_ID_LEN, MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN,
-    MAX_OBJECT_ID_LEN, MAX_STATE_ROOT_LEN, MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
+    Component, ConfigurationUrl, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId,
+    ObjectId, ShadeTopic, StateRoot, MAX_CONFIGURATION_URL_LEN, MAX_DEVICE_ID_LEN,
+    MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_STATE_ROOT_LEN,
+    MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
 };
 
 /// The widest shade id, and therefore the most digits.
 const WIDEST_SHADE: ShadeId = ShadeId(255);
 
+/// A configuration URL at exactly the crate's limit.
+///
+/// `http://` and a host of whatever is left, which is the widest a device block
+/// can be — and the widest the payload budget has to hold, since the URL is
+/// stored verbatim and no character `ConfigurationUrl` admits expands under the
+/// JSON escaper.
+fn maximal_url() -> ConfigurationUrl {
+    let url = "http://".to_owned() + &"h".repeat(MAX_CONFIGURATION_URL_LEN - "http://".len());
+    assert_eq!(url.len(), MAX_CONFIGURATION_URL_LEN);
+    ConfigurationUrl::new(&url).unwrap()
+}
+
+/// Every configured value at its widest, **the configuration URL included**.
+///
+/// It is in here rather than in a test of its own because the budget it
+/// consumes is the device block's, which every payload carries: a maximal
+/// config without it would measure a shape no build produces and would leave
+/// the field's cost unmeasured in all three payloads at once.
 fn maximal_config() -> MqttConfig {
+    unconfigurable_maximal_config().with_configuration_url(maximal_url())
+}
+
+/// The same, for a build with no web server to link to.
+fn unconfigurable_maximal_config() -> MqttConfig {
     MqttConfig::new(
         DiscoveryPrefix::new(&"p".repeat(MAX_DISCOVERY_PREFIX_LEN)).unwrap(),
         StateRoot::new(&"r".repeat(MAX_STATE_ROOT_LEN)).unwrap(),
@@ -101,7 +125,7 @@ fn the_widest_payload_fits() {
     // that is exactly when the budget wants re-checking.
     assert_eq!(
         buf.len(),
-        864,
+        951,
         "widest payload moved; re-check the budget against PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
     );
     // It must still be valid JSON at the extreme, not merely short enough.
@@ -127,9 +151,75 @@ fn the_widest_diagnostic_payload_fits() {
         widest = widest.max(buf.len());
     }
     assert_eq!(
-        widest, 610,
+        widest, 697,
         "widest diagnostic payload moved; re-check the budget against \
          PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
+    );
+}
+
+/// The widest `button` payload, for the same reason the other two are measured.
+///
+/// It is the smallest of the three and is measured anyway: the pairing button
+/// is the one entity that puts `Prog` on the air, and a payload that stopped
+/// fitting would take it away silently.
+#[test]
+fn the_widest_button_payload_fits() {
+    let cfg = maximal_config();
+    let name = "\u{1}".repeat(MAX_NAME_LEN);
+    let mut buf: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    cfg.button_discovery(WIDEST_SHADE, &name)
+        .render(&mut buf)
+        .expect("the widest button payload must fit");
+    let parsed: serde_json::Value = serde_json::from_str(&buf).expect("valid JSON");
+    assert_eq!(
+        parsed["device"]["configuration_url"].as_str(),
+        Some(maximal_url().as_str()),
+    );
+    assert_eq!(
+        buf.len(),
+        785,
+        "widest button payload moved; re-check the budget against \
+         PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
+    );
+}
+
+/// What the configuration URL costs, measured rather than argued.
+///
+/// The same payload rendered with and without it, so the difference is the
+/// field's price on every entity this device publishes — and so that a change
+/// to the key, the quoting or the escaping shows up as a number rather than as
+/// a diff nobody re-measures.
+#[test]
+fn the_configuration_url_costs_what_it_says_it_does() {
+    let with = maximal_config();
+    let without = unconfigurable_maximal_config();
+    let name = "Lounge";
+
+    let mut a: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    let mut b: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    with.cover_discovery(WIDEST_SHADE, name, true)
+        .render(&mut a)
+        .unwrap();
+    without
+        .cover_discovery(WIDEST_SHADE, name, true)
+        .render(&mut b)
+        .unwrap();
+
+    // `,"configuration_url":"<url>"` and nothing else.
+    assert_eq!(
+        a.len() - b.len(),
+        21 + 2 + MAX_CONFIGURATION_URL_LEN,
+        "the configuration URL cost something other than its own key and value",
+    );
+
+    // **Absent, never `null`.** Home Assistant validates this key with
+    // `cv.configuration_url`, and a value it cannot parse discards the whole
+    // payload — so a build with no web server must omit the key rather than
+    // send a placeholder, or every entity on it would silently fail to appear.
+    let parsed: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        parsed["device"].get("configuration_url").is_none(),
+        "a device with nothing to link to must omit the key: {b}",
     );
 }
 

@@ -29,6 +29,7 @@ use crate::topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,
     MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
 };
+use crate::url::ConfigurationUrl;
 use somfy_domain::ShadeId;
 
 /// The last segment of every discovery topic.
@@ -57,6 +58,12 @@ pub struct MqttConfig {
     state_root: StateRoot,
     node_id: NodeId,
     device_id: DeviceId,
+    /// Where a person goes to configure this controller. `None` is the ordinary
+    /// answer for a build with no web server in it, and it is why this is not
+    /// an argument to [`MqttConfig::new`]: a required value that half the
+    /// builds cannot supply becomes a placeholder, and a placeholder here is a
+    /// link Home Assistant renders and nobody can follow.
+    configuration_url: Option<ConfigurationUrl>,
 }
 
 impl MqttConfig {
@@ -107,7 +114,55 @@ impl MqttConfig {
             state_root,
             node_id,
             device_id,
+            configuration_url: None,
         })
+    }
+
+    /// Point Home Assistant's device page at this controller's own web server.
+    ///
+    /// Carried in every discovery payload's `device` block, so the link appears
+    /// once per device rather than once per entity.
+    ///
+    /// # Why a builder rather than a fifth argument
+    ///
+    /// Because there is a real configuration with no answer. A build with no
+    /// web server has nothing to link to, and a build whose name does not
+    /// resolve — no mDNS responder — has a name that is worse than no link,
+    /// because a link that fails to open reads as a device that has broken.
+    /// Both are ordinary, so the value is optional and its absence is silence
+    /// rather than a placeholder.
+    ///
+    /// ```
+    /// use somfy_mqtt::{
+    ///     ConfigurationUrl, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, StateRoot,
+    /// };
+    ///
+    /// let config = MqttConfig::new(
+    ///     DiscoveryPrefix::new("homeassistant")?,
+    ///     StateRoot::new("somfyrs")?,
+    ///     NodeId::new("somfyrs")?,
+    ///     DeviceId::new("a1b2c3d4")?,
+    /// )?
+    /// .with_configuration_url(
+    ///     ConfigurationUrl::new("http://somfy-a1b2c3d4.local").expect("a usable URL"),
+    /// );
+    /// assert_eq!(
+    ///     config.configuration_url(),
+    ///     Some("http://somfy-a1b2c3d4.local"),
+    /// );
+    /// # Ok::<(), somfy_mqtt::ConfigError>(())
+    /// ```
+    #[must_use]
+    pub fn with_configuration_url(mut self, url: ConfigurationUrl) -> MqttConfig {
+        self.configuration_url = Some(url);
+        self
+    }
+
+    /// The address Home Assistant's device page links to, if there is one.
+    pub fn configuration_url(&self) -> Option<&str> {
+        self.configuration_url
+            .as_ref()
+            .map(ConfigurationUrl::as_str)
     }
 
     /// The stable device identifier, for building `unique_id`s.
@@ -241,6 +296,7 @@ impl MqttConfig {
             unique_id: UniqueId::for_shade(&self.device_id, Component::Cover, shade),
             name,
             device_id: self.device_id.as_str(),
+            configuration_url: self.configuration_url(),
             has_tilt,
         }
     }
@@ -261,6 +317,7 @@ impl MqttConfig {
             unique_id: UniqueId::for_shade(&self.device_id, Component::Button, shade),
             name,
             device_id: self.device_id.as_str(),
+            configuration_url: self.configuration_url(),
         }
     }
 
@@ -277,6 +334,7 @@ impl MqttConfig {
             object_id: ObjectId::for_device(entity),
             unique_id: UniqueId::for_device(&self.device_id, entity),
             device_id: self.device_id.as_str(),
+            configuration_url: self.configuration_url(),
             entity,
         }
     }

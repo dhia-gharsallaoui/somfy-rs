@@ -41,6 +41,22 @@
 //! the argument for why "an operator reported it" is the strongest claim
 //! available in a one-way protocol.
 //!
+//! # It counts the ones it leaves out
+//!
+//! Excluding them is right and being *silent* about them is not. From Home
+//! Assistant's side a setup started and abandoned half-way is invisible: no
+//! cover, no button, nothing pending, no difference at all from a controller
+//! nobody has touched. The web UI puts it at the top of its dashboard, which
+//! helps whoever opens the web UI, and the operator this matters to is the one
+//! who does not.
+//!
+//! So [`Inventory::awaiting_setup`] is carried alongside the ids and published
+//! as `somfy_mqtt::DeviceEntity::AwaitingSetup`. It is a **number about the
+//! controller**, not an entity for any shade, and the distinction is the whole
+//! reason it is allowed to exist: a control on a shade no motor has heard would
+//! transmit and move nothing, while a count claims only what this device
+//! genuinely knows about its own table.
+//!
 //! # What used to be missing
 //!
 //! Nothing recorded which shades had been **announced**, so a shade removed
@@ -69,14 +85,22 @@ struct Entry {
     pairing: Pairing,
 }
 
-/// One boot's view of which shades exist, what they are called, and which of
-/// them this controller can pair.
+/// One boot's view of which shades exist, what they are called, which of them
+/// this controller can pair, and how many are still being set up.
 pub struct Inventory {
     /// Kept as a slice because that is what `somfy-mqtt`'s plan builders take.
     ids: Vec<ShadeId, MAX_SHADES>,
     /// Parallel to `ids`. A separate vector rather than a field on one struct
     /// so `ids()` can hand out a `&[ShadeId]` without a copy.
     entries: Vec<Entry, MAX_SHADES>,
+    /// Shades that exist and that nobody has reported working — the ones this
+    /// snapshot deliberately leaves out of `ids`.
+    ///
+    /// **A boot figure, and only a boot figure.** It seeds the broker session's
+    /// live counter and is never updated here: the runtime figure arrives on
+    /// `crate::edits::ShadeEvent::AwaitingSetup`, because the registry belongs
+    /// to the state task and this is a copy taken before that task existed.
+    awaiting_setup: u8,
 }
 
 impl Inventory {
@@ -97,6 +121,7 @@ impl Inventory {
         let mut inventory = Inventory {
             ids: Vec::new(),
             entries: Vec::new(),
+            awaiting_setup: crate::edits::awaiting_setup(registry),
         };
         for (id, shade) in registry.confirmed_shades() {
             // The pairing button is offered only for an address this controller
@@ -206,5 +231,13 @@ impl Inventory {
     /// How many shades this session is announcing.
     pub fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    /// How many shades existed at boot that nobody had reported working.
+    ///
+    /// The seed for the broker session's live figure, which the state task
+    /// keeps current. See the field.
+    pub fn awaiting_setup(&self) -> u8 {
+        self.awaiting_setup
     }
 }
