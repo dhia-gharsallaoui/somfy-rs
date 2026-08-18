@@ -1557,6 +1557,26 @@ Uploading `target/…/release/firmware` instead — the ELF — is the mistake t
 step exists to prevent, and the device refuses it by its first byte with
 `{"code":"imageNotFirmware"}`.
 
+**Or let `xtask` do all of it**, which is the same three commands plus the
+checks a release wants:
+
+```bash
+source ~/export-esp.sh
+cargo run -p xtask -- release --chip esp32s3
+# xtask: somfy-rs 0.1.0 for 1 chip(s)
+# xtask: building the web UI
+# xtask: building esp32s3 (xtensa-esp32s3-none-elf)
+# xtask:   somfy-rs-0.1.0-esp32s3.bin — 1276112 bytes, sha256 <64 hex>
+# xtask: wrote target/release-artifacts/manifest.json
+```
+
+The image lands in `target/release-artifacts/` and is the same file the manual
+recipe produces. What the extra step buys is that **the image has already been
+through the device's own verifier** — `xtask` runs `somfy_ota::image::Verifier`
+over it in 256-byte slices, exactly as the state task does — so an image the
+board would refuse never leaves the host, and the app descriptor's version has
+been checked against the manifest's, which is what catches a stale `target/`.
+
 ### 2. Upload it
 
 ```bash
@@ -1643,7 +1663,7 @@ is marked bootable until the last byte has arrived and been checked.
 |---|---|---|
 | `400` | `{"code":"imageNotFirmware"}` | Not an ESP-IDF app image. Almost always the ELF instead of the output of `espflash save-image`. |
 | `400` | `{"code":"imageForAnotherChip"}` | An image for one of the other two chips this project builds for. |
-| `400` | `{"code":"imageDamaged"}` | The upload was short, long, or a byte of it changed on the way. Try again. |
+| `400` | `{"code":"imageDamaged"}` | The upload was short, long, or a byte of it changed on the way — the length, the one-byte checksum or **the image's own SHA-256** disagreed. Try again; the console line says which. |
 | `413` | `{"code":"imageTooLarge"}` | Larger than the 2,031,616-byte slot. Refused from `Content-Length`, before any flash is touched. |
 | `409` | `{"code":"updateInProgress"}` | Another upload holds the session. Wait for it, or for its socket to time out. |
 | `500` | `{"code":"updateUnwritable"}` | Flash refused, or this board has no `otadata` region. The console line says which. |
@@ -1654,6 +1674,52 @@ is released, the half-written slot is inert because nothing points at it, and
 the next upload erases it. **Prove it if you like** — `Ctrl-C` an upload after a
 few seconds, then reset the board and confirm it comes up on the slot it was
 already running, with its survey lines unchanged.
+
+### 6. Publishing it
+
+Only when the image is one other people should have. `--publish` needs `gh`
+already logged in; it never handles a token itself.
+
+```bash
+cargo run -p xtask -- release --publish
+```
+
+That builds **every** chip, verifies each, and attaches the images and
+`manifest.json` to a `v<version>` release. The version is read from
+`crates/firmware/Cargo.toml` and is never passed on the command line, because
+`esp_app_desc!()` bakes that same string into the image — so bumping the release
+means bumping the manifest, and nothing else can disagree.
+
+`manifest.json` looks like this:
+
+```json
+{
+  "schema": 1,
+  "project": "somfy-rs",
+  "version": "0.1.0",
+  "tag": "v0.1.0",
+  "images": [
+    {
+      "chip": "esp32s3",
+      "asset": "somfy-rs-0.1.0-esp32s3.bin",
+      "bytes": 1276112,
+      "sha256": "<64 hex>",
+      "url": "https://github.com/dhia-gharsallaoui/somfy-rs/releases/download/v0.1.0/somfy-rs-0.1.0-esp32s3.bin"
+    }
+  ]
+}
+```
+
+**`sha256` is the digest of the whole file** — what `sha256sum` prints, and what
+GitHub's own release API publishes as `assets[].digest`. It is **not** the
+SHA-256 inside the image, which covers everything except its own last 32 bytes
+and is the one the device checks. Both are correct and they are different
+numbers; `xtask`'s module docs say so at more length.
+
+**The device does not read this file.** It cannot: TLS does not fit in its DRAM,
+which is measured on `heap::DRAM_FOR_STACK_AND_HEAP` and in
+`docs/provenance.md`. The manifest is for a person, or for a browser — which has
+TLS — deciding what to install and then uploading it by step 2 above.
 
 ### Getting it wrong
 
@@ -1681,11 +1747,17 @@ Three ways, in descending order of what they cost.
   `warn_if_tight` no longer fires. **But the peak is an ESP32-S3 measurement and
   the C3's own has never been observed**, so if a C3 ever runs this, watch
   `heap: session announced` on it before trusting the margin.
-- **That an image with an appended digest that does not match is refused
-  *here*.** This firmware checks the image's own one-byte checksum, not its
-  SHA-256; a corruption that survives both TCP and that byte is caught by the
-  bootloader on the next boot, which falls back to the slot that was running.
-  That costs one reboot and is a path nobody has deliberately exercised.
+- **That a damaged image is refused on real hardware.** Since 2026-08-18 the
+  firmware verifies the image's own appended SHA-256 before it touches
+  `otadata`, so a corruption that survives TCP and the one-byte checksum is a
+  `400 imageDamaged` rather than a `202` followed by two reboots. Every part of
+  that is host-tested — `somfy-ota/tests/image.rs` breaks it five ways,
+  including two segment-data flips that cancel in the XOR checksum — and **none
+  of it has been made to fire on a board**, because doing so means deliberately
+  corrupting a megabyte in flight. To try it: `dd` a byte over the middle of
+  `/tmp/firmware.bin` and upload that. The expected answer is `400
+  {"code":"imageDamaged"}` with `ota: the image was refused — BadDigest` on the
+  console, and `ota: running from` unchanged on the next boot.
 - **Anything about a hung image.** See the next section.
 
 ---

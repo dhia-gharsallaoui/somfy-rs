@@ -7,7 +7,7 @@ description = "somfy-rs ESP32 firmware"
 # Spelled out rather than inherited: this crate is excluded from the root
 # workspace (it builds only for ESP targets), so `*.workspace = true` is
 # unavailable here. Keep in step with [workspace.package] in the root manifest.
-repository = "https://github.com/dhiagharsallaoui/somfy-rs"
+repository = "https://github.com/dhia-gharsallaoui/somfy-rs"
 
 # This crate is the root of its own workspace, stated rather than inferred.
 #
