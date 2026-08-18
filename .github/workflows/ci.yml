@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs. Added 2026-08-18 after CI had been failing for two days at the
+  # billing layer — every job refused in ~3 s with zero steps — and there was no
+  # way to re-run it once the cause was fixed without pushing a commit.
+  workflow_dispatch:
 
 jobs:
   host:
