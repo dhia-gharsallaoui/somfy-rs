@@ -439,10 +439,10 @@ impl SetupMessage {
     pub const fn as_str(self) -> &'static str {
         match self {
             SetupMessage::Drafting => {
-                "Step 1 of 2. Name the shade, pick its kind, and set how long a full travel \
-                 takes each way in milliseconds - measure them, do not guess. Then hold PROG \
-                 on the shade's existing remote about 2 s until it jogs, and press Send \
-                 pairing within about 2 minutes."
+                "Step 1 of 2. Name the shade, pick its kind, and time a full travel each way \
+                 in milliseconds - measure, do not guess. Then hold PROG on the shade's \
+                 existing remote about 2 s until it jogs, and press Send pairing within 2 \
+                 minutes."
             }
             SetupMessage::AwaitingReport => {
                 "Step 2 of 2. A pairing frame has gone out. Command the shade and watch it: \
@@ -489,6 +489,13 @@ const fn longest_message() -> usize {
 }
 
 /// Bytes the longest message occupies.
+///
+/// **228 of the 255 available**, which is deliberate headroom rather than an
+/// accident: the first draft of [`SetupMessage::Drafting`] measured 253 and
+/// would have been broken by a two-word edit. The assertion below would have
+/// caught it — that is what it is for — but a budget with two bytes left is one
+/// that fails the next time anybody improves a sentence, and the sentences here
+/// are the whole reason the form is expressible at all.
 pub const MAX_MESSAGE_LEN: usize = longest_message();
 
 // **The budget Home Assistant enforces, enforced here first.** Over 255 the
