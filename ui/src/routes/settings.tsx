@@ -316,7 +316,6 @@ function WifiPanel({
         <SecretField
           label={t('settings.wifiPsk')}
           name="psk"
-          stored={wifi ? wifi.pskSet : false}
           storedText={
             wifi ? (wifi.pskSet ? 'settings.wifiPskStored' : 'settings.wifiPskOpen') : undefined
           }
@@ -562,7 +561,6 @@ function MqttPanel({ mqtt, t }: { mqtt: SettingsDto['mqtt']; t: Translate }) {
         <SecretField
           label={t('settings.mqttPassword')}
           name="mqtt-password"
-          stored={mqtt ? mqtt.passwordSet : false}
           storedText={
             mqtt
               ? mqtt.passwordSet
@@ -691,7 +689,6 @@ function ClearBroker({
 function SecretField({
   label,
   name,
-  stored,
   storedText,
   canKeep,
   choice,
@@ -703,7 +700,6 @@ function SecretField({
 }: {
   label: string;
   name: string;
-  stored: boolean;
   storedText: MessageKey | undefined;
   canKeep: boolean;
   choice: SecretDto['secret'];
@@ -740,10 +736,6 @@ function SecretField({
           onInput={(event) => onValue(event.currentTarget.value)}
         />
       )}
-      {/* `stored` is deliberately unused for rendering the value: there is none
-          to render. It only decides whether "keep" was ever an option, which
-          the caller has already applied through `canKeep`. */}
-      <span class="visually-hidden">{stored ? '' : ''}</span>
     </fieldset>
   );
 }
