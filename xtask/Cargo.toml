@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side release tooling for somfy-rs: build the images, verify them, publish the manifest"
+publish = false
+
+[dependencies]
+# The digest the manifest publishes. Same version and the same
+# `default-features = false` as `somfy-ota` pins, so the workspace carries one
+# copy — and the tool that publishes a digest and the firmware that hashes an
+# image are running the same code.
+sha2 = { version = "0.11", default-features = false }
+# **The point of the whole verify step**: this is the identical streaming
+# verifier the device runs on an upload, so an image that a board would refuse
+# cannot reach a release. It is a `no_std` library and builds for the host
+# unchanged, which is what makes the reuse free rather than clever.
+somfy-ota = { path = "../crates/somfy-ota" }

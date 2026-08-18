@@ -169,8 +169,11 @@ crates/
 ├── somfy-migrate/  C++ backup-file parser
 ├── somfy-cc1101/   radio driver      somfy-rmt/  RMT pulse I/O
 ├── somfy-tasks/    Embassy task bodies, transport-agnostic
+├── somfy-ota/      app-image verification and update policy
+├── somfy-backup/   the export/restore container
 └── firmware/       the only hardware-aware crate
 ui/                 Preact + Vite, embedded in the image
+xtask/              host-side release tooling — build, verify, publish
 ```
 
 Everything above `firmware` is `no_std` and host-testable. CI builds each of them
@@ -182,10 +185,16 @@ is checked rather than claimed.
 ## Development
 
 ```bash
-cargo test --workspace          # ~950 tests, no hardware needed
+cargo test --workspace          # ~1,070 tests, no hardware needed
 cargo clippy --workspace --all-targets -- -D warnings
 cd ui && bun run dev            # UI against a mock device, no firmware required
+
+cargo run -p xtask -- release   # build every chip's image, verify, write the manifest
 ```
+
+`xtask release` puts each image through **the device's own verifier** before it
+can become a release, so an image a board would refuse never leaves the host.
+Add `--publish` to attach the images and `manifest.json` to a GitHub release.
 
 The UI's mock serves the **real API paths**, so the same client code runs against
 mock and device with no "mock mode" branch — and the generated TypeScript is a CI

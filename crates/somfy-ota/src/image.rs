@@ -26,24 +26,47 @@
 //! | App-descriptor magic `0xABCD5432` | a bootloader image, a partition table | byte 112 |
 //! | The segment walk reaching exactly `Content-Length` | truncation, extra bytes | the last byte |
 //! | The image's own checksum byte | corruption anywhere in the segment data | the last byte |
+//! | The image's own appended SHA-256 | corruption anywhere at all | the last byte |
 //!
-//! **What slips through, said plainly.** The checksum is one byte — the XOR of
-//! every segment byte with a seed — so a corruption that survives TCP's own
-//! sixteen-bit checksum has about a one-in-256 chance of surviving this one too.
-//! Nothing here is a signature: there is no key, the endpoint is not
-//! authenticated, and an attacker who can reach it can upload whatever they
-//! like. What this establishes is *integrity against accident*, which is what
-//! the failure modes of a manual upload over a LAN actually are.
+//! **What slips through, said plainly.** Nothing here is a signature: there is
+//! no key, the endpoint is not authenticated, and an attacker who can reach it
+//! can upload whatever they like — including a consistent image with a correct
+//! digest, since every check below is computed from the bytes rather than
+//! against a secret. What this establishes is *integrity against accident*,
+//! which is what the failure modes of a manual upload over a LAN actually are.
 //!
-//! The image also carries a **SHA-256 of itself** in its last thirty-two bytes
+//! # The digest, and why the earlier ruling was reversed
+//!
+//! An image carries a **SHA-256 of itself** in its last thirty-two bytes
 //! ([`Header::hash_appended`], set on every image `espflash` produces), and the
-//! ESP-IDF bootloader verifies it before booting. This crate does not: a
-//! software SHA-256 is about 110 bytes of live state, and on the chip this
-//! firmware is tightest on that is paid four times over in Wi-Fi driver
-//! headroom. The consequence is bounded and worth stating — a corruption that
-//! passes everything above is written, marked bootable, and then **refused by
-//! the bootloader on the next boot, which falls back to the slot that was
-//! running**. It costs one reboot, not a device.
+//! ESP-IDF bootloader verifies it before booting. This crate used to leave it
+//! to the bootloader, and said so: a software SHA-256 is about 110 bytes of
+//! live state, and on the chip this firmware was tightest on that was paid
+//! several times over in Wi-Fi driver headroom.
+//!
+//! **Two things changed and the second is the one that matters.** The chip that
+//! could not afford it is no longer in the matrix, so the cost is now measured
+//! against an ESP32-S3's headroom rather than an ESP32-C3's —
+//! `crates/firmware/src/heap.rs` carries the figure and it is not free.
+//!
+//! And the old consequence was under-stated. "One reboot" is what it costs
+//! *the device*; what it costs the **operator** is worse, because the upload is
+//! answered `202 Accepted` and `otadata` is moved to name the damaged image, so
+//! what they see is a board that agreed to the update and is then still running
+//! the old firmware, with nothing in the exchange saying why. Verifying here
+//! turns that into `400 imageDamaged` with the cause on the console, and the
+//! boot selection never moves at all.
+//!
+//! **Being careful about what is *not* claimed**, because it would be easy to
+//! oversell: the bootloader's own check is a real safety net and this does not
+//! replace it. A board in that state is not bricked and, as far as this project
+//! has established, recovers on its own — nobody here has deliberately put a
+//! board into it, which is exactly why the argument above is about the
+//! *response* rather than about damage.
+//!
+//! So the checksum's one-in-256 escape rate is now backed by a 256-bit one, at
+//! the cost of one pass of SHA-256 over bytes that are being written to flash
+//! anyway.
 //!
 //! # Provenance
 //!
@@ -54,6 +77,7 @@
 //! before they were written down.
 
 use heapless::String;
+use sha2::{Digest, Sha256};
 
 /// The first byte of every ESP-IDF image.
 pub const IMAGE_MAGIC: u8 = 0xE9;
@@ -249,6 +273,21 @@ pub enum ImageError {
         /// What the image says.
         found: u8,
     },
+    /// The appended SHA-256 does not match the bytes before it.
+    ///
+    /// **The one variant that carries no number, and the exception is
+    /// deliberate.** Every other one names something an operator already has:
+    /// a first byte they can look at, a chip id they can compare, a length
+    /// `curl` printed. A digest has no such counterpart — `sha256sum` on the
+    /// file they sent covers the image *and* the thirty-two bytes appended to
+    /// it, so it equals neither the value computed here nor the value found,
+    /// and quoting either would invite a comparison that always fails.
+    ///
+    /// A prefix was tried and is worse than nothing: two digests can agree on
+    /// their first four bytes and differ later, so the console line would read
+    /// as two identical numbers being called unequal. What the operator does is
+    /// send the file again, and if it is refused twice, rebuild it.
+    BadDigest,
 }
 
 /// Where the walk currently is.
@@ -276,7 +315,10 @@ enum Phase {
     },
     /// Reading the one checksum byte.
     Checksum,
-    /// Reading the appended SHA-256, which this crate does not verify.
+    /// Reading the appended SHA-256.
+    ///
+    /// The walk only counts these bytes; the digest itself is checked out of
+    /// band by [`Verifier::absorb`], which does not care where the walk is.
     Digest {
         /// Bytes still to come.
         remaining: usize,
@@ -329,6 +371,17 @@ pub struct Verifier {
     partial: [u8; HEADER_BYTES],
     /// How much of `partial` is filled.
     partial_len: usize,
+    /// SHA-256 over every byte fed except the last [`APPENDED_DIGEST_BYTES`].
+    digest: Sha256,
+    /// The last [`APPENDED_DIGEST_BYTES`] fed so far, oldest first.
+    ///
+    /// This is the delay line that makes [`Verifier::absorb`] independent of
+    /// the walk: at any moment it holds what *would* be the appended digest if
+    /// the stream ended here, and everything older has gone into `digest`.
+    tail: [u8; APPENDED_DIGEST_BYTES],
+    /// How much of `tail` is filled. Only below [`APPENDED_DIGEST_BYTES`] for
+    /// the first few slices of a stream.
+    tail_len: usize,
 }
 
 impl Verifier {
@@ -355,6 +408,9 @@ impl Verifier {
             phase: Phase::Header,
             partial: [0; HEADER_BYTES],
             partial_len: 0,
+            digest: Sha256::new(),
+            tail: [0; APPENDED_DIGEST_BYTES],
+            tail_len: 0,
         })
     }
 
@@ -375,6 +431,13 @@ impl Verifier {
                 declared: self.declared,
             });
         }
+
+        // **Before the walk and before any refusal**, so that every byte fed is
+        // hashed exactly once and in order, whatever the walk goes on to make
+        // of it. A refusal drops the verifier, so hashing bytes that turn out
+        // to belong to a rejected image costs one pass over a slice that is
+        // already in cache.
+        self.absorb(bytes);
 
         // Kept before the walk consumes it, because the descriptor sits inside
         // the first segment's data and the walk has no reason to look at it.
@@ -405,6 +468,52 @@ impl Verifier {
             bytes = &bytes[consumed..];
         }
         Ok(())
+    }
+
+    /// Hash `bytes`, holding back the most recent [`APPENDED_DIGEST_BYTES`].
+    ///
+    /// # Why a delay line rather than "hash everything below `declared - 32`"
+    ///
+    /// That arithmetic is only available once [`Header::hash_appended`] has
+    /// been read, which happens at byte 24 — and the slices are allowed to be
+    /// any length, including one byte, so bytes arrive before the boundary is
+    /// known. Holding the last thirty-two back needs no boundary at all: at
+    /// every instant `tail` is what the appended digest would be if the stream
+    /// stopped here, and `digest` has absorbed exactly everything before it.
+    /// When the stream really does stop, [`Verifier::finish`] compares the two.
+    ///
+    /// An image with no appended digest leaves `tail` holding thirty-two real
+    /// image bytes and `digest` covering all but those, which is a digest of
+    /// nothing in particular — and is never read, because the only reader is
+    /// guarded by `hash_appended`.
+    fn absorb(&mut self, mut bytes: &[u8]) {
+        // Fill the delay line first. Until it is full nothing is old enough to
+        // hash, because everything seen so far could still be the tail.
+        if self.tail_len < APPENDED_DIGEST_BYTES {
+            let take = bytes.len().min(APPENDED_DIGEST_BYTES - self.tail_len);
+            self.tail[self.tail_len..self.tail_len + take].copy_from_slice(&bytes[..take]);
+            self.tail_len += take;
+            bytes = &bytes[take..];
+        }
+        if bytes.is_empty() {
+            return;
+        }
+
+        if bytes.len() >= APPENDED_DIGEST_BYTES {
+            // The whole delay line is evicted, and so is everything but the
+            // last thirty-two bytes of this slice.
+            self.digest.update(self.tail);
+            let split = bytes.len() - APPENDED_DIGEST_BYTES;
+            self.digest.update(&bytes[..split]);
+            self.tail.copy_from_slice(&bytes[split..]);
+        } else {
+            // Only the oldest `bytes.len()` of the delay line is evicted; the
+            // rest shuffles down and this slice lands on the end.
+            let shift = bytes.len();
+            self.digest.update(&self.tail[..shift]);
+            self.tail.copy_within(shift.., 0);
+            self.tail[APPENDED_DIGEST_BYTES - shift..].copy_from_slice(bytes);
+        }
     }
 
     /// Advance one phase against `bytes`, returning how much it took.
@@ -627,6 +736,18 @@ impl Verifier {
                 walked: self.pos,
                 declared: self.declared,
             });
+        }
+        // **Last, and that ordering is deliberate.** Every refusal above names
+        // something an operator can act on — the wrong file, the wrong chip, a
+        // transfer that stopped. A digest mismatch names none of those; it says
+        // the bytes are not the bytes, which is only worth reporting once the
+        // cheaper and more specific answers have been ruled out.
+        //
+        // Reaching here with `hash_appended` set means the walk consumed the
+        // whole `Phase::Digest`, so the delay line is full and holds exactly
+        // those thirty-two bytes.
+        if self.hash_appended && self.digest.finalize().as_slice() != self.tail {
+            return Err(ImageError::BadDigest);
         }
         Ok(Accepted {
             len: self.declared,

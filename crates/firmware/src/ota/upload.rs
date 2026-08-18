@@ -585,7 +585,15 @@ pub fn abort(pages: &mut Pages) {
 /// not arrive intact" does the same thing whether it was short, long or
 /// corrupt, and three codes sharing an action are three translations sharing a
 /// sentence. The *precise* cause goes to the console, where a developer is.
-const fn refuse(error: ImageError) -> ApiErrorCode {
+///
+/// **That last sentence was a promise this function did not keep** until
+/// 2026-08-18: it mapped and said nothing, so `imageDamaged` reached the
+/// operator with no way to tell a short upload from a bad digest, on either
+/// side of the wire. Logging here rather than at the three call sites is what
+/// makes that true for all of them at once — and it is why this is no longer a
+/// `const fn`, which it had no other reason to be.
+fn refuse(error: ImageError) -> ApiErrorCode {
+    crate::logln!("ota: the image was refused — {:?}", error);
     match error {
         ImageError::NotAnImage { .. }
         | ImageError::NotAnApp { .. }
@@ -594,6 +602,7 @@ const fn refuse(error: ImageError) -> ApiErrorCode {
         ImageError::TooLarge { .. } => ApiErrorCode::ImageTooLarge,
         ImageError::Truncated { .. }
         | ImageError::LengthMismatch { .. }
-        | ImageError::BadChecksum { .. } => ApiErrorCode::ImageDamaged,
+        | ImageError::BadChecksum { .. }
+        | ImageError::BadDigest => ApiErrorCode::ImageDamaged,
     }
 }

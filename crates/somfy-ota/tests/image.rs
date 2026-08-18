@@ -17,6 +17,7 @@
 //! come out where this crate says they are. If any offset here were wrong by
 //! four bytes, that test is the one that fails.
 
+use sha2::{Digest, Sha256};
 use somfy_ota::image::{
     Chip, Header, ImageError, Verifier, APPENDED_DIGEST_BYTES, CHECKSUM_ALIGN, CHECKSUM_SEED,
     DESCRIPTOR_MAGIC, DESCRIPTOR_OFFSET, HEADER_BYTES, IMAGE_MAGIC, MAX_SEGMENTS,
@@ -89,7 +90,12 @@ fn build(chip: Chip, segments: &[usize], hash_appended: bool) -> Vec<u8> {
     }
     out.push(checksum);
     if hash_appended {
-        out.extend_from_slice(&[0xAB; APPENDED_DIGEST_BYTES]);
+        // **A real digest, not a placeholder.** It used to be `[0xAB; 32]`,
+        // which was harmless while nothing read it and became three failing
+        // tests the moment something did — which is the useful kind of
+        // failure, and is why these fixtures are assembled rather than
+        // recorded.
+        out.extend_from_slice(&Sha256::digest(&out));
     }
     out
 }
@@ -426,5 +432,117 @@ fn a_last_segment_ending_one_byte_short_of_a_block_still_walks_to_the_end() {
     assert!(
         found,
         "no segment length in the search range produced zero padding"
+    );
+}
+
+#[test]
+fn two_flipped_bits_that_cancel_in_the_checksum_are_caught_by_the_digest() {
+    // Arrange: the checksum is a byte-wise XOR, so flipping the *same* bit in
+    // two segment-data bytes leaves it identical. This is the one-in-256
+    // escape the module docs name, made concrete — and it is exactly what the
+    // digest exists to close.
+    let good = build(Chip::Esp32S3, &[512, 1024], true);
+    let mut image = good.clone();
+    let first = HEADER_BYTES + SEGMENT_HEADER_BYTES + 100;
+    let second = HEADER_BYTES + SEGMENT_HEADER_BYTES + 300;
+    image[first] ^= 0x40;
+    image[second] ^= 0x40;
+
+    // Act
+    let outcome = run(Chip::Esp32S3, &image, 256);
+
+    // Assert: the checksum is satisfied and the digest is not.
+    assert!(
+        matches!(outcome, Err(ImageError::BadDigest)),
+        "two cancelling flips were not caught: {outcome:?}",
+    );
+}
+
+#[test]
+fn a_corrupted_segment_header_is_invisible_to_the_checksum_and_caught_by_the_digest() {
+    // Arrange: the checksum covers segment *data* only, so a damaged load
+    // address passes it untouched — and a load address is not a field the walk
+    // reads either, because the bootloader is the only thing that acts on it.
+    // Nothing but the digest can see this.
+    let good = build(Chip::Esp32S3, &[512, 1024], true);
+    let mut image = good.clone();
+    // The first segment header's `load_addr` is the four bytes straight after
+    // the file header.
+    image[HEADER_BYTES] ^= 0x08;
+
+    // Act
+    let outcome = run(Chip::Esp32S3, &image, 256);
+
+    // Assert
+    assert!(
+        matches!(outcome, Err(ImageError::BadDigest)),
+        "a damaged load address was not caught: {outcome:?}",
+    );
+}
+
+#[test]
+fn a_damaged_appended_digest_is_refused_even_though_the_image_is_intact() {
+    // Arrange: the bytes that make up the image are perfect and the thirty-two
+    // that claim to describe them are not. That is a truncated-and-resumed
+    // download rather than a damaged build, and it has to be refused for the
+    // same reason: the bootloader will refuse it on the next boot.
+    let good = build(Chip::Esp32S3, &[2048], true);
+    let mut image = good.clone();
+    let last = image.len() - 1;
+    image[last] ^= 0xFF;
+
+    // Act
+    let outcome = run(Chip::Esp32S3, &image, 256);
+
+    // Assert: the *last* byte, so the damage is past where any prefix would
+    // show it — which is the case that decided this variant carries nothing.
+    assert_eq!(outcome, Err(ImageError::BadDigest));
+    assert!(
+        run(Chip::Esp32S3, &good, 256).is_ok(),
+        "the intact image this was derived from is itself refused",
+    );
+}
+
+#[test]
+fn the_digest_agrees_with_itself_at_every_slice_size() {
+    // Arrange: the delay line that holds the last thirty-two bytes back is the
+    // one piece of this crate whose correctness depends on how the stream is
+    // cut up. One byte at a time exercises the shuffle-down branch on every
+    // call; a slice larger than the whole image exercises the other branch
+    // once; the sizes between straddle the thirty-two-byte boundary.
+    let good = build(Chip::Esp32S3, &[600], true);
+    let mut damaged = good.clone();
+    damaged[HEADER_BYTES] ^= 0x08;
+
+    // Act + Assert
+    for chunk in [1, 2, 31, 32, 33, 64, 256, good.len(), good.len() * 2] {
+        assert!(
+            run(Chip::Esp32S3, &good, chunk).is_ok(),
+            "a good image was refused in {chunk}-byte slices",
+        );
+        assert!(
+            matches!(
+                run(Chip::Esp32S3, &damaged, chunk),
+                Err(ImageError::BadDigest),
+            ),
+            "a damaged image was accepted in {chunk}-byte slices",
+        );
+    }
+}
+
+#[test]
+fn an_image_that_declares_no_digest_is_not_judged_on_the_bytes_in_its_place() {
+    // Arrange: with `hash_appended` clear there is no digest, so the last
+    // thirty-two bytes are ordinary image bytes and the delay line holds
+    // something that is not a digest of anything. Nothing may read it.
+    let image = build(Chip::Esp32S3, &[512, 1024], false);
+
+    // Act
+    let outcome = run(Chip::Esp32S3, &image, 256);
+
+    // Assert
+    assert!(
+        outcome.is_ok(),
+        "an image with no appended digest was judged on one: {outcome:?}",
     );
 }

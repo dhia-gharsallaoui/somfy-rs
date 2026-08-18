@@ -956,11 +956,52 @@ const _: () = assert!(
 /// another chip's peak is a great deal better than −2,396 against it, and it is
 /// not the same as knowing. Watch `heap: session announced` on that board before
 /// trusting any of this.
+///
+/// **Re-measured 2026-08-18 for the image digest, and this is the first change
+/// that moved the ESP32-S3 down a whole kilobyte for a few hundred bytes of
+/// need.** `somfy_ota::image::Verifier` gained a `Sha256` and a thirty-two byte
+/// delay line — about 150 bytes of struct — and that struct is a field of the
+/// state task's future, which embassy sizes as a `static`. Measured the
+/// documented way, one worktree built twice:
+///
+/// | chip | before | after | delta |
+/// |---|---|---|---|
+/// | ESP32-S3 (all) | 128,020 | 127,692 | −328 |
+/// | ESP32-C3 (`mqtt`+`ui`) | 122,552 | 122,216 | −336 |
+///
+/// Attributed: **376 bytes** of it is `firmware::tasks::state::POOL`, 16,304 →
+/// 16,680, read off the linked image with `nm --size-sort`. That is two and a
+/// half bytes of DRAM per byte of struct, which is the future-layout tax this
+/// file has priced once before, and the rest is a small give-back elsewhere.
+///
+/// **What it cost is not 328 bytes, and the difference is the point.** The heap
+/// is a floor division by 1,024, so what matters is which side of a kilobyte
+/// boundary the subtraction lands on:
+///
+/// | chip | heap before | heap after | vs [`WIFI_PEAK_BYTES`] | to the next cliff |
+/// |---|---|---|---|---|
+/// | ESP32-S3 | 61,440 | **60,416** | +5,796 | 996 bytes |
+/// | ESP32-C3 | 55,296 | 55,296 | +676 | 640 bytes |
+///
+/// The ESP32-C3 does not move: 336 bytes came out of a band that had 976 of
+/// slack. The ESP32-S3 had **300**, so 328 bytes cost it a kilobyte, and its
+/// clearance over the worst announcement peak ever measured falls from 6,820 to
+/// 5,796 — still **2.9× that peak's own ~2,000-byte spread**, and 8.6× what the
+/// ESP32-C3 ships with today.
+///
+/// **Twenty-eight bytes would have kept the old band, and they were not taken.**
+/// The obvious source is `Verifier`'s three length counters, which index
+/// buffers of 112, 24 and 32 bytes and are `usize` for no reason. Narrowing
+/// them to `u8` was written, and it needs fifteen `usize::from` casts through
+/// the walk — a permanent cost in the most-read function in that crate, to sit
+/// 32 bytes above a cliff that the next feature crosses anyway. The band was
+/// bought instead: there are now 996 bytes of slack on the ESP32-S3, which is
+/// where the next few hundred bytes should go before this is re-read.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 128_020;
+const DRAM_FOR_STACK_AND_HEAP: usize = 127_692;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 122_552;
+const DRAM_FOR_STACK_AND_HEAP: usize = 122_216;
 
 // **The ESP32-C3 does not have the DRAM for the mDNS responder or the SNTP
 // client on top of the web server, and these say so at compile time.**
@@ -984,8 +1025,13 @@ const DRAM_FOR_STACK_AND_HEAP: usize = 122_552;
 // larger than its own constant was measured on — which is the unsafe direction,
 // and the direction this row has failed in three times.
 //
-// The ESP32-S3 carries both with 10,916 bytes of heap to spare over the same
-// peak.
+// The ESP32-S3 carries both, and with **5,796 bytes** of heap to spare over the
+// same peak. That figure said 10,916 until 2026-08-18 and had been wrong for
+// two revisions of `DRAM_FOR_STACK_AND_HEAP` — 10,916 is the spare of a 64 KiB
+// heap, which this chip last had before the web server landed. It is corrected
+// here rather than quietly because it is the exact failure this file's own
+// "loses things in merges" section is about: a number in prose beside a
+// constant, with nothing checking that the two still agree.
 #[cfg(all(feature = "chip-c3", feature = "mdns"))]
 compile_error!(
     "the ESP32-C3 does not have the DRAM for the mDNS responder as well as the web server: it \
