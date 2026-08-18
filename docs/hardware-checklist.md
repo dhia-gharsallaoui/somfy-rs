@@ -497,6 +497,42 @@ do nothing with.
 **Prefer the broker's address on the ESP's own subnet** where it is dual-homed:
 it removes any dependency on inter-VLAN firewall rules from the path.
 
+#### Taking the broker half from the old controller's backup
+
+```bash
+cargo run -p somfy-config --example provision -- --from-backup device.backup wificfg.bin
+```
+
+The **broker half only**. Wi-Fi credentials are never migrated, and the backup
+does not carry the broker's username or password either — the old firmware keeps
+both outside the exported file — so all four are still typed.
+
+What it does carry is the address, the port and the two topic namespaces, and
+the last of those is the reason this path exists. The old controller stores
+`rootTopic` and `discoTopic` separately and **joins them at publish time**, which
+is why its Home Assistant discovery has never worked in any configuration. The
+import **undoes** that: `discoTopic` becomes `discovery_prefix` on its own and
+`rootTopic` becomes `state_root` on its own. It prints the transformation before
+asking for anything, so you can check it:
+
+```
+read the broker from the backup: 192.0.2.10:1883
+  discoTopic "homeassistant" becomes discovery_prefix "homeassistant"
+  rootTopic "espsomfyrts" becomes state_root "espsomfyrts"
+  (the old controller joins the two at publish time; this does not)
+```
+
+An import that cannot be made valid is **refused with the field named** rather
+than stored: an empty `discoTopic` is an empty `discovery_prefix`; an empty
+`rootTopic` is an empty `state_root`; and both set to `homeassistant` — the
+natural way to "fix" the first on the old controller — is an overlap, which
+would put this device's availability topic on Home Assistant's own birth and
+will topic and mark it **available while it is offline**. A broker host that is
+a *name* rather than an address is refused too, because there is no resolver on
+that path; look the address up and run the tool without `--from-backup`. So is
+`mqtts://`, because there is no TLS on the broker socket and a silent downgrade
+would send the password across the network in the clear.
+
 ### 2. Put it on the board
 
 Step 0 above — **identify the board** — applies here too, every time.
@@ -743,8 +779,17 @@ motors. Do not commit it or paste it anywhere. For the same reason the tool
 *.backup` when the glob matches more than one file, which would otherwise put a
 real backup in the output slot.
 
-Rooms, groups and network settings are **not** imported by this step — the
-region holds shades only.
+**This step writes two files, for two regions.** `shades.bin` is the shade
+table; `estate.bin` is the rooms, which room each shade is in, and the groups.
+They come from one import and **must be flashed together**: a group's membership
+and a room assignment are stored as *rows of the shade table*, so an estate
+written beside a different table names the wrong shades. The interactive path
+writes an empty `estate.bin` for the same reason — so the pair always describes
+one installation.
+
+Network settings are **not** imported by this step. Wi-Fi credentials are never
+migrated (you re-enter them), and the broker settings are a third region and a
+different tool — `provision --from-backup`, below.
 
 ### 2. Put it on the board
 
@@ -752,18 +797,21 @@ Step 0 above — **identify the board** — applies here too, every time.
 
 ```bash
 cd crates/firmware
-espflash erase-parts --port /dev/ttyUSB0 --partition-table partitions.csv shades
+espflash erase-parts --port /dev/ttyUSB0 --partition-table partitions.csv shades estate
 espflash write-bin   --port /dev/ttyUSB0 0x204000 shades.bin
+espflash write-bin   --port /dev/ttyUSB0 0x208000 estate.bin
 ```
 
 The erase is **not optional when re-provisioning**, for the same reason as
 `wificfg`: the tool writes sequence number 0, so an existing record with a
 higher sequence number stays newest and the new table is ignored.
 
-A board flashed before this region existed has no `shades` partition at all and
-says so (`region unavailable (PartitionMissing)`); reflash the firmware from
-this directory so espflash writes the current `partitions.csv`. `rollcode` and
-`wificfg` keep their offsets, so rolling codes and credentials survive it.
+A board flashed before either region existed has no such partition and says so
+(`region unavailable (PartitionMissing)`); reflash the firmware from this
+directory so espflash writes the current `partitions.csv`. `rollcode`, `wificfg`
+and `shades` keep their offsets, so rolling codes, credentials and the shade
+table survive it — `estate` is new and arrives blank, which reads as no rooms
+and no groups, the state that board is already in.
 
 ### 3. Confirm it landed
 
@@ -789,6 +837,31 @@ shades: 0x00C0DE keeps its stored rolling code 42 — the provisioned starting
 That is the check that matters. A board that prints `seeded` on every boot is
 walking its rolling code backwards, and every shade on it will stop responding.
 
+The estate follows it, and on a board that imported one it reads:
+
+```
+estate: partition 'estate' at 0x00208000, 4 slots of 2048 bytes
+estate: survey slots=4 valid=1 blank=3 damaged=0 newest_seq=Some(0)
+estate: 2 room(s), 3 shade(s) assigned, 1 group(s)
+```
+
+A board with no estate — never imported, or flashed with an older table — says
+so instead and carries on: every shade still exists, still moves and still keeps
+its code, and what is missing is the arrangement.
+
+**Watch for one line in particular.** A group whose rolling code could not be
+recovered from the backup (format versions 19 to 22 keep it outside the file)
+prints:
+
+```
+estate: GroupId(0) 'Whole House' carries a placeholder rolling code, not the one
+ the old controller used — it could not be recovered from the backup.
+```
+
+It is harmless today: a group command is transmitted to each member shade, so
+nothing ever sends that code. It becomes a walk to a motor the first time
+anything transmits *as* the group.
+
 | Quantity | Value |
 |---|---|
 | Partition | `shades`, data/undefined, 0x204000, 8 KB |
@@ -797,6 +870,17 @@ walking its rolling code backwards, and every shade on it will stop responding.
 | Slots | 4, in 2 erase sectors of 2 |
 | Capacity | 32 shades, which is the registry's own limit |
 | Written by | the host tool only — the firmware has no write path for this region |
+
+And the estate beside it:
+
+| Quantity | Value |
+|---|---|
+| Partition | `estate`, data/undefined, 0x208000, 8 KB |
+| Record | 2048 bytes: magic `RTSE`, version **1**, room and group counts, seq, then 16 room rows of 36 bytes (name), 32 bytes of "which room is this shade in", 16 group rows of 44 bytes — address, next code, flags, member bitmap, name(32) — and a CRC-32 |
+| Older versions | none. This region has never been written before, so a blank one is the ordinary state rather than a loss |
+| Slots | 4, in 2 erase sectors of 2 |
+| Capacity | 16 rooms and 16 groups, which are the registry's own limits |
+| Written by | the host tool only, from the same import as `shades.bin` — rooms and groups have no runtime edit yet |
 
 ---
 
@@ -1165,13 +1249,17 @@ costs one command.
 | `wificfg` | data, 0x202000, 8 KB | **unchanged** |
 | `shades` | data, 0x204000, 8 KB | **unchanged** |
 | `otadata` | — | **new**, data/ota, 0x206000, 8 KB |
+| `estate` | — | **new**, data/undefined, 0x208000, 8 KB |
 | `ota_1` | — | **new**, app, 0x210000, 0x1F0000 |
 
 The app slot did not move and did not change size, so the image lands on the
-same sectors it already occupied. The three data regions did not move, so every
-byte a provisioned board is carrying stays where the firmware looks for it.
-`crates/firmware/partitions.csv` carries the derivation; `crates/firmware/build.rs`
-fails the build if a later edit moves any of the three.
+same sectors it already occupied. The three older data regions did not move, so
+every byte a provisioned board is carrying stays where the firmware looks for
+it. `estate` is purely additive — it sits above all of them, in space the table
+had already set aside — and arrives blank, which the firmware reads as no rooms
+and no groups. `crates/firmware/partitions.csv` carries the derivation;
+`crates/firmware/build.rs` fails the build if a later edit moves any of the
+four.
 
 The table now ends at 0x400000 exactly, so it still fits a 4 MB board — which
 matters because only the ESP32-S3 here is known to carry 8 MB.

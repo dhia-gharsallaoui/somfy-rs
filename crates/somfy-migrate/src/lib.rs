@@ -8,7 +8,7 @@
 //! re-pairing every motor.
 //!
 //! [`parse_backup`] is the entry point. The [`parse_header`] and per-record
-//! [`parse_shade_record`]/[`parse_room_record`]/[`parse_group_record`] parsers,
+//! [`parse_shade_record`]/[`parse_room_record`]/[`parse_group_record`]/[`parse_net_record`] parsers,
 //! and the [`Reader`] value tokenizer beneath them, are public for targeted
 //! testing. The crate is `no_std` and allocation-free (heapless collections, no
 //! floating-point — a workspace constraint; fractional positions parse straight
@@ -57,21 +57,38 @@
 //!
 //! ## What this pass does NOT migrate
 //!
-//! - **Repeater, settings, net, and transceiver records** are skipped to EOF.
-//!   Network credentials are intentionally not imported — the user re-enters them
-//!   through the captive portal (design spec §3.4).
+//! - **Repeater, settings, and transceiver records** are stepped over. The
+//!   **net** record between them *is* read, but only for the broker settings in
+//!   it — see below. Network credentials are intentionally not imported: the
+//!   user re-enters them through the captive portal (design spec §3.4), and the
+//!   static-IP block a net record also carries would be a claim about a network
+//!   this device has not joined.
 //! - **Linked-remote rolling codes and v19–v22 group rolling codes** are
 //!   NVS-only in the C++ firmware and absent from the backup file, so they cannot
 //!   be recovered from a file-only migration. Addresses are recovered;
 //!   linked-remote codes are dropped and v19–v22 group codes are fabricated as
 //!   [`somfy_rts::RollingCode`]`(1)` — see [`parse_group_record`], which calls
 //!   this out loudly as a re-pair prompt for the consuming plan.
-//! - **MQTT settings import is deferred to Plan 6** — a deliberate deviation from
-//!   design spec §3.4, which lists MQTT among the migrated fields. Rationale: the
-//!   settings record (`writeSettingsRecord`, `ConfigFile.cpp:1019`) parses fine,
-//!   but there is nowhere to store the result until configuration persistence
-//!   exists in Plan 6, which owns both MQTT config storage and this import. It is
-//!   deferred, not dropped.
+//! - **The broker username, password, and whether MQTT was even enabled.** The
+//!   backup does not carry them: `writeNetRecord` emits the protocol, host,
+//!   port, discovery flag and the two topic namespaces, while `MQTTSettings`
+//!   also holds `enabled`, `username` and `password` in NVS. So an import can
+//!   recover *where* to publish and never *as whom*.
+//!
+//! ## MQTT settings, and the one transform that is not a copy
+//!
+//! [`MigratedMqtt`] carries `rootTopic` and `discoTopic` exactly as the file
+//! holds them. The C++ then **concatenates** them at publish time —
+//! `MQTTClass::makeTopic` prepends `rootTopic` to every topic, including the
+//! discovery topic built from `discoTopic` — which is the single fault that
+//! makes Home Assistant discovery unusable on that firmware.
+//!
+//! This crate does not undo it, and deliberately: a deserializer that silently
+//! reinterpreted its input would make the file and the struct disagree. Undoing
+//! it belongs to the consumer, which maps `discoTopic` onto `discovery_prefix`
+//! and `rootTopic` onto `state_root` as two independent namespaces, and refuses
+//! the result if the pair breaks a rule. See
+//! `docs/specs/2026-08-15-mqtt-ha-discovery-requirements.md` R1 and R3.
 //!
 //! ## Port fidelity
 //!
@@ -91,6 +108,6 @@ pub use header::{parse_header, BackupHeader, MAX_SUPPORTED_VERSION, MIN_SUPPORTE
 pub use migrate::{parse_backup, MigrationData};
 pub use reader::{MigrateError, Reader};
 pub use records::{
-    parse_group_record, parse_room_record, parse_shade_record, MigratedGroup, MigratedRoom,
-    MigratedShade,
+    parse_group_record, parse_net_record, parse_room_record, parse_shade_record, MigratedGroup,
+    MigratedMqtt, MigratedRoom, MigratedShade,
 };

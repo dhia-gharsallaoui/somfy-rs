@@ -15,26 +15,53 @@
 //! measured travel times. Reading them is strictly better than copying them by
 //! eye from another device's screen, and the rolling code is the reason.
 //!
-//! ## What is not carried across
+//! ## What is carried, and into which of two images
 //!
-//! The backup describes a whole installation; this record holds shades. **Not
-//! written here:** rooms, groups, network settings, each shade's room
-//! assignment, and the rolling codes of remotes linked to a shade — those last
-//! are not in the exported file at all. Nor are the live positions the old
-//! controller was tracking, which a fresh controller has no business believing
-//! anyway: it re-establishes them by driving a shade to an end stop.
+//! The backup describes a whole installation and this import writes **two**
+//! records for **two** flash regions, from one read of one file:
+//!
+//! - the **shade table** — names, addresses, kinds, travel times, the
+//!   next-to-send rolling code, and the wall remotes linked to each shade;
+//! - the **estate** — the rooms, which room each shade is in, and the groups
+//!   with their names, members and virtual-remote identities.
+//!
+//! They are written together because they are one thing: a group's membership
+//! and a room assignment are both *rows of the shade table*, so an estate
+//! beside a different table names the wrong shades. See
+//! `somfy_config::EstateRecord`.
+//!
+//! **Still not written:** network credentials (the operator re-enters them —
+//! design spec §3.4), the broker settings (a different region and a different
+//! tool: `provision --from-backup`), and the live positions the old controller
+//! was tracking, which a fresh controller has no business believing anyway — it
+//! re-establishes them by driving a shade to an end stop.
 //!
 //! The one omission with teeth is the **"my" favourite**. `somfy_domain::Shade`
 //! models it (`my_pos: Option<Pos>`) and acts on it — a `My` press with no
 //! favourite set is a *no-op in the domain* while the motor still recalls its
 //! own, so the position estimate silently walks away from the shade — but
 //! `ShadeConfig` has no field to provision one into. [`Import`] therefore
-//! counts the favourites it had to drop, along with the rooms and groups and
-//! linked remotes, so the tool can say so rather than let a person discover it.
+//! counts the favourites it had to drop, so the tool can say so rather than let
+//! a person discover it.
 //!
 //! Shade flags (sun and wind sensor bits, `SimMy`) are dropped without a count:
 //! nothing in this firmware models any of them, so there is no behaviour to
 //! lose and nothing a person could act on.
+//!
+//! ## Two things the backup cannot tell us, and only one of them matters
+//!
+//! Neither a **linked remote's** rolling code nor, on a version 19 to 22
+//! backup, a **group's** is in the file: the old controller keeps both in NVS,
+//! which an export does not include.
+//!
+//! They are not the same loss. A linked remote is only ever *listened to* — its
+//! address is all that is needed to recognise its frames and move the position
+//! estimate — so the missing code costs nothing, and the tool says so in one
+//! line rather than warning about it. A group is *transmitted as*, so a
+//! fabricated code is a group a motor will reject; that one is a per-group
+//! warning ([`Caveat::FabricatedGroupCode`]) **and** a bit in the record
+//! (`somfy_config::StoredGroup::code_recovered`), because the warning is read
+//! once and the value is stored forever.
 //!
 //! ## Order is identity, and the backup's own ids are not it
 //!
@@ -70,14 +97,37 @@
 //!   at the top of this file. The tool shows the table and demands confirmation.
 
 use somfy_config::{
-    LinkedRemote, ShadeError, StoredShade, MAX_LINKED_REMOTES, MAX_LINKS, SHADE_TABLE_CAPACITY,
+    EstateRecord, LinkedRemote, Members, ShadeError, StoredGroup, StoredRoom, StoredShade,
+    ESTATE_GROUP_CAPACITY, ESTATE_ROOM_CAPACITY, MAX_LINKED_REMOTES, MAX_LINKS,
+    SHADE_TABLE_CAPACITY,
 };
 use somfy_domain::{
-    DomainError, FrameWidth, RadioProtocol, ShadeConfig, ShadeId, ShadeKind, TiltMode,
+    DomainError, FrameWidth, RadioProtocol, RoomId, ShadeConfig, ShadeId, ShadeKind, TiltMode,
 };
 use somfy_migrate::{
     parse_backup, MigrateError, MigrationData, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
+
+/// The lowest backup version whose file carries a **group's** rolling code.
+///
+/// Not a number picked here: it is where `somfy_migrate::parse_group_record`
+/// stops fabricating. Below it the old controller keeps a group's code outside
+/// the file it exports, so the parser writes
+/// `RollingCode(1)` — a value indistinguishable from a real code that happens
+/// to be 1. At this version and above, the file has the real one.
+///
+/// Everything [`Caveat::FabricatedGroupCode`] says follows from this one
+/// comparison, which is why it is a named constant rather than a `>= 23`
+/// buried in a branch.
+const GROUP_CODE_MIN_VERSION: u8 = 23;
+
+/// The room id a shade carries in a backup when it is in no room.
+///
+/// **Two values mean it, and both have to be honoured.** Deleting a room on the
+/// old controller writes `0` into every shade that was in it, while a shade
+/// that was never assigned one is written as `255`. Treating either as a room
+/// to look up would produce a warning about a room nobody ever assigned.
+const ROOM_UNASSIGNED: [u8; 2] = [0, 255];
 
 /// The radio-protocol discriminant a shade must carry to be one this firmware
 /// can drive.
@@ -131,6 +181,42 @@ pub enum Caveat {
     /// width. The shade is provisioned, appears in Home Assistant, and does not
     /// move.
     Protocol(u8),
+    /// A shade names a room the backup does not carry. Imported into no room.
+    ///
+    /// Should not occur: deleting a room on the old controller clears the room
+    /// id on every shade that was in it. So this is either a hand-edited file
+    /// or a record that did not align, and both are worth a line rather than a
+    /// silent rearrangement of somebody's installation.
+    UnknownRoom(u8),
+    /// A group lists a shade the backup does not carry. Dropped from the group.
+    ///
+    /// **This one is expected**, and it is why a dangling member does not
+    /// refuse the import: deleting a shade on the old controller clears its
+    /// slot and does *not* remove its id from any group, so a group outliving
+    /// its members is the ordinary state of a real installation. Dropping the
+    /// member is the only thing that can be done with an id nothing answers to;
+    /// saying so is what stops a group that quietly moves fewer shades than the
+    /// old controller's did.
+    MissingMember(u8),
+    /// A group's rolling code could not be recovered from the backup, so the
+    /// stored one is a fabrication.
+    ///
+    /// Backup format versions 19 to 22 keep a group's rolling code in NVS and
+    /// not in the exported file, so `somfy_migrate::parse_group_record`
+    /// substitutes `RollingCode(1)`. A motor rejects any code at or below the
+    /// last it accepted, so **that group will not actuate** until it is
+    /// re-paired or the real code is entered — and nothing about the number
+    /// says so, because `1` is a value a real group could be at.
+    ///
+    /// It costs nothing today, because v1.0 executes a group command by
+    /// transmitting to each member shade rather than as the group. It costs a
+    /// walk to a motor the first time anything transmits as the group, which
+    /// is why the fact is written into the record as well as printed here —
+    /// see `somfy_config::StoredGroup::code_recovered`.
+    FabricatedGroupCode {
+        /// The backup's format version, which is why it could not be read.
+        version: u8,
+    },
 }
 
 impl core::fmt::Display for Caveat {
@@ -158,16 +244,65 @@ impl core::fmt::Display for Caveat {
                  one speaks only {TRANSMITTED_PROTOCOL:#04X} — there is no per-shade protocol \
                  to import it into, so the shade will be provisioned and will not respond"
             ),
+            Caveat::UnknownRoom(raw) => write!(
+                f,
+                "this shade was in room {raw}, which the backup does not contain — imported \
+                 into no room, so put it back in one on the new controller"
+            ),
+            Caveat::MissingMember(raw) => write!(
+                f,
+                "this group listed shade {raw}, which the backup does not contain — the old \
+                 controller leaves a deleted shade in its groups, so the group is imported \
+                 without it"
+            ),
+            Caveat::FabricatedGroupCode { version } => write!(
+                f,
+                "this group's rolling code is NOT in a version {version} backup — the old \
+                 controller kept it outside the file — so the imported code is a placeholder \
+                 and a motor would reject it as a replay. Nothing transmits as a group today, \
+                 so this costs nothing yet; re-pair the group or set its code by hand before \
+                 anything does"
+            ),
         }
     }
 }
 
-/// One caveat, and which shade it is about.
+/// What a [`Warning`] is about.
+///
+/// Two kinds rather than one, because the import now writes groups as well as
+/// shades. The row is the id each will take on the device, so a warning names
+/// what a person will see in the UI rather than what the old controller called
+/// it.
+///
+/// **There is deliberately no room variant.** The one thing that can go wrong
+/// with a room — a shade naming one the backup does not carry — is a fact about
+/// the *shade*, and reporting it against the room would name the thing that is
+/// missing rather than the thing that lost it. Everything else about a room is
+/// either fine or a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    /// A shade, by its row in the imported table — which is its `ShadeId`.
+    Shade(usize),
+    /// A group, by its row — which is its `GroupId`.
+    Group(usize),
+}
+
+impl core::fmt::Display for Subject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Subject::Shade(index) => write!(f, "ShadeId({index})"),
+            Subject::Group(index) => write!(f, "GroupId({index})"),
+        }
+    }
+}
+
+/// One caveat, and which shade, room or group it is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
-    /// The shade's index in the imported table, which is also its `ShadeId`.
-    pub index: usize,
-    /// The shade's name, so the warning names something a person recognises.
+    /// Which entity, and its row in the imported table — which is also the id
+    /// it will have on the device.
+    pub subject: Subject,
+    /// Its name, so the warning names something a person recognises.
     pub name: String,
     /// What could not be carried across as it stands.
     pub caveat: Caveat,
@@ -188,11 +323,15 @@ pub struct Import {
     pub skipped_resyncs: u16,
     /// The backup's format version, for the report.
     pub version: u8,
-    /// Rooms the backup carried. None are written here, and neither is any
-    /// shade's room assignment.
-    pub rooms: usize,
-    /// Groups the backup carried. None are written here.
-    pub groups: usize,
+    /// The rooms, the room each shade is in, and the groups — everything the
+    /// backup describes that is not a shade.
+    ///
+    /// A **second record for a second region**, written from the same import
+    /// as `shades` and only meaningful beside it: a group's membership and a
+    /// room assignment are both *rows of the shade table*, so importing one
+    /// without the other would leave references pointing at whatever was there
+    /// before. See `somfy_config::EstateRecord`.
+    pub estate: EstateRecord,
     /// Every linked remote the backup carried, ready for the record's pool.
     ///
     /// **Their rolling codes are not in the file** — the old controller kept
@@ -290,6 +429,81 @@ pub enum Refusal {
         /// Why it was refused.
         error: DomainError,
     },
+    /// Two rooms with the same id in the backup, so a shade assigned to that
+    /// id does not say which room it means.
+    DuplicateRoomId {
+        /// The later of the two rooms, by row.
+        index: usize,
+        /// Its name.
+        name: String,
+        /// The id they share.
+        room_id: u8,
+    },
+    /// A group at an address no remote can have. A group **is** a virtual
+    /// remote in the controller being replaced, allocated out of the same
+    /// address space as the shades, so it is held to a remote's rule: `0` and
+    /// `0xFFFFFF` are the sentinels the domain refuses.
+    GroupAddress {
+        /// The group's row in the imported table.
+        index: usize,
+        /// Its name.
+        name: String,
+        /// The address the backup carried.
+        address: u32,
+    },
+    /// Two entities at one radio address, at least one of them a group.
+    ///
+    /// Refused rather than imported, because the record would then hold two
+    /// rolling codes for one remote and no way to say which is current. It
+    /// should not happen — the old controller's address allocator checks shades
+    /// *and* groups before handing one out — so it is evidence of a hand-edited
+    /// file or a record that did not align.
+    GroupAddressClash {
+        /// The group's row in the imported table.
+        index: usize,
+        /// Its name.
+        name: String,
+        /// The address it shares.
+        address: u32,
+        /// What else already holds it.
+        with: Clash,
+    },
+    /// More rooms or groups than a record holds. Unreachable while the
+    /// parser's own capacities and the record's are both 16 — the parser
+    /// refuses first, as [`Refusal::Unreadable`] — and kept because it is the
+    /// refusal that catches them ever differing.
+    TooManyEstate {
+        /// Which of the two ran out.
+        what: &'static str,
+        /// How many the record holds.
+        held: usize,
+    },
+}
+
+/// What a group's address collided with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clash {
+    /// A shade, by its row in the imported table.
+    Shade(usize),
+    /// An earlier group, by its row.
+    Group(usize),
+    /// A wall remote linked to a shade, by that shade's row. A group
+    /// transmitting at a wall remote's address is two remotes with one
+    /// identity and two independent rolling counters, which is the failure
+    /// this whole project was started over.
+    LinkedRemote(usize),
+}
+
+impl core::fmt::Display for Clash {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Clash::Shade(index) => write!(f, "shade {index}"),
+            Clash::Group(index) => write!(f, "group {index}"),
+            Clash::LinkedRemote(index) => {
+                write!(f, "a wall remote linked to shade {index}")
+            }
+        }
+    }
 }
 
 impl core::fmt::Display for Refusal {
@@ -370,6 +584,40 @@ impl core::fmt::Display for Refusal {
                 "shade {index} {name:?} has a remote at address {address} ({address:#08X}) the \
                  device would refuse ({error:?})"
             ),
+            Refusal::DuplicateRoomId {
+                index,
+                name,
+                room_id,
+            } => write!(
+                f,
+                "room {index} {name:?} has id {room_id}, which an earlier room already has; a \
+                 shade assigned to it would not say which room it meant"
+            ),
+            Refusal::GroupAddress {
+                index,
+                name,
+                address,
+            } => write!(
+                f,
+                "group {index} {name:?} is at address {address} ({address:#08X}), which is not \
+                 one a remote can have: 0 and 0xFFFFFF are reserved, and the field is 24 bits \
+                 wide"
+            ),
+            Refusal::GroupAddressClash {
+                index,
+                name,
+                address,
+                with,
+            } => write!(
+                f,
+                "group {index} {name:?} is at address {address} ({address:#08X}), which {with} \
+                 already holds; two remotes at one address is two rolling-code counters that \
+                 will overtake each other"
+            ),
+            Refusal::TooManyEstate { what, held } => write!(
+                f,
+                "the backup holds more {what} than the {held} this record has room for"
+            ),
         }
     }
 }
@@ -392,11 +640,52 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         return Err(Refusal::NoShades);
     }
 
+    let mut warnings: Vec<Warning> = Vec::new();
+    let mut estate = EstateRecord::empty(0);
+
+    // The rooms first, because a shade carries the *backup's* room id and this
+    // is what turns it into a row. The old controller's ids are not carried
+    // for the same reason its shade ids are not: a row here is a `RoomId`
+    // there, and a backup holding rooms 3 and 7 imports as rooms 0 and 1.
+    let mut room_row: [Option<usize>; 256] = [None; 256];
+    for room in data.rooms.iter() {
+        let index = estate.rooms.len();
+        if let Some(_earlier) = room_row[room.room_id as usize] {
+            return Err(Refusal::DuplicateRoomId {
+                index,
+                name: room.name.as_str().to_string(),
+                room_id: room.room_id,
+            });
+        }
+        room_row[room.room_id as usize] = Some(index);
+        estate
+            .rooms
+            .push(StoredRoom {
+                // Infallible: both capacities are 32 bytes.
+                name: heapless::String::try_from(room.name.as_str()).unwrap_or_default(),
+            })
+            .map_err(|_| Refusal::TooManyEstate {
+                what: "rooms",
+                held: ESTATE_ROOM_CAPACITY,
+            })?;
+    }
+
     let mut shades: heapless::Vec<StoredShade, SHADE_TABLE_CAPACITY> = heapless::Vec::new();
     let mut links: heapless::Vec<LinkedRemote, MAX_LINKS> = heapless::Vec::new();
     let mut wanted_links = 0usize;
-    let mut warnings: Vec<Warning> = Vec::new();
     let mut favourites = 0usize;
+    // The backup's shade ids, by row, so a group's membership can be resolved
+    // the same way a room assignment is.
+    //
+    // **First row wins on a duplicate id**, which is a defensive path rather
+    // than a policy: the old controller keys its shades by id — a delete
+    // removes every slot matching one — so a file with two shades at one id is
+    // one no writer produces. It is not a refusal because this import has
+    // already
+    // declared the backup's shade ids irrelevant (a row here is the id there),
+    // and refusing on the strength of a field the tool does not carry would be
+    // refusing on something it has said does not matter.
+    let mut shade_row: [Option<usize>; 256] = [None; 256];
 
     for migrated in data.shades.iter() {
         // The position in the *imported* table, which is the shade's id and
@@ -424,7 +713,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
 
         let mut note = |caveat| {
             warnings.push(Warning {
-                index,
+                subject: Subject::Shade(index),
                 name: name.to_string(),
                 caveat,
             })
@@ -547,6 +836,106 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         if migrated.my_position_centi >= 0 {
             favourites += 1;
         }
+
+        shade_row[migrated.shade_id as usize].get_or_insert(index);
+
+        // Which room this shade is in, translated from the backup's room id to
+        // the row that will be its `RoomId`.
+        if !ROOM_UNASSIGNED.contains(&migrated.room_id) {
+            match room_row[migrated.room_id as usize] {
+                Some(row) => estate.room_of[index] = Some(RoomId(row as u8)),
+                None => warnings.push(Warning {
+                    subject: Subject::Shade(index),
+                    name: name.to_string(),
+                    caveat: Caveat::UnknownRoom(migrated.room_id),
+                }),
+            }
+        }
+    }
+
+    // The groups last: every one of them refers to shade rows, so the shade
+    // table has to be settled first.
+    for migrated in data.groups.iter() {
+        let index = estate.groups.len();
+        let name = migrated.name.as_str();
+
+        // A group is a virtual remote, so its address is held to a remote's
+        // rule — the same one `ShadeConfig::new` applies, restated here rather
+        // than reached through a constructor because `ShadeConfig` is a shade
+        // and a group is not one.
+        if migrated.address == 0 || migrated.address >= 0xFF_FFFF {
+            return Err(Refusal::GroupAddress {
+                index,
+                name: name.to_string(),
+                address: migrated.address,
+            });
+        }
+        let clash = shades
+            .iter()
+            .position(|shade| shade.config.address == migrated.address)
+            .map(Clash::Shade)
+            .or_else(|| {
+                estate
+                    .groups
+                    .iter()
+                    .position(|group| group.address == migrated.address)
+                    .map(Clash::Group)
+            })
+            .or_else(|| {
+                links
+                    .iter()
+                    .find(|link| link.address == migrated.address)
+                    .map(|link| Clash::LinkedRemote(link.shade.0 as usize))
+            });
+        if let Some(with) = clash {
+            return Err(Refusal::GroupAddressClash {
+                index,
+                name: name.to_string(),
+                address: migrated.address,
+                with,
+            });
+        }
+
+        let mut members = Members::NONE;
+        for id in migrated.member_shade_ids.iter().copied() {
+            match shade_row[id as usize] {
+                Some(row) => members = members.with(ShadeId(row as u8)),
+                // Expected rather than exceptional — see `Caveat::MissingMember`.
+                None => warnings.push(Warning {
+                    subject: Subject::Group(index),
+                    name: name.to_string(),
+                    caveat: Caveat::MissingMember(id),
+                }),
+            }
+        }
+
+        // The one warning here that is about a value rather than a reference,
+        // and the one this task exists for.
+        let code_recovered = data.version >= GROUP_CODE_MIN_VERSION;
+        if !code_recovered {
+            warnings.push(Warning {
+                subject: Subject::Group(index),
+                name: name.to_string(),
+                caveat: Caveat::FabricatedGroupCode {
+                    version: data.version,
+                },
+            });
+        }
+
+        estate
+            .groups
+            .push(StoredGroup {
+                // Infallible: both capacities are 32 bytes.
+                name: heapless::String::try_from(name).unwrap_or_default(),
+                address: migrated.address,
+                next_code: migrated.next_code,
+                code_recovered,
+                members,
+            })
+            .map_err(|_| Refusal::TooManyEstate {
+                what: "groups",
+                held: ESTATE_GROUP_CAPACITY,
+            })?;
     }
 
     Ok(Import {
@@ -554,8 +943,7 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
         warnings,
         skipped_resyncs: data.skipped_resyncs,
         version: data.version,
-        rooms: data.rooms.len(),
-        groups: data.groups.len(),
+        estate,
         links,
         favourites,
     })

@@ -1,9 +1,13 @@
-//! Record parsers for the C++ backup body: rooms, shades, and groups.
+//! Record parsers for the C++ backup: rooms, shades, groups, and the net
+//! record's broker settings.
 //!
 //! Each parser ports the matching C++ `read*Record`/`write*Record` pair and
 //! documents the discovered field map with citations. The shade parser is the
 //! migration-critical rolling-code carrier; the group parser is a second one
 //! (groups are their own virtual remotes) and carries the SAME `+1` contract.
+//! [`parse_net_record`] is the odd one out: it is a *trailer* record, present
+//! only in an exported backup and not in the on-flash config, and the value it
+//! recovers is the MQTT configuration — see [`MigratedMqtt`].
 //!
 //! Ports C++ `ShadeConfigFile::readShadeRecord` (`src/ConfigFile.cpp:801-885`),
 //! cross-checked field-for-field against `writeShadeRecord` (`:970-1018`). The
@@ -485,4 +489,178 @@ fn read_name(r: &mut Reader) -> Result<String<32>, MigrateError> {
     name.push_str(wide.as_str())
         .map_err(|_| MigrateError::StringTooLong)?;
     Ok(name)
+}
+
+/// Capacity of a C++ `MQTT.protocol` field — `char protocol[10]`
+/// (`ConfigSettings.h:153`), so at most nine characters of content.
+const MQTT_PROTOCOL_CAP: usize = 16;
+
+/// Capacity of the three long MQTT strings — `char hostname[65]`,
+/// `char rootTopic[65]`, `char discoTopic[65]` (`ConfigSettings.h:152,157-158`),
+/// so at most sixty-four characters of content each.
+const MQTT_STRING_CAP: usize = 64;
+
+/// First backup version whose net record carries the MQTT block at all
+/// (`readNetRecord`'s `version >= 22` gate, `ConfigFile.cpp:641`). Below it the
+/// broker settings are NVS-only and a file-only migrator cannot recover them.
+const MQTT_MIN_VERSION: u8 = 22;
+
+/// Ethernet PHY fields the net record ends with, parsed positionally and
+/// dropped — three `uint8` then four `int8` (`writeNetRecord` :1044-1050).
+const ETHERNET_FIELD_COUNT: usize = 7;
+
+/// The broker settings a C++ backup carries, exactly as written.
+///
+/// # These are two namespaces that the C++ then concatenates
+///
+/// [`root_topic`](MigratedMqtt::root_topic) and
+/// [`disco_topic`](MigratedMqtt::disco_topic) are stored as two independent
+/// values and **published as one**: the discovery topic is built from
+/// `discoTopic` (`Somfy.cpp`'s `publishDisco` call sites), and then every
+/// publish passes through `MQTTClass::makeTopic` (`MQTT.cpp:22-30`), which
+/// prepends `rootTopic` and a `/` to whatever it is given. So a device with
+/// root `espsomfyrts` and disco `homeassistant` publishes its discovery configs
+/// to `espsomfyrts/homeassistant/cover/1/config`, which is under no prefix Home
+/// Assistant reads.
+///
+/// This struct is a faithful deserializer and does **not** undo that: the two
+/// fields arrive as the file holds them. Undoing it is the consumer's job, and
+/// it is a mapping rather than a copy — see
+/// `docs/specs/2026-08-15-mqtt-ha-discovery-requirements.md` R1.
+///
+/// # What the file does not carry
+///
+/// The broker **username and password are not in the backup**. `writeNetRecord`
+/// (`:1039-1044`) emits `protocol`, `hostname`, `port`, `pubDisco`, `rootTopic`
+/// and `discoTopic` and nothing else, while `MQTTSettings` also holds
+/// `enabled`, `username` and `password` (`ConfigSettings.h:148-159`) — those
+/// live in NVS via `MQTTSettings::save`, which a file-only migrator cannot
+/// read. So is `enabled`: a backup cannot say whether the old controller was
+/// actually talking to its broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedMqtt {
+    /// URL scheme the old controller used — `"mqtt://"` or `"mqtts://"`
+    /// (`ConfigSettings.h:153`, default `"mqtt://"`).
+    pub protocol: String<MQTT_PROTOCOL_CAP>,
+    /// Broker host, as typed on the old controller. **A name, not an address**:
+    /// the C++ resolves it, so this may be a DNS name, an mDNS name or an IPv4
+    /// literal. Empty means no broker was configured.
+    pub hostname: String<MQTT_STRING_CAP>,
+    /// Broker TCP port (`writeNetRecord` :1041; C++ default 1883).
+    pub port: u16,
+    /// Whether the old controller published Home Assistant discovery configs at
+    /// all — C++ `MQTT.pubDisco` (`:1042`).
+    pub publish_discovery: bool,
+    /// The namespace the device's own state topics lived under — C++
+    /// `MQTT.rootTopic` (`:1043`). Empty is a value the C++ accepts, and is one
+    /// of the three combinations that made its discovery unusable.
+    pub root_topic: String<MQTT_STRING_CAP>,
+    /// The namespace the device *appended* its discovery configs to — C++
+    /// `MQTT.discoTopic` (`:1044`), default `"homeassistant"`. See this
+    /// struct's docs for what the C++ does with the pair.
+    pub disco_topic: String<MQTT_STRING_CAP>,
+}
+
+/// Parse the net record at the cursor, returning the broker settings it carries.
+///
+/// Ports C++ `ShadeConfigFile::readNetRecord` (`src/ConfigFile.cpp:612-676`),
+/// cross-checked field-for-field against `writeNetRecord` (`:1030-1052`).
+///
+/// Returns `Ok(None)` without consuming anything when the header reports no net
+/// record (`net_record_size == 0`), which is what the *on-flash* `shades.cfg`
+/// has: `ShadeConfigFile::save` (`:315-346`) sets the settings, net and
+/// transceiver record sizes to zero and writes none of them, while
+/// `ShadeConfigFile::backup` (`:347-383`) sizes and writes all three. Returns
+/// `Ok(None)` **after** consuming the record for a backup below
+/// version 22, whose net record holds the IP settings and the Ethernet
+/// tail but no MQTT block at all.
+///
+/// ## Field map (wire order; `→` = modeled, `skip` = parsed then dropped)
+///
+/// | # | C++ field (`readNetRecord`) | reader | destination |
+/// |---|-----------------------------|--------|-------------|
+/// | 1 | `connType` (:617)           | u8     | skip |
+/// | 2 | `IP.dhcp` (:618)            | bool   | skip |
+/// | 3 | `IP.ip` (:620)              | varstr | skip |
+/// | 4 | `IP.gateway` (:622)         | varstr | skip |
+/// | 5 | `IP.subnet` (:624)          | varstr | skip |
+/// | 6 | `IP.dns1` (:626)            | varstr | skip |
+/// | 7 | `IP.dns2` (:628)            | varstr | skip |
+/// | 8 | `MQTT.protocol` (:643, v>=22)  | varstr | → `protocol` |
+/// | 9 | `MQTT.hostname` (:644, v>=22) | varstr | → `hostname` |
+/// |10 | `MQTT.port` (:645, v>=22)     | u16    | → `port` |
+/// |11 | `MQTT.pubDisco` (:646, v>=22) | bool   | → `publish_discovery` |
+/// |12 | `MQTT.rootTopic` (:647, v>=22)| varstr | → `root_topic` |
+/// |13 | `MQTT.discoTopic` (:648, v>=22)| varstr | → `disco_topic` |
+/// |14 | `Ethernet.*` (:663-669)     | 3×u8 + 4×i8 | skip |
+///
+/// ## Why the network half is read and thrown away
+///
+/// The IP settings are parsed positionally so the cursor reaches the MQTT
+/// block, and then dropped. Network credentials are deliberately not migrated —
+/// the operator re-enters them, per design spec §3.4 — and the static-IP
+/// settings would be a claim about a network this device has not joined yet.
+///
+/// ## Why the Ethernet tail is read rather than skipped to the record end
+///
+/// So that a well-formed net record leaves the cursor exactly on the record
+/// boundary, the same as every other record parser here. The alternative —
+/// jumping to the next `\n` — would make a genuinely short record
+/// indistinguishable from one this parser simply stopped reading early.
+///
+/// # Errors
+///
+/// - [`MigrateError::UnexpectedEof`] if the record is truncated.
+/// - [`MigrateError::StringTooLong`] if a field exceeds its C++ capacity.
+/// - [`MigrateError::BadRecord`] on invalid UTF-8.
+pub fn parse_net_record(
+    r: &mut Reader,
+    header: &BackupHeader,
+) -> Result<Option<MigratedMqtt>, MigrateError> {
+    if header.net_record_size == 0 {
+        return Ok(None);
+    }
+
+    let _conn_type = r.read_u8()?; // 1 connType — not modeled
+    let _dhcp = r.read_bool()?; // 2 IP.dhcp — not modeled
+    for _ in 0..5 {
+        // 3-7 ip, gateway, subnet, dns1, dns2 — not modeled
+        read_var::<MQTT_STRING_CAP>(r)?;
+    }
+
+    let mqtt = if header.version >= MQTT_MIN_VERSION {
+        Some(MigratedMqtt {
+            protocol: read_var(r)?,            // 8 MQTT.protocol
+            hostname: read_var(r)?,            // 9 MQTT.hostname
+            port: r.read_u16()?,               // 10 MQTT.port
+            publish_discovery: r.read_bool()?, // 11 MQTT.pubDisco
+            root_topic: read_var(r)?,          // 12 MQTT.rootTopic
+            disco_topic: read_var(r)?,         // 13 MQTT.discoTopic
+        })
+    } else {
+        None
+    };
+
+    for _ in 0..ETHERNET_FIELD_COUNT {
+        // 14 Ethernet.boardType/phyType/CLKMode/phyAddress/PWRPin/MDCPin/MDIOPin.
+        // Read as u8: `read_i8` and `read_u8` share one `atoi`, and the values
+        // are discarded, so the signedness of the last four cannot matter.
+        r.read_u8()?;
+    }
+
+    Ok(mqtt)
+}
+
+/// Read a quote-delimited variable-length string into the model capacity.
+///
+/// [`Reader::read_var_str`] fills its fixed `String<64>`; the value is copied
+/// into `N`, which errors rather than truncating when the source field is wider
+/// than the model — the same divergence policy [`read_name`] follows.
+fn read_var<const N: usize>(r: &mut Reader) -> Result<String<N>, MigrateError> {
+    let mut wide: String<64> = String::new();
+    r.read_var_str(&mut wide)?;
+    let mut out: String<N> = String::new();
+    out.push_str(wide.as_str())
+        .map_err(|_| MigrateError::StringTooLong)?;
+    Ok(out)
 }

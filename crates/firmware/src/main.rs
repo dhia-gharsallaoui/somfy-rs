@@ -100,6 +100,7 @@ mod api;
 mod chip;
 mod config;
 mod edits;
+mod estate;
 mod heap;
 #[cfg(feature = "mdns")]
 mod identity;
@@ -142,6 +143,7 @@ use somfy_tasks::{
 
 use config::ConfigStore;
 use edits::{AckChannel, EditChannel, EventChannel};
+use estate::EstateStore;
 use heapless::Vec;
 #[cfg(feature = "mqtt")]
 use inventory::Inventory;
@@ -149,11 +151,11 @@ use radio::air::{Air, AirError};
 use radio::rmt_rx::{rx_channel_config, RmtPulseSource};
 use radio::rmt_tx::{tx_channel_config, RmtTx};
 use shades::ShadeStore;
-use somfy_config::{Announced, Catalog, LinkedRemote, StoredShade, WifiCredentials};
+use somfy_config::{
+    Announced, Catalog, LinkedRemote, StoredGroup, StoredRoom, StoredShade, WifiCredentials,
+};
 use somfy_config::{MqttSettings, Namespaces};
-#[cfg(feature = "mqtt")]
-use somfy_domain::ShadeId;
-use somfy_domain::{Registry, RemoteIdentity, MAX_SHADES};
+use somfy_domain::{GroupId, Registry, RemoteIdentity, RoomId, ShadeId, MAX_SHADES};
 use somfy_rts::RollingCode;
 use somfy_store::{seed_if_absent, RegionState, Seeded};
 use store::{FlashStore, StoreError};
@@ -529,6 +531,10 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // for the whole stack is 14,588.
     let mut machine = StateMachine::new(TxProfile::default());
     let catalog = provision_shades(machine.registry_mut(), &mut store, shades, survey.damaged);
+    // After the shades and not before: a room assignment and a group membership
+    // are both **rows of the shade table**, so neither can be placed until the
+    // shades they name are in the registry.
+    provision_estate(machine.registry_mut(), &mut store);
 
     // Copied **here**, before the state task takes ownership of the machine.
     // The MQTT session works from this copy rather than from the registry, so
@@ -894,6 +900,191 @@ fn report_shades(store: &mut FlashStore<'static>) -> (Option<ShadeStore>, Shades
 /// the record's own decode has already refused both — so reaching either here
 /// means the two disagree, which is worth a line rather than a silent gap in
 /// the ids.
+/// Where a loaded estate goes: into the registry, with a count of what landed.
+///
+/// A struct rather than three closures because all three need the registry, and
+/// one `&mut` cannot be lent three times at once — see
+/// [`estate::EstateVisitor`].
+struct Placement<'a> {
+    registry: &'a mut Registry,
+    rooms: usize,
+    assigned: usize,
+    groups: usize,
+    /// Group members naming a shade row the table does not have. Not a fault in
+    /// itself: the controller being replaced leaves a deleted shade in its
+    /// groups, so the import drops those and this catches a shade table
+    /// re-provisioned without its estate.
+    orphans: usize,
+}
+
+impl estate::EstateVisitor for Placement<'_> {
+    fn room(&mut self, id: RoomId, room: StoredRoom) {
+        match self.registry.add_room(room.name.as_str()) {
+            // The record's row *is* the id, and `add_room` fills the lowest
+            // free slot of an empty registry — so this is the check that the
+            // two agree rather than the assumption that they do. A disagreement
+            // would put every assignment on the wrong shades.
+            Ok(placed) if placed == id => self.rooms += 1,
+            Ok(placed) => esp_println::println!(
+                "estate: room {} landed at RoomId({}) — the record and the registry \
+                 disagree about ids",
+                id.0,
+                placed.0,
+            ),
+            Err(error) => {
+                esp_println::println!("estate: room {} refused ({:?})", id.0, error)
+            }
+        }
+    }
+
+    fn assign(&mut self, shade: ShadeId, room: RoomId) {
+        match self.registry.room_assign(room, shade) {
+            Ok(()) => self.assigned += 1,
+            // Reached when the estate names a shade the table no longer has,
+            // which is what a partly re-provisioned board looks like.
+            Err(error) => esp_println::println!(
+                "estate: ShadeId({}) could not be put in RoomId({}) ({:?})",
+                shade.0,
+                room.0,
+                error,
+            ),
+        }
+    }
+
+    fn group(&mut self, id: GroupId, group: StoredGroup) {
+        let placed = match self.registry.add_group(group.name.as_str()) {
+            Ok(placed) if placed == id => placed,
+            Ok(placed) => {
+                esp_println::println!(
+                    "estate: group {} landed at GroupId({}) — the record and the registry \
+                     disagree about ids",
+                    id.0,
+                    placed.0,
+                );
+                placed
+            }
+            Err(error) => {
+                esp_println::println!("estate: group {} refused ({:?})", id.0, error);
+                return;
+            }
+        };
+        self.groups += 1;
+        for member in group.members.ids() {
+            if self.registry.group_add_shade(placed, member).is_err() {
+                self.orphans += 1;
+            }
+        }
+        // **The one value here that costs a walk to a motor if it is believed.**
+        // A backup at format version 19 to 22 does not contain a group's
+        // rolling code, so the import stored a placeholder. Nothing transmits
+        // as a group in this build — a group command is fanned out to its
+        // members — so it costs nothing today, and this line exists so it is
+        // not discovered later at a shade.
+        if !group.code_recovered {
+            esp_println::println!(
+                "estate: GroupId({}) '{}' carries a placeholder rolling code, not the one \
+                 the old controller used — it could not be recovered from the backup. \
+                 Harmless while a group command is sent to each shade; re-pair the group \
+                 before anything transmits as it.",
+                placed.0,
+                group.name.as_str(),
+            );
+        }
+    }
+}
+
+/// Put the rooms and the groups into the registry, and say what was found.
+///
+/// Runs **after** [`provision_shades`] and takes the same registry, because
+/// every reference this region holds is a row of the shade table: a room
+/// assignment names a shade, and so does every group membership.
+///
+/// ## Why nothing here can stop a boot
+///
+/// Losing this region costs the *arrangement* of an installation and not the
+/// installation: every shade still exists, still moves and still keeps its
+/// rolling code, and what is gone is which room it is in and which group it
+/// moves with. So every failure below prints a line and continues, which is
+/// also what a board that has never been imported into does — and what **every
+/// board provisioned before this partition existed** does, since the region is
+/// simply not in its table.
+///
+/// ## Why the store is not kept
+///
+/// Because nothing writes it. There is no room or group edit in
+/// [`crate::edits`], so a stored `EstateStore` would be a field with no reader
+/// — see that module's docs. Dropping it here also releases the mount's stack
+/// before the state task is built.
+fn provision_estate(registry: &mut Registry, store: &mut FlashStore<'_>) {
+    let mut estate_store = match store.with_flash(EstateStore::mount) {
+        Ok(estate_store) => estate_store,
+        Err(error) => {
+            esp_println::println!(
+                "estate: region unavailable ({:?}) — no rooms and no groups. A board \
+                 flashed with a partition table from before this region existed has no \
+                 '{}' partition; reflash it with this crate's partitions.csv.",
+                error,
+                estate::PARTITION_LABEL,
+            );
+            return;
+        }
+    };
+
+    let (base, slots, slot_len) = estate_store.geometry();
+    esp_println::println!(
+        "estate: partition '{}' at {:#010X}, {} slots of {} bytes",
+        estate::PARTITION_LABEL,
+        base,
+        slots,
+        slot_len,
+    );
+
+    let mut placement = Placement {
+        registry,
+        rooms: 0,
+        assigned: 0,
+        groups: 0,
+        orphans: 0,
+    };
+    let survey = match store.with_flash(|flash| estate_store.load_with(flash, &mut placement)) {
+        Ok(survey) => survey,
+        Err(error) => {
+            esp_println::println!("estate: unreadable ({:?}) — no rooms and no groups", error);
+            return;
+        }
+    };
+    esp_println::println!(
+        "estate: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
+        survey.slots,
+        survey.valid,
+        survey.blank,
+        survey.damaged,
+        survey.newest_seq,
+    );
+    if let Some(error) = survey.first_error {
+        // Printed with the row it names, because that is the room or group to
+        // re-import. A refused record places **nothing** at all, on purpose:
+        // see `somfy_config::EstateRecord::for_each_room`.
+        esp_println::println!(
+            "estate: a record did not decode ({}). If it was the newest one, nothing from \
+             it was loaded — re-import it.",
+            error,
+        );
+    }
+    if placement.orphans > 0 {
+        esp_println::println!(
+            "estate: {} group member(s) named a shade this table does not have",
+            placement.orphans,
+        );
+    }
+    esp_println::println!(
+        "estate: {} room(s), {} shade(s) assigned, {} group(s)",
+        placement.rooms,
+        placement.assigned,
+        placement.groups,
+    );
+}
+
 /// The factory MAC as an array.
 ///
 /// `esp-hal` wraps a `[u8; 6]` but hands it back as a `&[u8]`, and this

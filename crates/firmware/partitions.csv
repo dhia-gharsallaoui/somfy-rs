@@ -61,11 +61,17 @@
 #
 # ## What is deliberately not allocated
 #
-# 0x208000–0x210000, 32 KB, eight erase sectors. It is the space between the
-# last data region and the 64 KB boundary `ota_1` has to start on, so it costs
-# neither app slot anything, and it is the only room a future data region can
-# have without shrinking a slot or pushing the table past 4 MB. Plan 6's real
-# config store is the likely claimant.
+# 0x20A000–0x210000, 24 KB, six erase sectors. It is what is left of the space
+# between the last data region and the 64 KB boundary `ota_1` has to start on,
+# so it costs neither app slot anything, and it is the only room a further data
+# region can have without shrinking a slot or pushing the table past 4 MB.
+#
+# `estate` took the first 8 KB of it, which is what that reserve was for. It is
+# **purely additive**: it sits above every region a provisioned board already
+# has, so nothing moves and a board reflashed with this table keeps its rolling
+# codes, its credentials and its shade table exactly as before. What it does not
+# keep is an estate, because it never had one — a blank `estate` region reads as
+# "no rooms and no groups", which is what that board is running today.
 #
 # On an 8 MB board 0x400000–0x800000 is unallocated too. Spending it would mean
 # either slots larger than 0x1F0000 — impossible while `rollcode` stays put —
@@ -88,13 +94,30 @@
 # registry holds. Its slots are 2048 bytes — one whole shade table per record,
 # for the reason `somfy_store::Record` gives about erasing a ring — so two
 # records tile a 4 KB sector and the region is two sectors for the same
-# guarantee as the other two. **The firmware only ever reads it**; the host-side
-# `provision_shades` example writes it.
+# guarantee as the other two.
+#
+# `estate` is the fourth: the rooms, which room each shade is in, and the groups
+# with their names, members and virtual-remote identities. It is a fourth region
+# for the same reason `shades` was a third — there is nowhere else to put it.
+# The shade record is full **to the byte**: a compile-time assertion in
+# `somfy_config::shade` states that its linked-remote pool "must fill the record
+# exactly", so a room cannot be added to it without taking a wall remote away.
+# Its slots are also 2048 bytes, so it tiles a sector the same way and the region
+# is two sectors for the same guarantee.
+#
+# **The firmware only ever reads `estate`**; the host-side `provision_shades`
+# example writes it, from the same import that writes `shades`. That coupling is
+# not incidental: a group's membership and a room assignment are stored as *rows
+# of the shade table*, so an estate written beside a different table names the
+# wrong shades. Flash the two together.
 #
 # ## What a board already in service keeps
 #
 # `rollcode`, `wificfg` and `shades` keep their offsets, their sizes and their
-# contents. A provisioned board reflashed with this table keeps its rolling
+# contents. `estate` is new and blank, which reads as no rooms and no groups —
+# the state that board is already in.
+#
+# Original text, which still holds for the three older regions: A provisioned board reflashed with this table keeps its rolling
 # codes, its credentials and its shade table; `factory` becomes `ota_0` at the
 # same offset and the same size, so even the app image lands where it already
 # was. `otadata` is new and blank, and a blank `otadata` with no `factory`
@@ -138,4 +161,5 @@ rollcode,   data, undefined, 0x200000, 0x2000,
 wificfg,    data, undefined, 0x202000, 0x2000,
 shades,     data, undefined, 0x204000, 0x2000,
 otadata,    data, ota,       0x206000, 0x2000,
+estate,     data, undefined, 0x208000, 0x2000,
 ota_1,      app,  ota_1,     0x210000, 0x1F0000,

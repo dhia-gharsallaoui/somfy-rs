@@ -168,6 +168,15 @@
 /// `crate::stack_used` prints a measurement beside the claim on every boot, and
 /// why the claim has to be re-read whenever the state machine changes shape.
 ///
+/// **Re-read 2026-08-18 after Plan 6 Task 3, and it did not grow.** That task
+/// added a fourth flash region and a `provision_estate` pass over it, so the
+/// question was whether `crate::start`'s frame took any of it: on the ESP32 it
+/// reads **0x4e60 = 20,064**, sixteen bytes *below* the figure in the table
+/// above, and `crate::tasks::state` is unchanged at 0x3a90 = 14,992.
+/// `firmware::provision_estate` has a frame of its own (0x9c0 = 2,496) and
+/// returns before the state task is built, so it sits about 25 KB down a branch
+/// that is not this one. The constant stays where it is, as an upper bound.
+///
 /// **The ESP32-C3 was not re-measured.** It is RISC-V, so its frames are
 /// `addi sp, sp, -N` rather than Xtensa's `entry a1, N`, and reading them needs
 /// different tooling than the commands at the top of this file. The three

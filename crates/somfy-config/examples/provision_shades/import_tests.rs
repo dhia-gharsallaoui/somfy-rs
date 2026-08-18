@@ -9,8 +9,9 @@
 //! binary.
 
 use super::*;
-use somfy_config::Announced;
-use somfy_migrate::MigratedShade;
+use somfy_config::{Announced, MAX_LINKS};
+use somfy_domain::RoomId;
+use somfy_migrate::{MigratedGroup, MigratedRoom, MigratedShade};
 use somfy_rts::RollingCode;
 
 /// A shade as the backup parser hands it over, with everything valid. Tests
@@ -29,7 +30,10 @@ fn migrated(name: &str, address: u32) -> MigratedShade {
         position_centi: 0,
         tilt_position_centi: 0,
         my_position_centi: -100,
-        room_id: 1,
+        // In no room. `0` and `255` both spell that in a backup, and a
+        // fixture that named a room `data()` does not carry would raise an
+        // `UnknownRoom` caveat in every test that is about something else.
+        room_id: 0,
         linked_addresses: heapless::Vec::new(),
         flags_raw: 0,
         // The width and protocol this controller speaks, so no test warns
@@ -52,6 +56,28 @@ fn hvec<T: Clone, const N: usize>(items: &[T]) -> heapless::Vec<T, N> {
     out
 }
 
+/// A room as the backup parser hands it over.
+fn room(room_id: u8, name: &str) -> MigratedRoom {
+    MigratedRoom {
+        room_id,
+        name: hstr(name),
+    }
+}
+
+/// A group as the backup parser hands it over, at a fixed address distinct
+/// from every shade address these tests use. `members` are the **backup's**
+/// shade ids, which the import translates into rows.
+fn group(group_id: u8, name: &str, members: &[u8]) -> MigratedGroup {
+    MigratedGroup {
+        group_id,
+        name: hstr(name),
+        address: 0x00_9001,
+        // What `parse_group_record` produces from a stored last-sent code of 3.
+        next_code: RollingCode(4),
+        member_shade_ids: hvec(members),
+    }
+}
+
 /// Backup data carrying `shades` and nothing else.
 fn data(shades: &[MigratedShade]) -> MigrationData {
     MigrationData {
@@ -60,6 +86,7 @@ fn data(shades: &[MigratedShade]) -> MigrationData {
         rooms: heapless::Vec::new(),
         shades: hvec(shades),
         groups: heapless::Vec::new(),
+        mqtt: None,
         skipped_resyncs: 0,
     }
 }
@@ -139,7 +166,7 @@ fn an_unmodelled_shade_kind_becomes_a_roller_and_is_warned_about() {
     assert_eq!(
         import.warnings,
         vec![Warning {
-            index: 0,
+            subject: Subject::Shade(0),
             name: "Garage".to_string(),
             caveat: Caveat::Kind(0x05),
         }]
@@ -156,7 +183,7 @@ fn an_unmodelled_tilt_mode_becomes_none_and_is_warned_about() {
     assert_eq!(
         import.warnings,
         vec![Warning {
-            index: 0,
+            subject: Subject::Shade(0),
             name: "Store".to_string(),
             caveat: Caveat::TiltMode(0x09),
         }]
@@ -234,7 +261,7 @@ fn a_bit_length_that_is_not_a_frame_width_is_warned_about() {
     assert_eq!(
         import.warnings,
         vec![Warning {
-            index: 0,
+            subject: Subject::Shade(0),
             name: "Awning".to_string(),
             caveat: Caveat::FrameWidth(42),
         }]
@@ -254,7 +281,7 @@ fn a_shade_using_another_radio_protocol_is_warned_about() {
     assert_eq!(
         import.warnings,
         vec![Warning {
-            index: 0,
+            subject: Subject::Shade(0),
             name: "Relay".to_string(),
             caveat: Caveat::Protocol(0x08),
         }]
@@ -278,7 +305,7 @@ fn a_warning_names_the_shade_it_is_about() {
 
     let import = import(&data(&[good, odd])).expect("both shades import");
     assert_eq!(import.warnings.len(), 1);
-    assert_eq!(import.warnings[0].index, 1);
+    assert_eq!(import.warnings[0].subject, Subject::Shade(1));
     assert_eq!(import.warnings[0].name, "Garage");
 }
 
@@ -402,9 +429,13 @@ fn refusal_variant(refusal: &Refusal) -> usize {
         Refusal::DuplicateAddress { .. } => 5,
         Refusal::TooManyLinks { .. } => 6,
         Refusal::Link { .. } => 7,
+        Refusal::DuplicateRoomId { .. } => 8,
+        Refusal::GroupAddress { .. } => 9,
+        Refusal::GroupAddressClash { .. } => 10,
+        Refusal::TooManyEstate { .. } => 11,
     }
 }
-const REFUSAL_VARIANTS: usize = 6;
+const REFUSAL_VARIANTS: usize = 12;
 
 /// Every refusal has to read as a sentence a person can act on, not as the
 /// `Debug` spelling of an enum — and every refusal has to be in the list.
@@ -429,6 +460,48 @@ fn every_refusal_says_something() {
             first: 0,
             name: "Salon".to_string(),
             address: 0x00_1001,
+        },
+        Refusal::TooManyLinks {
+            wanted: 40,
+            held: MAX_LINKS,
+        },
+        Refusal::Link {
+            index: 0,
+            name: "Kitchen".to_string(),
+            address: 0x00_1001,
+            error: somfy_domain::DomainError::DuplicateAddress,
+        },
+        Refusal::DuplicateRoomId {
+            index: 1,
+            name: "Salon".to_string(),
+            room_id: 3,
+        },
+        Refusal::GroupAddress {
+            index: 0,
+            name: "Whole House".to_string(),
+            address: 0,
+        },
+        Refusal::GroupAddressClash {
+            index: 0,
+            name: "Whole House".to_string(),
+            address: 0x00_1001,
+            with: Clash::Shade(0),
+        },
+        Refusal::GroupAddressClash {
+            index: 1,
+            name: "Upstairs".to_string(),
+            address: 0x00_9001,
+            with: Clash::Group(0),
+        },
+        Refusal::GroupAddressClash {
+            index: 0,
+            name: "Upstairs".to_string(),
+            address: 0x00_2001,
+            with: Clash::LinkedRemote(0),
+        },
+        Refusal::TooManyEstate {
+            what: "rooms",
+            held: 16,
         },
     ];
 
@@ -589,24 +662,25 @@ fn more_links_than_the_record_holds_are_refused_rather_than_dropped() {
 // -- what was seen but not written ---------------------------------------
 
 #[test]
-fn groups_are_counted_but_not_written() {
-    use somfy_migrate::MigratedGroup;
-
+fn a_group_reaches_the_estate_with_its_identity_intact() {
     let mut with_group = data(&[migrated("Kitchen", 0x00_1001)]);
     with_group
         .groups
-        .push(MigratedGroup {
-            group_id: 1,
-            name: hstr("Whole House"),
-            address: 0x00_9001,
-            next_code: RollingCode(1),
-            member_shade_ids: heapless::Vec::new(),
-        })
+        .push(group(1, "Whole House", &[7]))
         .expect("fits");
 
     let import = import(&with_group).expect("valid");
-    assert_eq!(import.groups, 1);
     assert_eq!(import.shades.len(), 1, "a group is not a shade");
+    assert_eq!(import.estate.groups.len(), 1);
+
+    let stored = &import.estate.groups[0];
+    assert_eq!(stored.name.as_str(), "Whole House");
+    // The half nothing reads yet, and the reason it is carried: only the
+    // controller being replaced knows it, and only at the moment of the export.
+    assert_eq!(stored.address, 0x00_9001);
+    assert_eq!(stored.next_code, RollingCode(4));
+    // The backup's shade id 7 is row 0 here, because a row is the id.
+    assert_eq!(stored.members.ids().collect::<Vec<_>>(), vec![ShadeId(0)]);
 }
 
 /// A favourite is real behaviour in the domain (`Shade::my_pos`) that this
@@ -638,21 +712,19 @@ fn a_favourite_at_fully_open_is_still_a_favourite() {
 }
 
 #[test]
-fn rooms_are_counted_but_not_written() {
-    use somfy_migrate::MigratedRoom;
-
-    let mut with_room = data(&[migrated("Kitchen", 0x00_1001)]);
-    with_room
-        .rooms
-        .push(MigratedRoom {
-            room_id: 1,
-            name: hstr("Living Room"),
-        })
-        .expect("fits");
+fn a_room_reaches_the_estate_and_takes_its_shade_with_it() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.room_id = 4;
+    let mut with_room = data(&[shade]);
+    with_room.rooms.push(room(4, "Living Room")).expect("fits");
 
     let import = import(&with_room).expect("valid");
-    assert_eq!(import.rooms, 1);
     assert_eq!(import.shades.len(), 1, "a room is not a shade");
+    assert_eq!(import.estate.rooms.len(), 1);
+    assert_eq!(import.estate.rooms[0].name.as_str(), "Living Room");
+    // The backup's room id 4 is row 0 here, and the shade points at the row.
+    assert_eq!(import.estate.room_of[0], Some(RoomId(0)));
+    assert!(import.warnings.is_empty());
 }
 
 #[test]
@@ -959,7 +1031,8 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
         "every parsed shade must reach the table"
     );
     assert!(!import.shades.is_empty(), "a real backup has shades");
-    assert_eq!(import.groups, parsed.groups.len());
+    assert_eq!(import.estate.groups.len(), parsed.groups.len());
+    assert_eq!(import.estate.rooms.len(), parsed.rooms.len());
     assert_eq!(import.version, parsed.version);
 
     // A real export aligns exactly, so this table needs no confirmation.
@@ -1008,7 +1081,12 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
 
     // Whatever was flagged, the handling is the documented one.
     for warning in &import.warnings {
-        let config = &import.shades[warning.index].config;
+        let Subject::Shade(row) = warning.subject else {
+            // Group caveats are checked below, against the estate rather than
+            // the shade table.
+            continue;
+        };
+        let config = &import.shades[row].config;
         match warning.caveat {
             Caveat::Kind(_) => assert_eq!(config.kind, ShadeKind::Roller),
             Caveat::TiltMode(_) => assert_eq!(config.tilt_mode, TiltMode::None),
@@ -1022,7 +1100,26 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
             // could have gone into. What is checked instead is that it did not
             // fire at all — see below.
             Caveat::Protocol(raw) => assert_ne!(raw, TRANSMITTED_PROTOCOL),
+            // A shade in a room the backup does not carry ends up in no room.
+            Caveat::UnknownRoom(_) => assert_eq!(import.estate.room_of[row], None),
+            // Neither can be about a shade.
+            Caveat::MissingMember(_) | Caveat::FabricatedGroupCode { .. } => {
+                panic!("{:?} is a group caveat on a shade", warning.caveat)
+            }
         }
+    }
+
+    // A group's code is a fabrication exactly when the backup is too old to
+    // carry one, and the record says which it is.
+    for (row, group) in import.estate.groups.iter().enumerate() {
+        let warned = import.warnings.iter().any(|warning| {
+            warning.subject == Subject::Group(row)
+                && matches!(warning.caveat, Caveat::FabricatedGroupCode { .. })
+        });
+        assert_eq!(
+            group.code_recovered, !warned,
+            "group {row}: the stored flag and the warning must agree"
+        );
     }
 
     // [`TRANSMITTED_PROTOCOL`] is a *derived* constant — the value the reader
@@ -1034,11 +1131,11 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
     // is wrong; both are worth stopping for. The width caveat is checked with
     // it, because a real backup should carry real widths. Indices only, as
     // everywhere here.
-    let undrivable: Vec<usize> = import
+    let undrivable: Vec<String> = import
         .warnings
         .iter()
         .filter(|warning| matches!(warning.caveat, Caveat::FrameWidth(_) | Caveat::Protocol(_)))
-        .map(|warning| warning.index)
+        .map(|warning| warning.subject.to_string())
         .collect();
     assert!(
         undrivable.is_empty(),
@@ -1059,5 +1156,289 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
     assert!(
         decoded.shades == record.shades,
         "the encoded table did not decode back to itself"
+    );
+}
+
+// -- the estate: rooms, assignments and groups ---------------------------
+
+/// The one this task exists for. A backup at format version 19 to 22 does not
+/// contain a group's rolling code, so the parser substitutes `RollingCode(1)` —
+/// and nothing about the number says so. The import must say so twice: to the
+/// person now, and to the record forever.
+#[test]
+fn a_group_from_an_old_backup_is_warned_about_and_flagged_in_the_record() {
+    for version in [19u8, 20, 21, 22] {
+        let mut old = data(&[migrated("Kitchen", 0x00_1001)]);
+        old.version = version;
+        old.groups
+            .push(group(1, "Whole House", &[7]))
+            .expect("fits");
+
+        let import = import(&old).expect("valid");
+        assert_eq!(
+            import.warnings,
+            vec![Warning {
+                subject: Subject::Group(0),
+                name: "Whole House".to_string(),
+                caveat: Caveat::FabricatedGroupCode { version },
+            }],
+            "version {version}"
+        );
+        assert!(
+            !import.estate.groups[0].code_recovered,
+            "version {version}: the record must carry the warning too"
+        );
+    }
+}
+
+/// And the other side of it: a version 23 backup *does* carry the code, so
+/// there is nothing to warn about and the record says the code is real. The
+/// boundary is worth pinning because it is the one place the two halves of the
+/// group format meet — v23 writes the code before the member list, v24 and
+/// above at the record end.
+#[test]
+fn a_group_from_version_23_or_later_carries_a_real_code_and_says_so() {
+    for version in [23u8, 24, 25] {
+        let mut backup = data(&[migrated("Kitchen", 0x00_1001)]);
+        backup.version = version;
+        backup
+            .groups
+            .push(group(1, "Whole House", &[7]))
+            .expect("fits");
+
+        let import = import(&backup).expect("valid");
+        assert!(import.warnings.is_empty(), "version {version}");
+        assert!(import.estate.groups[0].code_recovered, "version {version}");
+        assert_eq!(import.estate.groups[0].next_code, RollingCode(4));
+    }
+}
+
+/// The expected dangling reference, and the reason it is a warning rather than
+/// a refusal: deleting a shade on the old controller clears its slot and
+/// leaves its id in every group it was in, so a group outliving a member is
+/// ordinary.
+#[test]
+fn a_group_member_the_backup_does_not_carry_is_dropped_and_reported() {
+    let mut backup = data(&[migrated("Kitchen", 0x00_1001)]);
+    // Shade id 7 exists; 31 does not.
+    backup
+        .groups
+        .push(group(1, "Whole House", &[7, 31]))
+        .expect("fits");
+
+    let import = import(&backup).expect("the import is not refused");
+    assert_eq!(
+        import.warnings,
+        vec![Warning {
+            subject: Subject::Group(0),
+            name: "Whole House".to_string(),
+            caveat: Caveat::MissingMember(31),
+        }]
+    );
+    assert_eq!(
+        import.estate.groups[0].members.ids().collect::<Vec<_>>(),
+        vec![ShadeId(0)],
+        "the member that exists is kept and the one that does not is dropped"
+    );
+}
+
+/// A shade pointing at a room the backup does not carry ends up in no room and
+/// says so. Should not happen — deleting a room clears the room id on every
+/// shade it was holding — which is exactly why it is worth a line if it does.
+#[test]
+fn a_shade_in_a_room_the_backup_does_not_carry_is_reported() {
+    let mut shade = migrated("Kitchen", 0x00_1001);
+    shade.room_id = 9;
+    let backup = data(&[shade]);
+
+    let import = import(&backup).expect("the shade is still imported");
+    assert_eq!(
+        import.warnings,
+        vec![Warning {
+            subject: Subject::Shade(0),
+            name: "Kitchen".to_string(),
+            caveat: Caveat::UnknownRoom(9),
+        }]
+    );
+    assert_eq!(import.estate.room_of[0], None);
+}
+
+/// Both spellings of "no room" a backup can hold are silent. Deleting a room
+/// writes `0` into every shade it was holding, and a shade that was never
+/// assigned one is written as `255`; looking either up would warn about a room
+/// nobody ever assigned.
+#[test]
+fn neither_unassigned_sentinel_raises_a_warning() {
+    for room_id in [0u8, 255] {
+        let mut shade = migrated("Kitchen", 0x00_1001);
+        shade.room_id = room_id;
+        let mut backup = data(&[shade]);
+        backup.rooms.push(room(1, "Living Room")).expect("fits");
+
+        let import = import(&backup).expect("valid");
+        assert!(import.warnings.is_empty(), "room_id {room_id}");
+        assert_eq!(import.estate.room_of[0], None, "room_id {room_id}");
+    }
+}
+
+/// Rooms take their ids from position here, exactly as shades do, so the
+/// backup's own ids are translated rather than carried. A backup holding rooms
+/// 3 and 7 imports as rooms 0 and 1, and the shades follow.
+#[test]
+fn room_ids_come_from_position_and_the_backups_own_ids_are_translated() {
+    let mut first = migrated("Kitchen", 0x00_1001);
+    first.shade_id = 1;
+    first.room_id = 7;
+    let mut second = migrated("Salon", 0x00_1002);
+    second.shade_id = 2;
+    second.room_id = 3;
+
+    let mut backup = data(&[first, second]);
+    backup.rooms.push(room(3, "Downstairs")).expect("fits");
+    backup.rooms.push(room(7, "Upstairs")).expect("fits");
+
+    let import = import(&backup).expect("valid");
+    assert_eq!(import.estate.rooms[0].name.as_str(), "Downstairs");
+    assert_eq!(import.estate.rooms[1].name.as_str(), "Upstairs");
+    assert_eq!(
+        import.estate.room_of[0],
+        Some(RoomId(1)),
+        "Kitchen is upstairs"
+    );
+    assert_eq!(
+        import.estate.room_of[1],
+        Some(RoomId(0)),
+        "Salon is downstairs"
+    );
+}
+
+/// Two rooms at one id make every shade assigned to it ambiguous, and there is
+/// no reading of the file that resolves it.
+#[test]
+fn two_rooms_at_one_id_are_refused() {
+    let mut backup = data(&[migrated("Kitchen", 0x00_1001)]);
+    backup.rooms.push(room(3, "Downstairs")).expect("fits");
+    backup.rooms.push(room(3, "Upstairs")).expect("fits");
+
+    let Err(Refusal::DuplicateRoomId {
+        index,
+        name,
+        room_id,
+    }) = import(&backup)
+    else {
+        panic!("two rooms at one id must be refused");
+    };
+    assert_eq!((index, name.as_str(), room_id), (1, "Upstairs", 3));
+}
+
+/// A group is a virtual remote, so its address is held to a remote's rule.
+/// Both sentinels, because a group at `0` is as undrivable as a shade at `0`
+/// and the record refuses it either way.
+#[test]
+fn a_group_at_a_sentinel_address_is_refused() {
+    for address in [0u32, 0xFF_FFFF] {
+        let mut backup = data(&[migrated("Kitchen", 0x00_1001)]);
+        let mut broken = group(1, "Whole House", &[]);
+        broken.address = address;
+        backup.groups.push(broken).expect("fits");
+
+        let Err(Refusal::GroupAddress {
+            name, address: got, ..
+        }) = import(&backup)
+        else {
+            panic!("a group at {address:#08X} must be refused");
+        };
+        assert_eq!((name.as_str(), got), ("Whole House", address));
+    }
+}
+
+/// Two remotes at one address is two rolling-code counters that overtake each
+/// other, which is the failure this whole project was started over. It is
+/// refused whichever of the three things the group collides with.
+#[test]
+fn a_group_sharing_an_address_with_anything_else_is_refused() {
+    let shade_address = 0x00_1001;
+    let remote_address = 0x00_2001;
+
+    let mut with_remote = migrated("Kitchen", shade_address);
+    with_remote
+        .linked_addresses
+        .push(remote_address)
+        .expect("fits");
+
+    for (address, expected) in [
+        (shade_address, Clash::Shade(0)),
+        (remote_address, Clash::LinkedRemote(0)),
+    ] {
+        let mut backup = data(&[with_remote.clone()]);
+        let mut clashing = group(1, "Whole House", &[]);
+        clashing.address = address;
+        backup.groups.push(clashing).expect("fits");
+
+        let Err(Refusal::GroupAddressClash { with, .. }) = import(&backup) else {
+            panic!("a group at {address:#08X} must be refused");
+        };
+        assert_eq!(with, expected);
+    }
+
+    // And two groups at one address, which is the third.
+    let mut backup = data(&[migrated("Kitchen", shade_address)]);
+    backup
+        .groups
+        .push(group(1, "Whole House", &[]))
+        .expect("fits");
+    backup.groups.push(group(2, "Upstairs", &[])).expect("fits");
+    let Err(Refusal::GroupAddressClash { index, with, .. }) = import(&backup) else {
+        panic!("two groups at one address must be refused");
+    };
+    assert_eq!((index, with), (1, Clash::Group(0)));
+}
+
+/// The whole estate through the bytes it will occupy, because the record is
+/// what the device reads and an import that cannot be encoded and decoded back
+/// is an import that has not happened.
+#[test]
+fn an_imported_estate_survives_the_record_it_is_written_to() {
+    let mut first = migrated("Kitchen", 0x00_1001);
+    first.shade_id = 1;
+    first.room_id = 2;
+    let mut second = migrated("Salon", 0x00_1002);
+    second.shade_id = 2;
+    second.room_id = 2;
+
+    let mut backup = data(&[first, second]);
+    backup.rooms.push(room(2, "Downstairs")).expect("fits");
+    backup
+        .groups
+        .push(group(1, "Whole House", &[1, 2]))
+        .expect("fits");
+
+    let import = import(&backup).expect("valid");
+    let bytes = import.estate.encode();
+    assert_eq!(
+        somfy_config::EstateRecord::decode(&bytes),
+        Ok(import.estate.clone()),
+        "an estate this tool writes must be one the device can read"
+    );
+    // And the references still point where the import put them.
+    let decoded = somfy_config::EstateRecord::decode(&bytes).expect("decodes");
+    assert_eq!(decoded.room_of[0], Some(RoomId(0)));
+    assert_eq!(decoded.room_of[1], Some(RoomId(0)));
+    assert_eq!(
+        decoded.groups[0].members.ids().collect::<Vec<_>>(),
+        vec![ShadeId(0), ShadeId(1)]
+    );
+}
+
+/// A backup with no rooms and no groups still produces an estate — an empty
+/// one — because the two images are written together and an estate left over
+/// from a previous import would name rows by position.
+#[test]
+fn a_backup_with_no_estate_still_produces_an_empty_one() {
+    let import = import(&data(&[migrated("Kitchen", 0x00_1001)])).expect("valid");
+    assert!(import.estate.is_empty());
+    assert_eq!(
+        somfy_config::EstateRecord::decode(&import.estate.encode()),
+        Ok(import.estate.clone())
     );
 }
