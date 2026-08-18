@@ -508,14 +508,35 @@ const _: () = assert!(
 /// combine, and a conflict here can only be settled by measuring again. The
 /// subtraction below was cross-checked against the serial console — the ELF gave
 /// 53,516 for the S3 and the board reported `available: 53516`.
+///
+/// **Re-measured 2026-08-18, −16 bytes on every chip**, when the per-shade
+/// transmit width landed. Nothing on any stack chain moved — every frame on the
+/// boot chain is byte-identical, so [`REQUIRED_STACK_BYTES`] is unchanged — but
+/// the image gained 16 bytes of statics, and this row is about the image rather
+/// than about the chains. Measured the documented way, the same worktree built
+/// twice with the change out and in:
+///
+/// | chip | `.stack` before | after |
+/// |---|---|---|
+/// | ESP32 (`mqtt`) | 67,164 | 67,148 |
+/// | ESP32-S3 (all) | 66,828 | 66,812 |
+/// | ESP32-C3 (all) | 66,952 | 66,936 |
+///
+/// Identical on all three, and on both instruction sets, so it is a data static
+/// rather than anything a code generator chose. **[`RADIO_HEAP_BYTES`] does not
+/// move**: the division rounds down to a whole KiB and 16 bytes does not cross a
+/// boundary on any of the three, so the whole of it comes out of the stack —
+/// which is the direction this row's rounding is chosen to fail in. The margin
+/// over [`REQUIRED_STACK_BYTES`] is ~11 KB, so the change is recorded here
+/// because the self-check above must stay exact, not because anything is tight.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 124_508;
+const DRAM_FOR_STACK_AND_HEAP: usize = 124_492;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 146_700;
+const DRAM_FOR_STACK_AND_HEAP: usize = 146_684;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 133_512;
+const DRAM_FOR_STACK_AND_HEAP: usize = 133_496;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**

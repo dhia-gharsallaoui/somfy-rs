@@ -58,6 +58,15 @@
 //! [`PlannedTx`] carries a [`Repeats`] *policy* that the radio layer resolves
 //! against its own configured count.
 //!
+//! The **frame width is the exception, and the asymmetry is the point.** It is
+//! not a policy for the radio to resolve but a fact about the motor at the far
+//! end — one width was paired and nothing else is answered — so [`PlannedTx`]
+//! carries the value itself, taken from the shade's own [`ShadeConfig`], and
+//! nothing downstream may substitute for it. It also decides which commands
+//! exist at all: the extended commands live only in the wide frame, which
+//! [`FrameWidth::carries`] states and [`DomainError::CommandNotAtThisWidth`]
+//! reports.
+//!
 //! The TX buffer contract is **per-call**: caller buffers are sized to
 //! [`TX_CAPACITY`] (the structural worst case of one call — a full group
 //! commanded at once) and must be drained between calls, not accumulated across

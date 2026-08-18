@@ -19,7 +19,7 @@ use crate::shade::{
 };
 use crate::{Direction, DomainError, Pos};
 use heapless::Vec;
-use somfy_rts::{Frame, RxDeduper};
+use somfy_rts::{Command, Frame, RxDeduper};
 
 /// RX dedupe window: repeats of one button press inside this span collapse to a
 /// single logical event. A physical RTS remote fires ~7 repeats over well under
@@ -228,7 +228,9 @@ impl Controller {
 
     /// Apply a command to one shade: update its motion model, queue any radio
     /// frame(s), and emit a delta if its state changed. [`DomainError::NotFound`]
-    /// if the slot is empty or out of range.
+    /// if the slot is empty or out of range,
+    /// [`DomainError::CommandNotAtThisWidth`] if the shade's paired frame width
+    /// has no way to express the command.
     ///
     /// Plans at most 2 frames; `tx` is sized to [`TX_CAPACITY`] so a shared
     /// buffer also survives the `command_group`/`tick` worst cases.
@@ -251,6 +253,21 @@ impl Controller {
         if matches!(cmd, ShadeCommand::Vent) && shade.config.vent_band_ms == 0 {
             return Err(DomainError::VentBandNotMeasured);
         }
+        // And refused here for the same reason, one step earlier in the chain:
+        // a shade paired at the narrow width has no command field a `StepUp`
+        // fits in. Letting it through would move the estimate one step up and
+        // put a frame on the air that a motor reads as one step *down*, because
+        // the nibble a narrow frame carries for it is `StepDown`'s.
+        //
+        // `carries` is the single statement of that rule; this arm only names
+        // the one `ShadeCommand` that reaches it. That the enumeration is
+        // complete is not asserted here, it is *tested*: `shade.rs`'s sweep
+        // drives every command at both widths and checks that nothing planned
+        // is anything its own width cannot carry.
+        if matches!(cmd, ShadeCommand::StepUp) && !shade.config.frame_width.carries(Command::StepUp)
+        {
+            return Err(DomainError::CommandNotAtThisWidth);
+        }
         let mut local: Vec<PlannedTx, 4> = Vec::new();
         let next = shade.handle(cmd, now_ms, &mut local);
         // Stored *before* the frames are drained, so a command that starts a
@@ -266,6 +283,10 @@ impl Controller {
     /// Fan a command out to every member of a group. [`DomainError::NotFound`]
     /// if the group slot is empty or out of range; an existing but empty group
     /// is `Ok(())` with no work.
+    ///
+    /// A member whose paired frame width cannot express the command is refused
+    /// with [`DomainError::CommandNotAtThisWidth`], across the whole group and
+    /// before any of it moves.
     ///
     /// [`ShadeCommand::Pair`] is refused with [`DomainError::NotAGroupCommand`],
     /// **before anything is planned**. It is the one command here that is not a
@@ -309,12 +330,20 @@ impl Controller {
         // never measured, and discovering that half way through would leave the
         // rest of the group already closing with no vent coming. Same standard
         // as the gate above: no partial fan-out.
-        if matches!(cmd, ShadeCommand::Vent) {
-            for id in &members {
-                let shade = self.registry.shade(*id).ok_or(DomainError::NotFound)?;
-                if shade.config.vent_band_ms == 0 {
-                    return Err(DomainError::VentBandNotMeasured);
-                }
+        //
+        // A `StepUp` at a member paired to the narrow width is checked in the
+        // same sweep and to the same standard: half a group stepped and the
+        // rest refused is a group that has to be inspected shade by shade to
+        // find out what it did.
+        for id in &members {
+            let shade = self.registry.shade(*id).ok_or(DomainError::NotFound)?;
+            if matches!(cmd, ShadeCommand::Vent) && shade.config.vent_band_ms == 0 {
+                return Err(DomainError::VentBandNotMeasured);
+            }
+            if matches!(cmd, ShadeCommand::StepUp)
+                && !shade.config.frame_width.carries(Command::StepUp)
+            {
+                return Err(DomainError::CommandNotAtThisWidth);
             }
         }
         for id in members {

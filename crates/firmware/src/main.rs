@@ -921,19 +921,24 @@ fn provision_shades(
 
     for (index, shade) in found.shades.into_iter().enumerate() {
         let address = shade.config.address;
-        // What the shade would be driven as, against what this controller
-        // transmits. Said out loud because the alternative is a shade that
-        // imports looking healthy and never moves — which is exactly what
-        // storing the width and the protocol was for.
-        if shade.config.frame_width != somfy_domain::FrameWidth::Bits56
-            || shade.config.protocol != somfy_domain::RadioProtocol::Rts
-        {
+        // **Narrowed to the protocol, because the width half is now driven
+        // rather than reported.** This line used to name a shade whose *frame
+        // width* differed from the controller's too; every frame now carries
+        // the width its own shade was paired at (`somfy_domain::PlannedTx`), so
+        // there is nothing left to warn about — a mixed-width installation is
+        // an installation this firmware drives.
+        //
+        // The protocol is not the same case and cannot be made into it here:
+        // `somfy-rts` encodes RTS and has no byte layout for RTW, RTV or the
+        // general-purpose kinds at either width. So a shade set to one of those
+        // is still a shade that will accept commands and never move, and this
+        // is still the only place that can say which one it is.
+        if shade.config.protocol != somfy_domain::RadioProtocol::Rts {
             esp_println::println!(
-                "shades: entry {} at {:#08X} is a {:?} shade on {:?} — this controller \
-                 transmits 56-bit RTS only, so it will accept commands and never move",
+                "shades: entry {} at {:#08X} speaks {:?} — this controller transmits RTS \
+                 only, so it will accept commands and never move",
                 index,
                 address,
-                shade.config.frame_width,
                 shade.config.protocol,
             );
         }

@@ -56,8 +56,8 @@ use embassy_sync::pubsub::PubSubChannel;
 use heapless::Vec;
 use somfy_domain::DomainError;
 use somfy_domain::{
-    CalibrationLeg, CalibrationMark, CalibrationOutcome, Controller, GroupId, PlannedTx, Registry,
-    ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY, TX_CAPACITY,
+    CalibrationLeg, CalibrationMark, CalibrationOutcome, Controller, FrameWidth, GroupId,
+    PlannedTx, Registry, ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY, TX_CAPACITY,
 };
 use somfy_rts::Frame;
 use somfy_store::{
@@ -119,25 +119,29 @@ pub const DEFAULT_REPEATS: u8 = 2;
 
 /// How this controller puts a planned frame on the air.
 ///
-/// Per-controller rather than per-shade, and that is a real limitation: a
-/// motor is paired as either a 56-bit or an 80-bit device, so a mixed
-/// installation needs the width recorded against each shade. `ShadeConfig`
-/// has no field for it, adding one is a change to the migration format as well
-/// as to the domain, and no 80-bit-capable hardware exists to test against —
-/// so the width is stated once, here, where it is visible, rather than guessed
-/// per frame somewhere it is not.
+/// **Redundancy only.** How many repeat frames follow the first is a property
+/// of this installation's RF path — a longer burst is what an operator reaches
+/// for when a motor at the end of the house misses presses — so it is a
+/// controller-wide setting and the domain plans a [`Repeats`](somfy_domain::Repeats)
+/// policy against it.
+///
+/// **The frame width is deliberately not here.** It used to be, and that was the
+/// defect: a motor is paired as either a 56-bit or an 80-bit device and answers
+/// nothing else, so a width chosen once for the whole controller is a setting
+/// that is simply wrong for every shade that disagrees with it — and wrong
+/// silently, because a motor that cannot hear a frame does not say so. It now
+/// travels with the frame instead ([`PlannedTx::width`](somfy_domain::PlannedTx)),
+/// read from the shade's own record, which is the only place that knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxProfile {
-    pub bits: FrameBits,
     pub repeats: u8,
 }
 
 impl Default for TxProfile {
-    /// 56-bit, two repeats — what every committed capture and every on-air
-    /// transmission this project has made so far actually used.
+    /// Two repeats — what every committed capture and every on-air transmission
+    /// this project has made so far actually used.
     fn default() -> Self {
         Self {
-            bits: FrameBits::Bits56,
             repeats: DEFAULT_REPEATS,
         }
     }
@@ -375,7 +379,14 @@ impl StateMachine {
             let plan = TransmitPlan {
                 address: frame.address,
                 command: frame.command,
-                bits: self.profile.bits,
+                // **The width is the frame's, and there is nothing here to
+                // resolve it against.** It came from the shade's own record and
+                // names the width the motor at this address was paired at; a
+                // controller-wide setting could only disagree with it, and
+                // disagreeing is exactly what made a shade import looking
+                // healthy and never move. Contrast the repeat count below,
+                // which genuinely is a controller setting.
+                bits: bits(frame.width),
                 // **The profile is a default, not an override.** The domain
                 // plans a `Repeats` policy rather than a count, because two
                 // kinds of frame cannot take whatever this controller happens
@@ -418,5 +429,20 @@ impl StateMachine {
             }
         }
         outcome
+    }
+}
+
+/// The radio layer's name for a width the domain has already decided.
+///
+/// Two enums for one fact, and they stay two because the crates they live in do
+/// not know about each other: `somfy-domain` models a shade without a radio and
+/// `somfy-store` models a transmission without a shade. This crate is the one
+/// that has both, so the translation is here and is exhaustive — a width added
+/// to either enum stops this compiling rather than defaulting to the narrow
+/// frame, which is the failure this whole path exists to remove.
+fn bits(width: FrameWidth) -> FrameBits {
+    match width {
+        FrameWidth::Bits56 => FrameBits::Bits56,
+        FrameWidth::Bits80 => FrameBits::Bits80,
     }
 }
