@@ -78,6 +78,7 @@
 
 mod catalog;
 mod credentials;
+mod estate;
 mod mqtt;
 mod record;
 mod shade;
@@ -86,6 +87,10 @@ mod trial;
 pub use catalog::{Catalog, CatalogError, Dropped, DEBOUNCE_MS, MAX_DEFER_MS};
 pub use credentials::{
     CredentialError, Field, WifiCredentials, MAX_PSK_LEN, MAX_SSID_LEN, MIN_PSK_LEN,
+};
+pub use estate::{
+    EstateHeader, EstateRecord, EstateRecordError, Members, Row, StoredGroup, StoredRoom,
+    ESTATE_GROUP_CAPACITY, ESTATE_RECORD_LEN, ESTATE_ROOM_CAPACITY, ESTATE_SHADE_CAPACITY,
 };
 pub use mqtt::{
     MqttField, MqttSettings, MqttSettingsError, Namespaces, DEFAULT_DISCOVERY_PREFIX,

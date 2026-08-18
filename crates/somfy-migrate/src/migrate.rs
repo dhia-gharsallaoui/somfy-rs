@@ -20,16 +20,30 @@
 //!
 //! ## Trailing records
 //!
-//! The repeater (if `version >= 21`), settings, net, and transceiver records
-//! that follow the groups are not modeled in this migration pass. They are
-//! skipped by record end (`\n`) until EOF, trusting the separators rather than
-//! the advisory record-size fields in the header.
+//! The repeater (if `version >= 21`), settings and transceiver records that
+//! follow the groups are not modeled. They are skipped by record end (`\n`),
+//! one per record the header counts, trusting the separators rather than the
+//! advisory record-size fields.
+//!
+//! The **net** record between them is modeled, because the broker settings live
+//! in it — see [`parse_net_record`]. Reaching it is why the skips above are
+//! counted rather than run to EOF: a trailer record has to be stepped over
+//! exactly once, not swallowed along with everything after it.
+//!
+//! ## What tells the trailers apart from an on-flash config
+//!
+//! The header's record *sizes*. `ShadeConfigFile::save` (`:315-346`) writes the
+//! on-flash `shades.cfg` with the settings, net and transceiver sizes set to
+//! **zero** and none of those records emitted; `ShadeConfigFile::backup`
+//! (`:347-383`) sizes and writes all three. So a size of zero means the record
+//! is absent, which is exactly the test `restoreFile` itself applies before
+//! seeking past one (`:583-596`).
 
 use crate::header::{parse_header, BackupHeader};
 use crate::reader::{MigrateError, Reader};
 use crate::records::{
-    parse_group_record, parse_room_record, parse_shade_record, MigratedGroup, MigratedRoom,
-    MigratedShade,
+    parse_group_record, parse_net_record, parse_room_record, parse_shade_record, MigratedGroup,
+    MigratedMqtt, MigratedRoom, MigratedShade,
 };
 use heapless::{String, Vec};
 
@@ -60,6 +74,21 @@ pub struct MigrationData {
     pub shades: Vec<MigratedShade, MAX_SHADES>,
     /// Live groups in slot order.
     pub groups: Vec<MigratedGroup, MAX_GROUPS>,
+    /// The broker settings the backup carried, or `None` when none could be
+    /// read.
+    ///
+    /// `None` has three causes and they are not the same fact: an on-flash
+    /// `shades.cfg` rather than an exported backup (no net record at all), a
+    /// backup below version 22 (a net record with no MQTT block), or a net
+    /// record that did not read — see [`parse_backup`], which does not let that
+    /// refuse the migration.
+    ///
+    /// A controller that simply had **no broker configured** is a fourth thing
+    /// and is *not* `None`: it arrives as `Some` with an empty
+    /// [`hostname`](MigratedMqtt::hostname), because "no broker" is a
+    /// configuration somebody meant and the consumer is entitled to tell it
+    /// apart from a backup that could not be read.
+    pub mqtt: Option<MigratedMqtt>,
     /// Count of records whose fields did not align exactly, forcing the defensive
     /// resync to skip leftover content bytes before the record end.
     ///
@@ -95,9 +124,29 @@ pub fn parse_backup(data: &[u8]) -> Result<MigrationData, MigrateError> {
     let shades = parse_shades(&mut r, &header, &mut skipped_resyncs)?;
     let groups = parse_groups(&mut r, &header, &mut skipped_resyncs)?;
 
-    // Trailing repeater/settings/net/trans records are not modeled; skip them by
-    // record end until EOF so a well-formed backup is consumed cleanly. These are
-    // expected extra records, not misalignments, so they never touch the counter.
+    // The repeater and settings records sit between the groups and the net
+    // record, so they are stepped over one at a time rather than run to EOF —
+    // the net record is the one trailer this migrator reads. These are expected
+    // extra records, not misalignments, so they never touch the counter.
+    for _ in 0..header.repeater_records {
+        r.skip_record_end()?;
+    }
+    if header.settings_record_size > 0 {
+        r.skip_record_end()?;
+    }
+    // **Best effort, and deliberately.** A failure inside the net record does not
+    // refuse the backup: the broker settings are recoverable by hand — they are
+    // on the old controller's screen — while the rolling codes above are not,
+    // and refusing the whole migration over an unreadable trailer would trade
+    // the irrecoverable value for the recoverable one. A header that claims a
+    // net record the file does not have is the ordinary case here, not a
+    // corruption: `full_backup.rs` has carried a fixture like that since the
+    // record counts were advisory.
+    let mqtt = parse_net_record(&mut r, &header).ok().flatten();
+
+    // Whatever is left — the transceiver record, and the net record's Ethernet
+    // tail if a backup ever turns out to be shorter there than the writer this
+    // was read against.
     while !r.at_end() {
         r.skip_record_end()?;
     }
@@ -108,6 +157,7 @@ pub fn parse_backup(data: &[u8]) -> Result<MigrationData, MigrateError> {
         rooms,
         shades,
         groups,
+        mqtt,
         skipped_resyncs,
     })
 }

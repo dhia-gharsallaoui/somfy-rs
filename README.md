@@ -99,10 +99,9 @@ policy-free:
   (1) persist `MigrationData` (shades, rooms, groups) into the new config store,
   surfacing v19–v22 groups and linked remotes whose rolling codes could not be
   recovered from the backup so the user re-pairs or sets them manually;
-  (2) **import MQTT settings**, which `somfy-migrate` deliberately defers — the
-  C++ settings record (`ConfigFile.cpp` `writeSettingsRecord`, :1019) parses
-  cleanly, but Plan 3 has nowhere to store it until Plan 6 persistence exists.
-  This is a recorded deviation from design spec §3.4, not a dropped requirement;
+  (2) **import MQTT settings**, which `somfy-migrate` deliberately deferred until
+  there was somewhere to store the result. This is a recorded deviation from
+  design spec §3.4, not a dropped requirement;
   (3) **default unknown shade kinds to `Roller` and warn the user.**
   `ShadeKind::from_raw`/`TiltMode::from_raw` return `None` for a valid C++ kind
   outside the v1.0 subset (garage/gate/drycontact) or an invalid byte; Plan 6
@@ -123,21 +122,54 @@ policy-free:
   — on the host, before anything is flashed.
 
   **A linked remote's *address* is discharged too, 2026-08-17.** The record
-  carries the wall remotes now (a shared pool of 58 across the table) and the
-  firmware loads them into `Shade::linked`, so overheard presses finally reach
-  the position estimate — which, RTS being one-way, is the only feedback path
-  this controller has. What the file never carried is their **rolling codes**,
-  and that turns out not to matter: a linked remote is listened to and never
-  transmitted as. **What is still Plan 6's** is the rest of (1) and (2): rooms,
-  groups (including the v19–v22 fabricated codes), MQTT settings, and applying
-  those on the device rather than into a provisioning image.
+  carries the wall remotes now (a shared pool of 58 across the table, since
+  shortened to 26) and the firmware loads them into `Shade::linked`, so
+  overheard presses finally reach the position estimate — which, RTS being
+  one-way, is the only feedback path this controller has. What the file never
+  carried is their **rolling codes**, and that turns out not to matter: a linked
+  remote is listened to and never transmitted as, so its address is the whole of
+  what is needed.
+
+  **(1) and (2) are discharged, 2026-08-18.** Rooms and groups are persisted in
+  a **fourth** flash region, `estate` at 0x208000 — a `RTSE` record beside the
+  shade table's `RTSS`, because that one is full to the byte and a compile-time
+  assertion says so. `provision_shades --from-backup` writes both images from
+  one import and the firmware loads both into the registry, so
+  `GET /api/v1/rooms` and `/api/v1/groups` answer with the imported estate and a
+  group command fans out to the shades the old controller had in it.
+
+  The **v19–v22 fabricated group code** is surfaced twice, and deliberately: the
+  importer prints a per-group caveat naming the format version, and the record
+  carries a `code_recovered` bit beside the code, because the warning is read
+  once by one person and the value outlives them. Nothing transmits as a group
+  in v1.0 — a group command is sent to each member shade — so it costs nothing
+  today; it is the first thing a group-transmit path must read.
+
+  The **MQTT settings** come from the backup's *net* record (not its settings
+  record — see `docs/provenance.md`, which corrects the citation that used to be
+  here), and `provision --from-backup` maps them onto `somfy_config::MqttSettings`
+  with the **concatenation undone**: a migrated `discoTopic` becomes
+  `discovery_prefix` on its own and `rootTopic` becomes `state_root` on its own.
+  An import that would produce an invalid pair — an empty namespace, or both set
+  to `homeassistant`, which puts availability on Home Assistant's own birth
+  topic — is refused with the field named, per requirements-spec R3. The backup
+  does not carry the broker's username or password (the C++ keeps both in NVS),
+  so both are still asked for.
+
+  **What is still open:** applying any of this *on the device* rather than into
+  a provisioning image. `estate` is read-only to the firmware, exactly as
+  `shades` was before Plan 6 Task 2 gave it a writer, because rooms and groups
+  have no runtime edit vocabulary yet.
 - **Group commands stay per-shade fan-out in v1.0.** The domain executes a group
   command by fanning it out to each member shade (Plan 2 `Controller::command_group`),
   not by transmitting a single group virtual-remote frame. Even so, group
   virtual-remote identities (`address` + `next_code` from `MigratedGroup`) MUST
   still be persisted by Plan 6 for future group-TX support and to preserve the
   option of pairing-compatible group frames. The v19–v22 fabricated-code warning
-  applies only if/when group-TX is implemented.
+  applies only if/when group-TX is implemented. **Both are done**: the identity
+  is stored in `somfy_config::StoredGroup` and the warning is stored beside it
+  as `code_recovered`, so a group-TX path can refuse a placeholder rather than
+  transmit one.
 
 ## Workspace crates
 
@@ -146,7 +178,7 @@ policy-free:
 | [`somfy-rts`](crates/somfy-rts) | yes | Somfy RTS protocol engine: 56/80-bit frame encode/decode, rolling codes, OOK pulse rendering (TX) and dual-stream pulse decoding (RX), repeat-frame dedupe. Hardware-free — pure pulse data in/out. |
 | [`somfy-domain`](crates/somfy-domain) | yes | Domain model: shade/group/room registries + position dead-reckoning. Travel-time position/tilt estimator, command orchestration (commands in → planned radio TX + state-delta events out), and overheard-remote tracking. Also the controller's own virtual-remote identity: a per-shade radio address derived from the device-unique half of the board's MAC, so this controller never transmits as a remote another controller also owns. Clock-free — callers inject `now_ms`. |
 | [`somfy-api`](crates/somfy-api) | yes¹ | Shared REST/WebSocket contract: serde DTOs mirroring the domain entities (camelCase wire, whole-percent `u8` positions, C++ numeric discriminants). The `ts` feature generates TypeScript types into `ui/src/api/generated/` so UI/firmware drift is a compile error. |
-| [`somfy-migrate`](crates/somfy-migrate) | yes | C++ ESPSomfy-RTS backup-file parser: reads an exported `.backup` into `MigrationData` (shades, rooms, groups) so an existing setup migrates without re-pairing. Applies the rolling-code `+1` (last-sent → next-to-send) contract; allocation-free. |
+| [`somfy-migrate`](crates/somfy-migrate) | yes | C++ ESPSomfy-RTS backup-file parser: reads an exported `.backup` into `MigrationData` (shades, rooms, groups, and the broker settings out of the net record) so an existing setup migrates without re-pairing. Applies the rolling-code `+1` (last-sent → next-to-send) contract; allocation-free. Carries `rootTopic` and `discoTopic` **apart**, exactly as the file holds them — undoing the concatenation the C++ performs at publish time is the importer's job, not a deserializer's. |
 | [`somfy-rmt`](crates/somfy-rmt) | yes | Packs Somfy pulse trains into ESP32 RMT symbols: renders, merges adjacent same-level halves, packs two pulses per 32-bit symbol and terminates the buffer. Pure data, so the packing that hardware depends on is host-testable. |
 | [`somfy-cc1101`](crates/somfy-cc1101) | yes | CC1101 radio driver for on-off-keyed asynchronous-serial transmission at 433.42 MHz. Speaks only `embedded-hal` SPI. Every register byte is assembled from named bit-fields carrying the datasheet arithmetic that produced it, re-checked by compile-time assertion. |
 | [`somfy-mqtt`](crates/somfy-mqtt) | yes | MQTT topic construction, configuration validation, Home Assistant discovery payloads, and the publish/subscribe **lifecycle as data**. The discovery prefix and the state root are separate types that hold their text privately, so concatenating them — the fault that made discovery unusable on the C++ build — does not compile. Bad configuration is refused with a typed error naming the field, never repaired. No user text reaches a topic segment: identifiers are built from literals and stable ids, so a rename cannot move a discovery topic. Payload and publisher are derived from one topic table so they cannot drift apart. The lifecycle is a value rather than a sequence of calls: a message carries its own retention with no constructor that takes one, removal is a zero-length retained publish, and whatever an announcement retains the matching retirement clears — so an entity cannot be added without also being removable, per-shade and device-level alike. The entity set is a cover and a pairing button per shade, plus five device diagnostics — uptime, Wi-Fi signal, free heap, peak heap use and damaged rolling-code slots — chosen by one rule: **an entity backed by nothing is worse than an absent one**, so anything the firmware cannot actually report is omitted and recorded rather than stubbed. Network-free. |

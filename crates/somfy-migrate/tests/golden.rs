@@ -20,8 +20,8 @@
 //!    file is gitignored: it carries radio addresses and rolling codes.
 
 use somfy_migrate::{
-    parse_backup, MigratedGroup, MigratedRoom, MigratedShade, MigrationData, MAX_SUPPORTED_VERSION,
-    MIN_SUPPORTED_VERSION,
+    parse_backup, MigratedGroup, MigratedMqtt, MigratedRoom, MigratedShade, MigrationData,
+    MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 use somfy_rts::RollingCode;
 
@@ -138,11 +138,33 @@ fn synthetic_v25_backup() -> Vec<u8> {
     group.push("7"); // lastRollingCode -> next_code (+1)
     line(&group);
 
-    // Trailer records present in a `backup` (:378-381) but not modeled — skipped
-    // to EOF by record end.
+    // Trailer records present in a `backup` (:378-381). The repeater, settings
+    // and transceiver records are stepped over; the net record between them is
+    // read for its MQTT block (`writeNetRecord` :1030-1052).
     line(&["       0", "       0", "       0", "       0"]); // repeater (4 addrs)
     line(&["settings", "record", "data"]);
-    line(&["net", "record", "data"]);
+    line(&[
+        "  1",               // connType
+        "true ",             // IP.dhcp
+        "\"192.0.2.50\"",    // IP.ip
+        "\"192.0.2.1\"",     // IP.gateway
+        "\"255.255.255.0\"", // IP.subnet
+        "\"192.0.2.1\"",     // IP.dns1
+        "\"\"",              // IP.dns2
+        "\"mqtt://\"",       // MQTT.protocol
+        "\"192.0.2.10\"",    // MQTT.hostname
+        " 1883",             // MQTT.port
+        "true ",             // MQTT.pubDisco
+        "\"espsomfyrts\"",   // MQTT.rootTopic
+        "\"homeassistant\"", // MQTT.discoTopic
+        "  1",               // Ethernet.boardType
+        "  0",               // Ethernet.phyType
+        "  0",               // Ethernet.CLKMode
+        "   1",              // Ethernet.phyAddress
+        "  -1",              // Ethernet.PWRPin
+        "  16",              // Ethernet.MDCPin
+        "  23",              // Ethernet.MDIOPin
+    ]);
     line(&["trans", "record", "data"]);
 
     out
@@ -186,6 +208,18 @@ fn expected_migration_data() -> MigrationData {
             next_code: RollingCode(8), // 7 + 1
             member_shade_ids: hvec(&[10, 11]),
         }]),
+        // The two namespaces exactly as the file holds them: this crate does
+        // not undo the concatenation the C++ performs at publish time, so
+        // `espsomfyrts` and `homeassistant` arrive separately and the consumer
+        // maps them onto `state_root` and `discovery_prefix`.
+        mqtt: Some(MigratedMqtt {
+            protocol: hstr("mqtt://"),
+            hostname: hstr("192.0.2.10"),
+            port: 1883,
+            publish_discovery: true,
+            root_topic: hstr("espsomfyrts"),
+            disco_topic: hstr("homeassistant"),
+        }),
         // A byte-perfect synthetic backup aligns every record exactly.
         skipped_resyncs: 0,
     }

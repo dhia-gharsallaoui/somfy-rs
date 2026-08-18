@@ -175,6 +175,42 @@ fn line(fields: &[String]) -> Vec<u8> {
     out
 }
 
+/// A net record in `writeNetRecord` order (:1030-1052): the IP block, the MQTT
+/// block (v>=22 only), then the Ethernet PHY tail. Every string the C++ writes
+/// with `writeVarString` is quoted, which is what lets a value contain a comma.
+fn net_fields(host: &str, port: &str, disco: &str, root: &str, proto: &str) -> Vec<String> {
+    vec![
+        "1".into(),                 // connType
+        "true".into(),              // IP.dhcp
+        "\"192.0.2.50\"".into(),    // IP.ip
+        "\"192.0.2.1\"".into(),     // IP.gateway
+        "\"255.255.255.0\"".into(), // IP.subnet
+        "\"192.0.2.1\"".into(),     // IP.dns1
+        "\"\"".into(),              // IP.dns2
+        format!("\"{proto}\""),     // MQTT.protocol
+        format!("\"{host}\""),      // MQTT.hostname
+        port.into(),                // MQTT.port
+        "true".into(),              // MQTT.pubDisco
+        format!("\"{root}\""),      // MQTT.rootTopic
+        format!("\"{disco}\""),     // MQTT.discoTopic
+        "1".into(),                 // Ethernet.boardType
+        "0".into(),                 // Ethernet.phyType
+        "0".into(),                 // Ethernet.CLKMode
+        "1".into(),                 // Ethernet.phyAddress
+        "-1".into(),                // Ethernet.PWRPin
+        "16".into(),                // Ethernet.MDCPin
+        "23".into(),                // Ethernet.MDIOPin
+    ]
+}
+
+/// The same record without the six MQTT fields — what a v19..v21 backup holds,
+/// since `readNetRecord` gates that block on `version >= 22` (:641).
+fn net_fields_without_mqtt() -> Vec<String> {
+    let mut fields = net_fields("h", "1883", "d", "r", "mqtt://");
+    fields.drain(7..13);
+    fields
+}
+
 fn header_line(version: u8, rooms: u8, shades: u8, groups: u8) -> Vec<u8> {
     // writeHeader order (ConfigFile.cpp:47-60). The repeater pair
     // (repeaterSize,repeaterRecs) only exists for version >= 21; readHeader
@@ -398,7 +434,13 @@ fn full_backup_bytes() -> Vec<u8> {
     // Trailing records the migrator skips (present in a `backup`, ConfigFile.cpp:378-381).
     bytes.extend(b"       0,       0,       0,       0\n"); // repeater (4 addrs)
     bytes.extend(b"settings,record,data\n"); // settings record
-    bytes.extend(b"net,record,data\n"); // net record
+    bytes.extend(line(&net_fields(
+        "192.0.2.10",
+        "1883",
+        "homeassistant",
+        "espsomfyrts",
+        "mqtt://",
+    )));
     bytes.extend(b"trans,record,data\n"); // trans record
     bytes
 }
@@ -519,9 +561,16 @@ fn record_with_extra_trailing_field_is_resynced() {
 
 #[test]
 fn truncated_file_is_eof() {
-    // Cut the backup off midway through the first shade record.
+    // Cut the backup off midway through the first shade record. Measured from
+    // the *front* — header plus both room records plus a few fields — rather
+    // than from the end, so the cut stays inside a shade however the trailer
+    // records grow. A truncation among the shades must still refuse the whole
+    // backup; only the trailers are best-effort.
     let full = full_backup_bytes();
-    let cut = full.len() - 120;
+    let cut = header_line(25, 2, 2, 1).len()
+        + line(&room_fields("1", "Kitchen", "0")).len()
+        + line(&room_fields("2", "Bedroom", "1")).len()
+        + 20;
     let truncated = &full[..cut];
     assert_eq!(parse_backup(truncated), Err(MigrateError::UnexpectedEof));
 }
@@ -552,4 +601,140 @@ fn version_26_ceiling_is_unsupported() {
         parse_backup(&bytes),
         Err(MigrateError::UnsupportedVersion(26))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Net record (the MQTT settings)
+// ---------------------------------------------------------------------------
+
+/// The whole point of reading this record: the two namespaces arrive **apart**.
+/// The C++ joins them at publish time (`MQTTClass::makeTopic` prepends
+/// `rootTopic` to the discovery topic built from `discoTopic`), and a
+/// deserializer that reproduced the join would hand its consumer one string
+/// where the format holds two — with no way back, because `espsomfyrts` and
+/// `homeassistant` are both legal roots and the boundary between them is not
+/// recoverable from `espsomfyrts/homeassistant`.
+#[test]
+fn the_two_namespaces_arrive_separately_and_are_not_concatenated() {
+    let data = parse_backup(&full_backup_bytes()).expect("backup parses");
+    let mqtt = data.mqtt.expect("a v25 backup carries the MQTT block");
+    assert_eq!(mqtt.root_topic.as_str(), "espsomfyrts");
+    assert_eq!(mqtt.disco_topic.as_str(), "homeassistant");
+    assert_eq!(mqtt.hostname.as_str(), "192.0.2.10");
+    assert_eq!(mqtt.port, 1883);
+    assert_eq!(mqtt.protocol.as_str(), "mqtt://");
+    assert!(mqtt.publish_discovery);
+}
+
+/// The MQTT block is gated on `version >= 22` in `readNetRecord` (:641). Below
+/// that the net record still exists — the IP block and the Ethernet tail — so
+/// the parser must consume it and report no broker rather than reading the
+/// Ethernet fields as topics.
+#[test]
+fn a_backup_below_version_22_has_no_mqtt_block_at_all() {
+    let mut bytes = header_line(21, 0, 1, 0);
+    bytes.extend(line(&shade_fields("5", "3333333", "Shade", "0", "1")));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    bytes.extend(b"settings,record,data\n");
+    bytes.extend(line(&net_fields_without_mqtt()));
+    bytes.extend(b"trans,record,data\n");
+
+    let data = parse_backup(&bytes).expect("v21 backup parses");
+    assert_eq!(data.mqtt, None);
+    // And the shade — the part that matters — is untouched by the trailer.
+    assert_eq!(data.shades.len(), 1);
+    assert_eq!(data.shades[0].next_code, RollingCode(1));
+}
+
+/// A controller with no broker configured writes an empty host, and that is a
+/// different fact from a backup whose net record could not be read: one says
+/// "there was nothing to migrate", the other "something here was not
+/// understood". The consumer is entitled to tell them apart, so the parser
+/// keeps them apart.
+#[test]
+fn no_broker_configured_is_an_empty_host_rather_than_no_record() {
+    let mut bytes = header_line(25, 0, 1, 0);
+    bytes.extend(line(&shade_fields("5", "3333333", "Shade", "0", "1")));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    bytes.extend(b"settings,record,data\n");
+    bytes.extend(line(&net_fields(
+        "",
+        "1883",
+        "homeassistant",
+        "",
+        "mqtt://",
+    )));
+    bytes.extend(b"trans,record,data\n");
+
+    let mqtt = parse_backup(&bytes)
+        .expect("parses")
+        .mqtt
+        .expect("the record was present and readable");
+    assert_eq!(mqtt.hostname.as_str(), "");
+    assert_eq!(mqtt.root_topic.as_str(), "");
+}
+
+/// An on-flash `shades.cfg` — what `ShadeConfigFile::save` writes — declares
+/// zero-length settings, net and transceiver records and emits none of them
+/// (`ConfigFile.cpp:326-328`). The size field is the test, so nothing is
+/// consumed and nothing is invented.
+#[test]
+fn a_zero_sized_net_record_is_absent_rather_than_empty() {
+    let mut bytes = b"25,76,29,0,276,1,200,0,77,1,0,0,0,SrvSave\n".to_vec();
+    bytes.extend(line(&shade_fields("5", "3333333", "Shade", "0", "1")));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    let data = parse_backup(&bytes).expect("an on-flash config parses");
+    assert_eq!(data.mqtt, None);
+    assert_eq!(data.shades.len(), 1);
+}
+
+/// A quoted topic may contain a comma — `writeVarString` quotes every string it
+/// writes, and `readVarString` only ends the field once the closing quote has
+/// been seen. Worth pinning here because a comma is exactly what shifts every
+/// field of an *unquoted* record, and the two behaviours look alike from
+/// outside.
+#[test]
+fn a_comma_inside_a_quoted_topic_does_not_shift_the_record() {
+    let mut bytes = header_line(25, 0, 1, 0);
+    bytes.extend(line(&shade_fields("5", "3333333", "Shade", "0", "1")));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    bytes.extend(b"settings,record,data\n");
+    bytes.extend(line(&net_fields(
+        "192.0.2.10",
+        "1883",
+        "home,assistant",
+        "root",
+        "mqtt://",
+    )));
+    bytes.extend(b"trans,record,data\n");
+
+    let data = parse_backup(&bytes).expect("parses");
+    let mqtt = data.mqtt.clone().expect("present");
+    assert_eq!(mqtt.disco_topic.as_str(), "home,assistant");
+    assert_eq!(mqtt.hostname.as_str(), "192.0.2.10");
+    // The record still ended where it should have: nothing leaked into the
+    // resync counter, which is the signal a shifted record raises.
+    assert_eq!(
+        data.skipped_resyncs, 0,
+        "a quoted comma is content, not a misalignment"
+    );
+}
+
+/// The trade this parser makes, stated as a test: a trailer that cannot be read
+/// costs the broker settings and **not** the migration. The rolling codes above
+/// it are the values a person cannot recover by hand; a broker address is on
+/// the old controller's screen.
+#[test]
+fn an_unreadable_net_record_costs_the_broker_and_not_the_shades() {
+    let mut bytes = header_line(25, 0, 1, 0);
+    bytes.extend(line(&shade_fields("5", "3333333", "Shade", "0", "1")));
+    bytes.extend(b"       0,       0,       0,       0\n"); // repeater
+    bytes.extend(b"settings,record,data\n");
+    bytes.extend(b"net,record,truncated\n"); // far too few fields, then EOF
+
+    let data = parse_backup(&bytes).expect("the backup still parses");
+    assert_eq!(data.mqtt, None);
+    assert_eq!(data.shades.len(), 1);
+    assert_eq!(data.shades[0].address, 3_333_333);
+    assert_eq!(data.shades[0].next_code, RollingCode(1));
 }

@@ -68,7 +68,7 @@ const GZIP_LEVEL: u32 = 9;
 /// migrate them, it abandons them, and the store cannot tell an abandoned
 /// region from a fresh one well enough to matter — a motor rejects any code at
 /// or below the last it accepted, and undoing that means re-pairing at the
-/// shade. The other two are pinned for the weaker reason that moving them
+/// shade. The other three are pinned for the weaker reason that moving them
 /// costs a re-provisioning over a cable.
 const PINNED: &[(&str, u32, u32, &str)] = &[
     (
@@ -91,6 +91,14 @@ const PINNED: &[(&str, u32, u32, &str)] = &[
         0x2000,
         "moving this region discards the stored shade table and costs a \
          re-provisioning over a cable",
+    ),
+    (
+        "estate",
+        0x0020_8000,
+        0x2000,
+        "moving this region discards the stored rooms and groups, and — because \
+         a group's membership is a row of the shade table — an estate read at \
+         the wrong offset would name the wrong shades rather than none",
     ),
 ];
 

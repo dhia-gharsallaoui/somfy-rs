@@ -44,12 +44,24 @@ somfy-rts = { path = "../somfy-rts" }
 # does not build this, and neither does the firmware.
 somfy-migrate = { path = "../somfy-migrate" }
 
-# `provision_shades` is listed explicitly for one reason: `test = true`, which
-# is what makes `cargo test` run the unit tests inside it. Its mapping and
+# Both examples are listed explicitly for one reason: `test = true`, which is
+# what makes `cargo test` run the unit tests inside them. Their mapping and
 # refusal rules are pure logic — which shade kind a byte means, which backups
-# are refused and why — and pure logic that no test reaches is pure logic
-# nobody has checked. The other example is found by autodiscovery as usual.
+# are refused and why, and which pair of MQTT namespaces is one Home Assistant
+# can read — and pure logic that no test reaches is pure logic nobody has
+# checked.
+#
+# `provision` was found by autodiscovery until it grew the backup-import path,
+# and autodiscovery does **not** imply `test = true`: the tests inside it
+# compiled, passed when run by name, and were silently absent from
+# `cargo test --workspace`. That is the shape of a CI hole this project keeps
+# finding, so the entry is here rather than left implicit.
 [[example]]
 name = "provision_shades"
 path = "examples/provision_shades/main.rs"
+test = true
+
+[[example]]
+name = "provision"
+path = "examples/provision.rs"
 test = true

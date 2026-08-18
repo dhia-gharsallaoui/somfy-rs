@@ -1,4 +1,5 @@
-//! Build the flash image that provisions a board's shades.
+//! Build the flash images that provision a board's shades and the estate
+//! around them.
 //!
 //! ```text
 //! # answer the prompts, one shade at a time
@@ -7,16 +8,35 @@
 //! # or read them out of the controller you are replacing
 //! cargo run -p somfy-config --example provision_shades -- --from-backup device.backup shades.bin
 //!
-//! espflash erase-parts --port /dev/ttyUSB0 --partition-table crates/firmware/partitions.csv shades
+//! espflash erase-parts --port /dev/ttyUSB0 --partition-table crates/firmware/partitions.csv shades estate
 //! espflash write-bin   --port /dev/ttyUSB0 0x204000 shades.bin
+//! espflash write-bin   --port /dev/ttyUSB0 0x208000 estate.bin
 //! ```
 //!
 //! A sibling of `provision`, not a part of it: the shade table lives in its own
 //! flash region because it does not fit beside the Wi-Fi and MQTT settings —
 //! that record is 512 bytes with room for four shades after its last field, and
-//! the registry holds 32. Two regions means two files and two `write-bin`
-//! steps, and it also means re-provisioning shades never risks the credentials
-//! and vice versa.
+//! the registry holds 32. Separate regions mean separate files and separate
+//! `write-bin` steps, and they also mean re-provisioning shades never risks the
+//! credentials and vice versa.
+//!
+//! ## Two images, always, and they are flashed together
+//!
+//! `shades.bin` is the table; `estate.bin` is the rooms, which room each shade
+//! is in, and the groups. **Both are written on every run**, including the
+//! interactive one, where the estate is empty.
+//!
+//! That is not a formality. A group's membership and a room assignment are
+//! stored as **rows of the shade table**, so an estate written beside a
+//! *different* table names the wrong shades — and a table replaced without its
+//! estate leaves the old one pointing at whatever now occupies those rows.
+//! Writing both from one import is what makes "these two files are the
+//! installation" true, and it is why `--estate` exists as a path rather than as
+//! an opt-in.
+//!
+//! What is still **not** here: the network and the broker. Wi-Fi credentials are
+//! never migrated — the operator re-enters them — and the broker settings are a
+//! third region and a different tool, `provision --from-backup`.
 //!
 //! ## Every value is read from standard input, and the two paths are two files
 //!
@@ -73,7 +93,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use somfy_config::{
-    Announced, ShadeError, ShadeRecord, StoredShade, SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
+    Announced, EstateRecord, ShadeError, ShadeRecord, StoredShade, ESTATE_RECORD_LEN,
+    SHADE_RECORD_LEN, SHADE_TABLE_CAPACITY,
 };
 use somfy_domain::{PairingState, RemoteIdentity, ShadeConfig, ShadeId, ShadeKind, TiltMode};
 use somfy_rts::RollingCode;
@@ -139,23 +160,36 @@ const TILT_MODES: [(&str, TiltMode); 5] = [
 /// What the two paths are, spelled the way a person types them.
 const USAGE: &str = "\
 usage:
-  provision_shades [OUT]                        answer the prompts, one shade at a time
-  provision_shades --from-backup FILE [OUT]     read them from an exported backup
+  provision_shades [OUT] [--estate EST]                    answer the prompts, one shade at a time
+  provision_shades --from-backup FILE [OUT] [--estate EST] read them from an exported backup
 
-OUT defaults to shades.bin. FILE is a backup exported from the controller being
-replaced; it carries real radio addresses and rolling codes, so treat it as a key.";
+OUT defaults to shades.bin and EST to estate.bin. TWO images are always written,
+one per flash region, and they must be flashed together: a group's membership and
+a room assignment are rows of the shade table, so an estate written beside a
+different table points at the wrong shades.
+
+FILE is a backup exported from the controller being replaced; it carries real
+radio addresses and rolling codes, so treat it as a key.";
 
 /// The extension a backup is exported with, and therefore the one thing the
 /// output must never be named. See [`Args::parse`].
 const BACKUP_EXTENSION: &str = "backup";
 
-/// Where the shades come from and where the image goes.
+/// Where the shades come from and where the images go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
     /// A backup to import, or `None` to ask.
     backup: Option<PathBuf>,
-    /// The flash image to write.
+    /// The shade-region image to write.
     out: PathBuf,
+    /// The estate-region image to write — rooms, room assignments and groups.
+    ///
+    /// Always written, including by the interactive path, where it is empty.
+    /// That is not a formality: this tool replaces a whole shade table, and an
+    /// estate left over from a previous import would still be naming rows by
+    /// position. Writing an empty one is what makes "these two files are the
+    /// installation" true.
+    estate: PathBuf,
 }
 
 /// What [`Args::parse`] decided: run, or print the usage and stop without it
@@ -198,9 +232,12 @@ impl Args {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
         const FLAG: &str = "--from-backup";
         const FLAG_EQ: &str = "--from-backup=";
+        const ESTATE: &str = "--estate";
+        const ESTATE_EQ: &str = "--estate=";
 
         let mut backup: Option<PathBuf> = None;
         let mut out: Option<PathBuf> = None;
+        let mut estate: Option<PathBuf> = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
@@ -217,6 +254,15 @@ impl Args {
                         .ok_or_else(|| format!("{FLAG} needs the path of a backup file"))?;
                     set_once(&mut backup, path.into(), FLAG)?;
                 }
+                Some(text) if text.starts_with(ESTATE_EQ) => {
+                    set_once(&mut estate, text[ESTATE_EQ.len()..].into(), ESTATE)?;
+                }
+                Some(ESTATE) => {
+                    let path = args
+                        .next()
+                        .ok_or_else(|| format!("{ESTATE} needs the path of an image to write"))?;
+                    set_once(&mut estate, path.into(), ESTATE)?;
+                }
                 Some(text) if text.starts_with('-') => {
                     return Err(format!("{text:?} is not an option this tool has"));
                 }
@@ -224,34 +270,55 @@ impl Args {
             }
         }
 
-        for (path, what) in [(backup.as_ref(), FLAG), (out.as_ref(), "the output file")] {
+        for (path, what) in [
+            (backup.as_ref(), FLAG),
+            (out.as_ref(), "the output file"),
+            (estate.as_ref(), ESTATE),
+        ] {
             if path.is_some_and(|path| path.as_os_str().is_empty()) {
                 return Err(format!("{what} was given an empty path"));
             }
         }
         let out = out.unwrap_or_else(|| PathBuf::from("shades.bin"));
+        let estate = estate.unwrap_or_else(|| PathBuf::from("estate.bin"));
 
-        if let Some(backup) = &backup {
-            if backup == &out {
+        if out == estate {
+            return Err(format!(
+                "{} is named as both images; they are two flash regions and the second write \
+                 would replace the first",
+                out.display(),
+            ));
+        }
+
+        // Both images are held to both rules the single one used to be: an
+        // image must not overwrite the backup it was read from, and must not be
+        // *named* like a backup, since `--from-backup *.backup` with two
+        // matches puts a real one in an output slot.
+        for image in [&out, &estate] {
+            if backup.as_ref() == Some(image) {
                 return Err(format!(
-                    "{} is both the backup to read and the image to write; the image would \
+                    "{} is both the backup to read and an image to write; the image would \
                      overwrite the backup, and a backup cannot be re-exported after the fact \
                      without the rolling codes having moved on",
-                    out.display(),
+                    image.display(),
                 ));
             }
-            if out.extension().is_some_and(|ext| ext == BACKUP_EXTENSION) {
+            if backup.is_some() && image.extension().is_some_and(|ext| ext == BACKUP_EXTENSION) {
                 return Err(format!(
-                    "the image would be written to {}, which is named like a backup. Refusing, \
+                    "an image would be written to {}, which is named like a backup. Refusing, \
                      because `--from-backup *.{BACKUP_EXTENSION}` with more than one match puts \
                      a real backup in the output slot — and that backup is the only copy of the \
                      rolling codes it holds",
-                    out.display(),
+                    image.display(),
                 ));
             }
         }
 
-        Ok(Parsed::Run(Args { backup, out }))
+        Ok(Parsed::Run(Args {
+            backup,
+            out,
+            estate,
+        }))
     }
 }
 
@@ -279,13 +346,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let record = match &args.backup {
+    let (record, estate) = match &args.backup {
         Some(path) => from_backup(path)?,
-        None => from_prompts()?,
+        None => (from_prompts()?, EstateRecord::empty(0)),
     };
 
     std::fs::write(&args.out, record.encode())?;
     eprintln!("\nwrote {SHADE_RECORD_LEN} bytes to {}", args.out.display());
+    std::fs::write(&args.estate, estate.encode())?;
+    eprintln!(
+        "wrote {ESTATE_RECORD_LEN} bytes to {} — {}",
+        args.estate.display(),
+        describe_estate(&estate),
+    );
     // The import path has already shown the table — it has to, because that is
     // what a confirmation is a confirmation *of*. Printing it twice would make
     // the copy above look like a different table from the one just written.
@@ -293,17 +366,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         describe(&record);
     }
     eprintln!(
+        "\nflash both, and together — the estate names shades by their row in the table:\n\
+         \x20 espflash erase-parts --partition-table crates/firmware/partitions.csv shades estate\n\
+         \x20 espflash write-bin 0x204000 {}\n\
+         \x20 espflash write-bin 0x208000 {}",
+        args.out.display(),
+        args.estate.display(),
+    );
+    eprintln!(
         "\nthe seed is applied only where the board's rolling-code store has nothing for \n\
          that address; an address it already knows keeps the code it has."
     );
     Ok(())
 }
 
-/// A shade table read out of an exported backup.
+/// One line saying what an estate image holds, for the write confirmation.
+fn describe_estate(estate: &EstateRecord) -> String {
+    if estate.is_empty() {
+        return "no rooms and no groups, which is what the prompts produce".to_string();
+    }
+    let assigned = estate.room_of.iter().flatten().count();
+    format!(
+        "{} room(s), {} shade(s) assigned to one, {} group(s)",
+        estate.rooms.len(),
+        assigned,
+        estate.groups.len(),
+    )
+}
+
+/// A shade table and the estate around it, read out of an exported backup.
 ///
 /// Nothing is written until this returns, which is what lets the misalignment
 /// case ask before it acts rather than apologise afterwards.
-fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
+fn from_backup(path: &Path) -> Result<(ShadeRecord, EstateRecord), Box<dyn std::error::Error>> {
     let shown = path.display();
     let bytes = std::fs::read(path)
         .inspect_err(|error| eprintln!("refusing to write: cannot read {shown}: {error}"))?;
@@ -317,22 +412,26 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         if imported.shades.len() == 1 { "" } else { "s" },
         imported.version,
     );
-    // Everything the backup carried that this region has no room for. Said
-    // plainly rather than left for someone to notice is missing.
-    for (count, what, because) in [
-        (imported.rooms, "room", "this region holds shades only"),
-        (imported.groups, "group", "this region holds shades only"),
-        (
-            imported.favourites,
-            "'my' favourite",
-            "there is no field to provision one into; the motors keep theirs, \
-             and this controller will not know it until you set it again",
-        ),
+    // What came across into the second image, and what still could not.
+    let assigned = imported.estate.room_of.iter().flatten().count();
+    for (count, one, many) in [
+        (imported.estate.rooms.len(), "room", "rooms"),
+        (assigned, "shade put in a room", "shades put in rooms"),
+        (imported.estate.groups.len(), "group", "groups"),
     ] {
         if count > 0 {
-            let plural = if count == 1 { "" } else { "s" };
-            eprintln!("  {count} {what}{plural} not written here — {because}.");
+            let what = if count == 1 { one } else { many };
+            eprintln!("  {count} {what} written to the estate image.");
         }
+    }
+    if imported.favourites > 0 {
+        let plural = if imported.favourites == 1 { "" } else { "s" };
+        eprintln!(
+            "  {} 'my' favourite{plural} not written — there is no field to provision one \
+             into; the motors keep theirs, and this controller will not know it until you \
+             set it again.",
+            imported.favourites,
+        );
     }
 
     // The half of a linked remote that *is* recoverable, and the half that is
@@ -356,6 +455,7 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         links: imported.links,
         shades: imported.shades,
     };
+    let estate = imported.estate;
     eprintln!();
     describe(&record);
 
@@ -370,8 +470,8 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
         );
         for warning in &imported.warnings {
             eprintln!(
-                "  !! ShadeId({}) '{}': {}",
-                warning.index, warning.name, warning.caveat,
+                "  !! {} '{}': {}",
+                warning.subject, warning.name, warning.caveat,
             );
         }
     }
@@ -379,7 +479,7 @@ fn from_backup(path: &Path) -> Result<ShadeRecord, Box<dyn std::error::Error>> {
     if let Some(records) = misaligned {
         confirm_misaligned(records)?;
     }
-    Ok(record)
+    Ok((record, estate))
 }
 
 /// Make the operator look at a table that may be subtly wrong, and say so.
@@ -718,6 +818,7 @@ mod tests {
         Ok(Parsed::Run(Args {
             backup: backup.map(PathBuf::from),
             out: PathBuf::from(out),
+            estate: PathBuf::from("estate.bin"),
         }))
     }
 
@@ -826,6 +927,7 @@ mod tests {
                 Parsed::Run(Args {
                     backup: Some(PathBuf::from("d.backup")),
                     out: PathBuf::from(odd),
+                    estate: PathBuf::from("estate.bin"),
                 })
             );
         }
