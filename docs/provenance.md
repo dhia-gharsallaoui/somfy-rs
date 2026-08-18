@@ -509,6 +509,80 @@ Recorded rather than left as absences, in the shape of the tilt entry below.
 | Damaged rolling-code slots | **A snapshot taken at boot, not a live figure.** The store belongs to the state task from the moment `main` hands it over, and re-surveying it from the broker session would cross the boundary that keeps a broker from being able to affect radio control — `crates/firmware/src/mqtt.rs`'s first structural claim. A slot damaged after boot is therefore reported at the next one. That is the same latency an operator reading the serial line has, and it is stated in `Diagnostics`' own docs rather than implied. **Revisit** when the state task publishes something on the delta channel that can carry it |
 | Peak heap use | The figure `heap::RADIO_HEAP_BYTES` is sized from. **The obligation Plan 5 carried since Task 2 is discharged** — the 46,660 bytes recorded there were taken with association *failing*, and the real worst peak under a live broker is 55,040, 8,380 higher; see "Hardware-verified values". Publishing it still matters, and the measurement is why: the peak is reached within a second of CONNACK and never moves again, and it varies by 4,216 bytes from boot to boot, so a serial cable catches one second of one sample where a graph catches the distribution |
 
+### The add-a-shade form — the ruling above, reversed, and the schemas it rests on
+
+**Asked for, explicitly, after the refusal above:** an add-a-shade *form* in Home
+Assistant, over MQTT discovery.
+
+**The refusal was right about a button and wrong about the alternative.** Its
+reasons 1, 3 and 4 stand and are honoured below. Reason 2 — "eight
+always-present entities, in no order, with nowhere to put the sentence that
+matters most" — rests on two assumptions that do not hold:
+
+- **"Always-present" was assumed, not required.** `announce_shade` /
+  `retire_shade` already add and remove entities at runtime, and the persisted
+  `announced` set already names what must be cleared. The form is announced when
+  a setup starts and retired when it ends, so an idle controller carries **one**
+  extra entity, not eight.
+- **"Nowhere to put the instructions" was measured against entity *names*.** A
+  `sensor`'s **state** string holds 255 characters
+  (`homeassistant/const.py:61`, `MAX_LENGTH_STATE_STATE`), which is enough for
+  the sentence that matters — *hold `PROG` on the shade's existing remote about
+  2 s until it jogs, then press Send pairing; you have roughly 2 minutes.*
+
+What does **not** change: a parameterless button can still only produce a
+generated name and the factory 10000/10000/7000 that made a 25 % command move a
+shade about 1 %. **The form exists to make those values chosen rather than
+defaulted**, and it is what reason 4 asked for.
+
+#### Home Assistant's `text`, `number` and `select` schemas, read rather than remembered
+
+Read from `home-assistant/core` on branch `dev` on **2026-08-18**. Line numbers
+are given because the task of checking them is otherwise unbounded, and the
+enclosing construct is named beside each one so a moved line is still findable —
+this is the documented exception to the "no line numbers" rule in *Format*
+above, which exists for the C++ reference and its prose-searchable names.
+
+| Fact | Where, in `homeassistant/` | What it means here |
+|---|---|---|
+| `MQTT_RW_SCHEMA` — `vol.Required(CONF_COMMAND_TOPIC)`, `vol.Optional(CONF_STATE_TOPIC)` | `components/mqtt/config.py:39-46` | `text`, `number` and `select` all extend it, so each **must** carry `command_topic` and *may* omit `state_topic`. They are controls first and readings second — the opposite way round from `cover` and `sensor` |
+| `MQTT_RO_SCHEMA` — `vol.Required(CONF_STATE_TOPIC)` | `components/mqtt/config.py:31-37` | `sensor` extends this instead, so the "Next step" sensor must carry a state topic and cannot be command-only |
+| `text`: `_PLATFORM_SCHEMA_BASE` | `components/mqtt/text.py:72-85` | `max` default 255 `cv.positive_int` (`:76`), `min` default 0 (`:77`), `mode` `vol.In([text, password])` default `text` (`:78-80`) |
+| `text`: `valid_text_size_configuration` | `components/mqtt/text.py:62-69` | Raises `vol.Invalid` unless `min <= max` **and** `max <= 255`. A `max` of 32 is legal; a `min` above it is not |
+| `text`: inbound state is length-checked | `components/mqtt/text.py:158` | Calls `check_state_too_long` |
+| `number`: `_PLATFORM_SCHEMA_BASE` | `components/mqtt/number.py:85-102` | `max` default 100.0 (`:91`), `min` default 0.0 (`:92`), `mode` `vol.Coerce(NumberMode)` default `auto` (`:93`), `step` default 1.0 with `vol.Range(min=1e-3)` (`:96-98`). **The defaults are 0–100**, so a travel time in milliseconds needs `min`/`max` stated or every value is refused |
+| `number`: `validate_config` | `components/mqtt/number.py:71-81` | Raises `vol.Invalid` when `min > max`; also silently rewrites `unit_of_measurement` when it is in `AMBIGUOUS_UNITS` |
+| `number`: outbound payload | `components/mqtt/number.py:225-236` | `int(value)` when the float is integral, the float otherwise. With no `command_template`, `10000` arrives as `"10000"` — but `"10000.0"` is reachable and must parse |
+| `number`: inbound out of range | `components/mqtt/number.py:189-199` | Logged at **ERROR** and dropped — the entity keeps its old value |
+| `number`: `payload_reset` default is the literal `"None"` | `components/mqtt/const.py:308` | A state payload of exactly `None` clears the value. Digits cannot collide with it |
+| `select`: `vol.Required(CONF_OPTIONS): cv.ensure_list` | `components/mqtt/select.py:57`, schema at `:53-60` | `options` is the one required key beyond `command_topic`. It is `ensure_list`, not "non-empty list" — an empty list validates and yields a select with nothing to pick |
+| `select`: outbound payload | `components/mqtt/select.py:162-166` | The option string **verbatim** |
+| `select`: inbound | `components/mqtt/select.py:124-136` | `"none"` case-insensitively clears the option; anything not in `options` is logged at **ERROR** and dropped |
+| `button`: `payload_press` default `"PRESS"` | `components/mqtt/const.py:307` | Matched rather than declared, exactly as `ButtonDiscovery` already does |
+| `entity_category` is validated once, for every platform | `components/mqtt/schemas.py:181` in `MQTT_ENTITY_COMMON_SCHEMA` (`:175-192`) | There is **no per-platform restriction**, so `entity_category: config` is as valid on a `sensor` as on a `button`. That is what lets the whole form — instructions included — land in one card on the device page |
+| `ENTITY_CATEGORIES_SCHEMA: Final = vol.Coerce(EntityCategory)` | `helpers/entity.py:212`, enum at `const.py:1024-1038` | A bare `vol.Coerce` over `config` \| `diagnostic`. **`null` raises**, so the key must be omitted rather than written as `null` — the same rule `configuration_url` already carries |
+| `configuration_url: cv.configuration_url` | `components/mqtt/schemas.py:150` in `MQTT_ENTITY_DEVICE_INFO_SCHEMA` (`:131-154`) | The row above cited the file; this is the line |
+| `MAX_LENGTH_STATE_STATE: Final = 255` | `const.py:61` | The instruction budget |
+| `check_state_too_long` | `components/mqtt/util.py:377-396` | Over-long state is logged at **WARNING** and the entity falls back to `unknown` — the message is lost, not truncated |
+| A `sensor` with `device_class` `None` goes through it | `components/mqtt/sensor.py:337-342` | The "Next step" sensor carries no `device_class`, so 255 is a hard budget for it and a compile-time assertion enforces it here |
+| Availability defaults are `online` / `offline` | `components/mqtt/const.py:297,301` | `somfy_mqtt::ONLINE` / `OFFLINE` already match, so neither is declared |
+
+**Two corrections to what this project believed.**
+
+1. **A rejected discovery payload is not discarded silently.**
+   `async_handle_schema_error` logs at **ERROR** with the topic and the whole
+   payload (`components/mqtt/entity.py:161-172`), and
+   `_handle_discovery_failure` then clears the discovery hash so no entity is
+   created (`:175-182`). The consequence — no entity — is as stated; the
+   *silence* is not. Anyone debugging a missing entity should read the HA log
+   before assuming nothing was said.
+2. **What *is* silent is an unrecognised key.** Every `DISCOVERY_SCHEMA` here is
+   built as `_PLATFORM_SCHEMA_BASE.extend({}, extra=vol.REMOVE_EXTRA)`
+   (`text.py:87-90`, `number.py:109-112`, `select.py:62`), so a misspelled or
+   unsupported key is **dropped without a word** and the entity appears missing
+   whatever that key carried. That is the failure mode to fear, and it is why
+   every key this crate emits appears in the table above.
+
 ### Deliberate deviation from R8 (tilt)
 
 **R8 requires tilt-capable shades to expose `tilt_command_topic` / `tilt_status_topic`. somfy-rs implements the mechanism but will publish them for no shade until the domain's tilt port lands.**

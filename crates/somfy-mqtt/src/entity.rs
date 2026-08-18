@@ -81,17 +81,32 @@ pub enum Component {
     Switch,
     /// The firmware update entity.
     Update,
+    /// A free-text field an operator types into.
+    ///
+    /// Added for the setup form — see [`crate::SetupEntity`]. Home Assistant
+    /// requires `command_topic` and treats `state_topic` as optional
+    /// (`homeassistant/components/mqtt/config.py:39-46`), so a text entity is
+    /// a control first and a reading second, which is the opposite way round
+    /// from every component above it.
+    Text,
+    /// A numeric field with a range and a step.
+    Number,
+    /// A field with a fixed list of options.
+    Select,
 }
 
 impl Component {
     /// Every component this crate can emit.
-    pub const ALL: [Component; 6] = [
+    pub const ALL: [Component; 9] = [
         Component::Cover,
         Component::Sensor,
         Component::BinarySensor,
         Component::Button,
         Component::Switch,
         Component::Update,
+        Component::Text,
+        Component::Number,
+        Component::Select,
     ];
 
     /// Bytes the longest component name occupies, for the capacity proofs.
@@ -106,6 +121,9 @@ impl Component {
             Component::Button => "button",
             Component::Switch => "switch",
             Component::Update => "update",
+            Component::Text => "text",
+            Component::Number => "number",
+            Component::Select => "select",
         }
     }
 }
@@ -841,7 +859,7 @@ impl DiagnosticDiscovery<'_> {
 /// Both halves are `[a-zA-Z0-9_-]` by construction — a validated `DeviceId` and
 /// an [`ObjectId`] built from literals — so the joined value is a legal
 /// entity-id suffix without any sanitising.
-fn write_object_id(
+pub(crate) fn write_object_id(
     out: &mut String<PAYLOAD_CAPACITY>,
     device_id: &str,
     object_id: &ObjectId,
@@ -876,7 +894,7 @@ fn write_object_id(
 /// chip is a compile-time constant and the version is `CARGO_PKG_VERSION` — and
 /// neither has a consumer until there is a firmware-update entity to compare
 /// against, which needs the OTA path Plan 6 brings.
-fn write_device_block(
+pub(crate) fn write_device_block(
     out: &mut String<PAYLOAD_CAPACITY>,
     device_id: &str,
     configuration_url: Option<&str>,
@@ -905,7 +923,7 @@ fn write_device_block(
     write(out, "}")
 }
 
-fn write(out: &mut String<PAYLOAD_CAPACITY>, text: &str) -> Result<(), PayloadError> {
+pub(crate) fn write(out: &mut String<PAYLOAD_CAPACITY>, text: &str) -> Result<(), PayloadError> {
     out.push_str(text).map_err(|_| PayloadError::TooLong)
 }
 
@@ -919,7 +937,7 @@ fn push(out: &mut String<PAYLOAD_CAPACITY>, ch: char) -> Result<(), PayloadError
 /// the whole payload unparseable, and Home Assistant discards a payload it
 /// cannot parse without logging anything an operator would find — the entity
 /// simply never appears.
-fn write_json_string(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
+pub(crate) fn write_json_string(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
     push(out, '"')?;
     write_json_escaped(out, value)?;
     push(out, '"')
@@ -927,7 +945,7 @@ fn write_json_string(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<
 
 /// The escaping half of [`write_json_string`], without the surrounding quotes,
 /// for the one place a JSON string is built from two pieces.
-fn write_json_escaped(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
+pub(crate) fn write_json_escaped(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
     for ch in value.chars() {
         match ch {
             '"' => write(out, "\\\"")?,
@@ -991,7 +1009,7 @@ const WORST_DEVICE_BLOCK_LEN: usize =
     + 1;
 
 /// The part of a payload every discovery config carries, at its widest.
-const WORST_COMMON_LEN: usize = 1
+pub(crate) const WORST_COMMON_LEN: usize = 1
     // "~":"<base>",  — the shade base is the longer of the two bases.
     + 6 + config::WORST_SHADE_BASE_LEN + 2
     // "availability_topic":"<topic>",
