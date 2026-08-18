@@ -871,7 +871,7 @@ const _: () = assert!(
 /// not the same as knowing. Watch `heap: session announced` on that board before
 /// trusting any of this.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 130_356;
+const DRAM_FOR_STACK_AND_HEAP: usize = 130_732;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
 const DRAM_FOR_STACK_AND_HEAP: usize = 124_968;
