@@ -1634,28 +1634,44 @@ impl Broker {
             }),
             Ask::Pair(id) => Rpc::Pair(id),
             Ask::Confirm(id) => Rpc::Edit(ShadeEdit::ConfirmPairing { id }),
-            Ask::Abandon(id) => Rpc::Edit(ShadeEdit::Remove { id }),
+            // `own.id()` and not an id from anywhere else: `somfy_mqtt::OwnShade`
+            // can only have come from this flow's own create step. See that
+            // type — it is the shape of the fault that deleted a confirmed
+            // shade, closed at the only place a `Remove` is issued.
+            Ask::Abandon(own) => Rpc::Edit(ShadeEdit::Remove { id: own.id() }),
             Ask::Amend(id) => Rpc::Edit(ShadeEdit::Reconfigure {
                 id,
                 patch: amend_request(&self.setup),
             }),
         };
-        match RPC.call(request).await {
-            Some(Reply::Created(id)) => Some(SetupInput::Created(id)),
+        // **Matched against the ask, not read on its own.** `Reply::Created`
+        // used to be accepted for any request, so a `Created` that belonged to
+        // somebody else — this seam is one `Signal` shared by every caller, and
+        // its own docs describe a window where a dropped caller's answer is
+        // left in the slot — would have been adopted by this flow as *its*
+        // shade. A later Discard then removes an id the form never made. That
+        // is the defect class behind a confirmed shade disappearing from a real
+        // estate, and a reply that does not belong to its request is now a
+        // reported refusal rather than a silent adoption.
+        match (ask, RPC.call(request).await) {
+            (Ask::Create, Some(Reply::Created(id))) => Some(SetupInput::Created(id)),
             // Only a confirmation ends the setup. The other three are done and
             // have nothing to say, so the form stays where it is.
-            Some(Reply::Done) => matches!(ask, Ask::Confirm(_)).then_some(SetupInput::Done),
-            Some(Reply::Refused(error)) => {
+            (Ask::Confirm(_), Some(Reply::Done)) => Some(SetupInput::Done),
+            (_, Some(Reply::Done)) => None,
+            (_, Some(Reply::Refused(error))) => {
                 esp_println::println!("mqtt: the setup form's {:?} was refused ({:?})", ask, error);
                 Some(SetupInput::Refused(refusal_message(error.code)))
             }
-            other => {
+            (_, other) => {
                 // The state task did not answer inside its timeout, or answered
-                // something this call cannot produce. Both are faults in this
-                // device rather than in the request, and both are reported —
-                // the alternative is a form that swallowed a press.
+                // something this request cannot produce. Both are faults in
+                // this device rather than in the request, and both are reported
+                // loudly — the alternative is a form that swallowed a press, or
+                // one that acted on somebody else's answer.
                 esp_println::println!(
-                    "mqtt: the setup form's {:?} went unanswered ({:?})",
+                    "mqtt: the setup form's {:?} got an answer that does not belong to it \
+                     ({:?}) — treating it as a refusal and touching nothing",
                     ask,
                     other
                 );

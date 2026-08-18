@@ -213,7 +213,8 @@ pub use entity::{
 };
 pub use error::{ConfigError, Field};
 pub use flow::{
-    Ask, Draft, Effect, FormChange, Setup, SetupInput, SetupPhase, SetupValue, PAYLOAD_PRESS,
+    Ask, Draft, Effect, FormChange, OwnShade, Setup, SetupInput, SetupPhase, SetupValue,
+    PAYLOAD_PRESS,
 };
 pub use ident::{
     DeviceId, NodeId, ObjectId, UniqueId, LONGEST_HA_COMPONENT_NAME, MAX_COMPONENT_HEADROOM,

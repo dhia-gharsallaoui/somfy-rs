@@ -722,13 +722,13 @@ fn discarding_after_creation_removes_the_shade_too() {
     setup.apply(SetupInput::Send);
     setup.apply(SetupInput::Created(ShadeId(5)));
 
-    assert_eq!(
-        setup.apply(SetupInput::Discard),
+    match setup.apply(SetupInput::Discard) {
         Effect {
             form: FormChange::Close,
-            ask: Some(Ask::Abandon(ShadeId(5))),
-        },
-    );
+            ask: Some(Ask::Abandon(own)),
+        } => assert_eq!(own.id(), ShadeId(5)),
+        other => panic!("a discard after a create must remove that shade, got {other:?}"),
+    }
     assert_eq!(setup.phase(), SetupPhase::Idle);
 }
 

@@ -659,7 +659,7 @@ const _: () = assert!(
 ///
 /// | chip | largest permitted set | DRAM |
 /// |---|---|---|
-/// | ESP32-S3 | `mqtt`, `ui`, `mdns`, `sntp` — everything | 130,372 |
+/// | ESP32-S3 | `mqtt`, `ui`, `mdns`, `sntp` — everything | 130,356 |
 /// | ESP32-C3 | `mqtt`, `ui` (and so `http`); `mdns` and `sntp` refused | 124,968 |
 ///
 /// The **ESP32 was dropped on 2026-08-18** and its row with it; see the module
@@ -871,7 +871,7 @@ const _: () = assert!(
 /// not the same as knowing. Watch `heap: session announced` on that board before
 /// trusting any of this.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 130_372;
+const DRAM_FOR_STACK_AND_HEAP: usize = 130_356;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
 const DRAM_FOR_STACK_AND_HEAP: usize = 124_968;
@@ -932,7 +932,7 @@ compile_error!(
 ///
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] | vs [`WIFI_PEAK_BYTES`] |
 /// |---|---|---|---|---|---|
-/// | ESP32-S3 | 130,372 | 62 KiB = 63,488 | 66,884 | 9,764 | +8,868 |
+/// | ESP32-S3 | 130,356 | 62 KiB = 63,488 | 66,868 | 9,748 | +8,868 |
 /// | ESP32-C3 | 124,968 | 57 KiB = 58,368 | 66,600 | 9,480 | **+3,748** |
 ///
 /// **Both rows moved again on 2026-08-18, and the ESP32-C3's margin is now
@@ -953,6 +953,19 @@ compile_error!(
 /// has already recorded once as "a coincidence with a good track record rather
 /// than a design". It is stated rather than papered over, and
 /// [`warn_if_tight`] says it at boot.
+///
+/// **A sixth re-measure, 2026-08-19, for 16 bytes.** The fix that made a removal
+/// unreachable except for a shade the setup form created — `somfy_mqtt::OwnShade`
+/// — cost the ESP32-S3 exactly 16 bytes of DRAM, so this row went 130,372 to
+/// 130,356. The heap does not move: the division still rounds to the same 62
+/// KiB, which is why the fixpoint held without a relink. It is recorded at that
+/// size because the alternative is a row that claims sixteen bytes it does not
+/// have, and this row has now gone stale five times by exactly that habit.
+///
+/// **This branch's figure is not `main`'s.** Two merges since — a restore fix
+/// and the release manifest — took `main` to 127,660, and a merge of this work
+/// must re-measure against that tree rather than reconcile two numbers on paper.
+/// Re-measure, never adjust.
 ///
 /// Nothing was cut to avoid that. The available levers are recorded below and
 /// on [`RADIO_HEAP_BYTES`] — `api::TCP_TX_BYTES` at 512 returns 2,048 bytes,
