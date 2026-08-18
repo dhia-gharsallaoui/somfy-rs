@@ -250,9 +250,15 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
         // Cannot fail: the vector's capacity is the loop's bound.
         let _ = tokens.push(token);
     }
+    // The settings screen's restart, which cannot be a `software_reset` inside a
+    // handler: the handler has not written its response yet, and resetting there
+    // would answer a successful save with a dropped connection — which looks
+    // exactly like a failed one.
+    let restarter = routes::restarter()?;
     for token in tokens {
         spawner.spawn(token);
     }
+    spawner.spawn(restarter);
 
     esp_println::println!(
         "api: serving the UI and /api/v1 on port {} — {} connections, at most {} websockets, \

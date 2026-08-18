@@ -2110,7 +2110,9 @@ version = "0.1.0"
 dependencies = [
  "heapless 0.8.0",
  "serde",
+ "somfy-config",
  "somfy-domain",
+ "somfy-mqtt",
 ]
 
 [[package]]

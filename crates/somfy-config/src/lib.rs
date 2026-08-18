@@ -81,6 +81,7 @@ mod credentials;
 mod mqtt;
 mod record;
 mod shade;
+mod trial;
 
 pub use catalog::{Catalog, CatalogError, Dropped, DEBOUNCE_MS, MAX_DEFER_MS};
 pub use credentials::{
@@ -95,4 +96,7 @@ pub use shade::{
     Announced, Layout, LinkedRemote, ShadeError, ShadeHeader, ShadeRecord, ShadeRecordError,
     StoredShade, TravelField, MAX_LINKED_REMOTES, MAX_LINKS, SHADE_RECORD_LEN,
     SHADE_TABLE_CAPACITY,
+};
+pub use trial::{
+    RevertReason, TrialOutcome, TrialPhase, WifiTrial, ASSOCIATE_DEADLINE_MS, CONFIRM_DEADLINE_MS,
 };

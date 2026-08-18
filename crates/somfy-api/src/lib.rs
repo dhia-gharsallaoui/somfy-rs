@@ -92,6 +92,7 @@ mod commands;
 mod entities;
 mod errors;
 mod events;
+mod settings;
 mod shades;
 
 pub use calibration::{CalibrationLegDto, CalibrationMarkDto, CalibrationStepDto};
@@ -100,6 +101,11 @@ pub use entities::{
     AddressOrigin, CalibrationSource, GroupDto, PairingState, RoomDto, ShadeDto,
     FACTORY_DOWN_TIME_MS, FACTORY_TILT_TIME_MS, FACTORY_UP_TIME_MS, SHADE_JSON_MAX_BYTES,
 };
-pub use errors::{ApiErrorCode, ApiErrorDto};
+pub use errors::{ApiErrorCode, ApiErrorDto, SettingsFieldDto};
 pub use events::{ShadeStateEvent, WsEvent};
+pub use settings::{
+    MqttSettingsDto, MqttUpdateDto, SecretDto, SettingsDto, TrialDecisionDto, TrialPhaseDto,
+    WifiSettingsDto, WifiTrialDto, WifiUpdateDto, MAX_ADDRESS_LEN, MAX_SECRET_LEN,
+    SETTINGS_JSON_MAX_BYTES,
+};
 pub use shades::{CreateShadeDto, PatchShadeDto, NAME_MAX_BYTES};

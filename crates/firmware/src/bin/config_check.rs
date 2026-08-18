@@ -93,7 +93,12 @@ fn entry() -> ! {
 
 fn check() -> Result<(), ConfigError> {
     let peripherals = esp_hal::init(esp_hal::Config::default());
-    let mut store = ConfigStore::mount(FlashStorage::new(peripherals.FLASH))?;
+    // The store holds no flash — the controller image has one owner for the
+    // peripheral and lends it per operation, and this binary uses the same API
+    // rather than a second one. Here there is nothing to share it with, so the
+    // owner is a local.
+    let mut flash = FlashStorage::new(peripherals.FLASH);
+    let store = ConfigStore::mount(&mut flash)?;
 
     let (base, slots, slot_len) = store.geometry();
     esp_println::println!(
@@ -106,7 +111,7 @@ fn check() -> Result<(), ConfigError> {
 
     // Printed before anything is written: the only chance to see what the
     // previous run, or the host-side provisioning tool, left behind.
-    let (found, survey) = store.load()?;
+    let (found, survey) = store.load(&mut flash)?;
     esp_println::println!(
         "config: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,
@@ -138,12 +143,12 @@ fn check() -> Result<(), ConfigError> {
         DEFAULT_STATE_ROOT,
     )
     .expect("the placeholder above is a valid setting");
-    store.store(Some(placeholder), Some(broker))?;
+    store.store(&mut flash, Some(placeholder), Some(broker))?;
     esp_println::println!("config: stored the placeholder credential and broker");
 
     // Re-read through a fresh scan rather than trusting `store`'s own
     // verification: this is what the next boot will see.
-    let (reloaded, survey) = store.load()?;
+    let (reloaded, survey) = store.load(&mut flash)?;
     esp_println::println!(
         "config: survey slots={} valid={} blank={} damaged={} newest_seq={:?}",
         survey.slots,

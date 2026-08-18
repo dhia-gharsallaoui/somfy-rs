@@ -80,7 +80,7 @@
 use core::cell::Cell;
 
 use embassy_executor::{SpawnError, Spawner};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either3};
 use embassy_net::{Config as NetConfig, Runner, Stack, StackResources};
 use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex};
 use embassy_time::{Duration, Instant, Timer};
@@ -267,18 +267,7 @@ pub fn start(
     // The task below never sees the credentials at all — it drives the
     // connection, not the configuration — which keeps the passphrase in one
     // place instead of inside a task's statically allocated future.
-    let station = StationConfig::default()
-        .with_ssid(credentials.ssid())
-        .with_password(alloc::string::String::from(credentials.psk()))
-        .with_auth_method(if credentials.is_open() {
-            AuthenticationMethod::None
-        } else {
-            // Not the strictest method the access point might offer: this is
-            // the *minimum* the station will accept, and raising it would
-            // refuse a WPA2 network that a WPA3 setting would have rejected
-            // outright. The driver negotiates upward from here.
-            AuthenticationMethod::Wpa2Personal
-        });
+    let station = station_config(credentials);
 
     // `ControllerConfig::default()`, taken whole and deliberately. Two of the
     // defaults it carries are worth naming, because both look wrong to a reader
@@ -344,12 +333,40 @@ pub fn start(
     let link = wifi_link(controller).map_err(NetError::Spawn)?;
     let stack_runner = net_stack(runner).map_err(NetError::Spawn)?;
     let watch = address_watch(stack).map_err(NetError::Spawn)?;
+    // The credential trial's clock. Gated on `http` because the settings screen
+    // is the only thing that can start a trial, and a build with no web server
+    // would be running a timer over a slot nothing can ever fill.
+    #[cfg(feature = "http")]
+    let trial = crate::trial::watch(stack).map_err(NetError::Spawn)?;
     spawner.spawn(link);
     spawner.spawn(stack_runner);
     spawner.spawn(watch);
+    #[cfg(feature = "http")]
+    spawner.spawn(trial);
 
     esp_println::println!("wifi: joining '{}'", credentials.ssid());
     Ok(stack)
+}
+
+/// What the driver needs to know about one network.
+///
+/// Factored out of [`start`] because a credential trial builds one too, and the
+/// two must be built the same way: a trial that negotiated authentication
+/// differently from the boot path would prove a credential under conditions the
+/// device would not reproduce after a restart.
+fn station_config(credentials: &WifiCredentials) -> StationConfig {
+    StationConfig::default()
+        .with_ssid(credentials.ssid())
+        .with_password(alloc::string::String::from(credentials.psk()))
+        .with_auth_method(if credentials.is_open() {
+            AuthenticationMethod::None
+        } else {
+            // Not the strictest method the access point might offer: this is
+            // the *minimum* the station will accept, and raising it would
+            // refuse a WPA2 network that a WPA3 setting would have rejected
+            // outright. The driver negotiates upward from here.
+            AuthenticationMethod::Wpa2Personal
+        })
 }
 
 /// Keep the station associated, with bounded backoff.
@@ -373,12 +390,38 @@ pub fn start(
 ///
 /// It holds the [`WifiController`] for the whole life of the program on
 /// purpose: dropping it deinitialises Wi-Fi.
+///
+/// ## Why the candidate is applied here and nowhere else
+///
+/// [`WifiController::set_config`] needs `&mut`, and this task holds the only
+/// controller there is. So a credential trial cannot apply itself; it leaves a
+/// candidate in `crate::trial`'s slot and raises a signal, and this loop picks
+/// it up at the top of its next pass. The signal is what makes "next pass"
+/// prompt: without it a candidate requested during a sixty-second backoff would
+/// sit unapplied until that wait ran out, and the trial's own deadline would
+/// have started counting against a radio that had not moved.
 #[embassy_executor::task]
 async fn wifi_link(mut controller: WifiController<'static>) -> ! {
     let mut backoff = Backoff::new(RETRY_MIN_MS, RETRY_MAX_MS);
     let mut consecutive = 0u32;
     let mut previous_delay = 0u32;
     loop {
+        if let Some(candidate) = crate::trial::take_requested() {
+            // **Before touching the radio**, so the `202` that started this has
+            // left the socket the candidate is about to take down. See
+            // `crate::trial`'s settle constant for why that is a socket
+            // question rather than a radio one.
+            Timer::after(crate::trial::settle()).await;
+            apply_candidate(&mut controller, candidate).await;
+            // Straight back to the top: `connect_async` below is what joins the
+            // candidate network, and the backoff is reset so the first attempt
+            // on a new network is immediate rather than inheriting whatever
+            // delay the previous one had reached.
+            backoff.succeed();
+            consecutive = 0;
+            previous_delay = 0;
+        }
+
         match controller.connect_async().await {
             Ok(info) => {
                 // Sampled here rather than only in the loop below, so the first
@@ -444,8 +487,52 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
             esp_println::println!("wifi: retrying in {} ms", waiting);
         }
         previous_delay = waiting;
-        Timer::after(Duration::from_millis(waiting as u64)).await;
+        // **`select`, not a bare `Timer`.** The wait itself is unchanged and
+        // still unavoidable — see the note above on why it is outside the match
+        // — but a candidate arriving during it must not have to sit out up to
+        // `RETRY_MAX_MS` first. Losing the remainder of a backoff to apply a
+        // candidate is exactly right: the network being backed off from is the
+        // one the operator is replacing.
+        let _ = select(
+            Timer::after(Duration::from_millis(waiting as u64)),
+            crate::trial::requested(),
+        )
+        .await;
     }
+}
+
+/// Put a candidate credential on the radio.
+///
+/// Nothing here writes flash and nothing here can: what makes a trial safe is
+/// that the stored credential is untouched until somebody has come back through
+/// the candidate and said so. See `crate::trial`.
+///
+/// A driver that refuses the configuration is reported and the trial dropped
+/// rather than started — the radio is still on the previous network and
+/// working, so running a deadline against it would revert a device that had
+/// nothing wrong with it.
+async fn apply_candidate(controller: &mut WifiController<'static>, candidate: WifiCredentials) {
+    esp_println::println!(
+        "wifi: trying '{}' — the stored credential is untouched and comes back \
+         unless somebody confirms from the new network",
+        candidate.ssid(),
+    );
+    if let Err(error) = controller.set_config(&WifiConfig::Station(station_config(&candidate))) {
+        esp_println::println!(
+            "wifi: the driver refused the candidate configuration ({:?}) — staying on \
+             the stored credential",
+            error,
+        );
+        crate::trial::not_applied();
+        return;
+    }
+    // The old association has to go before the new one can be made. An error
+    // here is the ordinary "there was nothing to disconnect" case, which is
+    // what a board whose network was already down looks like.
+    let _ = controller.disconnect_async().await;
+    // The last sample belonged to the previous network.
+    record_signal(None);
+    crate::trial::applied(candidate, Instant::now().as_millis());
 }
 
 /// Wait out one association, sampling the signal strength as it goes.
@@ -484,18 +571,29 @@ async fn wifi_link(mut controller: WifiController<'static>) -> ! {
 /// `connect_async` holds one and never overlaps with this function, and this
 /// holds at most one. The margin is exactly one slot, so a second concurrent
 /// waiter added to this task would be the thing that spends it.
+///
+/// ## The third arm, and why it does not spend the last subscriber slot
+///
+/// A candidate credential arriving while the link is up has to be applied, and
+/// applying it needs the caller's `&mut`. So this returns instead — with
+/// `NotConnected`, which the caller already treats as a lost link and which is
+/// about to be true. `crate::trial::requested` waits on a `Signal`, not on
+/// `esp-radio`'s event channel, so it costs no subscriber slot at all and the
+/// margin of exactly one above is untouched.
 async fn hold_link(
     controller: &WifiController<'static>,
 ) -> Result<esp_radio::wifi::DisconnectedStationInfo, WifiError> {
     loop {
-        match select(
+        match select3(
             controller.wait_for_disconnect_async(),
             Timer::after(Duration::from_secs(RSSI_POLL_S)),
+            crate::trial::requested(),
         )
         .await
         {
-            Either::First(outcome) => return outcome,
-            Either::Second(()) => sample_signal(controller),
+            Either3::First(outcome) => return outcome,
+            Either3::Second(()) => sample_signal(controller),
+            Either3::Third(()) => return Err(WifiError::NotConnected),
         }
     }
 }

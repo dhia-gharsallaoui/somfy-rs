@@ -29,7 +29,27 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::InvalidDeadBand
         | ApiErrorCode::VentBandNotMeasured
         | ApiErrorCode::NotCalibrating
-        | ApiErrorCode::CalibrationImplausible => true,
+        | ApiErrorCode::CalibrationImplausible
+        | ApiErrorCode::CommandNotAtThisWidth
+        | ApiErrorCode::ValueEmpty
+        | ApiErrorCode::ValueTooLong
+        | ApiErrorCode::ValueTooShort
+        | ApiErrorCode::ValueInteriorNul
+        | ApiErrorCode::BrokerAddressMalformed
+        | ApiErrorCode::BrokerAddressUnroutable
+        | ApiErrorCode::BrokerPortZero
+        | ApiErrorCode::PasswordWithoutUsername
+        | ApiErrorCode::TopicWildcard
+        | ApiErrorCode::TopicLeadingSlash
+        | ApiErrorCode::TopicTrailingSlash
+        | ApiErrorCode::TopicEmptySegment
+        | ApiErrorCode::TopicIllegalCharacter
+        | ApiErrorCode::NamespacesOverlap
+        | ApiErrorCode::SecretNotSet
+        | ApiErrorCode::NoTrialInProgress
+        | ApiErrorCode::TrialInProgress
+        | ApiErrorCode::TrialNotAssociated
+        | ApiErrorCode::SettingsUnwritable => true,
     }
 }
 
@@ -59,6 +79,46 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
         "calibrationImplausible",
         400,
     ),
+    (
+        ApiErrorCode::CommandNotAtThisWidth,
+        "commandNotAtThisWidth",
+        409,
+    ),
+    (ApiErrorCode::ValueEmpty, "valueEmpty", 400),
+    (ApiErrorCode::ValueTooLong, "valueTooLong", 400),
+    (ApiErrorCode::ValueTooShort, "valueTooShort", 400),
+    (ApiErrorCode::ValueInteriorNul, "valueInteriorNul", 400),
+    (
+        ApiErrorCode::BrokerAddressMalformed,
+        "brokerAddressMalformed",
+        400,
+    ),
+    (
+        ApiErrorCode::BrokerAddressUnroutable,
+        "brokerAddressUnroutable",
+        400,
+    ),
+    (ApiErrorCode::BrokerPortZero, "brokerPortZero", 400),
+    (
+        ApiErrorCode::PasswordWithoutUsername,
+        "passwordWithoutUsername",
+        400,
+    ),
+    (ApiErrorCode::TopicWildcard, "topicWildcard", 400),
+    (ApiErrorCode::TopicLeadingSlash, "topicLeadingSlash", 400),
+    (ApiErrorCode::TopicTrailingSlash, "topicTrailingSlash", 400),
+    (ApiErrorCode::TopicEmptySegment, "topicEmptySegment", 400),
+    (
+        ApiErrorCode::TopicIllegalCharacter,
+        "topicIllegalCharacter",
+        400,
+    ),
+    (ApiErrorCode::NamespacesOverlap, "namespacesOverlap", 400),
+    (ApiErrorCode::SecretNotSet, "secretNotSet", 400),
+    (ApiErrorCode::NoTrialInProgress, "noTrialInProgress", 409),
+    (ApiErrorCode::TrialInProgress, "trialInProgress", 409),
+    (ApiErrorCode::TrialNotAssociated, "trialNotAssociated", 409),
+    (ApiErrorCode::SettingsUnwritable, "settingsUnwritable", 500),
 ];
 
 #[test]

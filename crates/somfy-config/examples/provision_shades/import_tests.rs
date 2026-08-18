@@ -35,7 +35,7 @@ fn migrated(name: &str, address: u32) -> MigratedShade {
         // The width and protocol this controller speaks, so no test warns
         // about them by accident and the ones that do say so on their own
         // lines.
-        bit_length: TRANSMITTED_BIT_LENGTH,
+        bit_length: 56,
         proto_raw: TRANSMITTED_PROTOCOL,
     }
 }
@@ -172,7 +172,9 @@ fn a_shade_needing_every_caveat_is_warned_about_for_each() {
     let mut shade = migrated("Gate", 0x00_1001);
     shade.kind_raw = 0x0B;
     shade.tilt_mode_raw = 0xFF;
-    shade.bit_length = 80;
+    // **Not 80.** Eighty is a width this controller transmits at now, so it
+    // draws no caveat; the caveat is for a bit length that is not a width.
+    shade.bit_length = 42;
     shade.proto_raw = 0x09;
 
     let import = import(&data(&[shade])).expect("the shade is imported");
@@ -185,22 +187,48 @@ fn a_shade_needing_every_caveat_is_warned_about_for_each() {
         vec![
             Caveat::Kind(0x0B),
             Caveat::TiltMode(0xFF),
-            Caveat::FrameWidth(80),
+            Caveat::FrameWidth(42),
             Caveat::Protocol(0x09),
         ],
     );
 }
 
-// -- the width there is no field for -------------------------------------
+// -- the width, which the device now honours per shade --------------------
 
-/// A shade the old controller drove at 80 bits imports looking healthy and
-/// will not move: this controller transmits one width for the whole
-/// installation and `ShadeConfig` has no field to record another. Silence
-/// here is a shade that ignores every command with nothing to say why.
+/// **This is the test that changed when the transmitter learnt about width.**
+///
+/// It used to assert the opposite: that a shade paired at 80 bits imports with
+/// a caveat, because the controller transmitted one width for the whole
+/// installation and would not reach it. `PlannedTx` carries the width now, so
+/// an 80-bit shade is one this firmware drives — and a caveat that fired here
+/// would be a warning about nothing, which is worse than no warning at all
+/// because it teaches an operator to ignore the list.
 #[test]
-fn a_shade_paired_at_another_frame_width_is_warned_about() {
+fn either_of_the_protocols_two_widths_imports_without_a_caveat() {
+    for bits in [56, 80] {
+        let mut shade = migrated("Awning", 0x00_1001);
+        shade.bit_length = bits;
+        let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
+        assert!(
+            import.warnings.is_empty(),
+            "{bits}-bit drew a caveat: {:?}",
+            import.warnings,
+        );
+        assert_eq!(
+            import.shades[0].config.frame_width,
+            FrameWidth::from_raw(bits).expect("a real width"),
+            "the width was not carried into the record",
+        );
+    }
+}
+
+/// A bit length that is not a width at all is still a caveat, and now it is the
+/// only width caveat there is: nothing can be stored faithfully, so the shade
+/// falls back to `ShadeConfig::new`'s default.
+#[test]
+fn a_bit_length_that_is_not_a_frame_width_is_warned_about() {
     let mut shade = migrated("Awning", 0x00_1001);
-    shade.bit_length = 80;
+    shade.bit_length = 42;
 
     let import = import(&data(&[shade])).expect("the shade is imported, not dropped");
     assert_eq!(
@@ -208,16 +236,10 @@ fn a_shade_paired_at_another_frame_width_is_warned_about() {
         vec![Warning {
             index: 0,
             name: "Awning".to_string(),
-            caveat: Caveat::FrameWidth(80),
+            caveat: Caveat::FrameWidth(42),
         }]
     );
-}
-
-#[test]
-fn the_width_this_controller_sends_is_not_warned_about() {
-    let mut shade = migrated("Kitchen", 0x00_1001);
-    shade.bit_length = TRANSMITTED_BIT_LENGTH;
-    assert!(import(&data(&[shade])).expect("valid").warnings.is_empty());
+    assert_eq!(import.shades[0].config.frame_width, FrameWidth::Bits56);
 }
 
 /// And the same for the protocol: `somfy-rts` encodes one, `ShadeConfig` has
@@ -659,7 +681,7 @@ fn shade_fields(name: &str, address: u32, last_code: u16) -> Vec<String> {
         name.to_string(),                         // name
         (TiltMode::Integrated as u8).to_string(), // tiltType
         TRANSMITTED_PROTOCOL.to_string(),         // proto
-        TRANSMITTED_BIT_LENGTH.to_string(),       // bitLength
+        "56".to_string(),                         // bitLength
         "30000".to_string(),                      // upTime
         "29000".to_string(),                      // downTime
         "5000".to_string(),                       // tiltTime
@@ -990,22 +1012,28 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
         match warning.caveat {
             Caveat::Kind(_) => assert_eq!(config.kind, ShadeKind::Roller),
             Caveat::TiltMode(_) => assert_eq!(config.tilt_mode, TiltMode::None),
-            // Nothing to check in the config: the whole point of these two is
-            // that there is no field either could have gone into. What is
-            // checked instead is that they did not fire at all — see below.
-            Caveat::FrameWidth(bits) => assert_ne!(bits, TRANSMITTED_BIT_LENGTH),
+            // A width caveat means the byte was not a width at all, so the
+            // record carries the constructor's default.
+            Caveat::FrameWidth(bits) => {
+                assert!(FrameWidth::from_raw(bits).is_none());
+                assert_eq!(config.frame_width, FrameWidth::Bits56);
+            }
+            // Nothing to check in the config for this one: there is no field it
+            // could have gone into. What is checked instead is that it did not
+            // fire at all — see below.
             Caveat::Protocol(raw) => assert_ne!(raw, TRANSMITTED_PROTOCOL),
         }
     }
 
-    // [`TRANSMITTED_BIT_LENGTH`] and [`TRANSMITTED_PROTOCOL`] are *derived*
-    // constants — the second from the value the reader substitutes when a
-    // record has no protocol field at all — and this is the only place they
-    // meet real data. A shade on a working installation of the kind this
-    // firmware replaces is drivable by it, so neither caveat should fire. If
-    // one does, either a genuinely mixed installation is being imported (and
-    // those shades really will not move) or the derivation is wrong; both are
-    // worth stopping for. Indices only, as everywhere here.
+    // [`TRANSMITTED_PROTOCOL`] is a *derived* constant — the value the reader
+    // substitutes when a record has no protocol field at all — and this is the
+    // only place it meets real data. A shade on a working installation of the
+    // kind this firmware replaces is drivable by it, so the protocol caveat
+    // should not fire. If it does, either a genuinely mixed installation is
+    // being imported (and those shades really will not move) or the derivation
+    // is wrong; both are worth stopping for. The width caveat is checked with
+    // it, because a real backup should carry real widths. Indices only, as
+    // everywhere here.
     let undrivable: Vec<usize> = import
         .warnings
         .iter()
@@ -1015,7 +1043,7 @@ fn a_real_backup_imports_to_the_shape_the_parser_reports() {
     assert!(
         undrivable.is_empty(),
         "shades {undrivable:?} imported as undrivable — either this installation is mixed, \
-         or TRANSMITTED_BIT_LENGTH / TRANSMITTED_PROTOCOL is derived wrong"
+         carries a bit length that is not a frame width, or TRANSMITTED_PROTOCOL is derived wrong"
     );
 
     // And the table is one the device will load: the record's own decode is

@@ -16,9 +16,13 @@ import type { CalibrationStepDto } from './generated/CalibrationStepDto';
 import type { CommandDto } from './generated/CommandDto';
 import type { CreateShadeDto } from './generated/CreateShadeDto';
 import type { GroupDto } from './generated/GroupDto';
+import type { MqttUpdateDto } from './generated/MqttUpdateDto';
 import type { PatchShadeDto } from './generated/PatchShadeDto';
 import type { RoomDto } from './generated/RoomDto';
+import type { SettingsDto } from './generated/SettingsDto';
+import type { TrialDecisionDto } from './generated/TrialDecisionDto';
 import type { ShadeDto } from './generated/ShadeDto';
+import type { WifiUpdateDto } from './generated/WifiUpdateDto';
 
 export const API_BASE = '/api/v1';
 
@@ -186,4 +190,93 @@ export interface Snapshot {
 export async function loadSnapshot(): Promise<Snapshot> {
   const [shades, groups, rooms] = await Promise.all([listShades(), listGroups(), listRooms()]);
   return { shades, groups, rooms };
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+//
+// **Nothing here can read a secret back.** `SettingsDto` has no field a
+// passphrase or a broker password could arrive in — see
+// `crates/somfy-api/src/settings.rs` — so a screen that wanted to prefill one
+// could not, and this client does not have to be trusted not to.
+// ---------------------------------------------------------------------------
+
+/**
+ * What the device is provisioned with, plus whatever credential trial is live.
+ *
+ * One request rather than three, because the three are read together on every
+ * visit and polled together while a trial runs.
+ */
+export const getSettings = (): Promise<SettingsDto> => getJson('/settings');
+
+/**
+ * Try a candidate Wi-Fi credential.
+ *
+ * **This does not save anything.** The device puts the candidate on the radio,
+ * leaves the network this request arrived over, and puts the *stored*
+ * credential back unless somebody reaches it on the new network and calls
+ * {@link confirmWifi}. So the promise resolving means a trial has started, not
+ * that the network has changed — and the very next thing that happens is this
+ * page losing its connection, which is expected rather than an error.
+ *
+ * The candidate is validated before the radio is touched, so a rejection here
+ * costs no connection at all.
+ */
+export const startWifiTrial = (body: WifiUpdateDto): Promise<void> =>
+  sendNoBody('PUT', '/settings/wifi', body);
+
+/**
+ * Keep the network being tried. Reached **from the new network** — that is the
+ * whole point of it.
+ */
+export const confirmWifi = (): Promise<void> => settleWifiTrial({ decision: 'confirm' });
+
+/**
+ * Give up on the network being tried and go back to the stored one now, rather
+ * than waiting out the deadline.
+ *
+ * The device restarts to do it, so this response is the last thing this
+ * connection will carry.
+ */
+export const cancelWifiTrial = (): Promise<void> => settleWifiTrial({ decision: 'cancel' });
+
+/**
+ * Both endings share one endpoint, with the decision in the body.
+ *
+ * Not an arbitrary shape: on this device a route costs statically-allocated
+ * DRAM in every one of the web server's connection tasks, paid for out of the
+ * Wi-Fi driver's heap. `somfy_api::TrialDecisionDto` carries the measurement.
+ */
+const settleWifiTrial = (body: TrialDecisionDto): Promise<void> =>
+  sendNoBody('POST', '/settings/wifi/trial', body);
+
+/**
+ * Store broker settings. **The device restarts.**
+ *
+ * The restart is not an implementation detail to hide: it is what makes the
+ * retained discovery configs published under the *previous* namespaces get
+ * deleted before the new ones go out (spec R5). The device recovers the old
+ * namespaces by re-scanning its configuration ring at boot, which is the only
+ * place they still exist.
+ */
+export const saveMqtt = (body: MqttUpdateDto): Promise<void> =>
+  sendNoBody('PUT', '/settings/mqtt', body);
+
+/**
+ * Run without a broker. **The device restarts**, for the reason above.
+ *
+ * A device with no broker still receives, decodes and tracks; it publishes
+ * nothing. That is a configuration an operator can mean, which is why it is a
+ * `DELETE` on the resource rather than a save of something empty.
+ */
+export const clearMqtt = (): Promise<void> =>
+  request('/settings/mqtt', { method: 'DELETE' }).then(() => undefined);
+
+/** A JSON body sent to an endpoint that answers with no body. */
+async function sendNoBody(method: string, path: string, body: unknown): Promise<void> {
+  await request(path, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
