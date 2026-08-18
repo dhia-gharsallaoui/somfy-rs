@@ -79,23 +79,29 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::{Duration, Instant, Ticker, Timer};
+use heapless::Deque;
 use heapless::{String, Vec};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Publication, QoS, RetainHandling, Session,
     SubscriptionOptions, TopicFilter, Will,
 };
+use somfy_api::{ApiErrorCode, CreateShadeDto, PatchShadeDto};
 use somfy_config::{MqttSettings, Namespaces};
-use somfy_domain::{Direction, Pos, ShadeCommand, ShadeId, StateDelta, MAX_SHADES};
+use somfy_domain::{
+    Direction, Pos, ShadeCommand, ShadeId, StateDelta, TiltMode, FACTORY_TILT_TIME_MS, MAX_SHADES,
+};
 use somfy_mqtt::{
-    reconfigure, Component, ConfigError, ConfigurationUrl, DeviceEntity, DeviceId, DiscoveryPrefix,
-    MqttConfig, NodeId, Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step,
-    PAYLOAD_CAPACITY,
+    reconfigure, Ask, Component, ConfigError, ConfigurationUrl, DeviceEntity, DeviceId,
+    DiscoveryPrefix, Effect, FormChange, MqttConfig, NodeId, Pairing, Payload, PublishedTopic,
+    Retention, Setup, SetupEntity, SetupInput, SetupMessage, SetupValue, ShadeTopic, StateRoot,
+    Step, MAX_DRAFT_NAME_LEN, MAX_KIND_LABEL_LEN, PAYLOAD_CAPACITY,
 };
 use somfy_tasks::{Backoff, ControlCommand};
 
 use crate::config::MAX_SUPERSEDED;
-use crate::edits::{AckSender, EventReceiver, ShadeAck, ShadeEvent};
+use crate::edits::{AckSender, EventReceiver, ShadeAck, ShadeEdit, ShadeEvent};
 use crate::inventory::Inventory;
+use crate::rpc::{Reply, Request as Rpc, RPC};
 use crate::store::Survey;
 use crate::tasks::{CommandSender, DeltaSubscriber};
 
@@ -273,6 +279,33 @@ pub struct Broker {
     /// Where "the entities are on/off the broker" goes back to the state task,
     /// which is what persists it. See `crate::edits`.
     acks: AckSender,
+    /// The add-a-shade form's state: which phase, what has been typed, what
+    /// `Next step` says. Pure, and it holds no behaviour — see
+    /// `somfy_mqtt::Setup`.
+    setup: Setup,
+    /// Effects produced by an inbound message and not yet carried out.
+    ///
+    /// **A queue rather than an immediate action**, because a press arrives
+    /// while `minimq` holds the connection borrowed for the inbound packet, and
+    /// because one can arrive in the middle of an announcement. Applying the
+    /// flow is pure, so it happens the moment the message is decoded; only the
+    /// *publishing* waits, and it waits at most until the session loop comes
+    /// round.
+    effects: Deque<Effect, EFFECT_QUEUE_DEPTH>,
+    /// Whether the broker may be holding a form this device does not know it
+    /// left there.
+    ///
+    /// **True at boot**, because a device that was power-cut mid-setup left
+    /// eight retained discovery configs and their values behind, and nothing in
+    /// RAM remembers them. The first fresh session clears the form
+    /// unconditionally and sets this false; every later session in the same
+    /// boot knows what it published and clears nothing it need not.
+    ///
+    /// The alternative was persisting a "setup running" bit beside the shade
+    /// table, which is a flash write per press of `Add shade` for something a
+    /// reboot deliberately abandons. Thirteen tombstones once per boot is the
+    /// cheaper honesty.
+    form_dirty: bool,
 }
 
 /// Steps one shade's retirement costs: a discovery config per member of
@@ -288,6 +321,129 @@ const RETIRE_STEPS: usize = 10;
 /// Steps one shade's announcement costs: a discovery config per component it
 /// owns, plus one subscription per command topic.
 const ANNOUNCE_STEPS: usize = 10;
+
+/// Steps the add-a-shade form's announcement or retirement costs.
+///
+/// Eight discovery configs to open it and thirteen tombstones to close it —
+/// eight configs and the five values behind them. Sixteen covers the wider of
+/// the two with room, and the assertion below is the check rather than the
+/// constant.
+const FORM_STEPS: usize = 16;
+
+/// Effects waiting to be carried out.
+///
+/// Four, and the argument is the same one `crate::edits::EDIT_QUEUE_DEPTH`
+/// makes: an effect is a person pressing a button, and a queue deeper than the
+/// number of buttons a person can press while one announcement finishes buys
+/// nothing. An overflow is reported rather than dropped silently.
+const EFFECT_QUEUE_DEPTH: usize = 4;
+
+/// Bytes one form value may occupy, excluding the instructions.
+///
+/// A name is the longest — the same 32 a shade record holds — and a kind label
+/// and a rendered millisecond count are both shorter. The instructions are
+/// **not** here: they are a `&'static str` on `SetupMessage`, so they are
+/// published without a copy and their 255 bytes never reach a stack frame.
+const FORM_VALUE_BYTES: usize = MAX_DRAFT_NAME_LEN;
+
+const _: () = assert!(
+    FORM_VALUE_BYTES >= MAX_KIND_LABEL_LEN,
+    "a shade-kind label no longer fits the form-value buffer",
+);
+
+/// Which of the form's two plans [`Broker::walk_form`] is walking.
+///
+/// An enum rather than a `bool`, for the reason `somfy_mqtt::Retention` is not
+/// one: at a call site `true` says nothing about which way round it is, and
+/// getting it backwards would clear a form that was meant to appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// Publish the eight discovery configs, then the values behind them.
+    Open,
+    /// Clear the configs and the values, and publish nothing afterwards.
+    Close,
+    /// Republish the values alone, the form itself being unchanged.
+    Values,
+}
+
+/// How many times one queued effect may lead to another.
+///
+/// The longest real chain is two — `Send pairing` creates a shade, and the
+/// created id is what the pairing burst is addressed to. A bound rather than
+/// recursion, because a flow that answered its own ask would otherwise spin
+/// inside a broker session with the connection held.
+const MAX_EFFECT_CHAIN: usize = 4;
+
+/// The nearest thing the form can say about a refusal from the shade table.
+///
+/// Deliberately coarse. The form has one sensor and 255 characters, and the
+/// codes that reach here are either already prevented by
+/// `somfy_mqtt::Draft::blocker` — an empty name, a zero travel time — or are
+/// facts about the device rather than about the request. `RegistryFull` is
+/// singled out because it is the one an operator can act on without a serial
+/// cable, and the rest name the two surfaces that do carry the detail.
+fn refusal_message(code: ApiErrorCode) -> SetupMessage {
+    match code {
+        ApiErrorCode::RegistryFull => SetupMessage::RegistryFull,
+        ApiErrorCode::NameTooLong | ApiErrorCode::NameEmpty => SetupMessage::NeedsName,
+        ApiErrorCode::TravelTimeZero => SetupMessage::NeedsTimes,
+        _ => SetupMessage::Refused,
+    }
+}
+
+/// The draft, as the request `POST /api/v1/shades` would carry.
+///
+/// **The same DTO and therefore the same validator.** `CreateShadeDto::to_config`
+/// is where every rule about what a shade may be lives, and it runs at the
+/// allocated address inside `tasks::apply_edit` — so a form that got past
+/// `Draft::blocker` and should not have is still refused there, by the code the
+/// web surface is refused by.
+///
+/// `tilt_time_ms` is the factory figure because the form has no tilt field to
+/// carry one, and `somfy_api::supplied_source` marks a value equal to the
+/// factory default as `FactoryDefault` — which is the honest record: nobody
+/// supplied it. `tilt_mode` is `None` for the reason `HAS_TILT` is false; see
+/// that constant.
+fn create_request(setup: &Setup) -> CreateShadeDto {
+    let draft = setup.draft();
+    // Capacity comes from the field's own type, so this cannot drift from
+    // `somfy-api`'s inbound name budget.
+    let mut name = heapless::String::new();
+    // All-or-nothing in `heapless`, and it cannot fail: `Draft` holds at most
+    // `MAX_DRAFT_NAME_LEN` bytes and the DTO's inbox is wider. An empty name
+    // reaches `checked_name`, which refuses it.
+    let _ = name.push_str(draft.name());
+    CreateShadeDto {
+        name,
+        kind: draft.kind() as u8,
+        tilt_mode: TiltMode::None as u8,
+        // Unreachable while `Draft::blocker` gates the create — both are set —
+        // and zero rather than a guess if it ever is not, because
+        // `checked_lift_times` refuses zero and a guessed travel time is the
+        // fault this form exists to prevent.
+        up_time_ms: draft.up_ms().unwrap_or(0),
+        down_time_ms: draft.down_ms().unwrap_or(0),
+        tilt_time_ms: FACTORY_TILT_TIME_MS,
+    }
+}
+
+/// The draft, as the request `PATCH /api/v1/shades/{id}` would carry.
+///
+/// Only the four fields the form owns. Everything absent means unchanged, which
+/// is what lets an operator correct a travel time after watching the shade move
+/// without disturbing anything the guided calibration measured.
+fn amend_request(setup: &Setup) -> PatchShadeDto {
+    let draft = setup.draft();
+    let mut name = heapless::String::new();
+    let _ = name.push_str(draft.name());
+    PatchShadeDto {
+        name: (!draft.name().is_empty()).then_some(name),
+        kind: Some(draft.kind() as u8),
+        up_time_ms: draft.up_ms(),
+        down_time_ms: draft.down_ms(),
+        ..PatchShadeDto::default()
+    }
+}
 
 impl Broker {
     /// Assemble a session from what boot found.
@@ -321,6 +477,11 @@ impl Broker {
             version_logged: false,
             rare: Rare::default(),
             acks,
+            setup: Setup::new(),
+            effects: Deque::new(),
+            // See the field: a boot knows nothing about a form it may have left
+            // on the broker, so the first fresh session clears one.
+            form_dirty: true,
         }
     }
 }
@@ -414,6 +575,16 @@ struct Wire<'a> {
     commands: &'a CommandSender,
     payload: &'a mut String<PAYLOAD_CAPACITY>,
     rare: &'a mut Rare,
+    /// The add-a-shade flow, which an inbound message may advance.
+    ///
+    /// Applying an input is **pure**, so it happens here, synchronously, while
+    /// the connection is still borrowed for the inbound packet. What it
+    /// produces is an [`Effect`], which is a `Copy` value with no borrows and
+    /// therefore something the queue below can hold until the session loop can
+    /// publish.
+    setup: &'a mut Setup,
+    /// Effects this message produced, for the session loop to carry out.
+    effects: &'a mut Deque<Effect, EFFECT_QUEUE_DEPTH>,
 }
 
 /// What ended a wait in the session loop.
@@ -880,6 +1051,14 @@ impl Broker {
         let mut diagnostics = Ticker::every(Duration::from_secs(DIAGNOSTIC_INTERVAL_S));
 
         loop {
+            // **Before the wait, not after.** An effect can be queued from two
+            // places: the inbound branch below, which returns here, and
+            // `settle` inside an announcement, which does not — so draining
+            // after the `select4` would leave a press produced mid-announcement
+            // sitting until something else woke the task, which on a quiet
+            // device is the next diagnostic tick a minute later.
+            self.drain_setup(&mut connection, commands).await?;
+
             // Three inputs in one wait. All three futures are cancel-safe: the
             // delta subscriber advances its cursor only on `Poll::Ready`,
             // `minimq`'s `recv` is documented as cancel-safe, and
@@ -906,6 +1085,8 @@ impl Broker {
                             commands,
                             payload: &mut self.payload,
                             rare: &mut self.rare,
+                            setup: &mut self.setup,
+                            effects: &mut self.effects,
                         },
                         inbound.topic(),
                         inbound.payload(),
@@ -1085,6 +1266,8 @@ impl Broker {
                 commands,
                 payload: &mut self.payload,
                 rare: &mut self.rare,
+                setup: &mut self.setup,
+                effects: &mut self.effects,
             },
         )
         .await
@@ -1128,6 +1311,8 @@ impl Broker {
                 commands,
                 payload: &mut self.payload,
                 rare: &mut self.rare,
+                setup: &mut self.setup,
+                effects: &mut self.effects,
             };
             for step in reconfigure(
                 &self.stale,
@@ -1216,8 +1401,267 @@ impl Broker {
             self.retire(connection, id, commands).await?;
         }
 
+        // **The form a power cut left behind.** Its eight discovery configs and
+        // five values are retained on the broker and nothing in RAM remembers
+        // them, so the first fresh session of a boot clears them
+        // unconditionally. Thirteen zero-length publishes, once, against a
+        // flash write on every press of `Add shade` — see `Broker::form_dirty`.
+        //
+        // Skipped entirely when a setup is running, which is the reconnect
+        // case: the configs are still wanted, and `carry_out` republishes the
+        // values anyway on the next input.
+        if self.form_dirty && !self.setup.phase().is_open() {
+            self.sync_form(connection, commands, Form::Close).await?;
+        }
+        self.form_dirty = false;
+
+        // And a setup that survived a reconnect gets its form back: the retained
+        // configs should still be on the broker, but a broker that lost its
+        // retained store did not keep them, and this is the one moment that is
+        // knowable.
+        if self.setup.phase().is_open() {
+            self.sync_form(connection, commands, Form::Open).await?;
+        }
+
         self.stale.clear();
         Ok(())
+    }
+
+    /// Carry out every effect the inbound path queued.
+    ///
+    /// Called at the top of the session loop, so an effect produced while the
+    /// connection was borrowed — or in the middle of an announcement — waits
+    /// exactly until the next time round.
+    async fn drain_setup<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        while let Some(effect) = self.effects.pop_front() {
+            self.carry_out(connection, effect, commands).await?;
+        }
+        Ok(())
+    }
+
+    /// One effect, and whatever the shade table's answer leads to.
+    ///
+    /// # Why the asks run before anything is published
+    ///
+    /// Because the answer changes what there is to publish. `Send pairing`
+    /// produces [`Ask::Create`], whose answer moves the flow to
+    /// `AwaitingReport` and changes `Next step`; publishing before the round
+    /// trip would put the old message on the broker and then replace it a few
+    /// milliseconds later. So the chain runs first, the form change is
+    /// remembered, and exactly one publish pass follows.
+    ///
+    /// The loop is bounded rather than recursive. The longest real chain is two
+    /// — create, then pair — and a bound is what stops a flow that answered its
+    /// own ask from spinning inside a broker session.
+    async fn carry_out<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        first: Effect,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        let mut opened = false;
+        let mut closed = false;
+        let mut effect = first;
+        for _ in 0..MAX_EFFECT_CHAIN {
+            match effect.form {
+                FormChange::Open => opened = true,
+                FormChange::Close => closed = true,
+                FormChange::Unchanged => {}
+            }
+            let Some(ask) = effect.ask else { break };
+            match self.answer(ask).await {
+                Some(next) => effect = self.setup.apply(next),
+                None => break,
+            }
+        }
+
+        if closed {
+            // **R5 for the form.** Every config and every value the form could
+            // own goes, and nothing is published afterwards — the entities are
+            // gone, so a value would be a retained orphan under no config at
+            // all.
+            self.sync_form(connection, commands, Form::Close).await?;
+            return Ok(());
+        }
+        // One call, one nested frame. `Open` publishes the configs and then the
+        // values; `Values` publishes the values alone.
+        if opened {
+            self.sync_form(connection, commands, Form::Open).await?;
+        } else if self.setup.phase().is_open() {
+            self.sync_form(connection, commands, Form::Values).await?;
+        }
+        Ok(())
+    }
+
+    /// Put the broker's copy of the form where the flow says it should be.
+    ///
+    /// # Why the configs and the values are one function
+    ///
+    /// For ordering, not for size. Opening publishes the configs and then the
+    /// values, closing publishes the tombstones and then **nothing**, and
+    /// keeping both orders in one place is what stops a caller getting either
+    /// backwards — a value published after its config was cleared is a retained
+    /// orphan under no entity at all.
+    ///
+    /// It was *also* tried as a size measure, on the theory that two awaited
+    /// futures would each carry their own copy of the deep publish chain, and
+    /// **the theory was wrong**: split into `walk_form` and `publish_form` the
+    /// image measured 64,560 bytes of `.stack` on the ESP32-C3, merged it
+    /// measures 64,552 — eight bytes, which is alignment. The compiler already
+    /// overlaps sequential awaits. Recorded because a plausible optimisation
+    /// that does nothing is worth not attempting twice.
+    ///
+    /// # Why the plan is re-created per step
+    ///
+    /// A collected plan is worse still. A `Step` carries a `Topic`, which is a
+    /// `String<TOPIC_CAPACITY>` — about 280 bytes — so a `Vec<Step, 16>` is
+    /// **4.5 KB** resident for the life of the boot whether or not anybody ever
+    /// opens the form. That shape was measured at 7,088 bytes of DRAM across
+    /// three collections; this one is 1,328. Re-creating the iterator per step
+    /// is quadratic in a plan of at most thirteen entries of a few string
+    /// pushes, which is nothing against the broker round trip every step pays
+    /// anyway.
+    async fn sync_form<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        commands: &CommandSender,
+        which: Form,
+    ) -> Result<(), SessionEnd> {
+        if which != Form::Values {
+            let mut overran = true;
+            for index in 0..FORM_STEPS {
+                // The borrow of `self.config` ends with this expression: a
+                // `Step` owns its topic, so `perform_one` gets `&mut self` back.
+                let step = match which {
+                    Form::Close => self.config.close_form().nth(index),
+                    _ => self.config.open_form().nth(index),
+                };
+                let Some(step) = step else {
+                    overran = false;
+                    break;
+                };
+                self.perform_one(connection, &step, commands).await?;
+            }
+            if overran {
+                // A plan longer than the buffer would silently announce or clear
+                // fewer entities than it holds — the half-configured state R5 is
+                // about, arrived at from the firmware's side.
+                esp_println::println!(
+                    "mqtt: the add-a-shade form's plan is longer than {} steps — part of \
+                     it was not carried out",
+                    FORM_STEPS,
+                );
+            }
+        }
+
+        // **The entities are gone; nothing follows.** A value published after
+        // the configs were cleared is a retained orphan under no config at all.
+        if which == Form::Close {
+            return Ok(());
+        }
+
+        // The instructions first, and without a copy: `SetupMessage::as_str` is
+        // a `&'static str`, so its 255 bytes never reach a stack frame.
+        //
+        // **All five values, after any input that leaves the form open** — see
+        // `somfy_mqtt::Effect` for why that rule is stated once rather than
+        // optimised into a per-input list of what moved. `Next step` changes on
+        // almost every input in any case.
+        let message = Step::Send(self.config.setup_message(self.setup.message()));
+        self.perform_one(connection, &message, commands).await?;
+
+        for entity in SetupEntity::FORM {
+            if entity == SetupEntity::NextStep || !entity.has_state() {
+                continue;
+            }
+            // Copied out of the flow before the publish, because `perform_one`
+            // takes `&mut self` and the value borrows it. Thirty-two bytes.
+            //
+            // A value the flow reports as unset publishes **nothing**, exactly
+            // as a diagnostic with nothing to report does: the publish is
+            // retained, so a placeholder would outlive the setup that produced
+            // it, and an empty retained payload is a tombstone rather than a
+            // blank.
+            let Some(value) = self.form_value(entity) else {
+                continue;
+            };
+            let Some(publish) = self.config.setup_state(entity, value.as_bytes()) else {
+                // Unreachable: filtered on `has_state` above.
+                continue;
+            };
+            self.perform_one(connection, &Step::Send(publish), commands)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One form value as bytes, or `None` when there is nothing honest to
+    /// publish.
+    fn form_value(&self, entity: SetupEntity) -> Option<String<FORM_VALUE_BYTES>> {
+        let mut out: String<FORM_VALUE_BYTES> = String::new();
+        let written = match self.setup.value(entity) {
+            SetupValue::Text(text) => out.push_str(text).map_err(|()| core::fmt::Error),
+            SetupValue::Number(value) => write!(&mut out, "{value}"),
+            SetupValue::Unset => return None,
+        };
+        // Unreachable — `FORM_VALUE_BYTES` holds every one of these, and the
+        // assertion beside it pins the widest — and treated as "nothing to
+        // publish" rather than published half-written, because a truncated
+        // value is a plausible wrong value.
+        written.ok().map(|()| out)
+    }
+
+    /// Ask the shade table for one thing, and turn its answer back into an
+    /// input.
+    ///
+    /// **This is the whole of the flow's contact with behaviour**, and every
+    /// arm goes through `crate::rpc` to `tasks::apply_edit` — the same function
+    /// and the same seam the web server uses. Nothing about adding a shade is
+    /// implemented twice.
+    ///
+    /// `Rpc::Pair` rather than a `ShadeCommand::Pair` on the command channel:
+    /// the RPC carries a rule a movement does not — a shade whose address came
+    /// from another controller is refused — and it answers, which is what lets
+    /// a refusal reach the form instead of a serial console.
+    async fn answer(&mut self, ask: Ask) -> Option<SetupInput<'static>> {
+        let request = match ask {
+            Ask::Create => Rpc::Edit(ShadeEdit::Add {
+                request: create_request(&self.setup),
+            }),
+            Ask::Pair(id) => Rpc::Pair(id),
+            Ask::Confirm(id) => Rpc::Edit(ShadeEdit::ConfirmPairing { id }),
+            Ask::Abandon(id) => Rpc::Edit(ShadeEdit::Remove { id }),
+            Ask::Amend(id) => Rpc::Edit(ShadeEdit::Reconfigure {
+                id,
+                patch: amend_request(&self.setup),
+            }),
+        };
+        match RPC.call(request).await {
+            Some(Reply::Created(id)) => Some(SetupInput::Created(id)),
+            // Only a confirmation ends the setup. The other three are done and
+            // have nothing to say, so the form stays where it is.
+            Some(Reply::Done) => matches!(ask, Ask::Confirm(_)).then_some(SetupInput::Done),
+            Some(Reply::Refused(error)) => {
+                esp_println::println!("mqtt: the setup form's {:?} was refused ({:?})", ask, error);
+                Some(SetupInput::Refused(refusal_message(error.code)))
+            }
+            other => {
+                // The state task did not answer inside its timeout, or answered
+                // something this call cannot produce. Both are faults in this
+                // device rather than in the request, and both are reported —
+                // the alternative is a form that swallowed a press.
+                esp_println::println!(
+                    "mqtt: the setup form's {:?} went unanswered ({:?})",
+                    ask,
+                    other
+                );
+                Some(SetupInput::Refused(SetupMessage::Refused))
+            }
+        }
     }
 
     /// Which shades own a pairing button, as one bit per registry slot.
@@ -1385,23 +1829,41 @@ async fn settle<'buf, IO: minimq::Io>(
 /// Shared by the session loop and by [`settle`] so that a command arriving
 /// during an announcement is treated exactly like one arriving afterwards.
 fn dispatch(wire: &mut Wire<'_>, topic: &str, payload: &[u8]) {
-    let (config, inventory, commands, rare) =
-        (wire.config, wire.inventory, wire.commands, &mut *wire.rare);
-    match decode_command(config, inventory, topic, payload) {
+    let (config, inventory, commands) = (wire.config, wire.inventory, wire.commands);
+    if let Some(command) = decode_command(config, inventory, topic, payload) {
         // `try_send`, never `send`: see this module's docs.
-        Some(command) => {
-            if commands.try_send(command).is_err() {
-                report_rare(
-                    &mut rare.dropped_commands,
-                    "mqtt: command queue full, a command was dropped",
-                );
-            }
+        if commands.try_send(command).is_err() {
+            report_rare(
+                &mut wire.rare.dropped_commands,
+                "mqtt: command queue full, a command was dropped",
+            );
         }
-        None => report_rare(
-            &mut rare.unrecognised,
-            "mqtt: a message arrived on a subscribed topic that is not a command this device knows",
-        ),
+        return;
     }
+
+    // **The form, applied here and published later.** `Setup::apply` is pure —
+    // no socket, no clock, no registry — so the flow advances the moment the
+    // message is decoded, even though the connection is borrowed for the
+    // inbound packet and nothing can be published yet. What comes out is a
+    // `Copy` value the session loop carries out.
+    if let Some(input) = Setup::decode(config, topic, payload) {
+        let effect = wire.setup.apply(input);
+        if wire.effects.push_back(effect).is_err() {
+            // Reported rather than dropped in silence: the operator pressed
+            // something and the form will not move, and the `Next step` sensor
+            // is the only thing that could have said so.
+            report_rare(
+                &mut wire.rare.dropped_commands,
+                "mqtt: the setup-effect queue is full, a form action was dropped",
+            );
+        }
+        return;
+    }
+
+    report_rare(
+        &mut wire.rare.unrecognised,
+        "mqtt: a message arrived on a subscribed topic that is not a command this device knows",
+    );
 }
 
 /// How often each of the two broker-driven log lines has fired.
@@ -1524,6 +1986,26 @@ async fn execute<'buf, IO: minimq::Io>(
             // R7's device-level entities. Rendered from the entity alone: what
             // it *reports* is published separately, on the topic this config
             // names.
+            // The add-a-shade form. Rendered from the entity alone, exactly as a
+            // diagnostic is: what the control currently *holds* is published
+            // separately, on the topic this config names.
+            Payload::SetupDiscovery(entity) => {
+                if config.setup_discovery(entity).render(payload).is_err() {
+                    esp_println::println!(
+                        "mqtt: the discovery config for '{}' does not fit its buffer — \
+                         that part of the add-a-shade form will not appear",
+                        entity.slug(),
+                    );
+                    return Ok(());
+                }
+                publish_bytes(
+                    connection,
+                    publish.topic().as_str(),
+                    payload.as_bytes(),
+                    publish.retention(),
+                )
+                .await
+            }
             Payload::DeviceDiscovery(entity) => {
                 if config.diagnostic_discovery(entity).render(payload).is_err() {
                     esp_println::println!(

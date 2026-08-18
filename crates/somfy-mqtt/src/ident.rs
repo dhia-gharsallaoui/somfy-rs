@@ -46,6 +46,7 @@
 
 use crate::entity::{Component, DeviceEntity};
 use crate::error::{ConfigError, Field};
+use crate::setup::SetupEntity;
 use crate::validate::check_token;
 use core::fmt::Write as _;
 use heapless::String;
@@ -91,6 +92,10 @@ const _: () = assert!(
 const _: () = assert!(
     DeviceEntity::MAX_SLUG_LEN <= MAX_OBJECT_ID_LEN,
     "a device entity's slug outgrew the object-id budget",
+);
+const _: () = assert!(
+    SetupEntity::MAX_SLUG_LEN <= MAX_OBJECT_ID_LEN,
+    "a setup entity's slug outgrew the object-id budget",
 );
 
 /// The widest thing that follows the component in a unique id.
@@ -244,6 +249,25 @@ impl ObjectId {
         ObjectId(out)
     }
 
+    /// The object id of one entity of the add-a-shade form: its slug,
+    /// unchanged.
+    ///
+    /// Infallible and valid for the same reason the other two constructors are
+    /// — the only input is a firmware literal. Every setup slug begins
+    /// `setup_`, so it can meet neither a shade's `shade_N` nor a
+    /// [`DeviceEntity`]'s bare slug however either set grows.
+    ///
+    /// ```
+    /// use somfy_mqtt::{ObjectId, SetupEntity};
+    ///
+    /// assert_eq!(ObjectId::for_setup(SetupEntity::Begin).as_str(), "setup_begin");
+    /// ```
+    pub fn for_setup(entity: SetupEntity) -> ObjectId {
+        let mut out: String<MAX_OBJECT_ID_LEN> = String::new();
+        push_str(&mut out, entity.slug());
+        ObjectId(out)
+    }
+
     /// The single topic segment this becomes.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -283,6 +307,24 @@ impl UniqueId {
     /// letter. `tests/device_entities.rs` checks that against every shade id
     /// and every component rather than leaving it as an argument.
     pub fn for_device(device: &DeviceId, entity: DeviceEntity) -> UniqueId {
+        let mut out: String<MAX_UNIQUE_ID_LEN> = String::new();
+        push_str(&mut out, device.as_str());
+        push_str(&mut out, "_");
+        push_str(&mut out, entity.component().as_str());
+        push_str(&mut out, "_");
+        push_str(&mut out, entity.slug());
+        UniqueId(out)
+    }
+
+    /// Derive the unique id for one entity of the add-a-shade form.
+    ///
+    /// Built from the same three pieces as the other two, so the three sets
+    /// share one shape and cannot collide: a shade's suffix is decimal digits,
+    /// a device entity's is a slug starting with a letter, and this one's is a
+    /// slug starting with `setup_`. `tests/setup_form.rs` checks that against
+    /// every shade id, every device entity and every component rather than
+    /// leaving it as an argument.
+    pub fn for_setup(device: &DeviceId, entity: SetupEntity) -> UniqueId {
         let mut out: String<MAX_UNIQUE_ID_LEN> = String::new();
         push_str(&mut out, device.as_str());
         push_str(&mut out, "_");

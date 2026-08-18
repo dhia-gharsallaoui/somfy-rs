@@ -297,11 +297,19 @@ pub struct Rpc {
 
 /// Callers the gate can queue.
 ///
-/// One per thing that can be inside [`Rpc::call`] at once, which is one per
-/// connection task. Stated here rather than read from `crate::api::HTTP_TASKS`
-/// because this module is compiled whether or not there is a web server — the
-/// seam belongs to the state task, which offers it — and `crate::api` asserts
-/// that its own pool fits, so the two cannot drift without the build saying so.
+/// One per thing that can be inside [`Rpc::call`] at once: one per connection
+/// task, **plus the broker session**, which reaches this seam for the
+/// add-a-shade form — see `crate::mqtt`'s `Broker::answer`. That is five today
+/// against eight here, so the `WaitQueueFull` [`Rpc::call`] reports is still
+/// unreachable rather than merely unlikely.
+///
+/// Stated here rather than read from `crate::api::HTTP_TASKS` because this
+/// module is compiled whether or not there is a web server — the seam belongs to
+/// the state task, which offers it — and `crate::api` asserts that its own pool
+/// fits, so the two cannot drift without the build saying so. The broker session
+/// is deliberately *not* added to that assertion: a build with `mqtt` and
+/// without `http` has one caller in total, and an assertion that summed both
+/// features would refuse a configuration that is comfortably within the bound.
 pub const GATE_WAITERS: usize = 8;
 
 /// The seam itself.

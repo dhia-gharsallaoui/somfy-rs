@@ -594,7 +594,7 @@ const STACK_MARGIN_FLOOR_BYTES: usize = 8 * 1024;
 // The two ways out when it fires are both real work and neither is editing this
 // line: make the chain shallower — `crate::start_network`'s `#[inline(never)]`
 // is what that looks like, and it recovered 18,576 bytes — or move the division
-// and pay for it out of the ESP32-C3's 5,796-byte heap slack, which needs
+// and pay for it out of the ESP32-C3's 3,748-byte heap slack, which needs
 // hardware nobody has.
 const _: () = assert!(
     STACK_BUDGET_BYTES >= REQUIRED_STACK_BYTES + STACK_MARGIN_FLOOR_BYTES,
@@ -659,8 +659,8 @@ const _: () = assert!(
 ///
 /// | chip | largest permitted set | DRAM |
 /// |---|---|---|
-/// | ESP32-S3 | `mqtt`, `ui`, `mdns`, `sntp` — everything | 132,260 |
-/// | ESP32-C3 | `mqtt`, `ui` (and so `http`); `mdns` and `sntp` refused | 126,864 |
+/// | ESP32-S3 | `mqtt`, `ui`, `mdns`, `sntp` — everything | 130,372 |
+/// | ESP32-C3 | `mqtt`, `ui` (and so `http`); `mdns` and `sntp` refused | 124,968 |
 ///
 /// The **ESP32 was dropped on 2026-08-18** and its row with it; see the module
 /// docs for the arithmetic. The historical notes below keep their ESP32 columns
@@ -784,7 +784,7 @@ const _: () = assert!(
 /// | chip | before | after | delta |
 /// |---|---|---|---|
 /// | ESP32 (`mqtt`) | 123,732 | 123,284 | −448 |
-/// | ESP32-S3 (all) | 135,060 | 132,260 | −2,800 |
+/// | ESP32-S3 (all) | 135,060 | 130,372 | −4,688 |
 /// | ESP32-C3 (all) | 121,848 | 119,064 | −2,784 |
 ///
 /// Attributed against the linked images rather than estimated:
@@ -834,14 +834,18 @@ const _: () = assert!(
 /// Those six rows were all read at the heap the *old* constant gave (52,224), so
 /// they are directly comparable with each other, which is what the table is for.
 /// **The chosen row then had to be re-measured against its own heap**, and it
-/// moved by 8 bytes: at a 60,416-byte heap the C3's `.stack` links to 66,448
-/// rather than 74,632 − 8,192 = 66,440, so the constant below is **126,864**.
-/// The eight bytes are the linker's alignment response to a heap 8,192 bytes
-/// larger, and they are worth a sentence because they are the whole reason this
-/// row is *measured* rather than computed: `DRAM = .stack + heap`, and `heap` is
+/// moved by 8 bytes: at a 60,416-byte heap the C3's `.stack` linked to 66,448
+/// rather than 74,632 − 8,192 = 66,440, and the constant was **126,864**. The
+/// eight bytes are the linker's alignment response to a heap 8,192 bytes larger,
+/// and they are worth a sentence because they are the whole reason this row is
+/// *measured* rather than computed: `DRAM = .stack + heap`, and `heap` is
 /// derived from `DRAM`, so the constant is a fixpoint and only a second build
-/// proves you have reached it. 126,864 − 66,280 = 60,584, which still rounds
-/// down to the same 60,416, so the image does not move again — checked.
+/// proves you have reached it.
+///
+/// **That table is history: the rows were read before the add-a-shade form.**
+/// The chosen row is now 124,968 with a 58,368-byte heap, and the fixpoint was
+/// re-checked the same way — see [`RADIO_HEAP_BYTES`] for the arithmetic and
+/// for what the 2 KiB cost.
 ///
 /// **`ui` costs 240 bytes of DRAM. `mdns` costs 4,672 and `sntp` 2,880**, and
 /// the two are additive to the byte (4,672 + 2,880 = 7,792 = 126,856 − 119,064).
@@ -852,22 +856,25 @@ const _: () = assert!(
 ///
 /// So the C3 ships the fourth row — the web UI, the REST API and the update
 /// route, reached by IP rather than by name — and `mdns` and `sntp` are refused
-/// below. 60,416 is 5,796 above the worst announcement peak ever measured, about
-/// **2.9× that peak's own ~2,000-byte boot-to-boot spread**, where the full
-/// build sat 2,396 *below* it.
+/// below. **58,368 is 3,748 above the worst announcement peak ever measured**,
+/// where the full build sat 2,396 *below* it — but that clearance is now
+/// **under** the ~4,216-byte boot-to-boot spread of the peak itself, so it is a
+/// margin to distrust rather than one to rely on. It read 5,796 until the
+/// add-a-shade form and a stale row between them cost 1,896 bytes of DRAM; the
+/// arithmetic is on [`RADIO_HEAP_BYTES`].
 ///
 /// **The number to distrust, if you are the first person to boot a C3:**
 /// [`WIFI_PEAK_BYTES`] is an **ESP32-S3** measurement. No C3 has ever run this
 /// firmware, so its own announcement peak has never been observed — a different
-/// Wi-Fi blob on a different core could want more or less. +5,796 against
+/// Wi-Fi blob on a different core could want more or less. +3,748 against
 /// another chip's peak is a great deal better than −2,396 against it, and it is
 /// not the same as knowing. Watch `heap: session announced` on that board before
 /// trusting any of this.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 132_260;
+const DRAM_FOR_STACK_AND_HEAP: usize = 130_372;
 /// See the `chip-s3` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 126_864;
+const DRAM_FOR_STACK_AND_HEAP: usize = 124_968;
 
 // **The ESP32-C3 does not have the DRAM for the mDNS responder or the SNTP
 // client on top of the web server, and these say so at compile time.**
@@ -891,7 +898,7 @@ const DRAM_FOR_STACK_AND_HEAP: usize = 126_864;
 // larger than its own constant was measured on — which is the unsafe direction,
 // and the direction this row has failed in three times.
 //
-// The ESP32-S3 carries both with 10,916 bytes of heap to spare over the same
+// The ESP32-S3 carries both with 8,868 bytes of heap to spare over the same
 // peak.
 #[cfg(all(feature = "chip-c3", feature = "mdns"))]
 compile_error!(
@@ -925,21 +932,43 @@ compile_error!(
 ///
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] | vs [`WIFI_PEAK_BYTES`] |
 /// |---|---|---|---|---|---|
-/// | ESP32-S3 | 132,260 | 64 KiB = 65,536 | 66,724 | 9,604 | +10,916 |
-/// | ESP32-C3 | 126,864 | 59 KiB = 60,416 | 66,448 | 9,328 | +5,796 |
+/// | ESP32-S3 | 130,372 | 62 KiB = 63,488 | 66,884 | 9,764 | +8,868 |
+/// | ESP32-C3 | 124,968 | 57 KiB = 58,368 | 66,600 | 9,480 | **+3,748** |
 ///
-/// **Both rows moved on 2026-08-18**, and for different reasons. The ESP32-S3's
-/// is the same image it has always been, re-read after the ESP32 was dropped and
-/// unchanged by that. The ESP32-C3's is a *different configuration*: `mdns` and
-/// `sntp` are now refused on that chip, which is what takes its heap from 52,224
-/// — 2,396 bytes below the announcement peak — to 60,416, which is 5,796 above
-/// it. See [`DRAM_FOR_STACK_AND_HEAP`] for the whole feature-by-feature table
-/// and for why the web UI was *not* the thing to cut.
+/// **Both rows moved again on 2026-08-18, and the ESP32-C3's margin is now
+/// inside its own noise.** The add-a-shade form cost **1,312 bytes on the
+/// ESP32-S3 and 1,328 on the ESP32-C3**, measured the documented way — one
+/// worktree built twice per chip, `readelf -S | grep '.stack '` on each linked
+/// release image. **The row was already stale before that change by 576 bytes
+/// on the S3 and 568 on the C3**, from the shade-setup work that landed without
+/// re-reading it, which is the fourth time this row has gone stale and the
+/// reason the two causes are separated here rather than summed.
 ///
-/// **Neither chip trips [`warn_if_tight`] now**, which is the first time that
-/// has been true since it was written; the C3 was the reason it exists. It is
-/// kept, and the reason is in its own doc comment: the figure it compares
-/// against is one chip's reading, and the C3's own peak is still unmeasured.
+/// The consequence is not proportional, because the division rounds to a whole
+/// KiB: 1,896 bytes of DRAM take the C3's heap from 60,416 to **58,368**, a
+/// whole 2 KiB, and its clearance over the worst announcement peak ever
+/// measured from 5,796 to **3,748**. That peak moved about **4,216 bytes**
+/// between boots of one unchanged image, so **the C3's margin is now smaller
+/// than the spread of the thing it is a margin against** — which this project
+/// has already recorded once as "a coincidence with a good track record rather
+/// than a design". It is stated rather than papered over, and
+/// [`warn_if_tight`] says it at boot.
+///
+/// Nothing was cut to avoid that. The available levers are recorded below and
+/// on [`RADIO_HEAP_BYTES`] — `api::TCP_TX_BYTES` at 512 returns 2,048 bytes,
+/// and `TOPIC_CAPACITY` at 160 rather than 256 would return more still, since
+/// two collected plans hold twenty `Step`s between them — and both spend
+/// something that is not this change's to spend.
+///
+/// **The earlier move, 2026-08-18.** The ESP32-S3's was the same image it had
+/// always been, re-read after the ESP32 was dropped and unchanged by that. The
+/// ESP32-C3's was a *different configuration*: `mdns` and `sntp` are refused on
+/// that chip, which took its heap from 52,224 — 2,396 bytes below the
+/// announcement peak — to 60,416. See [`DRAM_FOR_STACK_AND_HEAP`] for the whole
+/// feature-by-feature table and for why the web UI was *not* the thing to cut.
+///
+/// **The ESP32-C3 trips [`warn_if_tight`] again**, which is what it was written
+/// for. The S3 clears the same peak by 8,868 and does not.
 ///
 /// The available lever, recorded rather than taken because it spends the
 /// operator's page-load time and that is not this change's to spend:
@@ -1096,7 +1125,7 @@ pub fn warn_if_undersized() {
 ///
 /// **The ESP32-C3 is the reason it exists**, and as of 2026-08-18 no chip in the
 /// matrix trips it: the C3 refuses `mdns` and `sntp`, which takes its heap to
-/// 60,416 — 5,796 above [`WIFI_PEAK_BYTES`], about 2.9× that peak's own spread —
+/// 58,368 — 3,748 above [`WIFI_PEAK_BYTES`], which is *less* than that peak's own spread —
 /// and the ESP32, whose 1,700-byte margin was the other case, was dropped.
 ///
 /// **It is kept anyway, and not as decoration.** [`RADIO_HEAP_BYTES`] is a

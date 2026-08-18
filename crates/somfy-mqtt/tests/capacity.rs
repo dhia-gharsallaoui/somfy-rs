@@ -10,7 +10,7 @@
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
     Component, ConfigurationUrl, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId,
-    ObjectId, ShadeTopic, StateRoot, MAX_CONFIGURATION_URL_LEN, MAX_DEVICE_ID_LEN,
+    ObjectId, SetupEntity, ShadeTopic, StateRoot, MAX_CONFIGURATION_URL_LEN, MAX_DEVICE_ID_LEN,
     MAX_DISCOVERY_PREFIX_LEN, MAX_NAME_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_STATE_ROOT_LEN,
     MAX_UNIQUE_ID_LEN, PAYLOAD_CAPACITY, TOPIC_CAPACITY,
 };
@@ -63,12 +63,17 @@ fn the_widest_topics_fit_with_room_to_spare() {
     let widest_object = DeviceEntity::ALL
         .iter()
         .map(|e| ObjectId::for_device(*e).as_str().len())
+        .chain(
+            SetupEntity::ALL
+                .iter()
+                .map(|e| ObjectId::for_setup(*e).as_str().len()),
+        )
         .chain(core::iter::once(object.as_str().len()))
         .max()
         .unwrap();
     assert_eq!(
-        widest_object, 16,
-        "`rollcode_damaged` is the widest object id"
+        widest_object, 17,
+        "`setup_travel_down` is the widest object id"
     );
     assert!(
         widest_object < MAX_OBJECT_ID_LEN,
@@ -80,6 +85,7 @@ fn the_widest_topics_fit_with_room_to_spare() {
         for object in DeviceEntity::ALL
             .iter()
             .map(|e| ObjectId::for_device(*e))
+            .chain(SetupEntity::ALL.iter().map(|e| ObjectId::for_setup(*e)))
             .chain(core::iter::once(ObjectId::for_shade(WIDEST_SHADE)))
         {
             widest = widest.max(cfg.discovery_topic(component, &object).len());
@@ -91,9 +97,15 @@ fn the_widest_topics_fit_with_room_to_spare() {
     for (_, topic) in cfg.device_topics() {
         widest = widest.max(topic.len());
     }
+    for (_, state, command) in cfg.setup_topics() {
+        for topic in state.iter().chain(command.iter()) {
+            widest = widest.max(topic.len());
+        }
+    }
     widest = widest.max(cfg.availability_topic().len());
     widest = widest.max(cfg.shade_base(WIDEST_SHADE).len());
     widest = widest.max(cfg.device_base().len());
+    widest = widest.max(cfg.setup_base().len());
 
     // Pinned rather than merely bounded. `Topic` wraps a `String<TOPIC_CAPACITY>`,
     // so "it is under the capacity" is a type invariant that no test can
@@ -101,7 +113,7 @@ fn the_widest_topics_fit_with_room_to_spare() {
     // assertion runs. The number is the thing worth watching: if a change moves
     // it, the capacity budget deserves a fresh look rather than a silent slide.
     assert_eq!(
-        widest, 135,
+        widest, 136,
         "widest topic moved; re-check the budget against TOPIC_CAPACITY = {TOPIC_CAPACITY}",
     );
     assert!(widest < TOPIC_CAPACITY);
@@ -179,6 +191,49 @@ fn the_widest_button_payload_fits() {
         buf.len(),
         785,
         "widest button payload moved; re-check the budget against \
+         PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
+    );
+}
+
+/// The same measurement for the add-a-shade form.
+///
+/// Nine entities across five components, and the widest is whichever carries
+/// the longest component-specific block — the `select`, whose seven options are
+/// the largest thing any payload here writes. Measured rather than argued for
+/// the same reason as the other three: the compile-time bound says it fits, and
+/// the number is what says whether it still nearly does.
+#[test]
+fn the_widest_setup_payload_fits() {
+    let cfg = maximal_config();
+    let mut widest = 0;
+    let mut widest_entity = SetupEntity::Begin;
+    for entity in SetupEntity::ALL {
+        let mut buf: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+        cfg.setup_discovery(entity)
+            .render(&mut buf)
+            .expect("the widest setup payload must fit");
+        let parsed: serde_json::Value = serde_json::from_str(&buf).expect("valid JSON");
+        assert_eq!(parsed["name"].as_str(), Some(entity.label()));
+        // Every form entity is filed under `config`, which is what puts the
+        // instructions in the same card as the controls they describe.
+        assert_eq!(parsed["entity_category"].as_str(), Some("config"));
+        if buf.len() > widest {
+            widest = buf.len();
+            widest_entity = entity;
+        }
+    }
+    // Not the `select`, which is the obvious guess: its seven options are the
+    // largest *component* block, but `TravelDown` carries the longest label,
+    // the longest leaf — twice, once in each topic — and the number block's
+    // four keys, and that adds up to more.
+    assert_eq!(
+        widest_entity,
+        SetupEntity::TravelDown,
+        "the widest setup payload moved to a different entity",
+    );
+    assert_eq!(
+        widest, 732,
+        "widest setup payload moved; re-check the budget against \
          PAYLOAD_CAPACITY = {PAYLOAD_CAPACITY}",
     );
 }

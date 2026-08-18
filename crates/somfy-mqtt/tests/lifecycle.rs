@@ -22,8 +22,8 @@
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
     reconfigure, Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId,
-    Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step, SubscribedTopic,
-    OFFLINE, ONLINE, SHADE_COMPONENTS,
+    Pairing, Payload, PublishedTopic, Retention, SetupEntity, ShadeTopic, StateRoot, Step,
+    SubscribedTopic, OFFLINE, ONLINE, SHADE_COMPONENTS,
 };
 
 const NODE: &str = "somfyrs";
@@ -62,6 +62,7 @@ enum FlatPayload {
     Bytes(Vec<u8>),
     Discovery(u8, &'static str),
     DeviceDiscovery(&'static str),
+    SetupDiscovery(&'static str),
     Nothing,
 }
 
@@ -77,6 +78,7 @@ fn flatten<'a>(steps: impl Iterator<Item = Step<'a>>) -> Vec<Flat> {
                         FlatPayload::Discovery(shade.0, component.as_str())
                     }
                     Payload::DeviceDiscovery(entity) => FlatPayload::DeviceDiscovery(entity.slug()),
+                    Payload::SetupDiscovery(entity) => FlatPayload::SetupDiscovery(entity.slug()),
                     Payload::Nothing => FlatPayload::Nothing,
                 },
             },
@@ -163,8 +165,9 @@ fn every_discovery_config_is_published_retained() {
         .collect();
     assert_eq!(
         configs.len(),
-        2 * SHADE_COMPONENTS.len() + DeviceEntity::ALL.len(),
-        "one config per shade per component, plus one per device entity: {steps:#?}",
+        2 * SHADE_COMPONENTS.len() + DeviceEntity::ALL.len() + SetupEntity::ALWAYS.len(),
+        "one config per shade per component, one per device entity, and the \
+         always-present half of the setup form: {steps:#?}",
     );
     for step in configs {
         let Flat::Send {
@@ -177,7 +180,9 @@ fn every_discovery_config_is_published_retained() {
         assert!(
             matches!(
                 payload,
-                FlatPayload::Discovery(..) | FlatPayload::DeviceDiscovery(_)
+                FlatPayload::Discovery(..)
+                    | FlatPayload::DeviceDiscovery(_)
+                    | FlatPayload::SetupDiscovery(_)
             ),
             "a discovery config carries a rendered payload: {step:?}",
         );
@@ -562,7 +567,18 @@ fn operations<'a>(steps: impl Iterator<Item = Step<'a>>) -> usize {
 #[test]
 fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     let config = default_config();
-    let k = DeviceEntity::ALL.len();
+    // `k` is no longer one table. It is the device's own diagnostics, plus the
+    // always-present half of the setup form, plus the subscription for every
+    // form command topic — see `MqttConfig::announce_setup` for why the
+    // subscriptions are in the per-session half rather than in the per-setup
+    // one. Derived from the tables rather than written out, for the reason the
+    // doc comment above gives.
+    let k = DeviceEntity::ALL.len()
+        + SetupEntity::ALWAYS.len()
+        + SetupEntity::ALL
+            .iter()
+            .filter(|entity| entity.accepts_command())
+            .count();
     let per_shade = SHADE_COMPONENTS.len() + SubscribedTopic::for_shade(false).count();
     for shades in 0u8..=3 {
         let ids: Vec<ShadeId> = (1..=shades).map(ShadeId).collect();
@@ -587,9 +603,9 @@ fn an_announcement_for_one_shade_already_exceeds_the_clients_inflight_slots() {
     let bare = operations(config.announce(&[], false, |_| Pairing::Offered));
     assert_eq!(bare, 1 + k);
     assert!(
-        bare + k > INFLIGHT_SLOTS,
-        "a board with nothing provisioned still exceeds the slot count once its \
-         readings follow the plan: {bare} + {k}",
+        bare > INFLIGHT_SLOTS,
+        "a board with nothing provisioned still exceeds the slot count on the \
+         plan alone: {bare}",
     );
 }
 
@@ -938,6 +954,14 @@ fn the_subscriptions_are_exactly_the_command_topics() {
                     .as_str()
                     .to_string()
             })
+            // Plus the setup form's, which are subscribed once per session
+            // rather than once per setup — see `MqttConfig::announce_setup`.
+            .chain(
+                SetupEntity::ALL
+                    .into_iter()
+                    .filter(|entity| entity.accepts_command())
+                    .map(|entity| config.setup_command_topic(entity).as_str().to_string()),
+            )
             .collect();
         listened.sort();
         expected.sort();
