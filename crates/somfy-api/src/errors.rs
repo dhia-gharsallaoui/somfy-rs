@@ -113,6 +113,21 @@ pub enum ApiErrorCode {
     /// traverse of zero or past three minutes, or marks that leave no travel
     /// between them. Nothing is stored and the shade is left as it was.
     CalibrationImplausible,
+    /// A command the shade's paired frame width cannot carry on the wire.
+    ///
+    /// 56-bit RTS has one 4-bit field for the command and no value in it for
+    /// `StepUp`: the nibble a narrow frame would send is `StepDown`'s, the
+    /// opposite direction. There is no degraded send here, only a different
+    /// command — so the device refuses in the domain, before anything is
+    /// planned, and neither a frame nor the position estimate moves.
+    ///
+    /// 409 rather than 400, for the reason
+    /// [`AddressNotAllocated`](ApiErrorCode::AddressNotAllocated) is: the
+    /// request is perfectly well-formed, and what makes it inapplicable is a
+    /// property of the shade. Nothing the caller could have sent instead would
+    /// work, and a UI that highlighted a form field over it would be pointing at
+    /// nothing — the button should not be offered on that shade at all.
+    CommandNotAtThisWidth,
 
     // -----------------------------------------------------------------------
     // Settings
@@ -305,6 +320,7 @@ impl ApiErrorCode {
             | ApiErrorCode::AddressNotAllocated
             | ApiErrorCode::VentBandNotMeasured
             | ApiErrorCode::NotCalibrating
+            | ApiErrorCode::CommandNotAtThisWidth
             // Both are conflicts with the state of a trial rather than
             // malformed requests: the body was fine and there was nothing else
             // the caller could have sent, because what is wrong is that no

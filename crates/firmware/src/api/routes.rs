@@ -72,7 +72,7 @@ use picoserve::{ResponseSent, Router};
 use serde::Serialize;
 use somfy_api::{
     ApiErrorCode, ApiErrorDto, CalibrationStepDto, CommandDto, CreateShadeDto, MqttUpdateDto,
-    PatchShadeDto, SettingsDto, WifiUpdateDto,
+    PatchShadeDto, SettingsDto, TrialDecisionDto, WifiUpdateDto,
 };
 use somfy_domain::{GroupId, ShadeId};
 use somfy_tasks::ControlCommand;
@@ -180,8 +180,12 @@ fn router() -> Router<impl PathRouter> {
             "/api/v1/settings/wifi",
             picoserve::routing::put(start_wifi_trial),
         )
-        .route("/api/v1/settings/wifi/confirm", post(confirm_wifi_trial))
-        .route("/api/v1/settings/wifi/cancel", post(cancel_wifi_trial))
+        // One route for both endings of a trial, with the decision in the
+        // body. Not tidiness: `picoserve`'s router is a type per route and
+        // there are `HTTP_TASKS` copies of the resulting future, statically
+        // allocated out of the same DRAM the Wi-Fi heap comes from. See
+        // `somfy_api::TrialDecisionDto`, and `/calibrate` for the precedent.
+        .route("/api/v1/settings/wifi/trial", post(settle_wifi_trial))
         .route(
             "/api/v1/settings/mqtt",
             picoserve::routing::put(save_mqtt).delete(clear_mqtt),
@@ -193,14 +197,37 @@ fn router() -> Router<impl PathRouter> {
 // Responses
 // ---------------------------------------------------------------------------
 
-/// A JSON body at a status of the caller's choosing.
+/// A JSON body at a status of the caller's choosing, into a buffer of `N`.
 ///
 /// `picoserve`'s own `Json` response hardcodes `200`, and the type behind it is
 /// private, so `201 Created` and `200 OK` after a `PATCH` need this. It is the
 /// entire cost of that gap.
-struct JsonBody<T: Serialize>(T);
+///
+/// # Why the capacity is a parameter, and what was tried instead
+///
+/// [`Content::write_content`] is `async` and its scratch is live across the
+/// write, so the buffer sits **inside the connection task's future** — and
+/// there are [`crate::api::HTTP_TASKS`] of those, statically allocated out of
+/// the DRAM the Wi-Fi driver's heap is carved from. Every byte here is spent
+/// four times, in Wi-Fi headroom, on every boot including the boots where
+/// nobody opens the UI.
+///
+/// The settings document is much wider than a shade — three of its strings can
+/// hold text an access point or a broker chose, and control characters escape
+/// six bytes at a time — so one shared constant would have to be the larger of
+/// the two and every shade response would carry the difference. A parameter
+/// lets each call site name the bound its own type is measured against in
+/// `somfy-api`.
+///
+/// **`picoserve::response::Json` was measured as the alternative and is worse
+/// here**, which is worth recording so it is not tried again: it re-serialises
+/// in 128-byte windows instead of holding a buffer, but its `JsonStream` keeps
+/// the value *and* a serializer state live across the write, and the connection
+/// task future grew from 16,960 bytes to 18,904 — 7,776 bytes of DRAM across
+/// the four tasks, against the 2,688 the wider buffer costs.
+struct JsonBody<T: Serialize, const N: usize>(T);
 
-impl<T: Serialize> Content for JsonBody<T> {
+impl<T: Serialize, const N: usize> Content for JsonBody<T, N> {
     fn content_type(&self) -> &'static str {
         "application/json; charset=utf-8"
     }
@@ -219,12 +246,12 @@ impl<T: Serialize> Content for JsonBody<T> {
         // gets `200 OK` with an empty body. It is unreachable — see
         // `ENTITY_JSON_BYTES` — and `write_content` says so out loud if it ever
         // happens, which is the half a header cannot.
-        let mut scratch = [0u8; ENTITY_JSON_BYTES];
+        let mut scratch = [0u8; N];
         serde_json_core::to_slice(&self.0, &mut scratch).unwrap_or(0)
     }
 
     async fn write_content<W: Write>(self, mut writer: W) -> Result<(), W::Error> {
-        let mut scratch = [0u8; ENTITY_JSON_BYTES];
+        let mut scratch = [0u8; N];
         let written = match serde_json_core::to_slice(&self.0, &mut scratch) {
             Ok(written) => written,
             Err(_) => {
@@ -261,7 +288,7 @@ impl IntoResponse for Refusal {
     ) -> Result<ResponseSent, W::Error> {
         (
             StatusCode::new(self.0.code.http_status()),
-            JsonBody(self.0),
+            JsonBody::<_, ENTITY_JSON_BYTES>(self.0),
         )
             .write_to(connection, response_writer)
             .await
@@ -421,7 +448,9 @@ async fn list_rooms() -> impl IntoResponse {
 
 async fn get_shade(id: u8) -> impl IntoResponse {
     match RPC.call(Rpc::Shade(ShadeId(id))).await {
-        Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
+        Some(Reply::Shade(Some(shade))) => {
+            Ok((StatusCode::OK, JsonBody::<_, ENTITY_JSON_BYTES>(shade)))
+        }
         Some(Reply::Shade(None)) => Err(Ok(refuse(ApiErrorCode::NotFound))),
         Some(_) => Err(Ok(refuse(ApiErrorCode::NotFound))),
         None => Err(Err(Unavailable)),
@@ -439,7 +468,7 @@ async fn create_shade(Json(request): Json<CreateShadeDto>) -> impl IntoResponse 
             Some(Reply::Shade(Some(shade))) => Ok((
                 StatusCode::CREATED,
                 ("Location", location_of(id)),
-                JsonBody(shade),
+                JsonBody::<_, ENTITY_JSON_BYTES>(shade),
             )),
             // The shade was created and then could not be read back, which
             // means something removed it in between. Reported as created but
@@ -465,7 +494,9 @@ async fn patch_shade(id: u8, Json(patch): Json<PatchShadeDto>) -> impl IntoRespo
         .await
     {
         Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
-            Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
+            Some(Reply::Shade(Some(shade))) => {
+                Ok((StatusCode::OK, JsonBody::<_, ENTITY_JSON_BYTES>(shade)))
+            }
             _ => Err(Ok(refuse(ApiErrorCode::NotFound))),
         },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
@@ -535,7 +566,9 @@ async fn confirm_pairing(id: u8) -> impl IntoResponse {
     let id = ShadeId(id);
     match RPC.call(Rpc::Edit(ShadeEdit::ConfirmPairing { id })).await {
         Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
-            Some(Reply::Shade(Some(shade))) => Ok((StatusCode::OK, JsonBody(shade))),
+            Some(Reply::Shade(Some(shade))) => {
+                Ok((StatusCode::OK, JsonBody::<_, ENTITY_JSON_BYTES>(shade)))
+            }
             _ => Err(Ok(refuse(ApiErrorCode::NotFound))),
         },
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
@@ -660,11 +693,16 @@ async fn events(upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
 /// The trial half is read here rather than asked of the state task: a live trial
 /// is not in flash, it belongs to `crate::trial`, and the state task has no
 /// business knowing about the radio.
+/// The buffer is [`somfy_api::SETTINGS_JSON_MAX_BYTES`] rather than
+/// [`ENTITY_JSON_BYTES`], because this document is the widest thing this API
+/// emits and 672 is not enough for it — the failure mode of getting that wrong
+/// is `200 OK` with an empty body, which is why the bound is measured in
+/// `somfy-api`'s own tests rather than counted here. See [`JsonBody`].
 async fn get_settings() -> impl IntoResponse {
     match RPC.call(Rpc::Settings).await {
         Some(Reply::Settings(wifi, mqtt)) => Ok((
             StatusCode::OK,
-            JsonBody(SettingsDto {
+            JsonBody::<_, { somfy_api::SETTINGS_JSON_MAX_BYTES }>(SettingsDto {
                 wifi,
                 mqtt,
                 wifi_trial: crate::trial::status(Instant::now().as_millis()),
@@ -700,44 +738,50 @@ async fn start_wifi_trial(Json(update): Json<WifiUpdateDto>) -> impl IntoRespons
     }
 }
 
-
-/// The operator reached the device on the candidate network. Store it.
+/// End a live trial, one way or the other.
 ///
-/// This is the only path on which a Wi-Fi credential reaches flash, and the
-/// order is what makes it safe: the trial is asked whether it has been proved
-/// **first**, the write happens second, and the trial is forgotten only once the
-/// write has been acknowledged. A trial cleared before the write landed would
-/// leave the device running on a credential it would not come back to after a
-/// power cut.
-async fn confirm_wifi_trial() -> impl IntoResponse {
-    let candidate = match crate::trial::commit(Instant::now().as_millis()) {
-        Ok(candidate) => candidate,
-        Err(code) => return Err(Ok(refuse(code))),
-    };
-    match RPC.call(Rpc::SaveWifi(candidate)).await {
-        Some(Reply::Done) => {
-            crate::trial::end();
-            Ok((StatusCode::NO_CONTENT, NoContent))
+/// # Confirm
+///
+/// The only path on which a Wi-Fi credential reaches flash, and the order is
+/// what makes it safe: the trial is asked whether it has been proved **first**,
+/// the write happens second, and the trial is forgotten only once the write has
+/// been acknowledged. A trial cleared before the write landed would leave the
+/// device running on a credential it would not come back to after a power cut.
+///
+/// Answers `204`, because the change is complete: the device is on the new
+/// network and the credential is stored.
+///
+/// # Cancel
+///
+/// Answers `202`, because what happens next is a restart onto the stored
+/// credential — see `crate::trial` for why a revert is a reboot — and this
+/// response cannot outlive it by much.
+async fn settle_wifi_trial(Json(decision): Json<TrialDecisionDto>) -> impl IntoResponse {
+    match decision {
+        TrialDecisionDto::Confirm => {
+            let candidate = match crate::trial::commit(Instant::now().as_millis()) {
+                Ok(candidate) => candidate,
+                Err(code) => return Err(Ok(refuse(code))),
+            };
+            match RPC.call(Rpc::SaveWifi(candidate)).await {
+                Some(Reply::Done) => {
+                    crate::trial::end();
+                    Ok((StatusCode::NO_CONTENT, NoContent))
+                }
+                // The trial is deliberately **left running**: the credential is
+                // proved and only the write failed, so the operator can retry
+                // the confirmation rather than run the whole trial again. If
+                // they do not, the confirmation deadline reverts the device as
+                // it always would.
+                Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
+                Some(_) => Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
+                None => Err(Err(Unavailable)),
+            }
         }
-        // The trial is deliberately **left running**: the credential is proved
-        // and only the write failed, so the operator can retry the confirmation
-        // rather than having to run the whole trial again. If they do not, the
-        // confirmation deadline reverts the device as it always would.
-        Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
-        Some(_) => Err(Ok(refuse(ApiErrorCode::SettingsUnwritable))),
-        None => Err(Err(Unavailable)),
-    }
-}
-
-/// Put the previous credential back now rather than waiting out the deadline.
-///
-/// `202`: what happens next is a restart onto the stored credential, which this
-/// response cannot outlive by much. See `crate::trial` for why a revert is a
-/// reboot.
-async fn cancel_wifi_trial() -> impl IntoResponse {
-    match crate::trial::cancel() {
-        Ok(()) => Ok((StatusCode::ACCEPTED, NoContent)),
-        Err(code) => Err(Ok::<Refusal, Unavailable>(refuse(code))),
+        TrialDecisionDto::Cancel => match crate::trial::cancel() {
+            Ok(()) => Ok((StatusCode::ACCEPTED, NoContent)),
+            Err(code) => Err(Ok(refuse(code))),
+        },
     }
 }
 

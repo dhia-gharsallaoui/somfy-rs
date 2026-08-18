@@ -217,9 +217,10 @@ pub fn status(now_ms: u64) -> Option<WifiTrialDto> {
         // form it just submitted.
         match (&slot.live, &slot.requested) {
             (Some(trial), _) => Some(WifiTrialDto::of(trial, now_ms)),
-            (None, Some(candidate)) => {
-                Some(WifiTrialDto::of(&WifiTrial::start(candidate.clone(), now_ms), now_ms))
-            }
+            (None, Some(candidate)) => Some(WifiTrialDto::of(
+                &WifiTrial::start(candidate.clone(), now_ms),
+                now_ms,
+            )),
             (None, None) => None,
         }
     })

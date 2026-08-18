@@ -30,6 +30,7 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::VentBandNotMeasured
         | ApiErrorCode::NotCalibrating
         | ApiErrorCode::CalibrationImplausible
+        | ApiErrorCode::CommandNotAtThisWidth
         | ApiErrorCode::ValueEmpty
         | ApiErrorCode::ValueTooLong
         | ApiErrorCode::ValueTooShort
@@ -77,6 +78,11 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
         ApiErrorCode::CalibrationImplausible,
         "calibrationImplausible",
         400,
+    ),
+    (
+        ApiErrorCode::CommandNotAtThisWidth,
+        "commandNotAtThisWidth",
+        409,
     ),
     (ApiErrorCode::ValueEmpty, "valueEmpty", 400),
     (ApiErrorCode::ValueTooLong, "valueTooLong", 400),

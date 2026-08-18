@@ -288,6 +288,8 @@ export const fr: Record<MessageKey, string> = {
   'error.notCalibrating': 'cette mesure n’est plus en cours',
   'error.calibrationImplausible':
     'l’appareil refuse ces valeurs — une course nulle, ou de plus de trois minutes, ou des appuis ne laissant aucune course entre eux',
+  'error.commandNotAtThisWidth':
+    'ce store est appairé en trames 56 bits, qui n’ont aucune commande de pas vers le haut — en envoyer une le ferait descendre d’un pas',
   'error.unknown': 'l’appareil n’en a pas donné la raison',
 
 
@@ -334,8 +336,8 @@ export const fr: Record<MessageKey, string> = {
   'settings.wifiPsk': 'phrase secrète',
   'settings.wifiPskStored': 'Une phrase secrète est enregistrée.',
   'settings.wifiPskOpen': 'Aucune phrase secrète — réseau ouvert.',
-  'settings.secretKeep': 'Conserver celle enregistrée',
-  'settings.secretSet': 'En saisir une nouvelle',
+  'settings.secretKeep': 'Conserver la valeur enregistrée',
+  'settings.secretSet': 'Saisir une nouvelle valeur',
   'settings.secretClear': 'Il ne doit pas y en avoir',
   'settings.wifiWarn':
     'L’appareil va quitter ce réseau pour essayer {ssid}. Rejoignez {ssid} vous-même et rouvrez cette page dans les {minutes} minutes pour le conserver. Si personne ne le fait, l’appareil redémarre sur {current} et rien n’est enregistré.',

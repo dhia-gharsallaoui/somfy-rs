@@ -38,10 +38,12 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_hal::{delay::Delay, gpio::Output, spi::master::Spi, Blocking};
 use heapless::{String, Vec};
-use somfy_api::{
-    ApiErrorCode, CalibrationStepDto, GroupDto, MqttSettingsDto, RoomDto, ShadeDto, WifiSettingsDto,
-};
-use somfy_config::{Catalog, CatalogError, ConfigRecord};
+use somfy_api::{ApiErrorCode, CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
+#[cfg(feature = "http")]
+use somfy_api::{MqttSettingsDto, WifiSettingsDto};
+#[cfg(feature = "http")]
+use somfy_config::ConfigRecord;
+use somfy_config::{Catalog, CatalogError};
 use somfy_domain::{
     allocate_with, AllocateError, DomainError, GroupId, Registry, RemoteIdentity, RoomId,
     ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY,
@@ -54,6 +56,7 @@ use somfy_tasks::{
     TRANSMIT_QUEUE_DEPTH,
 };
 
+#[cfg(feature = "http")]
 use crate::config::ConfigChange;
 use crate::edits::{AckReceiver, EditReceiver, EventSender, ShadeAck, ShadeEdit, ShadeEvent};
 use crate::radio::{air::Air, rmt_rx::RmtPulseSource};
@@ -248,6 +251,7 @@ pub async fn state(
 ) -> ! {
     let Table {
         ref mut shades,
+        #[cfg(feature = "http")]
         ref config,
         ref mut catalog,
         identity,
@@ -346,6 +350,7 @@ pub async fn state(
                 request,
                 &mut machine,
                 &mut store,
+                #[cfg(feature = "http")]
                 config,
                 &mut queue,
                 catalog,
@@ -421,6 +426,11 @@ pub struct Table {
     /// write off the radio's back. `None` is a board whose partition table has
     /// no `wificfg` — it runs, and settings changes are refused rather than
     /// silently lost.
+    ///
+    /// Only carried where something can change it. Boot reads this region on
+    /// every build — see `crate::report_config` — but only the settings screen
+    /// writes it, so a build without one hands the store back to be dropped.
+    #[cfg(feature = "http")]
     pub config: Option<crate::config::ConfigStore>,
     /// The table as the controller believes it, plus the debounce.
     pub catalog: Catalog,
@@ -436,6 +446,23 @@ pub struct Table {
 }
 
 /// Which of the three message kinds the second select arm delivered.
+#[cfg_attr(
+    feature = "http",
+    allow(
+        clippy::large_enum_variant,
+        reason = "the large variant is `rpc::Request`, at 380 bytes against \
+                  `ShadeEdit`'s 128, and the size is `SaveMqtt`'s six fields at \
+                  twice their stored capacity — the doubling that lets an \
+                  over-long value come back as a typed rejection naming the \
+                  field instead of a bare 'malformed body'. Clippy's remedy is \
+                  to box it, and the only allocator here is the one the Wi-Fi \
+                  driver's packet buffers come from: trading a stack temporary \
+                  in a function that destructures it immediately for a heap \
+                  allocation on the path between every HTTP request and the \
+                  radio's own heap is the wrong direction on the one resource \
+                  this firmware is short of"
+    )
+)]
 enum Edited {
     /// Somebody asked for a change to the table.
     Edit(ShadeEdit),
@@ -490,7 +517,7 @@ fn serve_request(
     request: rpc::Request,
     machine: &mut StateMachine,
     store: &mut FlashStore<'static>,
-    config: &Option<crate::config::ConfigStore>,
+    #[cfg(feature = "http")] config: &Option<crate::config::ConfigStore>,
     queue: &mut TransmitQueueHandle<'static, Mutex, TRANSMIT_QUEUE_DEPTH>,
     catalog: &mut Catalog,
     identity: &RemoteIdentity,
@@ -530,12 +557,27 @@ fn serve_request(
                 // slat-separation band has never been measured. Anything else is
                 // this device's fault and has just been logged by
                 // `run_command`.
-                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false),
+                Err(DomainError::NotFound) => {
+                    (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false)
+                }
                 Err(DomainError::VentBandNotMeasured) => (
                     rpc::Reply::Refused(ApiErrorCode::VentBandNotMeasured.into()),
                     false,
                 ),
-                Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()), false),
+                // The third, and it is about the *shade* rather than the
+                // request too: 56-bit RTS has no step-up command, so the
+                // nibble a narrow frame would send is `StepDown`'s. Without its
+                // own code it fell into the catch-all below and the UI would
+                // have told the operator the device's own address allocator had
+                // gone wrong.
+                Err(DomainError::CommandNotAtThisWidth) => (
+                    rpc::Reply::Refused(ApiErrorCode::CommandNotAtThisWidth.into()),
+                    false,
+                ),
+                Err(_) => (
+                    rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()),
+                    false,
+                ),
             }
         }
         // **The one rule that lives here.** A `Prog` burst at an address this
@@ -558,7 +600,10 @@ fn serve_request(
                 };
                 match run_command(machine, store, queue, command, now_ms, emitted) {
                     Ok(dispatched) => (rpc::Reply::Done, dispatched),
-                    Err(_) => (rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()), false),
+                    Err(_) => (
+                        rpc::Reply::Refused(ApiErrorCode::InvalidAddress.into()),
+                        false,
+                    ),
                 }
             }
         },
@@ -599,10 +644,13 @@ fn serve_request(
             };
             match outcome {
                 Ok(dispatched) => (rpc::Reply::Done, dispatched),
-                Err(DomainError::NotFound) => (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false),
-                Err(DomainError::NotCalibrating) => {
-                    (rpc::Reply::Refused(ApiErrorCode::NotCalibrating.into()), false)
+                Err(DomainError::NotFound) => {
+                    (rpc::Reply::Refused(ApiErrorCode::NotFound.into()), false)
                 }
+                Err(DomainError::NotCalibrating) => (
+                    rpc::Reply::Refused(ApiErrorCode::NotCalibrating.into()),
+                    false,
+                ),
                 Err(error) => {
                     // Everything left is a run whose numbers this device will
                     // not store — a traverse of zero or past three minutes, or
@@ -643,6 +691,7 @@ fn serve_request(
         // carried from. None of them dispatches a transmission, so all four
         // answer `false`.
         // -------------------------------------------------------------------
+        #[cfg(feature = "http")]
         rpc::Request::Settings => (
             match read_config(store, config) {
                 Ok(record) => {
@@ -656,6 +705,7 @@ fn serve_request(
             },
             false,
         ),
+        #[cfg(feature = "http")]
         rpc::Request::PrepareWifi(update) => (
             match read_config(store, config) {
                 Ok(record) => {
@@ -669,10 +719,12 @@ fn serve_request(
             },
             false,
         ),
+        #[cfg(feature = "http")]
         rpc::Request::SaveWifi(credentials) => (
             write_config(store, config, ConfigChange::Wifi(credentials)),
             false,
         ),
+        #[cfg(feature = "http")]
         rpc::Request::SaveMqtt(update) => (
             match read_config(store, config) {
                 Ok(record) => {
@@ -688,10 +740,8 @@ fn serve_request(
             },
             false,
         ),
-        rpc::Request::ClearMqtt => (
-            write_config(store, config, ConfigChange::Mqtt(None)),
-            false,
-        ),
+        #[cfg(feature = "http")]
+        rpc::Request::ClearMqtt => (write_config(store, config, ConfigChange::Mqtt(None)), false),
     };
     rpc::RPC.answer(reply);
     dispatched
@@ -700,11 +750,13 @@ fn serve_request(
 /// Read the newest configuration record, or report that the region could not
 /// be.
 ///
+///
 /// `Ok(None)` is a board with nothing provisioned, which is an ordinary state.
 /// `Err(())` is a region that is missing or unreadable, and the caller decides
 /// what that means — a *read* degrades to "nothing provisioned", a *write* is
 /// refused, because writing over a region that cannot be read is how a working
 /// credential gets lost.
+#[cfg(feature = "http")]
 fn read_config(
     store: &mut FlashStore<'static>,
     config: &Option<crate::config::ConfigStore>,
@@ -727,9 +779,8 @@ fn read_config(
 /// The stripping is [`WifiSettingsDto`]'s and [`MqttSettingsDto`]'s, not this
 /// function's: neither type has a field a secret could go into. See
 /// `somfy_api`'s settings module.
-fn split(
-    record: Option<&ConfigRecord>,
-) -> (Option<WifiSettingsDto>, Option<MqttSettingsDto>) {
+#[cfg(feature = "http")]
+fn split(record: Option<&ConfigRecord>) -> (Option<WifiSettingsDto>, Option<MqttSettingsDto>) {
     match record {
         None => (None, None),
         Some(record) => (
@@ -745,6 +796,7 @@ fn split(
 /// [`ApiErrorCode::SettingsUnwritable`], and the settings were **not** stored —
 /// the device carries on with what it had, which is the degradable behaviour
 /// this region is allowed and the rolling-code one is not.
+#[cfg(feature = "http")]
 fn write_config(
     store: &mut FlashStore<'static>,
     config: &Option<crate::config::ConfigStore>,

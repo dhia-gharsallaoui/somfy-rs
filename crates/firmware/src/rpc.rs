@@ -68,10 +68,10 @@
 use embassy_sync::semaphore::{FairSemaphore, Semaphore as _};
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration};
-use somfy_api::{
-    ApiErrorDto, CalibrationStepDto, GroupDto, MqttSettingsDto, MqttUpdateDto, RoomDto, ShadeDto,
-    WifiSettingsDto, WifiUpdateDto,
-};
+use somfy_api::{ApiErrorDto, CalibrationStepDto, GroupDto, RoomDto, ShadeDto};
+#[cfg(feature = "http")]
+use somfy_api::{MqttSettingsDto, MqttUpdateDto, WifiSettingsDto, WifiUpdateDto};
+#[cfg(feature = "http")]
 use somfy_config::WifiCredentials;
 use somfy_domain::ShadeId;
 use somfy_tasks::ControlCommand;
@@ -145,8 +145,19 @@ pub enum Request {
     // stored value by the state task, which is the only thing that can read it,
     // so a passphrase is never carried in this direction — the web server sends
     // the *instruction*, not the secret it stands in for.
+    //
+    // **These four are the one part of this seam that is `#[cfg]`-gated**, and
+    // the reason is measured rather than tidy. This enum lives in a `Signal`,
+    // which is a static sized to its largest variant, and `SaveMqtt` is the
+    // largest by a wide margin — six fields with doubled inbound capacity. On a
+    // build with no web server nothing can construct one, so an ungated variant
+    // would be several hundred bytes of DRAM taken out of the Wi-Fi driver's
+    // heap on every boot of a board that has no settings screen. The ESP32 is
+    // exactly that board — it cannot link the web server at all — and it is the
+    // chip with the least heap headroom to spare.
     // -----------------------------------------------------------------------
     /// What the device is provisioned with, minus every secret.
+    #[cfg(feature = "http")]
     Settings,
     /// Validate a candidate credential against what is stored, without applying
     /// or storing anything.
@@ -155,15 +166,19 @@ pub enum Request {
     /// touched: an SSID one byte too long must cost no connection at all. It is
     /// also where a `psk` of "keep what you have" becomes the stored
     /// passphrase, which nothing outside the state task can do.
+    #[cfg(feature = "http")]
     PrepareWifi(WifiUpdateDto),
     /// Store a credential a trial has proved. See `crate::trial`.
+    #[cfg(feature = "http")]
     SaveWifi(WifiCredentials),
     /// Validate and store broker settings, resolving the password against what
     /// is stored.
+    #[cfg(feature = "http")]
     SaveMqtt(MqttUpdateDto),
     /// Run without a broker. Not an absence — a device with no broker still
     /// receives, decodes and tracks — so it is its own request rather than an
     /// empty [`Request::SaveMqtt`].
+    #[cfg(feature = "http")]
     ClearMqtt,
 }
 
@@ -197,6 +212,9 @@ pub enum Reply {
     /// [`somfy_api::SettingsDto`] is not here: it belongs to `crate::trial`,
     /// which the web server reads directly, because it is not in flash and this
     /// task has no business knowing about the radio.
+    ///
+    /// Gated for the same measured reason as [`Request::Settings`].
+    #[cfg(feature = "http")]
     Settings(Option<WifiSettingsDto>, Option<MqttSettingsDto>),
     /// A candidate credential, validated and with its passphrase resolved.
     ///
@@ -205,6 +223,7 @@ pub enum Reply {
     /// Wi-Fi task, which puts it on the radio — the same passphrase the driver
     /// already holds. What it does not do is reach a socket; nothing in
     /// [`somfy_api::SettingsDto`] has a field it could be written into.
+    #[cfg(feature = "http")]
     WifiCandidate(WifiCredentials),
 }
 

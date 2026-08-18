@@ -196,6 +196,31 @@
 /// against 66,724 of stack. `#[inline(never)]` on `crate::start_network` is what
 /// separates them — 18,576 bytes, and the whole of the boot loop — and
 /// [`NETWORK_CHAIN_BYTES`] is what that branch costs once separated.
+/// **Re-measured 2026-08-18 for the settings screen, and deliberately not
+/// lowered.** The chain is shallower than this now, because the compiler moved
+/// its inlining: `TaskStorage<__embassy_main_task>::poll` fell from 3,856 bytes
+/// to 48 as `crate::start`'s body moved into the task closure, which itself grew
+/// from 20,064 to 21,424 (the configuration store is kept past boot now, so
+/// `report_config` returns four things instead of three). Walked again:
+///
+/// | | ESP32-S3, this commit |
+/// |---|---|
+/// | `main`, `Executor::run`, `run_inner` | 96 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 48 |
+/// | `__embassy_main_task_inner_function::{closure#0}`, which is [`crate::start`] | 21,424 |
+/// | [`crate::tasks::state`], building the task token | 15,024 |
+/// | `UninitCell::write_in_place`, moving the future into its static | 15,040 |
+/// | **total** | **51,632** |
+///
+/// It is left at 54,080 rather than lowered to that, and the direction is the
+/// whole argument: this constant is an **upper bound** the board refuses to boot
+/// below, so a figure that is too high costs a little unusable stack while a
+/// figure that is too low is the boot loop this file was rewritten for. Lowering
+/// it would buy 2,448 bytes of stack that nothing needs — `STACK_BUDGET_BYTES`
+/// already clears it by more than the margin floor — in exchange for pinning a
+/// number that moves with the optimiser's inlining decisions rather than with
+/// this firmware's code. The measurement is recorded so the next reader knows it
+/// was taken.
 const BOOT_CHAIN_BYTES: usize = 54_080;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
@@ -254,6 +279,19 @@ const NETWORK_CHAIN_BYTES: usize = 14_416;
 /// Zero without the web server, which is not a rounding — there is no connection
 /// task in that image at all.
 #[cfg(feature = "http")]
+/// **Re-measured 2026-08-18, when four settings routes were added** — which is
+/// exactly the change the paragraph above warns about. Every one of them is a
+/// plain literal path, the same `&str` family `/api/v1/shades`, `/api/v1/groups`
+/// and `/api/v1/rooms` were already in, so none adds a route shape. The frames
+/// moved anyway, and in opposite directions: the connection's `select` merged
+/// into one 15,840-byte frame where it was two of 7,600 and 7,552, while the
+/// `Route<&str, MethodRouter<…>>` frame fell from 8,720 to 6,544. Net about
+/// −1,500, so the clearance below [`BOOT_CHAIN_BYTES`] is wider than it was and
+/// this figure stays as the upper bound it is.
+///
+/// **What the routes did cost is DRAM, not stack** — 10,664 bytes of it, in the
+/// four connection task futures. See [`DRAM_FOR_STACK_AND_HEAP`], which is where
+/// that shows up and where it was paid for.
 const REQUEST_CHAIN_BYTES: usize = 33_504;
 /// See the `http` definition above.
 #[cfg(not(feature = "http"))]
@@ -484,16 +522,50 @@ const _: () = assert!(
 ///
 /// | chip | features measured with | DRAM |
 /// |---|---|---|
-/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 125,116 |
-/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 159,908 |
-/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 146,672 |
+/// | ESP32 | `mqtt` — see [`crate::api`]; `http` does not fit | 123,996 |
+/// | ESP32-S3 | `mqtt`, `ui` (and so `http`) | 136,020 |
+/// | ESP32-C3 | `mqtt`, `ui` (and so `http`) | 122,816 |
 ///
 /// The web server costs about **69,000 bytes on the ESP32, 70,000 on the
 /// ESP32-S3 and 70,000 on the ESP32-C3** — three measurements of one thing, and the spread is
 /// the per-architecture difference in what a generator lays out. Four connection
 /// tasks are 52,384 of it (`api::HTTP_TASKS` × a 13,096-byte future, which is
 /// `picoserve`'s router recursion) and their buffers are 14,336.
-/// **Re-measured 2026-08-18, and the reason is worth recording.** Two branches
+/// **Re-measured 2026-08-18 for the settings screen, and this one is a real
+/// cost rather than a correction.** The four settings routes and their handlers
+/// took **10,664 bytes** of DRAM on both the ESP32-S3 and the ESP32-C3, and
+/// essentially all of it is the web server's connection tasks: `picoserve`'s
+/// router is a type per route, so every path is a variant of the monomorphised
+/// future each of the [`crate::api::HTTP_TASKS`] tasks holds statically.
+/// `firmware::api::connection::POOL` went from 52,384 bytes to 67,840 — 13,096
+/// per task to 16,960.
+///
+/// Two things were done about that before it was accepted, and both are
+/// measured:
+///
+/// - **The two endings of a Wi-Fi trial became one route with the decision in
+///   the body** (`somfy_api::TrialDecisionDto`), which recovered 1,440 bytes.
+///   That is the same trade `/calibrate` made.
+/// - **Everything the settings screen reaches is `#[cfg(feature = "http")]`** —
+///   the `rpc::Request` variants, `tasks::Table::config`, the state task's arms.
+///   The ESP32 cannot link the web server and has the least heap headroom of the
+///   three, so it now pays 496 bytes rather than 1,632, and **its heap is
+///   unchanged at 56 KiB**.
+///
+/// What was tried and rejected, so it is not tried again:
+/// `picoserve::response::Json` streams instead of holding a buffer, but its
+/// `JsonStream` keeps the value *and* a serializer state live across the write —
+/// the connection future grew to 18,904 bytes per task, 7,776 across the four,
+/// against the 2,688 the wider fixed buffer costs. See `api::routes::JsonBody`.
+///
+/// **The ESP32-C3 is the chip this bill lands on**, and the figure is recorded
+/// here rather than left to be discovered: its heap falls from 65 KiB to 55 KiB,
+/// which is 1,700 bytes above the worst announcement peak ever measured — on a
+/// *different* chip, against a peak that varied by about 2,000 bytes between
+/// boots of one unchanged image. [`warn_if_tight`] says so at boot. It has not
+/// been run on hardware.
+///
+/// **Re-measured 2026-08-18 before that, and the reason is worth recording.** Two branches
 /// were merged that each added statics — the mDNS/SNTP services and the
 /// calibration state — and each had re-measured this row against a tree without
 /// the other. Resolving the conflict by taking one side kept a figure that was
@@ -530,13 +602,13 @@ const _: () = assert!(
 /// over [`REQUIRED_STACK_BYTES`] is ~11 KB, so the change is recorded here
 /// because the self-check above must stay exact, not because anything is tight.
 #[cfg(feature = "chip-esp32")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 124_492;
+const DRAM_FOR_STACK_AND_HEAP: usize = 123_996;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-s3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 146_684;
+const DRAM_FOR_STACK_AND_HEAP: usize = 136_020;
 /// See the `chip-esp32` definition above.
 #[cfg(feature = "chip-c3")]
-const DRAM_FOR_STACK_AND_HEAP: usize = 133_496;
+const DRAM_FOR_STACK_AND_HEAP: usize = 122_816;
 
 // **The ESP32 cannot carry the web server, and this says so at compile time
 // rather than at link time.**
@@ -579,14 +651,18 @@ compile_error!(
 ///
 /// | chip | DRAM to divide | heap | stack left | spare over [`REQUIRED_STACK_BYTES`] |
 /// |---|---|---|---|---|
-/// | ESP32 | 125,116 | 57 KiB = 58,368 | 66,748 | 12,028 |
-/// | ESP32-S3 | 159,908 | 91 KiB = 93,184 | 66,724 | 12,004 |
-/// | ESP32-C3 | 146,672 | 78 KiB = 79,872 | 66,800 | 12,080 |
+/// | ESP32 | 123,996 | 56 KiB = 57,344 | 66,652 | 10,860 |
+/// | ESP32-S3 | 136,020 | 68 KiB = 69,632 | 66,388 | 10,596 |
+/// | ESP32-C3 | 122,816 | 55 KiB = 56,320 | 66,496 | 10,704 |
 ///
 /// Nothing in that table is chosen; it is what the rule returns. Every `stack
-/// left` column was read back out of the linked ELF on 2026-08-17 — they are the
-/// `.stack` section's own size, and the middle one is the 66,724 the boot loop
-/// printed.
+/// left` column was read back out of the linked ELF on 2026-08-18 — they are the
+/// `.stack` section's own size.
+///
+/// **This table went stale twice before it was derived rather than
+/// transcribed**, which is why every figure in it now comes from one of two
+/// places: `readelf -S | grep '\.stack '` for the `stack left` column, and the
+/// rule above for the heap.
 ///
 /// **The table used to read 233,700 for the ESP32-S3 and a 163 KiB heap, and
 /// that was a measurement of an image without the web server in it.** It went
@@ -661,6 +737,23 @@ pub const RADIO_HEAP_BYTES: usize = (DRAM_FOR_STACK_AND_HEAP - STACK_BUDGET_BYTE
 #[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
 pub const WIFI_WORKING_SET_BYTES: usize = 47_464;
 
+/// The worst heap the driver and one announcement burst have ever needed.
+///
+/// 54,620 bytes, read off `heap: session announced` — the line `crate::mqtt`
+/// prints one step after the burst of retained discovery configs that *is* the
+/// peak. Measured on an ESP32-S3 against a real broker with a real installation;
+/// [`WIFI_WORKING_SET_BYTES`] is the resting figure the same boots settled on,
+/// and the difference between the two is what one announcement costs.
+///
+/// **It is one chip's number and it varies.** Across boots of one unchanged
+/// image the peak moved by about 2,000 bytes, and it scales with the shade
+/// count, so it is a floor on what a bigger installation would need rather than
+/// a ceiling on anything. That is precisely why [`warn_if_tight`] compares
+/// against it and says so out loud instead of a `const` assertion pretending to
+/// know.
+#[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
+pub const WIFI_PEAK_BYTES: usize = 54_620;
+
 /// Say at boot when this chip's heap cannot hold the driver's working set.
 ///
 /// **No chip in the matrix trips this today**, and it is here anyway, because
@@ -693,7 +786,60 @@ pub fn warn_if_undersized() {
             WIFI_WORKING_SET_BYTES,
         );
     }
+    warn_if_tight();
 }
+
+/// Say at boot when the heap clears the working set but not the peak by much.
+///
+/// # Why a second, softer line
+///
+/// [`warn_if_undersized`] catches a heap that cannot hold the driver *at rest*,
+/// which is a board that reboots seconds into every boot. This catches the one
+/// that holds the driver and then runs out during the announcement burst — a
+/// board that associates, connects to the broker, and dies while publishing,
+/// which looks like a broker problem and is not.
+///
+/// **The ESP32-C3 is the reason it exists.** The settings screen cost 10,664
+/// bytes of DRAM in the web server's connection tasks, and on the C3 that takes
+/// the heap from 65 KiB to 55 KiB — 1,700 bytes above [`WIFI_PEAK_BYTES`],
+/// against a peak that itself moved 2,000 bytes between boots of one unchanged
+/// image. A margin inside its own noise is a coincidence, not a design, and the
+/// honest thing is to say which boot it was measured on and let the board report
+/// what it actually sees.
+///
+/// Not a refusal, and not a `const` assertion, for the same reason
+/// [`warn_if_undersized`] is neither: the peak is one chip's measurement and a
+/// compile-time refusal would take the affected chip out of the matrix that
+/// would catch the problem.
+#[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
+fn warn_if_tight() {
+    // Only when the heap clears the resting set, so this never doubles up on
+    // the harder line above.
+    if RADIO_HEAP_BYTES >= WIFI_WORKING_SET_BYTES
+        && RADIO_HEAP_BYTES < WIFI_PEAK_BYTES + PEAK_NOISE_BYTES
+    {
+        esp_println::println!(
+            "heap: {} bytes leaves {} above the worst announcement peak ever measured \
+             ({}), which is inside the {}-byte spread that peak showed between boots. \
+             Watch `heap: session announced` on this board — if it lands near the \
+             total, an announcement can exhaust the heap and reset it. See \
+             crates/firmware/src/heap.rs.",
+            RADIO_HEAP_BYTES,
+            RADIO_HEAP_BYTES - WIFI_PEAK_BYTES,
+            WIFI_PEAK_BYTES,
+            PEAK_NOISE_BYTES,
+        );
+    }
+}
+
+/// How much [`WIFI_PEAK_BYTES`] moved between boots of one unchanged image.
+///
+/// About 2,000 bytes, from the sixteen boots the peak itself was read from. It
+/// is the width of the band inside which "the heap is big enough" cannot be
+/// distinguished from "it happened not to run out this time", which is the
+/// judgement [`warn_if_tight`] exists to hand to whoever is watching the console.
+#[allow(dead_code, reason = "see the allow on `RADIO_HEAP_BYTES`")]
+const PEAK_NOISE_BYTES: usize = 2_000;
 /// Bytes of heap for a binary that starts the scheduler and no radio.
 ///
 /// **The reason this constant used to give was false, and the constant is kept

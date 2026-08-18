@@ -36,6 +36,7 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   ventBandNotMeasured: 'error.ventBandNotMeasured',
   notCalibrating: 'error.notCalibrating',
   calibrationImplausible: 'error.calibrationImplausible',
+  commandNotAtThisWidth: 'error.commandNotAtThisWidth',
   // Settings. Each of these is a *rule*; the field it broke arrives beside it
   // as `ApiErrorDto.field`, so the sentences below are written to read with a
   // field name interpolated into them — `{field}` — and the form highlights the

@@ -20,6 +20,7 @@ import type { MqttUpdateDto } from './generated/MqttUpdateDto';
 import type { PatchShadeDto } from './generated/PatchShadeDto';
 import type { RoomDto } from './generated/RoomDto';
 import type { SettingsDto } from './generated/SettingsDto';
+import type { TrialDecisionDto } from './generated/TrialDecisionDto';
 import type { ShadeDto } from './generated/ShadeDto';
 import type { WifiUpdateDto } from './generated/WifiUpdateDto';
 
@@ -228,8 +229,7 @@ export const startWifiTrial = (body: WifiUpdateDto): Promise<void> =>
  * Keep the network being tried. Reached **from the new network** — that is the
  * whole point of it.
  */
-export const confirmWifi = (): Promise<void> =>
-  request('/settings/wifi/confirm', { method: 'POST' }).then(() => undefined);
+export const confirmWifi = (): Promise<void> => settleWifiTrial({ decision: 'confirm' });
 
 /**
  * Give up on the network being tried and go back to the stored one now, rather
@@ -238,8 +238,17 @@ export const confirmWifi = (): Promise<void> =>
  * The device restarts to do it, so this response is the last thing this
  * connection will carry.
  */
-export const cancelWifiTrial = (): Promise<void> =>
-  request('/settings/wifi/cancel', { method: 'POST' }).then(() => undefined);
+export const cancelWifiTrial = (): Promise<void> => settleWifiTrial({ decision: 'cancel' });
+
+/**
+ * Both endings share one endpoint, with the decision in the body.
+ *
+ * Not an arbitrary shape: on this device a route costs statically-allocated
+ * DRAM in every one of the web server's connection tasks, paid for out of the
+ * Wi-Fi driver's heap. `somfy_api::TrialDecisionDto` carries the measurement.
+ */
+const settleWifiTrial = (body: TrialDecisionDto): Promise<void> =>
+  sendNoBody('POST', '/settings/wifi/trial', body);
 
 /**
  * Store broker settings. **The device restarts.**

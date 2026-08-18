@@ -104,7 +104,8 @@ pub use entities::{
 pub use errors::{ApiErrorCode, ApiErrorDto, SettingsFieldDto};
 pub use events::{ShadeStateEvent, WsEvent};
 pub use settings::{
-    MqttSettingsDto, MqttUpdateDto, SecretDto, SettingsDto, TrialPhaseDto, WifiSettingsDto,
-    WifiTrialDto, WifiUpdateDto, MAX_ADDRESS_LEN, MAX_SECRET_LEN,
+    MqttSettingsDto, MqttUpdateDto, SecretDto, SettingsDto, TrialDecisionDto, TrialPhaseDto,
+    WifiSettingsDto, WifiTrialDto, WifiUpdateDto, MAX_ADDRESS_LEN, MAX_SECRET_LEN,
+    SETTINGS_JSON_MAX_BYTES,
 };
 pub use shades::{CreateShadeDto, PatchShadeDto, NAME_MAX_BYTES};

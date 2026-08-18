@@ -114,6 +114,16 @@ export function Settings() {
    */
   const [lastTrial, setLastTrial] = useState<WifiTrialDto | undefined>(undefined);
   const [reloadToken, setReloadToken] = useState(0);
+  /**
+   * How a trial ended, held **here** rather than inside the panel that ended it.
+   *
+   * The panel unmounts the moment the trial goes away, so a message set inside
+   * it would be gone before it was read. That is not cosmetic on a cancel: the
+   * device restarts onto the stored network, so the very next poll fails — and
+   * without this the screen would fall into "the device has left, go and join
+   * {candidate}", which is the opposite of what just happened.
+   */
+  const [settled, setSettled] = useState<MessageKey | undefined>(undefined);
 
   const reload = () => setReloadToken((token) => token + 1);
 
@@ -157,13 +167,40 @@ export function Settings() {
     );
   }
 
+  // A trial this page has just ended. Outranks everything below, including the
+  // unreachable branch: after a cancel the device *is* unreachable, because it
+  // is restarting onto the credential it never stopped having, and reporting
+  // that as a fault would be wrong twice over.
+  if (settled) {
+    return (
+      <div class="detail">
+        <Head t={t} />
+        <section class="panel panel--good">
+          <p role="status">{t(settled)}</p>
+          {settled === 'settings.trialCancelled' && <p class="note">{t('settings.restarting')}</p>}
+          <button
+            type="button"
+            class="btn"
+            onClick={() => {
+              setSettled(undefined);
+              setLastTrial(undefined);
+              reload();
+            }}
+          >
+            {t('settings.retry')}
+          </button>
+        </section>
+      </div>
+    );
+  }
+
   // Unreachable *and* a trial is running: the device has moved, which is what
   // was asked of it. Told as an instruction, not as a failure.
   if (loaded.at === 'unreachable' && trial) {
     return (
       <div class="detail">
         <Head t={t} />
-        <TrialPanel trial={trial} live={false} onSettled={reload} t={t} />
+        <TrialPanel trial={trial} live={false} onSettled={setSettled} t={t} />
       </div>
     );
   }
@@ -186,7 +223,7 @@ export function Settings() {
   return (
     <div class="detail">
       <Head t={t} />
-      {trial && <TrialPanel trial={trial} live onSettled={reload} t={t} />}
+      {trial && <TrialPanel trial={trial} live onSettled={setSettled} t={t} />}
       {/*
         The Wi-Fi form is hidden while a trial runs rather than disabled: a
         second candidate is refused by the device anyway (`trialInProgress`),
@@ -335,37 +372,36 @@ function TrialPanel({
 }: {
   trial: WifiTrialDto;
   live: boolean;
-  onSettled: () => void;
+  onSettled: (message: MessageKey) => void;
   t: Translate;
 }) {
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | undefined>(undefined);
-  const [settled, setSettled] = useState<MessageKey | undefined>(undefined);
 
+  // How it ended is reported **upwards**, not kept here: this panel unmounts as
+  // soon as the trial goes away, and after a cancel the device is restarting, so
+  // a message held here would be gone before it was read and the screen would
+  // fall into "the device has left, go and join {candidate}" — the opposite of
+  // what just happened.
   const act = (run: () => Promise<void>, message: MessageKey) => {
     if (busy) return;
     setBusy(true);
     setFailure(undefined);
     run()
-      .then(() => {
-        setSettled(message);
-        onSettled();
-      })
+      .then(() => onSettled(message))
       .catch((cause: unknown) => {
         setFailure(t(errorMessageKey(cause), fieldParam(cause, t)));
-      })
-      .finally(() => setBusy(false));
+        setBusy(false);
+      });
   };
 
   const seconds = Math.ceil(trial.remainingMs / 1000);
 
   return (
-    <section class={`panel ${settled ? 'panel--good' : 'panel--pending'}`}>
+    <section class="panel panel--pending">
       <h3>{t('settings.trialTitle', { ssid: trial.ssid })}</h3>
 
-      {settled ? (
-        <p role="status">{t(settled)}</p>
-      ) : (
+      {
         <>
           <p class="prose">
             {live
@@ -405,7 +441,7 @@ function TrialPanel({
             </button>
           </div>
         </>
-      )}
+      }
     </section>
   );
 }

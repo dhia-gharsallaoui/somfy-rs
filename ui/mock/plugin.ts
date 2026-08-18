@@ -42,6 +42,7 @@ import type { CreateShadeDto } from '../src/api/generated/CreateShadeDto.ts';
 import type { MqttUpdateDto } from '../src/api/generated/MqttUpdateDto.ts';
 import type { PatchShadeDto } from '../src/api/generated/PatchShadeDto.ts';
 import type { SecretDto } from '../src/api/generated/SecretDto.ts';
+import type { TrialDecisionDto } from '../src/api/generated/TrialDecisionDto.ts';
 import type { WifiUpdateDto } from '../src/api/generated/WifiUpdateDto.ts';
 import { Settings, type Rejection } from './settings.ts';
 import { World } from './world.ts';
@@ -105,6 +106,7 @@ const ERROR_STATUS: Record<ApiErrorCode, number> = {
   ventBandNotMeasured: 409,
   notCalibrating: 409,
   calibrationImplausible: 400,
+  commandNotAtThisWidth: 409,
   // Settings. Every validation refusal is a 400 and the two trial-state ones
   // are 409, matching `ApiErrorCode::http_status` — the argument for each is
   // there, beside the variant.
@@ -320,12 +322,12 @@ async function handleSettings(
     return settle(response, settings.startWifiTrial(body), 202);
   }
 
-  if (half === 'wifi' && action === 'confirm' && method === 'POST') {
-    return settle(response, settings.confirmWifi(), 204);
-  }
-
-  if (half === 'wifi' && action === 'cancel' && method === 'POST') {
-    return settle(response, settings.cancelWifiTrial(), 202);
+  if (half === 'wifi' && action === 'trial' && method === 'POST') {
+    const decision = parseTrialDecision(await readJson(request));
+    if (!decision) return sendJson(response, 400, { error: 'malformed body' });
+    return decision.decision === 'confirm'
+      ? settle(response, settings.confirmWifi(), 204)
+      : settle(response, settings.cancelWifiTrial(), 202);
   }
 
   if (half === 'mqtt' && action === undefined && method === 'PUT') {
@@ -373,6 +375,23 @@ function parseSecret(value: unknown): SecretDto | undefined {
     default:
       return undefined;
   }
+}
+
+/**
+ * Read a trial decision.
+ *
+ * The `KNOWN_*` records elsewhere in this file are total over a generated
+ * union; here the union is two fieldless variants, so the switch *is* the
+ * totality check — a third decision added in Rust makes `TrialDecisionDto`
+ * grow a member and this function stops returning it, which `tsc` catches at
+ * the call site.
+ */
+function parseTrialDecision(value: unknown): TrialDecisionDto | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { decision } = value as { decision?: unknown };
+  if (decision === 'confirm') return { decision: 'confirm' };
+  if (decision === 'cancel') return { decision: 'cancel' };
+  return undefined;
 }
 
 function parseWifiUpdate(value: unknown): WifiUpdateDto | undefined {

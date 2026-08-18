@@ -668,6 +668,19 @@ input:focus-visible {
   color: var(--danger);
 }
 
+/* The input the device named in its refusal.
+
+   The message alone is not enough on the settings screen: it has eight fields,
+   and a device that answers "must not contain //" without saying which of the
+   two namespaces it means sends the operator to read both. The wire carries the
+   field beside the code for exactly this — see `crates/somfy-api/src/errors.rs`
+   — so the colour and the sentence come from the same answer and cannot point
+   at different things. */
+.field__input--bad {
+  border-color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 7%, var(--paper));
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition-duration: 1ms !important;

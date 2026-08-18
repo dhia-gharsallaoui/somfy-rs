@@ -64,6 +64,29 @@ use crate::errors::{ApiErrorCode, ApiErrorDto, SettingsFieldDto};
 /// Longest dotted-quad IPv4 address: `255.255.255.255`.
 pub const MAX_ADDRESS_LEN: usize = 15;
 
+/// Longest JSON a [`SettingsDto`] serialises to, in bytes.
+///
+/// **Measured, not counted.** `tests/settings.rs` builds the widest legal value
+/// — every free-text string full of control characters, which escape to
+/// `\u00XX` six bytes at a time — and asserts this bound from both sides: never
+/// under it, and never more than 128 bytes over it. That is the discipline
+/// [`crate::SHADE_JSON_MAX_BYTES`] is held to, and for the same reason: that
+/// figure was hand-counted once at 512 and was wrong by 160 bytes, which would
+/// have made one shade answer with malformed JSON forever.
+///
+/// It is wider than a shade's because three of its strings can hold arbitrary
+/// text. An SSID is whatever an access point broadcasts and a broker username
+/// is whatever the broker was configured with, so neither can be restricted to
+/// a character class the way the two MQTT namespaces are.
+///
+/// **Every byte of it is spent four times.** The firmware serialises this into
+/// one fixed buffer held across the write, inside each of the web server's
+/// connection task futures, which are statically allocated out of the DRAM the
+/// Wi-Fi driver's heap is carved from. The measurement is **859**; this is that
+/// rounded up to the next 128, which is the granularity the test's own ceiling
+/// check uses. An ordinary document is 204.
+pub const SETTINGS_JSON_MAX_BYTES: usize = 896;
+
 /// Longest secret this API will carry inbound.
 ///
 /// The Wi-Fi passphrase's limit, which is the larger of the two — the broker
@@ -368,6 +391,65 @@ impl SecretDto {
             SecretDto::Set { value } => Ok(value.as_str()),
             SecretDto::Clear => Ok(""),
         }
+    }
+}
+
+/// What to do about a live credential trial.
+///
+/// One request with the decision in the body rather than two paths, and it is
+/// the same choice [`crate::CalibrationStepDto`] made for the same reason: on
+/// this device a route is not free. `picoserve`'s router is a type per route
+/// wrapping the previous one, so every path is a variant in the connection
+/// task's monomorphised future — and there are `api::HTTP_TASKS` of those
+/// futures, statically allocated, paid for in Wi-Fi heap on every boot whether
+/// or not anybody opens the UI. Folding two endpoints into one is measured in
+/// kilobytes here, not in tidiness.
+///
+/// The two are also genuinely one conversation: both end the same trial, and
+/// exactly one of them can be right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(
+        export,
+        export_to = "../../../ui/src/api/generated/",
+        tag = "decision",
+        rename_all = "camelCase"
+    )
+)]
+pub enum TrialDecisionDto {
+    /// The operator reached the device on the candidate network. Store it.
+    Confirm,
+    /// Put the stored credential back now, rather than waiting out the
+    /// deadline.
+    Cancel,
+}
+
+/// The tag half of [`TrialDecisionDto`]'s wire form.
+#[derive(DeriveDeserialize)]
+#[serde(rename_all = "camelCase")]
+enum DecisionTag {
+    Confirm,
+    Cancel,
+}
+
+/// The flat wire form [`TrialDecisionDto`] is read out of.
+#[derive(DeriveDeserialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionWire {
+    decision: DecisionTag,
+}
+
+impl<'de> Deserialize<'de> for TrialDecisionDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match DecisionWire::deserialize(deserializer)?.decision {
+            DecisionTag::Confirm => TrialDecisionDto::Confirm,
+            DecisionTag::Cancel => TrialDecisionDto::Cancel,
+        })
     }
 }
 

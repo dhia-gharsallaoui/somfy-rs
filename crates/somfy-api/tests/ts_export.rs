@@ -74,6 +74,7 @@ fn regenerate() {
         somfy_api::SettingsDto::export_all().expect("export SettingsDto");
         somfy_api::WifiUpdateDto::export_all().expect("export WifiUpdateDto");
         somfy_api::MqttUpdateDto::export_all().expect("export MqttUpdateDto");
+        somfy_api::TrialDecisionDto::export_all().expect("export TrialDecisionDto");
     });
 }
 
@@ -488,4 +489,12 @@ fn the_three_settings_halves_are_nullable_because_none_is_a_value() {
     assert!(ts.contains("wifi: WifiSettingsDto | null"), "{ts}");
     assert!(ts.contains("mqtt: MqttSettingsDto | null"), "{ts}");
     assert!(ts.contains("wifiTrial: WifiTrialDto | null"), "{ts}");
+}
+
+#[test]
+fn both_endings_of_a_trial_are_one_tagged_body() {
+    regenerate();
+    let ts = read("TrialDecisionDto.ts");
+    assert!(ts.contains(r#"{ "decision": "confirm" }"#), "{ts}");
+    assert!(ts.contains(r#"{ "decision": "cancel" }"#), "{ts}");
 }

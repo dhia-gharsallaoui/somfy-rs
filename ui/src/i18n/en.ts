@@ -281,6 +281,8 @@ export const en = {
   'error.notCalibrating': 'that measurement is no longer running',
   'error.calibrationImplausible':
     'the device will not store those numbers — a travel of zero, or longer than three minutes, or taps that leave no travel between them',
+  'error.commandNotAtThisWidth':
+    'this shade is paired with 56-bit frames, which have no step-up command at all — sending one would step it down instead',
   'error.unknown': 'the device did not say why',
 
 

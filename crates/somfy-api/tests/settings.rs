@@ -18,6 +18,7 @@
 use somfy_api::{
     ApiErrorCode, ApiErrorDto, MqttSettingsDto, MqttUpdateDto, SecretDto, SettingsDto,
     SettingsFieldDto, TrialPhaseDto, WifiSettingsDto, WifiTrialDto, WifiUpdateDto,
+    SETTINGS_JSON_MAX_BYTES,
 };
 use somfy_config::{MqttSettings, WifiCredentials, WifiTrial, CONFIRM_DEADLINE_MS};
 
@@ -518,4 +519,80 @@ fn a_rejection_about_a_field_carries_it() {
     ))
     .unwrap();
     assert_eq!(json, r#"{"code":"valueTooLong","field":"stateRoot"}"#);
+}
+
+// ---------------------------------------------------------------------------
+// The wire's width
+//
+// The firmware serialises this whole document into one fixed buffer held across
+// an await, so the buffer lives in every one of the web server's connection
+// task futures — statically allocated, out of the same DRAM the Wi-Fi driver's
+// heap is carved from. A bound that is too small answers `200` with an empty
+// body; one that is too large is paid for four times on every boot.
+// ---------------------------------------------------------------------------
+
+/// A string of `len` control characters, which JSON escapes six bytes at a time.
+///
+/// The widest legal content for any field the operator can put arbitrary text
+/// in. Not exotic: `WifiCredentials::new` refuses an empty SSID, one over 32
+/// bytes and an interior NUL, and nothing else — because an SSID is whatever an
+/// access point chose to broadcast.
+fn worst(len: usize) -> String {
+    "\u{1}".repeat(len)
+}
+
+#[test]
+fn the_settings_document_never_serialises_wider_than_the_declared_bound() {
+    let wifi = WifiCredentials::new(&worst(32), SECRET_PSK).expect("32 bytes is the limit");
+    let mqtt = MqttSettings::new(
+        Ipv4Addr::new(255, 255, 255, 254),
+        u16::MAX,
+        &worst(32),
+        SECRET_PASSWORD,
+        // The two namespaces are the *narrow* fields: `somfy-mqtt` restricts
+        // them to `[a-zA-Z0-9_-]` and `/`, so no character in one can escape.
+        &"a".repeat(32),
+        &"b".repeat(32),
+    )
+    .expect("valid at every limit");
+    let trial = WifiTrial::start(
+        WifiCredentials::new(&worst(32), SECRET_PSK).expect("32 bytes is the limit"),
+        0,
+    );
+    let json = serde_json::to_string(&SettingsDto {
+        wifi: Some(WifiSettingsDto::of(&wifi)),
+        mqtt: Some(MqttSettingsDto::of(&mqtt)),
+        wifi_trial: Some(WifiTrialDto::of(&trial, 0)),
+    })
+    .expect("serialises");
+
+    assert!(
+        json.len() <= SETTINGS_JSON_MAX_BYTES,
+        "the widest settings document serialises to {} bytes, over \
+         SETTINGS_JSON_MAX_BYTES of {SETTINGS_JSON_MAX_BYTES}",
+        json.len(),
+    );
+    // And the bound is not absurdly loose: every byte of slack is multiplied by
+    // the number of connection tasks and comes out of the Wi-Fi heap.
+    assert!(
+        json.len() + 128 >= SETTINGS_JSON_MAX_BYTES,
+        "SETTINGS_JSON_MAX_BYTES ({SETTINGS_JSON_MAX_BYTES}) is more than 128 bytes above \
+         the measured worst case ({})",
+        json.len(),
+    );
+}
+
+#[test]
+fn an_ordinary_settings_document_is_a_quarter_of_the_bound() {
+    let json = serde_json::to_string(&SettingsDto {
+        wifi: Some(WifiSettingsDto::of(&stored_wifi())),
+        mqtt: Some(MqttSettingsDto::of(&stored_mqtt())),
+        wifi_trial: None,
+    })
+    .expect("serialises");
+    assert_eq!(
+        json.len(),
+        204,
+        "an ordinary settings document's width moved; the ceiling above may have moved too",
+    );
 }

@@ -79,12 +79,6 @@ use somfy_migrate::{
     parse_backup, MigrateError, MigrationData, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 
-/// The frame width this controller transmits, and therefore the only one a
-/// shade can be imported as. It is a single setting for the whole installation
-/// — `somfy_tasks::TxProfile::default` — so a shade paired at any other width
-/// is carried across as data and cannot be driven.
-const TRANSMITTED_BIT_LENGTH: u8 = 56;
-
 /// The radio-protocol discriminant a shade must carry to be one this firmware
 /// can drive.
 ///
@@ -105,8 +99,17 @@ const TRANSMITTED_PROTOCOL: u8 = 0x00;
 
 /// A value the backup carried that this firmware cannot use as it stands.
 ///
-/// Two of these are substitutions — something else was written in the field.
-/// The third is not, and could not be: there is no field.
+/// Three of these are substitutions — something else was written in the field,
+/// and the operator is told what. The fourth is not, and could not be: there is
+/// no field to substitute into.
+///
+/// **[`Caveat::FrameWidth`] used to be a fourth non-substitution and is not
+/// any more.** The controller transmitted one width for the whole installation
+/// when this tool was written, so a shade paired at the other one imported
+/// looking healthy and never moved. Each shade now carries its own width and
+/// is transmitted at it, so a *recognised* width is no longer a caveat at all —
+/// what is left is a bit length that is not one of the protocol's two, which is
+/// substituted like an unmodelled shade kind and reported for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caveat {
     /// A shade-kind byte outside the set this firmware models. Imported as
@@ -115,14 +118,18 @@ pub enum Caveat {
     /// A tilt-mode byte outside the set this firmware models. Imported as
     /// [`TiltMode::None`].
     TiltMode(u8),
-    /// A frame width other than [`TRANSMITTED_BIT_LENGTH`]. Nothing is
-    /// substituted, because `ShadeConfig` has no width to substitute into: the
-    /// shade is imported exactly as it stands and will be transmitted to at the
-    /// controller's width, which is not the one its motor is paired for.
+    /// A bit length that is not one of the protocol's two widths. Imported at
+    /// [`somfy_domain::FrameWidth::Bits56`], which is `ShadeConfig::new`'s
+    /// default and the width nearly every RTS motor in the field uses.
+    ///
+    /// **A width the protocol does have — 56 or 80 — is not a caveat**: the
+    /// record carries it and the transmitter honours it per shade.
     FrameWidth(u8),
     /// A radio protocol other than [`TRANSMITTED_PROTOCOL`]. Nothing is
-    /// substituted, for the same reason and with the same consequence: the
-    /// shade is provisioned, appears in Home Assistant, and does not move.
+    /// substituted, because there is nothing to substitute into: `somfy-rts`
+    /// has no byte layout for RTW, RTV or the general-purpose kinds at either
+    /// width. The shade is provisioned, appears in Home Assistant, and does not
+    /// move.
     Protocol(u8),
 }
 
@@ -141,9 +148,9 @@ impl core::fmt::Display for Caveat {
             ),
             Caveat::FrameWidth(bits) => write!(
                 f,
-                "the old controller drove this shade with {bits}-bit frames and this one sends \
-                 {TRANSMITTED_BIT_LENGTH}-bit — there is no per-shade width to import it into, \
-                 so the shade will be provisioned and will not respond"
+                "bit length {bits} is not one of the protocol's two frame widths — imported at \
+                 56-bit, which is what nearly every RTS motor uses, so a shade that was really \
+                 paired at 80 will not respond"
             ),
             Caveat::Protocol(raw) => write!(
                 f,
@@ -435,25 +442,16 @@ pub fn import(data: &MigrationData) -> Result<Import, Refusal> {
             TiltMode::None
         });
 
-        // And the two that used to be neither substituted nor stored: a width
-        // and a protocol the record now carries. Both still mean a shade that
-        // is provisioned and inert — the transmit width is per-controller and
-        // only RTS is implemented — so both are still reported. What has
-        // changed is that the value survives to the device, which is what lets
-        // the device say which shade it cannot drive instead of being silent.
+        // The width, which the device now honours per shade. **Either of the
+        // protocol's two widths imports silently**, because either is one this
+        // controller transmits at — that is the whole of what changed when
+        // `PlannedTx` started carrying the width, and it is why the old caveat
+        // for an 80-bit shade is gone rather than reworded. What is left is a
+        // bit length that is not a width at all, which falls back to the
+        // constructor's default and is reported for the same reason an
+        // unmodelled shade kind is.
         match FrameWidth::from_raw(migrated.bit_length) {
-            // The ordinary case: a width this controller transmits.
-            Some(width) if migrated.bit_length == TRANSMITTED_BIT_LENGTH => {
-                config.frame_width = width
-            }
-            // A real width this controller does not transmit. Stored
-            // faithfully, and reported because the shade will not move.
-            Some(width) => {
-                config.frame_width = width;
-                note(Caveat::FrameWidth(migrated.bit_length));
-            }
-            // Not a frame width at all. Left at the constructor's default and
-            // reported, for the same reason an unmodelled shade kind is.
+            Some(width) => config.frame_width = width,
             None => note(Caveat::FrameWidth(migrated.bit_length)),
         }
         match RadioProtocol::from_raw(migrated.proto_raw) {

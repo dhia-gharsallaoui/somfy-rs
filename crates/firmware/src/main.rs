@@ -451,8 +451,8 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // 5 KB of stack for the partition table and `esp-storage`'s sector buffer,
     // and doing it before anything is spawned keeps that spike away from the
     // radio task's own stack needs. Every later operation is far cheaper.
-    let mut store = FlashStore::mount(FlashStorage::new(peripherals.FLASH))
-        .map_err(StartError::Store)?;
+    let mut store =
+        FlashStore::mount(FlashStorage::new(peripherals.FLASH)).map_err(StartError::Store)?;
     let survey = report_store(&mut store)?;
 
     // **The configuration is no longer read through a reborrow that ends at
@@ -460,6 +460,12 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
     // the settings screen does, so the store outlives boot for exactly the
     // reason the shade table's does.
     let (config_store, credentials, broker, superseded) = report_config(&mut store);
+    // Read on every build, written only where there is a settings screen. Named
+    // rather than left as a warning to silence: `report_config` has already
+    // printed everything this store had to say, and there is nothing in this
+    // image that could write it.
+    #[cfg(not(feature = "http"))]
+    let _ = config_store;
 
     let (shade_store, shades) = report_shades(&mut store);
 
@@ -589,6 +595,7 @@ fn start(spawner: Spawner) -> Result<Pending, StartError> {
         store,
         tasks::Table {
             shades: shade_store,
+            #[cfg(feature = "http")]
             config: config_store,
             catalog,
             identity: RemoteIdentity::from_mac(base_mac()),
