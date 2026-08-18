@@ -37,6 +37,14 @@ export const ERROR_MESSAGE: Record<ApiErrorCode, MessageKey> = {
   notCalibrating: 'error.notCalibrating',
   calibrationImplausible: 'error.calibrationImplausible',
   commandNotAtThisWidth: 'error.commandNotAtThisWidth',
+  commandRateLimited: 'error.commandRateLimited',
+  // Neither of these can be provoked by this app: it is served by the device,
+  // so its own requests always carry the device's own origin and host. They are
+  // translated because a person holding `curl`, or one reaching the device
+  // through a name it does not answer to, sees them — and because the record
+  // has to be total.
+  hostNotThisDevice: 'error.hostNotThisDevice',
+  originNotThisDevice: 'error.originNotThisDevice',
   // Settings. Each of these is a *rule*; the field it broke arrives beside it
   // as `ApiErrorDto.field`, so the sentences below are written to read with a
   // field name interpolated into them — `{field}` — and the form highlights the

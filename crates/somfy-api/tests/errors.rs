@@ -31,6 +31,9 @@ fn is_listed(code: ApiErrorCode) -> bool {
         | ApiErrorCode::NotCalibrating
         | ApiErrorCode::CalibrationImplausible
         | ApiErrorCode::CommandNotAtThisWidth
+        | ApiErrorCode::CommandRateLimited
+        | ApiErrorCode::HostNotThisDevice
+        | ApiErrorCode::OriginNotThisDevice
         | ApiErrorCode::ValueEmpty
         | ApiErrorCode::ValueTooLong
         | ApiErrorCode::ValueTooShort
@@ -83,6 +86,13 @@ const ALL: &[(ApiErrorCode, &str, u16)] = &[
         ApiErrorCode::CommandNotAtThisWidth,
         "commandNotAtThisWidth",
         409,
+    ),
+    (ApiErrorCode::CommandRateLimited, "commandRateLimited", 429),
+    (ApiErrorCode::HostNotThisDevice, "hostNotThisDevice", 403),
+    (
+        ApiErrorCode::OriginNotThisDevice,
+        "originNotThisDevice",
+        403,
     ),
     (ApiErrorCode::ValueEmpty, "valueEmpty", 400),
     (ApiErrorCode::ValueTooLong, "valueTooLong", 400),

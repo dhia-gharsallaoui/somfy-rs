@@ -19,6 +19,32 @@
 //! | Whether a shade may be paired | `somfy_domain::RemoteIdentity::is_allocated` | `inventory::Inventory::snapshot` |
 //! | Whether a shade has Home Assistant entities at all | `tasks::announce_shade` | `inventory::Inventory::snapshot` |
 //! | Which status a refusal carries | `somfy_api::ApiErrorCode::http_status` | `ui/mock/plugin.ts` |
+//! | Whether a command may be sent *yet* | `somfy_tasks::CommandLimiter` via `StateMachine::apply` | the MQTT command channel |
+//! | Whether the caller may ask at all | `somfy_api::origin::admit` via [`FromThisDevice`] | — (HTTP is the only door with headers) |
+//!
+//! # Every handler below takes [`FromThisDevice`], and a new one must too
+//!
+//! **This is the one rule in this file that a reviewer has to enforce by
+//! reading**, so it is stated where a diff is read rather than left to the
+//! module that implements it. `_from_this_device: FromThisDevice` is the
+//! `Origin`/`Host` check — the non-authentication half of design spec §7.3, and
+//! the thing that stops a page in somebody else's browser tab driving these
+//! shades. It is an extractor rather than a `picoserve::Router::layer`, which
+//! *would* have been unforgettable, because the layer costs 6,048 bytes of DRAM
+//! and the extractor costs none; [`crate::api::origin`] carries that
+//! measurement and the argument.
+//!
+//! The consequence is the discipline: **an `/api/v1` handler added without that
+//! parameter is unprotected, and nothing will say so.** Every handler here has
+//! it today — the reads as well as the writes, so there is no judgement about
+//! which ones need it — and it sits after any path parameters and before the
+//! body extractor, because that is the order `picoserve` requires and the order
+//! in which a refused `POST` never reaches `Json<T>`.
+//!
+//! The asset routes and the SPA fallback deliberately do **not** take it. They
+//! serve the compiled UI: public bytes with nothing to disclose and nothing to
+//! actuate, and `shell::base()` is a fallback rather than a handler with a
+//! signature to extend.
 //!
 //! # The contract is `ui/mock/plugin.ts`
 //!
@@ -78,6 +104,7 @@ use somfy_domain::{GroupId, ShadeId};
 use somfy_tasks::ControlCommand;
 
 use crate::api::events::Events;
+use crate::api::origin::FromThisDevice;
 use crate::api::shell;
 use crate::edits::ShadeEdit;
 use crate::rpc::{Reply, Request as Rpc, RPC};
@@ -278,7 +305,7 @@ impl<T: Serialize, const N: usize> Content for JsonBody<T, N> {
 /// — and that field is what lets the settings form highlight the input the
 /// operator has to fix. `From<ApiErrorCode>` fills it in as absent, so every
 /// other refusal is written exactly as it was.
-struct Refusal(ApiErrorDto);
+pub struct Refusal(ApiErrorDto);
 
 impl IntoResponse for Refusal {
     async fn write_to<R: Read, W: ResponseWriter<Error = R::Error>>(
@@ -296,7 +323,11 @@ impl IntoResponse for Refusal {
 }
 
 /// A refusal from a bare code, which is what every non-settings path has.
-fn refuse(code: ApiErrorCode) -> Refusal {
+///
+/// `pub(crate)` for one caller outside this module: the `Origin`/`Host` layer,
+/// which refuses before any handler runs and must answer in the same shape a
+/// handler would — see [`crate::api::origin`].
+pub fn refuse(code: ApiErrorCode) -> Refusal {
     Refusal(ApiErrorDto::from(code))
 }
 
@@ -430,15 +461,15 @@ impl Chunks for Collection {
     }
 }
 
-async fn list_shades() -> impl IntoResponse {
+async fn list_shades(_from_this_device: FromThisDevice) -> impl IntoResponse {
     ChunkedResponse::new(Collection::Shades)
 }
 
-async fn list_groups() -> impl IntoResponse {
+async fn list_groups(_from_this_device: FromThisDevice) -> impl IntoResponse {
     ChunkedResponse::new(Collection::Groups)
 }
 
-async fn list_rooms() -> impl IntoResponse {
+async fn list_rooms(_from_this_device: FromThisDevice) -> impl IntoResponse {
     ChunkedResponse::new(Collection::Rooms)
 }
 
@@ -446,7 +477,7 @@ async fn list_rooms() -> impl IntoResponse {
 // One shade
 // ---------------------------------------------------------------------------
 
-async fn get_shade(id: u8) -> impl IntoResponse {
+async fn get_shade(id: u8, _from_this_device: FromThisDevice) -> impl IntoResponse {
     match RPC.call(Rpc::Shade(ShadeId(id))).await {
         Some(Reply::Shade(Some(shade))) => {
             Ok((StatusCode::OK, JsonBody::<_, ENTITY_JSON_BYTES>(shade)))
@@ -462,7 +493,10 @@ async fn get_shade(id: u8) -> impl IntoResponse {
 /// The answer carries what the request could not: the id the registry assigned
 /// and the address this controller allocated. A `200` with a body would leave
 /// the client to find the id inside it, which is what `Location` is for.
-async fn create_shade(Json(request): Json<CreateShadeDto>) -> impl IntoResponse {
+async fn create_shade(
+    _from_this_device: FromThisDevice,
+    Json(request): Json<CreateShadeDto>,
+) -> impl IntoResponse {
     match RPC.call(Rpc::Edit(ShadeEdit::Add { request })).await {
         Some(Reply::Created(id)) => match RPC.call(Rpc::Shade(id)).await {
             Some(Reply::Shade(Some(shade))) => Ok((
@@ -487,7 +521,11 @@ async fn create_shade(Json(request): Json<CreateShadeDto>) -> impl IntoResponse 
 /// time counts as measured is derived from its value, so a `PATCH` that
 /// answered "no content" would make the UI guess at the very thing the edit was
 /// for.
-async fn patch_shade(id: u8, Json(patch): Json<PatchShadeDto>) -> impl IntoResponse {
+async fn patch_shade(
+    id: u8,
+    _from_this_device: FromThisDevice,
+    Json(patch): Json<PatchShadeDto>,
+) -> impl IntoResponse {
     let id = ShadeId(id);
     match RPC
         .call(Rpc::Edit(ShadeEdit::Reconfigure { id, patch }))
@@ -505,7 +543,7 @@ async fn patch_shade(id: u8, Json(patch): Json<PatchShadeDto>) -> impl IntoRespo
     }
 }
 
-async fn delete_shade(id: u8) -> impl IntoResponse {
+async fn delete_shade(id: u8, _from_this_device: FromThisDevice) -> impl IntoResponse {
     match RPC
         .call(Rpc::Edit(ShadeEdit::Remove { id: ShadeId(id) }))
         .await
@@ -524,7 +562,7 @@ async fn delete_shade(id: u8) -> impl IntoResponse {
 /// protocol is the shade jogging, watched by a person standing at it. `202` is
 /// the honest code for "this has been accepted for processing" with no claim
 /// about the outcome — and the outcome genuinely lives outside the system.
-async fn pair_shade(id: u8) -> impl IntoResponse {
+async fn pair_shade(id: u8, _from_this_device: FromThisDevice) -> impl IntoResponse {
     match RPC.call(Rpc::Pair(ShadeId(id))).await {
         Some(Reply::Done) => Ok((StatusCode::ACCEPTED, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
@@ -562,7 +600,7 @@ async fn pair_shade(id: u8) -> impl IntoResponse {
 /// deliberately the loud way. It is also not idempotent in the shape `PATCH`
 /// implies — it *is* idempotent, but what it triggers is a publish, and a
 /// verb whose job is "set these fields" is the wrong place for that.
-async fn confirm_pairing(id: u8) -> impl IntoResponse {
+async fn confirm_pairing(id: u8, _from_this_device: FromThisDevice) -> impl IntoResponse {
     let id = ShadeId(id);
     match RPC.call(Rpc::Edit(ShadeEdit::ConfirmPairing { id })).await {
         Some(Reply::Done) => match RPC.call(Rpc::Shade(id)).await {
@@ -581,7 +619,11 @@ async fn confirm_pairing(id: u8) -> impl IntoResponse {
 // Commands
 // ---------------------------------------------------------------------------
 
-async fn command_shade(id: u8, Json(command): Json<CommandDto>) -> impl IntoResponse {
+async fn command_shade(
+    id: u8,
+    _from_this_device: FromThisDevice,
+    Json(command): Json<CommandDto>,
+) -> impl IntoResponse {
     dispatch(ControlCommand::Shade {
         id: ShadeId(id),
         command: command.to_domain(),
@@ -594,7 +636,11 @@ async fn command_shade(id: u8, Json(command): Json<CommandDto>) -> impl IntoResp
 /// has no group route at all: fanned across a group it is a `Prog` burst at
 /// every shade in the house with nobody standing at any of them, which
 /// `Controller::command_group` refuses outright.
-async fn command_group(id: u8, Json(command): Json<CommandDto>) -> impl IntoResponse {
+async fn command_group(
+    id: u8,
+    _from_this_device: FromThisDevice,
+    Json(command): Json<CommandDto>,
+) -> impl IntoResponse {
     dispatch(ControlCommand::Group {
         id: GroupId(id),
         command: command.to_domain(),
@@ -616,7 +662,11 @@ async fn command_group(id: u8, Json(command): Json<CommandDto>) -> impl IntoResp
 /// something it will never learn. `begin` has queued a traverse and started a
 /// clock, and `finish` has stored numbers — both are facts about this device
 /// that the client can act on immediately.
-async fn calibrate_shade(id: u8, Json(step): Json<CalibrationStepDto>) -> impl IntoResponse {
+async fn calibrate_shade(
+    id: u8,
+    _from_this_device: FromThisDevice,
+    Json(step): Json<CalibrationStepDto>,
+) -> impl IntoResponse {
     match RPC.call(Rpc::Calibrate(ShadeId(id), step)).await {
         Some(Reply::Done) => Ok((StatusCode::NO_CONTENT, NoContent)),
         Some(Reply::Refused(code)) => Err(Ok(Refusal(code))),
@@ -653,7 +703,10 @@ async fn dispatch(
 /// subscription the deltas arrive on, or neither — see [`crate::api::events`]
 /// for why the subscription alone was not a sufficient bound, and for the
 /// lockout that oversight would have reproduced.
-async fn events(upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
+async fn events(
+    _from_this_device: FromThisDevice,
+    upgrade: ws::WebSocketUpgrade,
+) -> impl IntoResponse {
     match Events::admit() {
         Some(events) => Ok(upgrade.on_upgrade(events)),
         None => {
@@ -698,7 +751,7 @@ async fn events(upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
 /// emits and 672 is not enough for it — the failure mode of getting that wrong
 /// is `200 OK` with an empty body, which is why the bound is measured in
 /// `somfy-api`'s own tests rather than counted here. See [`JsonBody`].
-async fn get_settings() -> impl IntoResponse {
+async fn get_settings(_from_this_device: FromThisDevice) -> impl IntoResponse {
     match RPC.call(Rpc::Settings).await {
         Some(Reply::Settings(wifi, mqtt)) => Ok((
             StatusCode::OK,
@@ -725,7 +778,10 @@ async fn get_settings() -> impl IntoResponse {
 ///
 /// The candidate is validated **before** the radio is touched, so an SSID one
 /// byte too long costs no connection at all.
-async fn start_wifi_trial(Json(update): Json<WifiUpdateDto>) -> impl IntoResponse {
+async fn start_wifi_trial(
+    _from_this_device: FromThisDevice,
+    Json(update): Json<WifiUpdateDto>,
+) -> impl IntoResponse {
     let candidate = match RPC.call(Rpc::PrepareWifi(update)).await {
         Some(Reply::WifiCandidate(candidate)) => candidate,
         Some(Reply::Refused(code)) => return Err(Ok(Refusal(code))),
@@ -756,7 +812,10 @@ async fn start_wifi_trial(Json(update): Json<WifiUpdateDto>) -> impl IntoRespons
 /// Answers `202`, because what happens next is a restart onto the stored
 /// credential — see `crate::trial` for why a revert is a reboot — and this
 /// response cannot outlive it by much.
-async fn settle_wifi_trial(Json(decision): Json<TrialDecisionDto>) -> impl IntoResponse {
+async fn settle_wifi_trial(
+    _from_this_device: FromThisDevice,
+    Json(decision): Json<TrialDecisionDto>,
+) -> impl IntoResponse {
     match decision {
         TrialDecisionDto::Confirm => {
             let candidate = match crate::trial::commit(Instant::now().as_millis()) {
@@ -789,7 +848,10 @@ async fn settle_wifi_trial(Json(decision): Json<TrialDecisionDto>) -> impl IntoR
 ///
 /// `202`, because the settings are stored and then the device restarts, and the
 /// restart is not optional — see [`restart_for_mqtt`].
-async fn save_mqtt(Json(update): Json<MqttUpdateDto>) -> impl IntoResponse {
+async fn save_mqtt(
+    _from_this_device: FromThisDevice,
+    Json(update): Json<MqttUpdateDto>,
+) -> impl IntoResponse {
     apply_mqtt(Rpc::SaveMqtt(update)).await
 }
 
@@ -798,7 +860,7 @@ async fn save_mqtt(Json(update): Json<MqttUpdateDto>) -> impl IntoResponse {
 /// A device with no broker still receives, decodes and tracks; it just publishes
 /// nothing. That is a configuration an operator can mean, which is why it is a
 /// `DELETE` on the resource rather than a `PUT` of something empty.
-async fn clear_mqtt() -> impl IntoResponse {
+async fn clear_mqtt(_from_this_device: FromThisDevice) -> impl IntoResponse {
     apply_mqtt(Rpc::ClearMqtt).await
 }
 

@@ -64,6 +64,8 @@ use somfy_store::{
     transmit, FrameBits, RollingCodeStore, TransmitError, TransmitPlan, TransmitQueue,
 };
 
+use crate::limit::{CommandLimiter, TooSoon};
+
 /// Commands the state task may have waiting.
 ///
 /// Shallow on purpose: a queue of shade commands is a queue of *intentions*
@@ -175,10 +177,43 @@ impl<S, Q> Dispatch<S, Q> {
     }
 }
 
+/// Why a [`StateMachine::apply`] did nothing.
+///
+/// Two refusals with nothing in common but their timing, kept apart because the
+/// caller has to tell them apart: one says the request was wrong and the other
+/// says it was too soon, and a client shown the first for the second retries
+/// into the same wall.
+///
+/// It is deliberately **not** an API error code. This crate compiles with every
+/// transport feature off — that is the structural test that no transport logic
+/// has leaked into the core — so the mapping to a status code lives with the
+/// transport, and the MQTT side logs the same value instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The domain would not do it: no such shade, a vent with no measured band,
+    /// a command the shade's paired frame width cannot carry.
+    Domain(DomainError),
+    /// This shade has been commanded too often; try again after the delay.
+    TooSoon(TooSoon),
+}
+
+impl From<DomainError> for Refused {
+    fn from(error: DomainError) -> Self {
+        Refused::Domain(error)
+    }
+}
+
+impl From<TooSoon> for Refused {
+    fn from(too_soon: TooSoon) -> Self {
+        Refused::TooSoon(too_soon)
+    }
+}
+
 /// The state task's body: the domain plus the route to the radio.
 pub struct StateMachine {
     controller: Controller,
     profile: TxProfile,
+    limiter: CommandLimiter,
 }
 
 impl StateMachine {
@@ -188,6 +223,7 @@ impl StateMachine {
         Self {
             controller: Controller::new(),
             profile,
+            limiter: CommandLimiter::new(),
         }
     }
 
@@ -212,6 +248,26 @@ impl StateMachine {
     /// What the state task calls; the two methods below are what it calls
     /// *through*, and are public because a bring-up harness has a shade in hand
     /// rather than a channel message.
+    ///
+    /// # This is the rate limit's one door
+    ///
+    /// **Both transports arrive here** — an HTTP `POST …/command` through the
+    /// request seam, an MQTT command through the command channel — so this is
+    /// where [`CommandLimiter`] is consulted, and the two cannot drift into
+    /// having different limits because there is only one call.
+    ///
+    /// The two methods below are deliberately *not* limited: they are the
+    /// bring-up entry points, reached only by a harness that already has a
+    /// shade in hand. Neither is [`StateMachine::tick`], and that is the load-
+    /// bearing omission — the second and third frames of a vent are planned
+    /// there, on the clock, and a limiter able to refuse them would leave a
+    /// shade closed with no vent coming. See [`CommandLimiter`].
+    ///
+    /// The bucket is charged **before** the domain sees the command, so a
+    /// refusal the domain would raise anyway still costs allowance. That is the
+    /// conservative direction — the bound this states is an upper bound on
+    /// flash commits rather than an exact count — and it keeps the check and
+    /// the charge one indivisible step rather than two that could drift.
     pub fn apply<S, Q>(
         &mut self,
         store: &mut S,
@@ -219,11 +275,20 @@ impl StateMachine {
         command: ControlCommand,
         now_ms: u64,
         deltas: &mut Vec<StateDelta, DELTA_CAPACITY>,
-    ) -> Result<Dispatch<S::Error, Q::Error>, DomainError>
+    ) -> Result<Dispatch<S::Error, Q::Error>, Refused>
     where
         S: RollingCodeStore,
         Q: TransmitQueue,
     {
+        // Destructured rather than called through `self`, because the limiter
+        // needs the registry at the same time it needs itself and they are two
+        // disjoint fields.
+        let Self {
+            controller,
+            limiter,
+            ..
+        } = self;
+        limiter.admit(&controller.registry, command, now_ms)?;
         match command {
             ControlCommand::Shade { id, command } => {
                 self.command_shade(store, queue, id, command, now_ms, deltas)
@@ -232,6 +297,7 @@ impl StateMachine {
                 self.command_group(store, queue, id, command, now_ms, deltas)
             }
         }
+        .map_err(Refused::Domain)
     }
 
     /// Apply a command to one shade, and put every frame it plans on the queue

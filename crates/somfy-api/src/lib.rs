@@ -92,6 +92,7 @@ mod commands;
 mod entities;
 mod errors;
 mod events;
+pub mod origin;
 mod settings;
 mod shades;
 

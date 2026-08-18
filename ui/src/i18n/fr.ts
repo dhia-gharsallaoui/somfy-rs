@@ -290,6 +290,12 @@ export const fr: Record<MessageKey, string> = {
     'l’appareil refuse ces valeurs — une course nulle, ou de plus de trois minutes, ou des appuis ne laissant aucune course entre eux',
   'error.commandNotAtThisWidth':
     'ce store est appairé en trames 56 bits, qui n’ont aucune commande de pas vers le haut — en envoyer une le ferait descendre d’un pas',
+  'error.commandRateLimited':
+    'ce volet a reçu trop de commandes — chacune est écrite en mémoire flash avant d’être émise, l’appareil les espace donc. Patientez un instant et réessayez',
+  'error.hostNotThisDevice':
+    'cette requête visait un nom auquel l’appareil ne répond pas — utilisez son adresse ou son nom somfy-xxxx.local',
+  'error.originNotThisDevice':
+    'cette requête provient d’une page que l’appareil n’a pas servie, et il refuse d’y donner suite',
   'error.unknown': 'l’appareil n’en a pas donné la raison',
 
 

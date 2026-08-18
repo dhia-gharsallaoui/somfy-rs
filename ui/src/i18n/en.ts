@@ -283,6 +283,12 @@ export const en = {
     'the device will not store those numbers — a travel of zero, or longer than three minutes, or taps that leave no travel between them',
   'error.commandNotAtThisWidth':
     'this shade is paired with 56-bit frames, which have no step-up command at all — sending one would step it down instead',
+  'error.commandRateLimited':
+    'that shade has been commanded too often — every command is written to flash before it is sent, so the device paces them. Wait a moment and try again',
+  'error.hostNotThisDevice':
+    'this request was addressed to a name the device does not answer to — reach it by its own address or its somfy-xxxx.local name',
+  'error.originNotThisDevice':
+    'this request came from a page the device did not serve, and the device will not act on one',
   'error.unknown': 'the device did not say why',
 
 

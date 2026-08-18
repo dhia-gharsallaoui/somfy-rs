@@ -61,6 +61,7 @@ mod headless;
 use headless as shell;
 
 pub mod events;
+pub mod origin;
 pub mod routes;
 
 /// Connections this device serves at once.
@@ -267,6 +268,13 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), SpawnError> 
         HTTP_TASKS,
         WS_MAX,
         REST_TASKS_RESERVED,
+    );
+    esp_println::println!(
+        "api: every route is behind the Origin/Host check — this device answers to its own \
+         address and to {}.local, and refuses a request naming anything else. It is not \
+         authentication, and it is what stops a page in somebody else's browser tab driving \
+         these shades. See somfy_api::origin.",
+        crate::identity::hostname(),
     );
     shell::report();
     Ok(())
