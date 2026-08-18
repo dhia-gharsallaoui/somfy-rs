@@ -90,6 +90,43 @@ impl SetupPhase {
     }
 }
 
+/// A shade **this flow created**, and the only thing a removal can be addressed
+/// at.
+///
+/// # Why a newtype and not a `ShadeId`
+///
+/// Because a confirmed shade was deleted from a real estate, and the form was
+/// the only new thing that could issue a `Remove`. Whatever produced it, the
+/// defect class is that `Ask::Abandon(ShadeId)` let a removal name *any* id —
+/// so the invariant "only a shade the form created" lived in the reasoning of
+/// one match arm rather than in anything a compiler or a reviewer checks.
+///
+/// The field is private and [`OwnShade::new`] is private to this module, and
+/// the **single** call to it is in [`Setup::apply_drafting`]'s
+/// [`SetupInput::Created`] arm — the point at which the shade table has just
+/// told this flow the id it allocated *for this flow*. Nothing outside
+/// `somfy-mqtt` can construct one, and nothing inside it does anywhere else, so
+/// "the form can only delete what it made" is now a property of the type rather
+/// than a claim about control flow.
+///
+/// It deliberately exposes [`OwnShade::id`] and no `From<ShadeId>`: reading one
+/// out is what the firmware needs, and writing one in is the thing that must
+/// stay impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnShade(ShadeId);
+
+impl OwnShade {
+    /// Private, and called from exactly one place. See the type's docs.
+    fn new(id: ShadeId) -> OwnShade {
+        OwnShade(id)
+    }
+
+    /// The shade, for a caller that has to address it.
+    pub fn id(self) -> ShadeId {
+        self.0
+    }
+}
+
 /// What the operator has filled in.
 ///
 /// Travel times are [`Option`] and start `None` — **that is the point of the
@@ -220,8 +257,12 @@ pub enum Ask {
     /// Record the operator's report. The answer comes back as
     /// [`SetupInput::Done`] or [`SetupInput::Refused`].
     Confirm(ShadeId),
-    /// Remove this shade. The form closes either way.
-    Abandon(ShadeId),
+    /// Remove **a shade this flow created in this session**, and nothing else.
+    ///
+    /// Carries [`OwnShade`] rather than a bare [`ShadeId`], so a `Remove` is
+    /// not a thing a caller can address at a shade of its choosing — see that
+    /// type. The form closes either way.
+    Abandon(OwnShade),
     /// Store the draft's current values on the shade that already exists.
     Amend(ShadeId),
 }
@@ -274,6 +315,17 @@ pub struct Setup {
     phase: SetupPhase,
     draft: Draft,
     message: SetupMessage,
+    /// The shade this flow created in this session, if it created one.
+    ///
+    /// **The only thing a removal may be addressed at**, and the reason
+    /// [`OwnShade`] exists. Set in exactly one place — the [`SetupInput::Created`]
+    /// arm — and cleared by [`Setup::close`], so it cannot outlive the setup
+    /// that produced it. It duplicates the id in
+    /// [`SetupPhase::AwaitingReport`] on purpose: the phase is *where the form
+    /// is*, which several inputs move, and this is *what the form made*, which
+    /// only one thing sets. Keeping them separate is what makes
+    /// [`Setup::abandon`] able to check that they agree.
+    created: Option<OwnShade>,
 }
 
 impl Default for Setup {
@@ -282,6 +334,7 @@ impl Default for Setup {
             phase: SetupPhase::Idle,
             draft: Draft::default(),
             message: SetupMessage::Drafting,
+            created: None,
         }
     }
 }
@@ -457,6 +510,10 @@ impl Setup {
             // PROG on the remote right now.
             SetupInput::Created(shade) => {
                 self.phase = SetupPhase::AwaitingReport { shade };
+                // **The one call to `OwnShade::new` in the crate.** The shade
+                // table has just said it allocated this id for this flow, which
+                // is the only moment that claim is true.
+                self.created = Some(OwnShade::new(shade));
                 self.message = SetupMessage::AwaitingReport;
                 Effect {
                     form: FormChange::Unchanged,
@@ -512,10 +569,11 @@ impl Setup {
             // `Shades awaiting setup` that nothing on this surface can reach
             // again.
             SetupInput::Discard => {
+                let ask = self.abandon(shade);
                 self.close();
                 Effect {
                     form: FormChange::Close,
-                    ask: Some(Ask::Abandon(shade)),
+                    ask,
                 }
             }
             // The report landed and the shade is announced by the ordinary
@@ -614,6 +672,27 @@ impl Setup {
         self.phase = SetupPhase::Idle;
         self.draft = Draft::default();
         self.message = SetupMessage::Drafting;
+        // **Before anything else can run.** A shade this flow made stops being
+        // this flow's the moment the setup ends, whether it ended by being
+        // confirmed, discarded or abandoned — so a later `Discard`, a queued
+        // effect carried out after the fact, or any future arm cannot reach a
+        // removal through a stale claim.
+        self.created = None;
+    }
+
+    /// The removal for a shade **this flow created**, or `None`.
+    ///
+    /// The guard the deleted shade earned. `shade` is where the phase says the
+    /// form is; `self.created` is what the form actually made. They are set
+    /// together and cleared together, so they agree — and if they ever do not,
+    /// this returns `None` and the setup closes without touching the table,
+    /// which is the direction that costs an abandoned record rather than
+    /// somebody's shade.
+    fn abandon(&self, shade: ShadeId) -> Option<Ask> {
+        match self.created {
+            Some(own) if own.id() == shade => Some(Ask::Abandon(own)),
+            _ => None,
+        }
     }
 }
 
