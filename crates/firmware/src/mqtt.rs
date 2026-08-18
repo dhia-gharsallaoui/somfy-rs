@@ -87,8 +87,8 @@ use minimq::{
 use somfy_config::{MqttSettings, Namespaces};
 use somfy_domain::{Direction, Pos, ShadeCommand, ShadeId, StateDelta, MAX_SHADES};
 use somfy_mqtt::{
-    reconfigure, Component, ConfigError, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig,
-    NodeId, Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step,
+    reconfigure, Component, ConfigError, ConfigurationUrl, DeviceEntity, DeviceId, DiscoveryPrefix,
+    MqttConfig, NodeId, Pairing, Payload, PublishedTopic, Retention, ShadeTopic, StateRoot, Step,
     PAYLOAD_CAPACITY,
 };
 use somfy_tasks::{Backoff, ControlCommand};
@@ -306,6 +306,7 @@ impl Broker {
         acks: AckSender,
     ) -> Broker {
         let known = Known::new(&inventory);
+        let awaiting_setup = inventory.awaiting_setup();
         Broker {
             config,
             stale,
@@ -314,6 +315,7 @@ impl Broker {
             known,
             diagnostics: Diagnostics {
                 rollcode_damaged: survey.damaged,
+                awaiting_setup,
             },
             payload: String::new(),
             version_logged: false,
@@ -333,19 +335,37 @@ impl Broker {
 /// | free heap | [`crate::heap::free_bytes`] |
 /// | peak heap use | [`crate::heap::peak_bytes`] |
 /// | damaged rolling-code slots | the boot survey, carried here |
+/// | shades awaiting setup | the boot inventory, then [`ShadeEvent::AwaitingSetup`] |
 ///
-/// Everything but the last is read at the moment it is published, so nothing
-/// here has to be kept up to date. The rolling-code figure is the exception and
-/// is a **snapshot of the region as it was at boot**: the store belongs to the
-/// state task from the moment it is handed over, and re-surveying it would mean
-/// reaching across the boundary that keeps a broker from being able to affect
-/// radio control. A slot damaged after boot is therefore reported at the next
-/// one — which is the same latency an operator reading the serial line has, and
-/// `docs/provenance.md` records the condition for improving it.
+/// The first four are read at the moment they are published, so nothing about
+/// them has to be kept up to date. The last two are carried, for different
+/// reasons and with different consequences.
+///
+/// The rolling-code figure is a **snapshot of the region as it was at boot**:
+/// the store belongs to the state task from the moment it is handed over, and
+/// re-surveying it would mean reaching across the boundary that keeps a broker
+/// from being able to affect radio control. A slot damaged after boot is
+/// therefore reported at the next one — which is the same latency an operator
+/// reading the serial line has, and `docs/provenance.md` records the condition
+/// for improving it.
+///
+/// The awaiting-setup figure is carried for the same boundary reason and is
+/// **not** stale in the same way: the state task restates it after every edit
+/// that could move it, so the only window is one dropped event on a full queue,
+/// closed by the next edit or the next boot. See [`ShadeEvent::AwaitingSetup`],
+/// which is absolute rather than a delta precisely so that a dropped one heals.
 struct Diagnostics {
     /// Slots in the rolling-code region that were neither valid nor blank at
     /// boot.
     rollcode_damaged: usize,
+    /// Shades that exist and that nobody has reported working.
+    ///
+    /// **The only thing in Home Assistant that knows an unfinished setup
+    /// exists.** A created-and-unconfirmed shade has no cover and no button —
+    /// deliberately, because its address has been heard by no motor — so
+    /// without this number the whole first half of adding a shade is invisible
+    /// from the surface the operator is actually looking at.
+    awaiting_setup: u8,
 }
 
 impl Diagnostics {
@@ -368,6 +388,11 @@ impl Diagnostics {
             DeviceEntity::HeapFree => write!(&mut out, "{}", crate::heap::free_bytes()),
             DeviceEntity::HeapPeak => write!(&mut out, "{}", crate::heap::peak_bytes()),
             DeviceEntity::RollcodeDamaged => write!(&mut out, "{}", self.rollcode_damaged),
+            // Zero is published like any other reading. An entity that goes
+            // blank when there is nothing to report is one an operator cannot
+            // tell from a broken one, and "no setups are pending" is exactly
+            // the answer somebody checking this wants to be given.
+            DeviceEntity::AwaitingSetup => write!(&mut out, "{}", self.awaiting_setup),
         };
         // Unreachable — `READING_CAPACITY` holds every one of these — and
         // treated as "nothing to report" rather than published half-written,
@@ -429,10 +454,16 @@ pub fn start(
     acks: AckSender,
 ) -> Result<(), embassy_executor::SpawnError> {
     let device_id = device_id();
+    // Once, so the line it prints is a fact about this boot rather than one per
+    // configuration. The superseded ones are given it too: every step of their
+    // plans is a zero-length tombstone, so it never renders, and one
+    // construction path is easier to hold than a second that omits it.
+    let url = configuration_url();
     let config = match topic_config(
         settings.discovery_prefix(),
         settings.state_root(),
         &device_id,
+        url.as_ref(),
     ) {
         Ok(config) => config,
         Err(error) => {
@@ -456,7 +487,12 @@ pub fn start(
     // refusing to announce anything.
     let mut stale: Vec<MqttConfig, MAX_SUPERSEDED> = Vec::new();
     for old in &superseded {
-        match topic_config(old.discovery_prefix(), old.state_root(), &device_id) {
+        match topic_config(
+            old.discovery_prefix(),
+            old.state_root(),
+            &device_id,
+            url.as_ref(),
+        ) {
             Ok(config) => {
                 let _ = stale.push(config);
             }
@@ -503,17 +539,119 @@ fn device_id() -> String<12> {
 /// this device's own configs findable with
 /// `mosquitto_sub -t 'homeassistant/+/<id>/#'` on a broker shared with other
 /// integrations.
+///
+/// `url` is computed once by the caller rather than here, because saying which
+/// address Home Assistant's device page will point at is a line worth one boot
+/// rather than one per superseded namespace pair.
 fn topic_config(
     discovery_prefix: &str,
     state_root: &str,
     device_id: &str,
+    url: Option<&ConfigurationUrl>,
 ) -> Result<MqttConfig, ConfigError> {
-    MqttConfig::new(
+    let config = MqttConfig::new(
         DiscoveryPrefix::new(discovery_prefix)?,
         StateRoot::new(state_root)?,
         NodeId::new(device_id)?,
         DeviceId::new(device_id)?,
-    )
+    )?;
+    Ok(match url {
+        Some(url) => config.with_configuration_url(url.clone()),
+        None => config,
+    })
+}
+
+/// The scheme this device's web server answers on. No TLS: there is no
+/// certificate a `.local` name could carry that a browser would accept.
+#[cfg(feature = "mdns")]
+const URL_SCHEME: &str = "http://";
+
+/// The domain `edge-mdns` appends to the name this device claims.
+#[cfg(feature = "mdns")]
+const MDNS_DOMAIN: &str = ".local";
+
+/// `http://<hostname>.local` at its widest, which is also its only width.
+#[cfg(feature = "mdns")]
+const CONFIGURATION_URL_LEN: usize =
+    URL_SCHEME.len() + crate::identity::HOSTNAME_LEN + MDNS_DOMAIN.len();
+
+// The two limits meet here and nowhere else, so this is where the claim has to
+// be checked. `somfy_mqtt::ConfigurationUrl::new` refuses an over-long URL
+// rather than truncating it, which would leave the device page with no link and
+// one serial line to explain it — a compile error is the better end of that.
+#[cfg(feature = "mdns")]
+const _: () = assert!(
+    CONFIGURATION_URL_LEN <= somfy_mqtt::MAX_CONFIGURATION_URL_LEN,
+    "this device's own URL no longer fits somfy-mqtt's configuration-URL budget",
+);
+
+/// Where Home Assistant's device page sends a person who wants to configure
+/// this controller.
+///
+/// # Why this is the answer to "add a shade from Home Assistant"
+///
+/// Adding a shade is a guided procedure with a person in the middle of it, and
+/// `somfy_mqtt`'s crate docs carry the ruling on why it does not become a set
+/// of entities. What it becomes instead is this: Home Assistant's device page
+/// links straight into the assistant that runs it, so an operator standing at
+/// the window with a phone gets there from the app they already have open —
+/// which is what "without the web UI" was actually asking for. The one thing
+/// Home Assistant then reports on its own is
+/// [`DeviceEntity::AwaitingSetup`], so a setup left half-way is visible there
+/// too.
+///
+/// # Why it is gated on mDNS rather than on the web server
+///
+/// Because the name has to resolve. `http` alone means there is a server; only
+/// `mdns` means this device answers to `<hostname>.local`, and a link that
+/// fails to open is worse than no link — it reads as a device that has broken
+/// rather than one that was never advertised.
+///
+/// A DHCP address is deliberately **not** used as the fallback. A discovery
+/// config is retained, so an address baked into one outlives the lease that
+/// produced it and goes on pointing at whatever holds it next. That is the
+/// confidently-wrong retained value this whole integration is written around.
+#[cfg(feature = "mdns")]
+fn configuration_url() -> Option<ConfigurationUrl> {
+    let mut text: String<CONFIGURATION_URL_LEN> = String::new();
+    // None can fail: the capacity is the sum of exactly these three pieces.
+    let _ = text.push_str(URL_SCHEME);
+    let _ = text.push_str(&crate::identity::hostname());
+    let _ = text.push_str(MDNS_DOMAIN);
+    match ConfigurationUrl::new(&text) {
+        Ok(url) => {
+            esp_println::println!(
+                "mqtt: Home Assistant's device page will link to {} — which is where a shade is \
+                 added, because pairing needs a person at the motor and a remote this controller \
+                 is not",
+                url.as_str(),
+            );
+            Some(url)
+        }
+        Err(error) => {
+            // Unreachable: `identity::hostname` is a validated DNS label by
+            // construction and the assertion above bounds the length. Reported
+            // rather than `expect`ed, because a panic here reboots the board
+            // over a hyperlink.
+            esp_println::println!(
+                "mqtt: this device's own URL is not a usable configuration_url ({}) — \
+                 Home Assistant's device page will have no link to its web UI",
+                error,
+            );
+            None
+        }
+    }
+}
+
+/// No mDNS responder, so no name to link to. See the other arm.
+#[cfg(not(feature = "mdns"))]
+fn configuration_url() -> Option<ConfigurationUrl> {
+    esp_println::println!(
+        "mqtt: no mDNS responder in this image, so Home Assistant's device page will have no \
+         link to this controller's web UI — a DHCP address is not used instead, because a \
+         retained discovery config would outlive the lease"
+    );
+    None
 }
 
 /// Connect, announce, serve, and reconnect — forever.
@@ -811,6 +949,18 @@ impl Broker {
                     self.inventory.remove(id);
                     self.known.forget(id);
                 }
+                // No entity is created or retired here: the count is a fact
+                // about the controller, and its discovery config went out with
+                // the rest of `DeviceEntity::ALL`. What changes is the reading,
+                // and it is published at once rather than at the next
+                // diagnostic tick — a person who has just created a shade and
+                // gone to look at Home Assistant should not wait a minute to
+                // see that something is pending.
+                Some(Woken::Shade(ShadeEvent::AwaitingSetup { count })) => {
+                    self.diagnostics.awaiting_setup = count;
+                    self.publish_reading(&mut connection, DeviceEntity::AwaitingSetup, commands)
+                        .await?;
+                }
                 Some(Woken::Delta(delta)) => {
                     self.known.record(&delta);
                     for state in self.known.of(delta.id) {
@@ -892,13 +1042,30 @@ impl Broker {
         commands: &CommandSender,
     ) -> Result<(), SessionEnd> {
         for entity in DeviceEntity::ALL {
-            let Some(reading) = self.diagnostics.reading(entity) else {
-                continue;
-            };
-            let publish = Step::Send(self.config.device_state(entity, reading.as_bytes()));
-            self.perform_one(connection, &publish, commands).await?;
+            self.publish_reading(connection, entity, commands).await?;
         }
         Ok(())
+    }
+
+    /// One device-level entity's current reading, retained.
+    ///
+    /// Split out of [`Broker::publish_diagnostics`] so that a figure which has
+    /// just changed can be sent on its own, without a round trip for each of
+    /// the other five. Both callers get the same "nothing honest to report
+    /// publishes nothing" rule, which is the half that must not be duplicated:
+    /// a second copy would be a second chance to publish a placeholder
+    /// retained.
+    async fn publish_reading<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        entity: DeviceEntity,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        let Some(reading) = self.diagnostics.reading(entity) else {
+            return Ok(());
+        };
+        let publish = Step::Send(self.config.device_state(entity, reading.as_bytes()));
+        self.perform_one(connection, &publish, commands).await
     }
 
     /// One step, settled — the shape every caller that is not walking a plan
@@ -1161,7 +1328,7 @@ fn pairing_of(bits: u32, id: ShadeId) -> Pairing {
 /// operation with `InflightExhausted`, and then does the same on every
 /// reconnect, at the backoff ceiling, forever.
 ///
-/// An announcement costs `1 + 5N + k` operations for `N` shades and the `k = 5`
+/// An announcement costs `1 + 5N + k` operations for `N` shades and the `k = 6`
 /// entries of `DeviceEntity::ALL` — `online`, then per shade a discovery config
 /// for each entry of `somfy_mqtt::SHADE_COMPONENTS` (a cover and a pairing
 /// button) and one subscription per command topic (direction, target, pair),

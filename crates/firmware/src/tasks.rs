@@ -1200,6 +1200,19 @@ fn apply_edit(
                     id.0,
                 );
             }
+            // Whichever half it was in, the pending figure has to be restated:
+            // discarding an unfinished setup lowers it, and removing a
+            // confirmed shade leaves it alone but is still an edit no other
+            // report covers — this arm does not reach `announce_shade`, and the
+            // count is absolute, so restating it costs one message and cannot
+            // be wrong. After `Removed`, for the priority reason `announce_shade`
+            // gives.
+            announce(
+                events,
+                ShadeEvent::AwaitingSetup {
+                    count: crate::edits::awaiting_setup(registry),
+                },
+            );
             Ok(Applied::Changed)
         }
         ShadeEdit::Link { id, address } => {
@@ -1280,23 +1293,40 @@ fn free_shade_id(registry: &Registry) -> Option<ShadeId> {
 /// the same question, and the removal path can answer it from the registry
 /// without waiting for an acknowledgement that has not arrived yet.
 fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
-    let Some(shade) = registry.shade(id) else {
-        return;
-    };
-    if !shade.config.pairing_state.is_confirmed() {
-        esp_println::println!(
-            "shades: ShadeId({}) is not announced — nobody has reported it working yet, so it \
-             has no Home Assistant entities. Finish its setup in the web UI.",
-            id.0,
-        );
-        return;
+    if let Some(shade) = registry.shade(id) {
+        if shade.config.pairing_state.is_confirmed() {
+            announce(
+                events,
+                ShadeEvent::Added {
+                    id,
+                    name: shade.config.name.clone(),
+                    pairable: RemoteIdentity::is_allocated(shade.config.address),
+                },
+            );
+        } else {
+            esp_println::println!(
+                "shades: ShadeId({}) is not announced — nobody has reported it working yet, so \
+                 it has no Home Assistant entities. Finish its setup from the device page in \
+                 Home Assistant, which links to this controller's setup assistant.",
+                id.0,
+            );
+        }
     }
+    // **After the announcement, and on every path including the refused one.**
+    //
+    // On every path, because creating a shade is what *raises* the count and
+    // creating a shade is precisely the edit that is refused an announcement: a
+    // report sent only where an announcement is would never mention the state
+    // it exists to make visible.
+    //
+    // After, because [`announce`] drops rather than blocks, so the order here
+    // is a priority. A discovery config that is not published leaves a shade
+    // with no entities until the next broker session; a count that is not
+    // published leaves a diagnostic stale until the next edit. The cover wins.
     announce(
         events,
-        ShadeEvent::Added {
-            id,
-            name: shade.config.name.clone(),
-            pairable: RemoteIdentity::is_allocated(shade.config.address),
+        ShadeEvent::AwaitingSetup {
+            count: crate::edits::awaiting_setup(registry),
         },
     );
 }

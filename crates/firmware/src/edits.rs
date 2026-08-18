@@ -37,7 +37,7 @@
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::String;
 use somfy_api::{CreateShadeDto, PatchShadeDto};
-use somfy_domain::ShadeId;
+use somfy_domain::{Registry, ShadeId};
 
 use crate::tasks::Mutex;
 
@@ -167,6 +167,15 @@ pub enum ShadeEdit {
 ///
 /// `crates/firmware/src/tasks.rs`'s `announce_shade` is the one gate, and every
 /// producer goes through it.
+///
+/// # There is a *count* of them, though
+///
+/// [`AwaitingSetup`](ShadeEvent::AwaitingSetup) is how many shades are in that
+/// state, and it is not the same thing as an entity for one of them. A control
+/// on a shade no motor has heard transmits and moves nothing; a number is a
+/// fact about the controller's own table and claims nothing about any shade.
+/// Without it a setup abandoned half-way is invisible from Home Assistant —
+/// which is where the person who abandoned it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShadeEvent {
     /// A shade an operator has reported working now exists and needs entities.
@@ -186,6 +195,38 @@ pub enum ShadeEvent {
         /// Its id.
         id: ShadeId,
     },
+    /// How many shades now exist that nobody has reported working.
+    ///
+    /// **Absolute, never a delta**, and that is what makes it safe on a
+    /// `try_send` channel: a dropped event leaves the figure stale until the
+    /// next edit rather than permanently wrong, and a reboot re-seeds it from
+    /// the table. A `+1`/`-1` vocabulary would turn one dropped event into a
+    /// number that never comes right again.
+    AwaitingSetup {
+        /// Shades in the registry whose pairing nobody has confirmed.
+        count: u8,
+    },
+}
+
+/// The payload of [`ShadeEvent::AwaitingSetup`], from a registry.
+///
+/// # Why it lives here rather than with either producer
+///
+/// There are two, and they must agree. The boot seed is taken in
+/// `crate::inventory`, which a build without `mqtt` does not have; the runtime
+/// figure is emitted by `crate::tasks`, which every build has. A helper in the
+/// first would drag an MQTT-only module into the state task — the exact
+/// boundary error the feature gates exist to catch, and the one that already
+/// caught `edits.rs` borrowing a constant from `somfy-mqtt`. So it sits beside
+/// the message it fills, in the module that is the vocabulary rather than
+/// either speaker.
+///
+/// Saturating at `u8::MAX`, which cannot be reached — `somfy_domain::MAX_SHADES`
+/// bounds the registry well below it — and saturating rather than wrapping
+/// anyway, because a count that wrapped to zero would report "nothing pending"
+/// at the exact moment the most was.
+pub fn awaiting_setup(registry: &Registry) -> u8 {
+    u8::try_from(registry.unconfirmed_shades().count()).unwrap_or(u8::MAX)
 }
 
 /// What the broker session did, for the state task to persist.

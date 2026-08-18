@@ -22,12 +22,15 @@
 
 use somfy_domain::ShadeId;
 use somfy_mqtt::{
-    Component, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId, ObjectId, StateRoot,
-    UniqueId, PAYLOAD_CAPACITY,
+    Component, ConfigurationUrl, DeviceEntity, DeviceId, DiscoveryPrefix, MqttConfig, NodeId,
+    ObjectId, StateRoot, UniqueId, PAYLOAD_CAPACITY,
 };
 
 const NODE: &str = "somfyrs";
 const DEVICE: &str = "a1b2c3d4";
+/// The shape the firmware builds: its own `.local` name, which is the address a
+/// person opens to reach the setup assistant.
+const CONFIG_URL: &str = "http://somfy-a1b2c3d4e5f6.local";
 
 fn config(state_root: &str, discovery_prefix: &str) -> MqttConfig {
     MqttConfig::new(
@@ -37,6 +40,7 @@ fn config(state_root: &str, discovery_prefix: &str) -> MqttConfig {
         DeviceId::new(DEVICE).expect("valid device id"),
     )
     .expect("valid config")
+    .with_configuration_url(ConfigurationUrl::new(CONFIG_URL).expect("valid url"))
 }
 
 fn default_config() -> MqttConfig {
@@ -279,6 +283,49 @@ fn every_diagnostic_carries_the_fields_that_make_it_readable() {
     }
 }
 
+/// The one entity the adding-a-shade flow has in Home Assistant, and the rule
+/// that lets it exist.
+///
+/// A shade is created before it is paired and acquires **no** entities until an
+/// operator reports that it moved — so from Home Assistant's side a setup left
+/// half-way is invisible: no cover, no button, nothing pending, indistinguishable
+/// from a controller nobody has touched.
+///
+/// [`DeviceEntity::AwaitingSetup`] is what closes that, and the reason it does
+/// not reopen the failure the gate exists for is that it is a **number about the
+/// controller**. It claims nothing about any shade and offers no control on one,
+/// so it cannot be the entity that transmits and moves nothing. It is pinned
+/// here because it is a design decision rather than a reading: a later change
+/// that "tidied up" the entity set by dropping it would take the whole first
+/// half of adding a shade back out of Home Assistant.
+#[test]
+fn the_pending_setup_count_is_a_device_reading_and_not_a_shade_control() {
+    assert!(
+        DeviceEntity::ALL.contains(&DeviceEntity::AwaitingSetup),
+        "the count of unfinished setups is the only trace of one in Home Assistant",
+    );
+    assert_eq!(DeviceEntity::AwaitingSetup.component(), Component::Sensor);
+    // No `device_class`: Home Assistant formats a count with none of its
+    // classes, and picking a near-miss would change how the number reads.
+    assert_eq!(DeviceEntity::AwaitingSetup.device_class(), None);
+    assert_eq!(DeviceEntity::AwaitingSetup.unit(), None);
+
+    let cfg = default_config();
+    let payload = render(&cfg, DeviceEntity::AwaitingSetup);
+    // Filed with the diagnostics, so it does not sit on the device's main card
+    // beside the covers — an operator meets it when they go looking.
+    assert_eq!(payload["entity_category"].as_str(), Some("diagnostic"));
+    // Published, never subscribed. A device-level entity with a command topic
+    // would be a control on the setup flow, which is the thing `somfy-mqtt`'s
+    // crate docs rule out.
+    let object = payload.as_object().unwrap();
+    assert!(
+        object.keys().all(|key| key != "command_topic"),
+        "a diagnostic must not take commands: {payload}",
+    );
+    assert_eq!(payload["state_topic"].as_str(), Some("~/awaiting_setup"));
+}
+
 /// An absent attribute is absent, not `null`. Home Assistant treats an explicit
 /// `null` as a set value in several places, and a `"unit_of_measurement": null`
 /// on a sensor that has no unit is a difference worth not discovering later.
@@ -378,6 +425,13 @@ fn every_payload_names_the_same_device() {
     let cover: serde_json::Value = serde_json::from_str(&buf).unwrap();
     blocks.push(cover["device"].clone());
 
+    let mut button: heapless::String<PAYLOAD_CAPACITY> = heapless::String::new();
+    cfg.button_discovery(ShadeId(1), "Lounge")
+        .render(&mut button)
+        .unwrap();
+    let button: serde_json::Value = serde_json::from_str(&button).unwrap();
+    blocks.push(button["device"].clone());
+
     for block in &blocks {
         assert_eq!(
             block["identifiers"].as_array().map(Vec::as_slice),
@@ -388,9 +442,19 @@ fn every_payload_names_the_same_device() {
             block["name"].as_str().is_some_and(|n| n.contains(DEVICE)),
             "the device name must distinguish one board from another: {block:?}",
         );
+        // **The link is on every payload, or on none of them.** Home Assistant
+        // merges device blocks from whichever config it processes, so a
+        // renderer that forgot the URL would leave the link working or not
+        // depending on the order the entities were discovered in — which is a
+        // fault that reproduces once in ten broker restarts.
+        assert_eq!(
+            block["configuration_url"].as_str(),
+            Some(CONFIG_URL),
+            "every payload must carry the same link to the device's own UI: {block:?}",
+        );
     }
     assert!(
         blocks.windows(2).all(|w| w[0] == w[1]),
-        "the cover and the diagnostics must name the same device: {blocks:?}",
+        "the cover, the button and the diagnostics must name the same device: {blocks:?}",
     );
 }

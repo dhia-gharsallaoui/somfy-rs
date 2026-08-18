@@ -127,11 +127,11 @@
 //! ## The entity set, and what decides its contents (R7)
 //!
 //! A cover per shade, and [`DeviceEntity::ALL`] for the controller itself —
-//! uptime, Wi-Fi signal, free heap, peak heap use, and the number of damaged
-//! slots in the rolling-code region. All five are marked
-//! `entity_category: diagnostic` so they do not clutter the device's main card,
-//! and all five carry the same `device` block the cover does, so Home Assistant
-//! groups every entity under one controller.
+//! uptime, Wi-Fi signal, free heap, peak heap use, the number of damaged slots
+//! in the rolling-code region, and how many shades are part-way through being
+//! set up. All six are marked `entity_category: diagnostic` so they do not
+//! clutter the device's main card, and all six carry the same `device` block
+//! the cover does, so Home Assistant groups every entity under one controller.
 //!
 //! The set is not chosen to reach a number. **An entity backed by nothing is
 //! worse than an absent one**, because it reads as a device fault rather than
@@ -139,6 +139,38 @@
 //! own acceptance criterion names. Every entity here is a value the firmware
 //! already holds; what it does not hold is absent rather than stubbed, and
 //! `docs/provenance.md` records each omission with the condition for adding it.
+//!
+//! ## Adding a shade is not here, and that is a ruling rather than an omission
+//!
+//! There is no "add a shade" entity, and there is deliberately no way to reach
+//! one. Adding a shade is a four-step procedure with a person in the middle of
+//! it: a motor is put into programming mode by a remote *this controller is
+//! not*, a two-minute window opens that nothing here can see, `Prog` goes out,
+//! and then somebody drives the shade and reports whether it moved. RTS is
+//! one-way, so that last answer cannot be observed — it can only be asked for,
+//! and [`Pairing`] and `somfy_domain::PairingState` are both named after whose
+//! knowledge it is.
+//!
+//! A Home Assistant `button` takes no argument and returns no answer, so a
+//! button that "adds a shade" can only produce a record with a generated name,
+//! unmeasured travel times, and no motor that has heard its address. Announcing
+//! that as a cover is the failure this whole crate is written around; **not**
+//! announcing it leaves a button whose press has no visible effect. Either way
+//! it is a half-finished thing somebody has to find later, which is exactly
+//! what the flow was reshaped to make unreachable.
+//!
+//! Reproducing the whole procedure at device level is possible — slugs do not
+//! collide the way [`ObjectId::for_shade`] does, so a second per-device button
+//! is expressible where a second per-shade one is not — and it was weighed and
+//! refused: eight always-present entities, in no order, with nowhere to put the
+//! sentence about holding `PROG` on a remote that is not this one.
+//!
+//! What is here instead is the pair that makes the procedure reachable *and*
+//! visible from Home Assistant without reproducing it: `configuration_url` in
+//! the device block links to the assistant that runs it, and
+//! [`DeviceEntity::AwaitingSetup`] reports how many setups are unfinished, so a
+//! setup abandoned half-way is something Home Assistant can see and act on
+//! rather than something only the web UI knows about.
 //!
 //! ## What is deliberately not here
 //!
@@ -160,6 +192,7 @@ mod error;
 mod ident;
 mod lifecycle;
 mod topic;
+mod url;
 mod validate;
 
 pub use config::MqttConfig;
@@ -180,3 +213,4 @@ pub use topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,
     MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
 };
+pub use url::{ConfigurationUrl, UrlError, MAX_CONFIGURATION_URL_LEN};
