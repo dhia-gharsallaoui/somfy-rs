@@ -1856,6 +1856,10 @@ in this repository has ever run this code on a board.
 
 ### What is untested, in order of how much it would cost to be wrong
 
+**Two of these have since been settled on a real ESP32-S3** — the diagnostics
+screen and the export — and one of them found a bug. What follows is what
+remains, with the settled parts marked.
+
 1. **The panic record.** `crate::diag::record_panic` runs inside a panic handler,
    takes a critical section that the panicking code may already hold, and writes
    RTC-fast memory that `esp_hal::system::software_reset` then has to preserve.
@@ -1864,8 +1868,9 @@ in this repository has ever run this code on a board.
    `esp_println` already relies on it in the same handler — but **a panic path
    cannot be trusted until it has actually panicked on silicon.** The procedure
    is below.
-2. **The staged restore, applied at boot.** It writes the shade table and the
-   estate. If it is wrong in the direction that writes a bad table, the
+2. **The staged restore, applied at boot.** Exercised once on a real board and
+   found to be wrong — see step 4 — so what is untested now is the *fix*, not
+   the path. It writes the shade table and the estate. If it is wrong in the direction that writes a bad table, the
    consequence is a controller that will not move a shade until it is
    reprovisioned. If it is wrong in the direction that writes a bad *rolling
    code*, the consequence is a physical re-pairing at every motor — except that
@@ -1964,6 +1969,20 @@ says about the C++ backup: treat it like a key.
 The safe direction, and the one to try first: every address already has a code,
 so `seed_if_absent` plants nothing and the shade table is rewritten with the
 same values.
+
+**This is the step that found the one bug hardware has found so far**, and it is
+worth knowing what it looked like because the symptom points at the wrong place.
+A board with shades and **no rooms or groups** — a blank `estate` region, which
+is the ordinary state of anything provisioned without them — exported a file the
+host accepted and then refused it on the next boot as `backupDamaged`, with every
+count zero. The exporter fills a record slot with `0xFF` when the region it reads
+has nothing in it, and the reader was calling that damage rather than "empty".
+The rule now lives in `somfy_backup::Backup::{shade_table, estate_table}` where a
+host test runs the same code the boot path does; `crates/somfy-backup/tests/container.rs`
+holds it, and three of those tests fail if it is reverted.
+
+So: **if the board under test has rooms and groups, add a case that has
+neither**, because that is the branch the container's checksum cannot reach.
 
 ```bash
 curl -s -X POST --data-binary @board.rtsb \
