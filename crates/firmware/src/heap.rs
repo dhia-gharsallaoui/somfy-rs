@@ -1006,8 +1006,9 @@ compile_error!(
 ///   and the old headroom did not cover doubling it. This one does.
 /// - **Whether frame aggregation should be turned off.** It was measured at 316
 ///   bytes of steady use — a real, repeatable saving that was never worth what
-///   reaching the setter costs (`esp-radio/unstable`, and on `chip-esp32` an ADC2
-///   claim in `esp_radio`'s `init` that panics if esp-hal holds it). At 163 KiB
+///   reaching the setter costs (`esp-radio/unstable`, plus — on the ESP32, which
+///   this firmware no longer supports — an ADC2 claim in `esp_radio`'s `init`
+///   that panics if esp-hal holds it). At 163 KiB
 ///   it is not worth discussing. Recorded so it is not investigated a fourth
 ///   time; `docs/provenance.md` carries the per-boot figures.
 #[allow(
