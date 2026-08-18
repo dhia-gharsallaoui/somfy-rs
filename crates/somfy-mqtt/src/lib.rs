@@ -140,37 +140,46 @@
 //! already holds; what it does not hold is absent rather than stubbed, and
 //! `docs/provenance.md` records each omission with the condition for adding it.
 //!
-//! ## Adding a shade is not here, and that is a ruling rather than an omission
+//! ## Adding a shade *is* here — as a form, and never as a bare button
 //!
-//! There is no "add a shade" entity, and there is deliberately no way to reach
-//! one. Adding a shade is a four-step procedure with a person in the middle of
-//! it: a motor is put into programming mode by a remote *this controller is
-//! not*, a two-minute window opens that nothing here can see, `Prog` goes out,
-//! and then somebody drives the shade and reports whether it moved. RTS is
-//! one-way, so that last answer cannot be observed — it can only be asked for,
-//! and [`Pairing`] and `somfy_domain::PairingState` are both named after whose
+//! Adding a shade is a four-step procedure with a person in the middle of it: a
+//! motor is put into programming mode by a remote *this controller is not*, a
+//! two-minute window opens that nothing here can see, `Prog` goes out, and then
+//! somebody drives the shade and reports whether it moved. RTS is one-way, so
+//! that last answer cannot be observed — it can only be asked for, and
+//! [`Pairing`] and `somfy_domain::PairingState` are both named after whose
 //! knowledge it is.
 //!
-//! A Home Assistant `button` takes no argument and returns no answer, so a
-//! button that "adds a shade" can only produce a record with a generated name,
-//! unmeasured travel times, and no motor that has heard its address. Announcing
-//! that as a cover is the failure this whole crate is written around; **not**
-//! announcing it leaves a button whose press has no visible effect. Either way
-//! it is a half-finished thing somebody has to find later, which is exactly
-//! what the flow was reshaped to make unreachable.
+//! **A `button` is still the wrong surface**, for the reason it always was: it
+//! takes no argument, so it can only produce a record with a generated name and
+//! the factory travel times — and those are the values behind a shade that
+//! moved about 1% when it was asked for 25%. [`SetupEntity`] is a form instead:
+//! a `text`, a `select` and two `number`s carry the values, and
+//! [`SetupEntity::Send`] refuses to create anything until they are filled in.
 //!
-//! Reproducing the whole procedure at device level is possible — slugs do not
-//! collide the way [`ObjectId::for_shade`] does, so a second per-device button
-//! is expressible where a second per-shade one is not — and it was weighed and
-//! refused: eight always-present entities, in no order, with nowhere to put the
-//! sentence about holding `PROG` on a remote that is not this one.
+//! Two things make the form affordable where an earlier ruling said it was not,
+//! and both are recorded in `docs/provenance.md`:
 //!
-//! What is here instead is the pair that makes the procedure reachable *and*
-//! visible from Home Assistant without reproducing it: `configuration_url` in
-//! the device block links to the assistant that runs it, and
-//! [`DeviceEntity::AwaitingSetup`] reports how many setups are unfinished, so a
-//! setup abandoned half-way is something Home Assistant can see and act on
-//! rather than something only the web UI knows about.
+//! - **It is not always present.** Only [`SetupEntity::Begin`] is. The other
+//!   eight are announced by [`MqttConfig::open_form`] when a setup starts and
+//!   cleared by [`MqttConfig::close_form`] when it ends, exactly as a shade's
+//!   entities are announced and retired.
+//! - **The instructions have somewhere to live.** [`SetupEntity::NextStep`] is
+//!   a `sensor`, and a sensor's *state* holds 255 characters — room for the
+//!   sentence about holding `PROG` on a remote that is not this one, which no
+//!   entity name could carry.
+//!
+//! **No entity claims what the device does not know.** A shade created by the
+//! form has an address this controller invented, so it acquires no cover and no
+//! pairing button until [`SetupEntity::Confirm`] — *It moved* — is pressed by
+//! the person watching it. Until then it is one row in
+//! [`DeviceEntity::AwaitingSetup`], which is a count about the controller and a
+//! claim about no motor at all.
+//!
+//! [`Setup`] is the flow, and it holds no behaviour: every [`Ask`] it returns
+//! is one of the edits the web UI already makes, applied by the same code on
+//! the far side of the same seam. `configuration_url` still links to the web
+//! assistant, which remains the fuller of the two surfaces.
 //!
 //! ## What is deliberately not here
 //!
@@ -180,17 +189,19 @@
 //! - **The state and command vocabularies.** [`CoverDiscovery::render`] emits
 //!   the topics and lets Home Assistant's defaults stand, because fixing a
 //!   vocabulary before anything publishes it would be guessing.
-//! - **Components other than `cover` and `sensor`.** [`Component`] carries the
-//!   full set the firmware could emit; a payload is built only for the two that
-//!   have something to report.
+//! - **Components with no payload builder.** [`Component`] carries the full set
+//!   the firmware could emit; payloads exist for `cover`, `button`, `sensor`,
+//!   `text`, `number` and `select`, which are the ones with something to say.
 
 #![cfg_attr(not(test), no_std)]
 
 mod config;
 mod entity;
 mod error;
+mod flow;
 mod ident;
 mod lifecycle;
+mod setup;
 mod topic;
 mod url;
 mod validate;
@@ -201,6 +212,9 @@ pub use entity::{
     ShadeTopic, TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
 };
 pub use error::{ConfigError, Field};
+pub use flow::{
+    Ask, Draft, Effect, FormChange, Setup, SetupInput, SetupPhase, SetupValue, PAYLOAD_PRESS,
+};
 pub use ident::{
     DeviceId, NodeId, ObjectId, UniqueId, LONGEST_HA_COMPONENT_NAME, MAX_COMPONENT_HEADROOM,
     MAX_DEVICE_ID_LEN, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS, MAX_UNIQUE_ID_LEN,
@@ -208,6 +222,11 @@ pub use ident::{
 pub use lifecycle::{
     reconfigure, Listen, Pairing, Payload, Publish, PublishedTopic, Retention, Step,
     SubscribedTopic, OFFLINE, ONLINE, SHADE_COMPONENTS,
+};
+pub use setup::{
+    kind_from_label, kind_label, SetupDiscovery, SetupEntity, SetupMessage, KIND_OPTIONS,
+    MAX_DRAFT_NAME_LEN, MAX_KIND_LABEL_LEN, MAX_MESSAGE_LEN, MAX_STATE_LEN, MAX_TRAVEL_MS,
+    MIN_TRAVEL_MS, TRAVEL_STEP_MS,
 };
 pub use topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,

@@ -25,6 +25,7 @@ use crate::error::{ConfigError, Field};
 use crate::ident::{
     DeviceId, NodeId, ObjectId, UniqueId, MAX_NODE_ID_LEN, MAX_OBJECT_ID_LEN, MAX_SHADE_ID_DIGITS,
 };
+use crate::setup::{SetupDiscovery, SetupEntity};
 use crate::topic::{
     namespaces_overlap, DiscoveryPrefix, StateRoot, Topic, MAX_DISCOVERY_PREFIX_LEN,
     MAX_STATE_ROOT_LEN, TOPIC_CAPACITY,
@@ -49,6 +50,19 @@ const DEVICE_SEGMENT: &str = "device";
 
 /// The availability topic's segment under the state root.
 const STATUS_SEGMENT: &str = "status";
+
+/// The segment that groups the add-a-shade form under the state root.
+///
+/// A fourth namespace beside [`SHADES_SEGMENT`], [`DEVICE_SEGMENT`] and
+/// [`STATUS_SEGMENT`], for the same reason the third one is separate: a form
+/// entity must not be able to address what a shade or a diagnostic owns however
+/// any of the sets grows. `tests/setup_form.rs` checks that against all 256
+/// shade ids and every [`DeviceEntity`] rather than leaving it as an
+/// observation about four string literals.
+const SETUP_SEGMENT: &str = "setup";
+
+/// The segment that turns a form topic into the one the firmware subscribes to.
+const SET_SEGMENT: &str = "set";
 
 /// A validated MQTT configuration: two independent namespaces and two
 /// identifiers.
@@ -321,6 +335,80 @@ impl MqttConfig {
         }
     }
 
+    /// `{state_root}/setup` — the base every form topic sits under, and the
+    /// setup payloads' `~`.
+    pub fn setup_base(&self) -> Topic {
+        self.state_root.topic().segment(SETUP_SEGMENT).finish()
+    }
+
+    /// The absolute topic one form entity's value is published to.
+    ///
+    /// Meaningful only where [`SetupEntity::has_state`] is true. It is built
+    /// unconditionally anyway, because the retirement clears every topic the
+    /// form *could* own rather than every topic it did — the same asymmetry
+    /// [`MqttConfig::retire_shade`] uses, and for the same reason: clearing a
+    /// topic nothing was published to costs one packet the broker discards,
+    /// while failing to clear one leaves a retained value with no entity behind
+    /// it.
+    pub fn setup_topic(&self, entity: SetupEntity) -> Topic {
+        self.state_root
+            .topic()
+            .segment(SETUP_SEGMENT)
+            .segment(entity.leaf())
+            .finish()
+    }
+
+    /// The absolute topic one form entity takes commands on.
+    ///
+    /// Meaningful only where [`SetupEntity::accepts_command`] is true, and
+    /// **never published to** — a form command topic is subscribed, so it can
+    /// never carry a retained message from this device (R6).
+    pub fn setup_command_topic(&self, entity: SetupEntity) -> Topic {
+        self.state_root
+            .topic()
+            .segment(SETUP_SEGMENT)
+            .segment(entity.leaf())
+            .segment(SET_SEGMENT)
+            .finish()
+    }
+
+    /// Every form entity, paired with its state topic and its command topic.
+    ///
+    /// The counterpart of [`MqttConfig::shade_topics`] and
+    /// [`MqttConfig::device_topics`], and read by the round-trip check for the
+    /// same reason: the payload and the publisher must come from one table or
+    /// they will drift.
+    pub fn setup_topics(
+        &self,
+    ) -> impl Iterator<Item = (SetupEntity, Option<Topic>, Option<Topic>)> + '_ {
+        SetupEntity::ALL.into_iter().map(move |entity| {
+            (
+                entity,
+                entity.has_state().then(|| self.setup_topic(entity)),
+                entity
+                    .accepts_command()
+                    .then(|| self.setup_command_topic(entity)),
+            )
+        })
+    }
+
+    /// The discovery config for one entity of the add-a-shade form.
+    ///
+    /// Takes no value, exactly as [`MqttConfig::diagnostic_discovery`] does:
+    /// what the entity currently *holds* is published separately, on the topic
+    /// this payload names.
+    pub fn setup_discovery(&self, entity: SetupEntity) -> SetupDiscovery<'_> {
+        SetupDiscovery {
+            base: self.setup_base(),
+            availability: self.availability_topic(),
+            object_id: ObjectId::for_setup(entity),
+            unique_id: UniqueId::for_setup(&self.device_id, entity),
+            device_id: self.device_id.as_str(),
+            configuration_url: self.configuration_url(),
+            entity,
+        }
+    }
+
     /// The discovery config for one device-level entity.
     ///
     /// Takes no value: what the entity *reports* is published separately, on
@@ -374,6 +462,9 @@ pub(crate) const WORST_AVAILABILITY_LEN: usize = MAX_STATE_ROOT_LEN + 1 + STATUS
 const WORST_DEVICE_TOPIC_LEN: usize =
     MAX_STATE_ROOT_LEN + 1 + DEVICE_SEGMENT.len() + 1 + DeviceEntity::MAX_SLUG_LEN;
 
+/// `{state_root}/setup` at its widest — also the setup payloads' `~`.
+pub(crate) const WORST_SETUP_BASE_LEN: usize = MAX_STATE_ROOT_LEN + 1 + SETUP_SEGMENT.len();
+
 const _: () = assert!(
     TOPIC_CAPACITY >= WORST_DISCOVERY_TOPIC_LEN,
     "TOPIC_CAPACITY is too small for the longest discovery topic",
@@ -389,4 +480,8 @@ const _: () = assert!(
 const _: () = assert!(
     TOPIC_CAPACITY >= WORST_DEVICE_TOPIC_LEN,
     "TOPIC_CAPACITY is too small for the longest device topic",
+);
+const _: () = assert!(
+    TOPIC_CAPACITY >= crate::setup::WORST_SETUP_TOPIC_LEN,
+    "TOPIC_CAPACITY is too small for the longest setup topic",
 );

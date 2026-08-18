@@ -937,7 +937,10 @@ fn push(out: &mut String<PAYLOAD_CAPACITY>, ch: char) -> Result<(), PayloadError
 /// the whole payload unparseable, and Home Assistant discards a payload it
 /// cannot parse without logging anything an operator would find — the entity
 /// simply never appears.
-pub(crate) fn write_json_string(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
+pub(crate) fn write_json_string(
+    out: &mut String<PAYLOAD_CAPACITY>,
+    value: &str,
+) -> Result<(), PayloadError> {
     push(out, '"')?;
     write_json_escaped(out, value)?;
     push(out, '"')
@@ -945,7 +948,10 @@ pub(crate) fn write_json_string(out: &mut String<PAYLOAD_CAPACITY>, value: &str)
 
 /// The escaping half of [`write_json_string`], without the surrounding quotes,
 /// for the one place a JSON string is built from two pieces.
-pub(crate) fn write_json_escaped(out: &mut String<PAYLOAD_CAPACITY>, value: &str) -> Result<(), PayloadError> {
+pub(crate) fn write_json_escaped(
+    out: &mut String<PAYLOAD_CAPACITY>,
+    value: &str,
+) -> Result<(), PayloadError> {
     for ch in value.chars() {
         match ch {
             '"' => write(out, "\\\"")?,

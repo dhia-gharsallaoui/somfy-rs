@@ -70,6 +70,7 @@
 use crate::config::MqttConfig;
 use crate::entity::{Component, DeviceEntity, ShadeTopic, TopicRole};
 use crate::ident::ObjectId;
+use crate::setup::{SetupEntity, SetupMessage};
 use crate::topic::Topic;
 use somfy_domain::ShadeId;
 
@@ -204,6 +205,13 @@ pub enum Payload<'a> {
     /// there would leave the executor with a combination — a shade and a
     /// diagnostic — that means nothing.
     DeviceDiscovery(DeviceEntity),
+    /// The discovery config for one entity of the add-a-shade form, to be
+    /// rendered by the executor.
+    ///
+    /// A third variant for the same reason the second exists: a different
+    /// renderer over different data, and folding it into either of the others
+    /// would give the executor a combination that means nothing.
+    SetupDiscovery(SetupEntity),
     /// No bytes at all.
     ///
     /// **This is the removal.** Paired with [`Retention::Retained`] — which is
@@ -450,6 +458,7 @@ impl MqttConfig {
                     .flat_map(move |shade| self.announce_shade(*shade, has_tilt, pairing(*shade))),
             )
             .chain(self.announce_device())
+            .chain(self.announce_setup())
     }
 
     /// The controller's own diagnostics: one retained discovery config each.
@@ -466,6 +475,163 @@ impl MqttConfig {
                 retention: Retention::Retained,
             })
         })
+    }
+
+    /// The always-present half of the add-a-shade form: one `button`, and the
+    /// subscriptions for **every** form topic.
+    ///
+    /// # Why the subscriptions are here and not in [`MqttConfig::open_form`]
+    ///
+    /// Because a subscription is not an entity. What an operator sees is
+    /// governed by the discovery configs, which appear when a setup starts and
+    /// go when it ends; what the device *listens* to costs one packet per
+    /// session and has no visible effect at all. Subscribing once, here, buys
+    /// three things:
+    ///
+    /// - There is no window in which the form's entities exist and the device
+    ///   is not yet listening — a press in that window would be lost with
+    ///   nothing anywhere reporting it.
+    /// - R6's retained-replay suppression is decided once rather than on every
+    ///   open, and it is the half of R6 that is easy to lose.
+    /// - Closing the form needs no unsubscribe, so a failed unsubscribe cannot
+    ///   leave the device listening to entities that no longer exist. Out-of-
+    ///   phase input is refused by the flow, which is where the refusal belongs
+    ///   anyway — it is the same place an empty name is refused.
+    ///
+    /// The cost is eight subscriptions on every fresh session of every board,
+    /// including boards nobody ever adds a shade from. It is the reason `k` in
+    /// the announcement's `1 + 5N + k` moved from 6 to 15.
+    pub fn announce_setup(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        SetupEntity::ALWAYS
+            .into_iter()
+            .map(move |entity| {
+                Step::Send(Publish {
+                    topic: self.discovery_topic(entity.component(), &ObjectId::for_setup(entity)),
+                    payload: Payload::SetupDiscovery(entity),
+                    retention: Retention::Retained,
+                })
+            })
+            .chain(
+                SetupEntity::ALL
+                    .into_iter()
+                    .filter(|entity| entity.accepts_command())
+                    .map(move |entity| {
+                        Step::Listen(Listen {
+                            topic: self.setup_command_topic(entity),
+                            // See [`Listen`]: a retained message on a command
+                            // topic is a command that replays on every
+                            // reconnect — and one of these creates a shade.
+                            retained_replay: false,
+                        })
+                    }),
+            )
+    }
+
+    /// The form itself: a retained discovery config for each of
+    /// [`SetupEntity::FORM`].
+    ///
+    /// **This is what makes the form different from the button that was
+    /// refused.** It is published when a setup starts and cleared by
+    /// [`MqttConfig::close_form`] when it ends, so an idle controller shows one
+    /// entity rather than nine.
+    ///
+    /// The entities' *values* are not here, for exactly the reason a shade's
+    /// name is not in [`MqttConfig::announce_shade`]: this crate does not hold
+    /// them. The firmware publishes them from the draft immediately afterwards.
+    pub fn open_form(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        SetupEntity::FORM.into_iter().map(move |entity| {
+            Step::Send(Publish {
+                topic: self.discovery_topic(entity.component(), &ObjectId::for_setup(entity)),
+                payload: Payload::SetupDiscovery(entity),
+                retention: Retention::Retained,
+            })
+        })
+    }
+
+    /// Everything that removes the form: its discovery configs, then the
+    /// retained values behind them.
+    ///
+    /// **Configs first, values second, and the order is load-bearing.** Home
+    /// Assistant sees the entity removed before a zero-length payload lands on
+    /// its state topic, so nothing ever tries to interpret an empty string as a
+    /// name or a number. Reversed, a `text` entity would briefly be handed `""`
+    /// — which its own `min` would reject — for no gain.
+    ///
+    /// Every state topic [`SetupEntity::FORM`] *could* own is cleared, whether
+    /// or not it was written. That is the same asymmetry
+    /// [`MqttConfig::retire_shade`] uses and it is the safe direction: clearing
+    /// a topic holding nothing is a packet the broker discards, while missing
+    /// one leaves a retained value with no entity behind it, forever, clearable
+    /// only by a person with an MQTT client.
+    ///
+    /// This is R5 for the form, and `tests/setup_form.rs` checks it as a
+    /// property — every topic an open retains is a topic a close clears —
+    /// rather than as two lists that happen to agree.
+    pub fn close_form(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        SetupEntity::FORM
+            .into_iter()
+            .map(move |entity| {
+                Step::Send(tombstone(
+                    self.discovery_topic(entity.component(), &ObjectId::for_setup(entity)),
+                ))
+            })
+            .chain(
+                SetupEntity::FORM
+                    .into_iter()
+                    .filter(|entity| entity.has_state())
+                    .map(move |entity| Step::Send(tombstone(self.setup_topic(entity)))),
+            )
+    }
+
+    /// Everything that removes the form **and** the always-present button.
+    ///
+    /// Only for a configuration being abandoned altogether — see
+    /// [`MqttConfig::retire`]. Distinct from [`MqttConfig::close_form`], which
+    /// ends a setup and leaves the way to start another one.
+    pub fn retire_setup(&self) -> impl Iterator<Item = Step<'static>> + '_ {
+        SetupEntity::ALL
+            .into_iter()
+            .map(move |entity| {
+                Step::Send(tombstone(
+                    self.discovery_topic(entity.component(), &ObjectId::for_setup(entity)),
+                ))
+            })
+            .chain(
+                SetupEntity::ALL
+                    .into_iter()
+                    .filter(|entity| entity.has_state())
+                    .map(move |entity| Step::Send(tombstone(self.setup_topic(entity)))),
+            )
+    }
+
+    /// One form entity's current value, retained.
+    ///
+    /// Retained for the same reason a shade's position is: a Home Assistant
+    /// that restarts mid-setup must find the form as it was left rather than
+    /// blank. The bytes are the caller's — a draft name, a rendered number, or
+    /// a [`SetupMessage`] — because this crate holds none of them.
+    ///
+    /// Takes a [`SetupEntity`] that has a state, and returns `None` for one
+    /// that does not, so a button cannot be given a value to publish.
+    pub fn setup_state<'a>(&self, entity: SetupEntity, value: &'a [u8]) -> Option<Publish<'a>> {
+        entity.has_state().then(|| Publish {
+            topic: self.setup_topic(entity),
+            payload: Payload::Bytes(value),
+            retention: Retention::Retained,
+        })
+    }
+
+    /// The instructions, retained.
+    ///
+    /// A convenience over [`MqttConfig::setup_state`] that cannot address the
+    /// wrong entity: a [`SetupMessage`] belongs on
+    /// [`SetupEntity::NextStep`] and nowhere else.
+    pub fn setup_message(&self, message: SetupMessage) -> Publish<'static> {
+        Publish {
+            topic: self.setup_topic(SetupEntity::NextStep),
+            payload: Payload::Bytes(message.as_str().as_bytes()),
+            retention: Retention::Retained,
+        }
     }
 
     /// One shade's discovery configs and command subscriptions.
@@ -567,6 +733,7 @@ impl MqttConfig {
             .iter()
             .flat_map(move |shade| self.retire_shade(*shade))
             .chain(self.retire_device())
+            .chain(self.retire_setup())
             .chain(core::iter::once(Step::Send(tombstone(
                 self.availability_topic(),
             ))))
