@@ -16,13 +16,14 @@
 //! properties make it the only sensible place, and they are both load-bearing:
 //!
 //! 1. **It is not DRAM.** The linker gives it its own 8 KiB region — `readelf`
-//!    shows `.rtc_fast.persistent` at `0x600fe000` on the ESP32-S3 and
-//!    `0x50000000` on the ESP32-C3, both outside `dram_seg`. So none of it comes
-//!    out of [`crate::heap::DRAM_FOR_STACK_AND_HEAP`], which is the quantity the
-//!    Wi-Fi driver's heap is a *subtraction* from. A 4 KiB ring in a `static`
-//!    would have cost the ESP32-C3 4 KiB of a heap that clears its measured
-//!    announcement peak by about five, which is most of the margin. Here it
-//!    costs nothing.
+//!    shows `.rtc_fast.persistent` at `0x600fe000` on the ESP32-S3, outside
+//!    `dram_seg`. So none of it comes out of the DRAM
+//!    [`crate::heap::heap_region`] divides between the main stack and the Wi-Fi
+//!    driver's heap. A 4 KiB ring in an ordinary `static` would come straight
+//!    off that heap; here it costs nothing. (The argument was first made
+//!    against the ESP32-C3, where 4 KiB was most of the margin over the measured
+//!    announcement peak. That chip went on 2026-08-19 and the argument is
+//!    unchanged in kind, only less desperate.)
 //! 2. **It survives a software reset.** esp-hal zeroes `.rtc_fast.persistent`
 //!    only when `reset_reason()` is `ChipPowerOn` or unknown
 //!    (`esp_hal::soc::__init_persistent`), so a reset caused by the panic
@@ -123,14 +124,14 @@ use somfy_api::{LogDto, PanicDto, ResetReasonDto, MAX_PANIC_TEXT_LEN};
 /// bump into a link failure at the end of a long build.
 pub const RING_BYTES: usize = 4_096;
 
-/// RTC-fast memory on both chips in the matrix.
+/// RTC-fast memory on the ESP32-S3.
 ///
-/// Read off the linker scripts rather than a datasheet:
-/// `esp-hal-1.1.2/ld/esp32s3/memory.x` gives `rtc_fast_seg` `len = 8k` and
-/// `ld/esp32c3/memory.x` gives `RTC_FAST` `LENGTH = 0x2000`. Both chips alias
-/// `RTC_FAST_RWTEXT` and `RTC_FAST_RWDATA` onto the same region
-/// (`ld/*/linkall.x`), so code placed there would come out of this too — this
-/// firmware places none.
+/// Read off the linker script rather than a datasheet:
+/// `esp-hal-1.1.2/ld/esp32s3/memory.x` gives `rtc_fast_seg` `len = 8k`. (The
+/// ESP32-C3, built here until 2026-08-19, gave `RTC_FAST` `LENGTH = 0x2000`,
+/// which is the same figure — so nothing here moved when it went.) The region
+/// aliases `RTC_FAST_RWTEXT` and `RTC_FAST_RWDATA`, so code placed there would
+/// come out of this too — this firmware places none.
 const RTC_FAST_BYTES: usize = 8 * 1024;
 
 /// What this module places in RTC-fast memory, in bytes.
@@ -546,8 +547,10 @@ pub fn log_read(from: usize, out: &mut [u8]) -> usize {
 /// connection task futures, out of the DRAM the Wi-Fi driver's heap is a
 /// subtraction from. Admitting control characters would make the worst case six
 /// bytes per byte and admitting quotes two; refusing both makes it one, which
-/// takes the bound from 1,760 to 640 and gives the ESP32-C3 back a kilobyte of
-/// Wi-Fi heap it does not have to spare.
+/// takes the bound from 1,760 to 640. That kilobyte of Wi-Fi heap was bought
+/// for the ESP32-C3, which had none to spare and was dropped on 2026-08-19; the
+/// substitution stays because it is also what makes the bound *provable* rather
+/// than guessed at, which is the half that was never about the chip.
 ///
 /// What it costs is that a panic message quoting a string — `assertion failed:
 /// name == "x"` — reads with dots where the quotes were, and that an accented
@@ -764,12 +767,15 @@ pub fn uptime_s() -> u32 {
 
 /// Why this board started.
 ///
-/// **Matched on the discriminant rather than the variant name**, because the
-/// two chips spell the same causes differently — `CpuSw` on the ESP32-S3 against
-/// `Cpu0Sw` on the ESP32-C3 — so a name-based match would need a `#[cfg]` per
-/// arm. The numbers are ESP-IDF's own reset-reason codes and are identical
-/// across both parts; `esp-hal-1.1.2/src/rtc_cntl/rtc/esp32s3.rs:15` and
-/// `esp32c3.rs:185` are the two enums.
+/// **Matched on the discriminant rather than the variant name**, because
+/// Espressif parts spell the same causes differently — `CpuSw` on the ESP32-S3
+/// against `Cpu0Sw` on the ESP32-C3, built here until 2026-08-19 — so a
+/// name-based match needs a `#[cfg]` per arm the moment there is a second chip.
+/// The numbers are ESP-IDF's own reset-reason codes and are identical across
+/// parts; `esp-hal-1.1.2/src/rtc_cntl/rtc/esp32s3.rs:15` and `esp32c3.rs:185`
+/// were the two enums this was checked against. It is kept rather than
+/// simplified back to variant names: the `#[cfg]`s are the thing that would
+/// come back, and this code has no reason to change when a chip does.
 pub fn reset_reason() -> ResetReasonDto {
     let Some(reason) = esp_hal::system::reset_reason() else {
         return ResetReasonDto::Other;

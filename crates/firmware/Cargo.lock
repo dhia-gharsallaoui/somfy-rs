@@ -994,9 +994,7 @@ dependencies = [
  "esp-hal",
  "esp-metadata-generated",
  "esp-sync",
- "esp-wifi-sys-esp32c3",
  "esp-wifi-sys-esp32s3",
- "esp32c3",
  "esp32s3",
 ]
 
@@ -1033,9 +1031,7 @@ dependencies = [
  "esp-phy",
  "esp-radio-rtos-driver",
  "esp-sync",
- "esp-wifi-sys-esp32c3",
  "esp-wifi-sys-esp32s3",
- "esp32c3",
  "esp32s3",
  "heapless 0.9.3",
  "instability",
@@ -1077,7 +1073,6 @@ dependencies = [
  "cfg-if",
  "document-features",
  "esp-metadata-generated",
- "esp32c3",
  "esp32s3",
 ]
 
@@ -1150,12 +1145,6 @@ dependencies = [
  "usb-device",
  "vcell",
 ]
-
-[[package]]
-name = "esp-wifi-sys-esp32c3"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b290846b53db9a3965866964260220b67f2c41cc2dbc0b377e7136239fe168a7"
 
 [[package]]
 name = "esp-wifi-sys-esp32s3"

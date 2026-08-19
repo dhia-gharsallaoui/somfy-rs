@@ -37,7 +37,7 @@ seam Plan 5 plugs into.
 |---|---|---|
 | Hardware available | Spare ESP32-S3-DevKitC-1 + CC1101, **plus** the running C++ v2.5.6 device | Golden captures are obtainable; on-air validation is in scope |
 | Vertical slice | Radio task **wired to `somfy-domain`** | Plan 2 stops being dormant; Plan 5's seam is real code |
-| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues<br>**Superseded twice.** 2026-08-17: the ESP32-S2 was dropped (too little DRAM for the Wi-Fi heap *and* a bootable stack). 2026-08-18: the ESP32 was dropped too — it could not link the web server, and its one buildable configuration left its heap 1,700 bytes above the announcement peak, inside that peak's own spread. **Neither had ever been booted**, which is what made both "no porting debt accrues" and the support claim itself unbacked. The matrix is now two chips over both instruction sets |
+| Chip targets | **All four** — ESP32, S2, S3, C3 | 4-way CI matrix; no porting debt accrues<br>**Superseded three times.** 2026-08-17: the ESP32-S2 was dropped (too little DRAM for the Wi-Fi heap *and* a bootable stack). 2026-08-18: the ESP32 was dropped too — it could not link the web server, and its one buildable configuration left its heap 1,700 bytes above the announcement peak, inside that peak's own spread. **Neither had ever been booted**, which is what made both "no porting debt accrues" and the support claim itself unbacked. 2026-08-19: the ESP32-C3 was dropped as well, on the same criterion — it had needed `mdns` and `sntp` refused and its TCP buffers halved to stay, and its last margin over the announcement peak was 676 bytes. **None of the three had ever booted this firmware.** The matrix is now one chip, and losing the C3 lost the only RISC-V build — see `docs/provenance.md` for what that cost. The claim in this row was, at the time, one chip over both instruction sets |
 | Rolling codes | **Minimal persisted counter**, nothing else persisted | Invariant honoured from frame one; survives reflashing |
 | RX strategy | `PulseSource` trait; RMT RX primary, GPIO-interrupt fallback | Spec §5.3's recorded contingency becomes a swap, not a rewrite |
 
@@ -48,8 +48,8 @@ would try to build `esp-hal` for the host, which cannot work. Therefore:
 
 - Root `Cargo.toml` gains `exclude = ["crates/firmware"]`.
 - `crates/firmware` becomes its own workspace with its own `rust-toolchain.toml`
-  pinned to espup's `esp` channel, which carries both the Xtensa targets and the
-  RISC-V ones.
+  pinned to espup's `esp` channel for the Xtensa target. (It carries the RISC-V
+  ones too; nothing here builds for them since 2026-08-19.)
 - Repo root keeps `channel = "stable"` for the four host crates.
 - `firmware` depends on `somfy-rts` and `somfy-domain` by path; path
   dependencies cross workspace boundaries without issue.
@@ -61,20 +61,21 @@ firmware.
 
 ## 4. Chip matrix and CI
 
-`esp-hal`'s chip features are mutually exclusive, so "all four chips" means four
-builds, not one:
+`esp-hal`'s chip features are mutually exclusive, so "all four chips" meant four
+builds, not one. Three of the four have since been dropped:
 
 | Feature | `esp-hal` feature | Target triple |
 |---|---|---|
 | ~~`chip-esp32`~~ | ~~`esp32`~~ | dropped 2026-08-18 |
 | ~~`chip-s2`~~ | ~~`esp32s2`~~ | dropped 2026-08-17 |
 | `chip-s3` | `esp32s3` | `xtensa-esp32s3-none-elf` |
-| `chip-c3` | `esp32c3` | `riscv32imc-unknown-none-elf` |
+| ~~`chip-c3`~~ | ~~`esp32c3`~~ | dropped 2026-08-19 |
 
-The ESP32-C3 additionally refuses `mdns` and `sntp` (2026-08-18), so its
-shipping build is `--no-default-features --features chip-c3,mqtt,ui`: a web UI
+The ESP32-C3 additionally refused `mdns` and `sntp` from 2026-08-18, so its
+shipping build was `--no-default-features --features chip-c3,mqtt,ui`: a web UI
 and REST API reached by IP address, with no `.local` name and no wall clock.
-`crates/firmware/src/heap.rs` carries the measurement.
+Needing three such accommodations to stay in the matrix is what decided its
+removal a day later. `crates/firmware/src/heap.rs` carries the measurement.
 
 - **No default chip feature.** A bare `cargo build` hits a `compile_error!`
   naming the four options rather than silently selecting one.
@@ -133,7 +134,7 @@ S2. Two blocks is therefore 96 symbols at worst, and the largest frame is **95**
 in `firmware/src/radio/rmt_tx.rs`, next to a `const` assertion of
 `MAX_SYMBOLS <= MEMSIZE_BLOCKS * esp_hal::rmt::CHANNEL_RAM_SIZE`. That assertion
 reads the block size from `esp-hal`'s own per-chip constant rather than from this
-document, and is checked on all four chip builds; one block fails it on all four.
+document, and is checked on every chip build; one block fails it on all of them.
 
 The fallback this section previously reserved is **not needed and not
 implemented**: `esp-hal`'s blocking `transmit` already streams data longer than
@@ -218,7 +219,7 @@ pulse), but a LOW-only bound would leave the wake-up pulse outside the guard.
 **15 on the ESP32-S3 and ESP32-C3**, so the ceiling is 32,767 µs at 1 µs
 resolution, not 65,535. Any value in the window above is comfortably
 representable either way, and the firmware asserts the bound against `esp-hal`'s
-own per-chip `MAX_RX_IDLE_THRESHOLD` on all four builds rather than against a
+own per-chip `MAX_RX_IDLE_THRESHOLD` on every build rather than against a
 figure written down here.
 
 ## 7. Tasks and the persist-before-TX invariant
@@ -403,7 +404,7 @@ format.
 |---|---|
 | ~~80-bit frame barely fits two RMT memory blocks~~ **Closed.** Measured at 95 symbols including the end marker, against 96 on the smallest-block chips (§5.2) | One spare symbol, held by a `const` assertion against `esp-hal`'s own per-chip block size and checked on all four chip builds. The wrap-around fallback proved unnecessary: `esp-hal`'s blocking `transmit` already refills the channel from the remaining data |
 | RMT RX unsuitable for long frames | `PulseSource` trait with a GPIO-interrupt implementation ready (§6.1) |
-| Xtensa toolchain friction across three of the four chips | `espup`-pinned toolchain in a firmware-local `rust-toolchain.toml`; C3 stays the friction-free target |
+| ~~Xtensa toolchain friction across three of the four chips~~ | `espup`-pinned toolchain in a firmware-local `rust-toolchain.toml`. **The mitigation is void since 2026-08-19**: the C3 was the friction-free target and is gone, so `espup` is unavoidable and an editor must inherit `source ~/export-esp.sh`. |
 | TX to a real motor de-syncs a production shade | Golden captures pin the encoder **before** first TX (§12); rolling codes persist from frame one (§7.1) |
 | Rolling-code region wears out | Append-only wear-levelled region; ~2 writes per command against 100k-cycle endurance |
 

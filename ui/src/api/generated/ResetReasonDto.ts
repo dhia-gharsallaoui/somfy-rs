@@ -3,11 +3,13 @@
 /**
  * Why the device started.
  *
- * **Coarser than the silicon's own reset reason, and deliberately.** The
- * ESP32-S3 and ESP32-C3 spell the same causes with different variant names —
- * `CpuSw` against `Cpu0Sw`, `CpuMwdt0` against `Cpu0Mwdt0` — so a faithful
- * mirror would be two enums and a `#[cfg]` on the wire. What a person needs is
- * which of six things happened, and every one of those six has an action
- * behind it.
+ * **Coarser than the silicon's own reset reason, and deliberately.** Espressif
+ * parts spell the same causes with different variant names — the ESP32-S3's
+ * `CpuSw` against the ESP32-C3's `Cpu0Sw`, `CpuMwdt0` against `Cpu0Mwdt0` — so
+ * a faithful mirror would be an enum per chip and a `#[cfg]` on the wire. Only
+ * the S3 is built today (the C3 went on 2026-08-19), which makes that a reason
+ * this shape is *cheap to keep* rather than a reason to abandon it: what a
+ * person needs is which of six things happened, and every one of those six has
+ * an action behind it.
  */
 export type ResetReasonDto = "powerOn" | "software" | "watchdog" | "brownout" | "debugger" | "other";

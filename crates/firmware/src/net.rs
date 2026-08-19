@@ -200,11 +200,24 @@ const RSSI_POLL_S: u64 = 30;
 /// The station's last measured signal strength, in dBm, or `None` if the link
 /// has never come up.
 ///
-/// **A `blocking_mutex` rather than an atomic, and the matrix is why.**
-/// `riscv32imc` — the ESP32-C3's target — has no atomic read-modify-write
-/// instruction, so the natural `AtomicI32` shape is not available across all
-/// four chips. A critical-section mutex around a `Cell` is, costs a handful of
+/// **A `blocking_mutex` rather than an atomic, and this is the note the other
+/// four sites point at.** The reason was the build matrix: `riscv32imc` — the
+/// ESP32-C3's target — has no atomic read-modify-write instruction, so the
+/// natural `AtomicI32` shape was not available on every chip this crate built
+/// for. A critical-section mutex around a `Cell` is, costs a handful of
 /// instructions, and is held for a single load or store.
+///
+/// **The ESP32-C3 was dropped on 2026-08-19 and this shape is kept**, here and
+/// at the four other sites that cite it (`api::events::WS_HELD`,
+/// `sntp::WALL_CLOCK`, `trial::Slot`, `mqtt::Rare`). That is a decision, and it
+/// is recorded rather than left as a stale reason. Changing five of these to
+/// atomics would be five edits to working, shipped, unmeasured-cost code in
+/// exchange for a handful of instructions on paths that run at most once a
+/// second — and it would throw away the one property that survives the chip:
+/// this shape compiles for *any* Espressif part, including the RISC-V ones a
+/// future contributor may want back. `docs/provenance.md` records that the
+/// RISC-V row is what caught the original fault, and that nothing in CI catches
+/// the next one.
 ///
 /// It exists because [`WifiController::rssi`] takes `&self` on a controller the
 /// [`hold_link`] task owns for the life of the program — dropping it

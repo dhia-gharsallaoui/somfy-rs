@@ -70,11 +70,10 @@ const RESET_TEXT: Record<ResetReasonDto, { label: MessageKey; note: MessageKey }
  * These are product names printed on the silicon; "ESP32-S3" is ESP32-S3 in
  * every language, and putting them through the catalogue would invite somebody
  * to translate one. It is still a total `Record<ChipDto, …>`, so the drift gate
- * is intact: a third part added in Rust fails `tsc` here.
+ * is intact: a second part added in Rust fails `tsc` here.
  */
 const CHIP_NAME: Record<ChipDto, string> = {
   esp32S3: 'ESP32-S3',
-  esp32C3: 'ESP32-C3',
 };
 
 /** Which reset causes are faults rather than routine. */

@@ -45,8 +45,8 @@
 //! several times over in Wi-Fi driver headroom.
 //!
 //! **Two things changed and the second is the one that matters.** The chip that
-//! could not afford it is no longer in the matrix, so the cost is now measured
-//! against an ESP32-S3's headroom rather than an ESP32-C3's —
+//! could not afford it is no longer in the matrix — nor is the ESP32-C3, since
+//! 2026-08-19 — so the cost is measured against an ESP32-S3's headroom —
 //! `crates/firmware/src/heap.rs` carries the figure and it is not free.
 //!
 //! And the old consequence was under-stated. "One reboot" is what it costs
@@ -135,12 +135,15 @@ pub const MAX_SEGMENTS: u8 = 16;
 
 /// A chip this project has produced images for.
 ///
-/// **Not the same set as the chips it builds today**, and the difference is
-/// deliberate. `chip-esp32` was dropped from the firmware on 2026-08-18, so no
-/// new ESP32 image can be produced — but images already exist, on operators'
-/// disks and in earlier releases, which makes an ESP32 upload a *realistic
-/// mistake* rather than an impossible one. Naming it costs one match arm and
-/// turns the refusal into "this is an esp32 image" instead of a raw number.
+/// **Not the same set as the chips it builds today** — it is a superset, and
+/// the difference is deliberate. `chip-esp32` was dropped from the firmware on
+/// 2026-08-18 and `chip-c3` on 2026-08-19, so no new image for either can be
+/// produced — but images already exist, on operators' disks and in earlier
+/// releases, which makes uploading one a *realistic mistake* rather than an
+/// impossible one. The ESP32-C3 is the stronger case of the two: `xtask` was
+/// publishing `somfy-rs-*-esp32c3.bin` until the day it went. Naming them costs
+/// one match arm each and turns the refusal into "this is an esp32c3 image"
+/// instead of a raw number.
 ///
 /// That is the whole membership rule, and it is why an ESP32-C6 is still absent:
 /// this project has never produced one, so its id could only ever arrive by
@@ -153,7 +156,8 @@ pub enum Chip {
     Esp32,
     /// ESP32-S3, Xtensa.
     Esp32S3,
-    /// ESP32-C3, RISC-V.
+    /// ESP32-C3, RISC-V. **No longer built** — kept so an image from before
+    /// 2026-08-19 is refused by name.
     Esp32C3,
 }
 

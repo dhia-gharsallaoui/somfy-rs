@@ -1507,6 +1507,10 @@ impl Broker {
     /// backwards — a value published after its config was cleared is a retained
     /// orphan under no entity at all.
     ///
+    /// **The measurement below was taken on a chip that is no longer built** (the
+    /// ESP32-C3, dropped 2026-08-19). The finding is about what the compiler
+    /// does with sequential awaits, not about the part, which is why it is kept.
+    ///
     /// It was *also* tried as a size measure, on the theory that two awaited
     /// futures would each carry their own copy of the deep publish chain, and
     /// **the theory was wrong**: split into `walk_form` and `publish_form` the
@@ -1884,10 +1888,12 @@ fn dispatch(wire: &mut Wire<'_>, topic: &str, payload: &[u8]) {
 
 /// How often each of the two broker-driven log lines has fired.
 ///
-/// Plain counters on the session rather than atomic statics, and the reason is
-/// the matrix: **`riscv32imc` — the ESP32-C3's target — has no atomic
-/// read-modify-write instruction**, so `AtomicU32::fetch_add` does not exist
-/// there at all. Nothing needs synchronising either; the broker session is the
+/// Plain counters on the session rather than atomic statics. The reason was the
+/// matrix — `riscv32imc`, the ESP32-C3's target, has no atomic read-modify-write
+/// instruction, so `AtomicU32::fetch_add` does not exist there at all, and that
+/// is the fault the RISC-V row caught and nothing else did. The chip went on
+/// 2026-08-19 and the shape stays, for the reason `crate::net::SIGNAL_DBM`
+/// records. Nothing needs synchronising here either; the broker session is the
 /// only thing that touches these.
 #[derive(Default)]
 struct Rare {

@@ -33,6 +33,12 @@ use std::path::{Path, PathBuf};
 
 use esp_idf_part::{AppType, DataType, Partition, PartitionTable, SubType, Type};
 
+// The stack budget, from the one file that defines it. `src/heap.rs` includes
+// the same file for the compile-time gate against `REQUIRED_STACK_BYTES`; this
+// script includes it to reserve those bytes in the linker. See the doc comment
+// on `reserve_stack_and_heap`.
+include!("stack_budget.rs");
+
 /// Where the built UI is, relative to this crate.
 ///
 /// It is a build artefact — `/ui/dist` is in `.gitignore` — so a fresh checkout
@@ -115,10 +121,13 @@ const PINNED: &[(&str, u32, u32, &str)] = &[
 /// The largest flash this table is allowed to assume.
 ///
 /// It ends on exactly this boundary, which is deliberate and is the reason
-/// `ota_1` is not simply extended into the spare half of the ESP32-S3's 8 MB:
-/// only that one board is known to carry 8 MB, and the single-app table this
-/// one replaces fit a 4 MB part. A layout that quietly needs 8 MB would be
-/// found by an ESP32 or ESP32-C3 refusing to flash, long after the edit.
+/// `ota_1` is not simply extended into the spare half of the ESP32-S3's 8 MB.
+/// The two boards this project has are 8 MB parts; **the chip is not**. An
+/// ESP32-S3 module is sold with 4 MB as often as with 8, the single-app table
+/// this one replaces fit a 4 MB part, and a layout that quietly needs 8 MB is
+/// found by somebody else's board refusing to flash, long after the edit. The
+/// ceiling costs nothing today — `partitions.csv` records 1.33 MiB spare in the
+/// app slot — so it is kept until there is a reason it is not free.
 const MAX_FLASH: u64 = 4 * 1024 * 1024;
 
 fn main() {
@@ -140,6 +149,7 @@ fn main() {
     check_fits_four_megabytes(&table);
 
     embed_web_ui();
+    reserve_stack_and_heap();
 }
 
 /// Copy each built UI file into `OUT_DIR`, and write a gzipped copy beside it.
@@ -329,6 +339,105 @@ fn check_fits_four_megabytes(table: &PartitionTable) {
              the wrong moment to find out."
         ));
     }
+}
+
+/// Reserve the main stack in the linker, and give the heap what is left.
+///
+/// **This is what replaced `heap::DRAM_FOR_STACK_AND_HEAP`**, a hand-measured
+/// constant that needed re-reading after six consecutive merges, was twice
+/// wrong in the direction that refuses to boot, and once actually stopped a
+/// board starting. It was a property of the whole linked image, so any change
+/// anywhere moved it; it was circular, because it decided the size of the
+/// largest static in the image; and two branches could each measure it
+/// correctly and produce a merge for which neither figure was right.
+///
+/// The fix is to stop writing the number down. esp-hal's `ld/sections/stack.x`
+/// gives `.stack` everything left in `RWDATA` once the statics are placed, so
+/// **the linker already knows the answer**. This emits one more output section
+/// immediately before it, ending exactly [`STACK_BUDGET_BYTES`] below the top
+/// of DRAM — so `.stack` is exactly the budget, `.heap` is exactly the
+/// remainder, and `src/heap.rs` reads the remainder's two bounds at boot
+/// instead of subtracting two constants.
+///
+/// # Why it forks the four lines of `linkall.x`
+///
+/// `INSERT BEFORE .stack` is the mechanism, and GNU ld's rule for it is that it
+/// moves *all prior commands in the script* to the insertion point. So a script
+/// reading `INCLUDE linkall.x` followed by our section and the `INSERT` fails
+/// with `.stack not found for insert`, because `.stack` is among the commands
+/// being moved — observed, not inferred. Our section therefore has to come
+/// before the includes that define `.stack`, and it needs `RWDATA` to exist
+/// when it is parsed, which is `memory.x` and `alias.x`. That splits
+/// `linkall.x`'s body, which is four `INCLUDE` lines and nothing else.
+///
+/// The fork is what the two `ASSERT`s below exist for: they check at **link
+/// time** that our section really did land immediately beneath esp-hal's stack
+/// and that the stack really is the budget, so a future esp-hal that reorders
+/// its scripts or adds a fifth one fails the link rather than shipping a
+/// silently different memory map.
+///
+/// # What this buys beyond deleting a constant
+///
+/// `_stack_end_cpu0` now *is* the bottom of the usable stack, which it was not
+/// before: the heap used to be a `static` placed among the other statics, so
+/// esp-hal's stack-guard word, its `ensure_stack_pointer_in_range`, esp-rtos's
+/// per-task range check and `crate::stack_region` all measured a region that
+/// included memory the allocator owned. They now agree, and the hardware
+/// watchpoint esp-hal arms sits 60 bytes above the true floor.
+fn reserve_stack_and_heap() {
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR"));
+    println!("cargo:rerun-if-changed=stack_budget.rs");
+
+    // One chip, so one name. `chip.rs` refuses a build with no chip feature and
+    // a build with two, so this is not a fallback so much as a statement of
+    // which script the fork above is a fork of.
+    let chip_script = "esp32s3.x";
+
+    let script = format!(
+        "/* Generated by crates/firmware/build.rs. Do not edit — see the doc\n\
+         comment on `reserve_stack_and_heap` and on crates/firmware/src/heap.rs. */\n\
+         \n\
+         INCLUDE memory.x\n\
+         INCLUDE alias.x\n\
+         \n\
+         SECTIONS {{\n\
+         \x20 /* Everything left of RWDATA once the statics are placed, minus the\n\
+         \x20    main stack's budget. `MAX` rather than a bare assignment so that an\n\
+         \x20    image too large to leave the budget fails the ASSERT below with a\n\
+         \x20    sentence, instead of ld's \"cannot move location counter backwards\". */\n\
+         \x20 .heap (NOLOAD) : ALIGN(16)\n\
+         \x20 {{\n\
+         \x20   _somfy_heap_start = ABSOLUTE(.);\n\
+         \x20   . = MAX(ABSOLUTE(.), ORIGIN(RWDATA) + LENGTH(RWDATA) - {budget});\n\
+         \x20   _somfy_heap_end = ABSOLUTE(.);\n\
+         \x20 }} > RWDATA\n\
+         }}\n\
+         INSERT BEFORE .stack;\n\
+         \n\
+         INCLUDE {chip_script}\n\
+         INCLUDE hal-defaults.x\n\
+         \n\
+         ASSERT(_stack_start_cpu0 - _stack_end_cpu0 == {budget},\n\
+         \x20 \"crates/firmware: this image's statics no longer leave \
+         heap::STACK_BUDGET_BYTES for the main stack. That is the DRAM ceiling: the image \
+         has to get smaller, rather than the budget lower — crates/firmware/stack_budget.rs \
+         says what the budget is for. (The .heap assertion below fires with this one, \
+         because a heap clamped to nothing is also a heap that is not where it should be.)\")\n\
+         ASSERT(_somfy_heap_end == _stack_end_cpu0,\n\
+         \x20 \"crates/firmware: the .heap section did not land immediately below esp-hal's \
+         .stack. If the assertion above did not also fire, the INSERT BEFORE .stack in \
+         build.rs has stopped doing what it did — check whether esp-hal's \
+         ld/sections/stack.x still names that section.\")\n",
+        budget = STACK_BUDGET_BYTES,
+    );
+
+    std::fs::write(out.join("somfy-link.x"), script)
+        .unwrap_or_else(|e| panic!("cannot write somfy-link.x into OUT_DIR: {e}"));
+    println!("cargo:rustc-link-search={}", out.display());
+    // Replaces the `-Tlinkall.x` that would otherwise come from
+    // `.cargo/config.toml`: this script includes linkall.x's four lines itself,
+    // and loading both would define every memory region twice.
+    println!("cargo:rustc-link-arg=-Tsomfy-link.x");
 }
 
 /// A build-script failure that reads as prose rather than as a stack trace.

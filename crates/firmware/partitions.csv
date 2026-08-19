@@ -51,10 +51,15 @@
 #     ESP32-S3  585,376 bytes   28.8%   1,446,240 free
 #     ESP32-C3  581,040 bytes   28.6%   1,450,576 free
 #
+# Only the middle row is a live figure: the ESP32 was dropped on 2026-08-18 and
+# the ESP32-C3 on 2026-08-19. The other two are kept because the point of the
+# table is the spread — three unrelated images all landing near 30%.
+#
 # The slot has to hold firmware **and** the web UI, because there is no
 # filesystem: spec §6 puts the UI in the image with `include_bytes!` so that one
-# image is firmware and UI together and an OTA is atomic. Against the worst chip
-# there is 1.33 MiB spare, and spec §8 budgets the whole UI at ≤200 KB gzipped.
+# image is firmware and UI together and an OTA is atomic. Against the largest of
+# them there is 1.33 MiB spare, and spec §8 budgets the whole UI at ≤200 KB
+# gzipped.
 # What else is still to come — TLS, an HTTP server, the real config store, mDNS
 # and SNTP — is the part with no measurement behind it yet; mbedTLS is the large
 # one and is the figure to re-check when it lands.

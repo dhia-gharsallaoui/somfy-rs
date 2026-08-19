@@ -171,10 +171,9 @@ struct Anchor {
 /// The one wall clock in this firmware.
 ///
 /// **A `blocking_mutex` around a `Cell` rather than an atomic, for the reason
-/// `crate::net::SIGNAL_DBM` gives**: `riscv32imc` — the ESP32-C3's target — has
-/// no atomic read-modify-write instruction, so the natural shape is unavailable
-/// on one of the supported chips. A critical-section mutex costs a handful of
-/// instructions and is held for a single load or store.
+/// `crate::net::SIGNAL_DBM` gives** — including why the shape is kept now that
+/// the chip which forced it is gone. A critical-section mutex costs a handful
+/// of instructions and is held for a single load or store.
 ///
 /// `None` until a server has answered, and it never returns to `None`: an answer
 /// that was true an hour ago plus monotonic elapsed time is still a better

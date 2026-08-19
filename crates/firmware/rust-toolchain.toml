@@ -1,4 +1,6 @@
-# espup's `esp` channel carries the Xtensa targets (ESP32/S3) and the
-# RISC-V ones (C3). The repo root stays on stable for the host crates.
+# The ESP32-S3 is Xtensa, which upstream Rust does not target, so this crate is
+# pinned to espup's `esp` channel. The repo root stays on stable for the host
+# crates. (This used to carry a RISC-V chip as well; the ESP32-C3 was dropped on
+# 2026-08-19 and the ESP32 on 2026-08-18.)
 [toolchain]
 channel = "esp"

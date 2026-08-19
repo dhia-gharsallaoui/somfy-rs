@@ -47,9 +47,8 @@
 //! So the permit is its own counter, [`WS_HELD`], and [`Permit`] is the RAII
 //! guard that returns it. The subscription is still taken and still dropped
 //! with it; it is simply no longer pretending to be the bound. The counter is a
-//! `blocking_mutex` around a `Cell` rather than an atomic because the ESP32-C3
-//! is `riscv32imc` and has no atomic read-modify-write — the same reason
-//! `crate::net`'s signal-strength cell is one.
+//! `blocking_mutex` around a `Cell` rather than an atomic — the same shape
+//! `crate::net`'s signal-strength cell has, and for the reason recorded there.
 //!
 //! # A dead tab does not hold a slot forever
 //!
@@ -106,10 +105,12 @@ const FRAME_BYTES: usize = 192;
 
 /// WebSockets currently held.
 ///
-/// A `blocking_mutex` around a `Cell` rather than an atomic: the ESP32-C3 is
-/// `riscv32imc` and has no atomic read-modify-write instruction, so the natural
-/// `AtomicUsize` is not available across the matrix. A critical section costs a
-/// handful of instructions and is held for one load and one store.
+/// A `blocking_mutex` around a `Cell` rather than an atomic, for the reason
+/// `crate::net::SIGNAL_DBM` gives: the natural `AtomicUsize` did not exist on
+/// every chip this crate built for, and the shape is kept now that only one
+/// remains. A critical section costs a handful of instructions and is held for
+/// one load and one store — which is why keeping it is cheaper than proving a
+/// change to it.
 static WS_HELD: BlockingMutex<CriticalSectionRawMutex, Cell<usize>> =
     BlockingMutex::new(Cell::new(0));
 

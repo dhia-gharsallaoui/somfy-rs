@@ -45,11 +45,14 @@ const WORD_BYTES: usize = <FlashStorage as NorFlash>::WRITE_SIZE;
 /// of every length it is given.
 ///
 /// **The reason it is not larger is DRAM, and the figure is small.** The buffer
-/// is a `static`, so it comes out of `crate::heap::DRAM_FOR_STACK_AND_HEAP` and
+/// is a `static`, so it comes out of the DRAM `crate::heap::heap_region` divides and
 /// therefore out of the Wi-Fi driver's heap on the chip with the least of it.
-/// The next size up that divides a sector is 512, which on the ESP32-C3 would
-/// cross the kilobyte boundary that constant rounds on and cost a whole KiB of
-/// heap against a margin of a few hundred bytes over the worst announcement
+/// The next size up that divides a sector is 512, which used to cost a whole
+/// KiB on the ESP32-C3 — the heap was rounded down to a whole kilobyte then, and
+/// that chip's margin was a few hundred bytes. Neither is true now (the chip
+/// went on 2026-08-19 and the rounding with the constant), so 512 would cost
+/// exactly 256 more bytes on an ESP32-S3 with room. It is left at 256 because
+/// raising it buys nothing measurable and would cost a re-measurement over the worst announcement
 /// peak ever measured.
 ///
 /// What it costs in time is nothing that matters: a 1.1 MB image is about 4,300
@@ -95,14 +98,11 @@ impl Page {
 /// Both values were read off real images built from this repository rather
 /// than out of a header file; `somfy_ota::image::Chip` holds them and
 /// `docs/provenance.md` records the images. The `compile_error!` below is the
-/// part that matters: a third chip added to the build matrix without a
+/// part that matters: a second chip added to the build matrix without a
 /// `chip_id` here would otherwise be a board that accepts any image at all.
 #[cfg(feature = "chip-s3")]
 const THIS_CHIP: Chip = Chip::Esp32S3;
-/// See the `chip-s3` definition above.
-#[cfg(feature = "chip-c3")]
-const THIS_CHIP: Chip = Chip::Esp32C3;
-#[cfg(not(any(feature = "chip-s3", feature = "chip-c3")))]
+#[cfg(not(feature = "chip-s3"))]
 compile_error!(
     "an over-the-air update refuses an image built for a different chip, and that check needs \
      this chip's `chip_id`. Add one to `somfy_ota::image::Chip` and name it here."
@@ -114,8 +114,7 @@ compile_error!(
 /// waits, the state task drains it and hands it back. A second buffer would let
 /// the socket read overlap the flash write and roughly halve an update's
 /// wall-clock time — and would cost another [`PAGE_BYTES`] of the DRAM the
-/// Wi-Fi driver's heap is carved from, which on the ESP32-C3 is the wrong side
-/// of that trade. See [`PAGE_BYTES`].
+/// Wi-Fi driver's heap is carved from, for a transfer nobody has called slow. See [`PAGE_BYTES`].
 static PAGES: StaticCell<[Page; 1]> = StaticCell::new();
 
 /// The channel over that buffer.

@@ -131,22 +131,24 @@ const TCP_RX_BYTES: usize = 512;
 /// once per page load, and not at all on a reload, because the assets carry
 /// compile-time ETags and answer `304`.
 ///
-/// # Why both of these were halved, and what it bought
+/// # Why both of these were halved, and why they stay halved
 ///
 /// **The diagnostics and backup screens cost DRAM, and this is where it came
 /// from.** Their routes, their response buffers and `crate::restore`'s share of
-/// the connection task futures took [`DRAM_FOR_STACK_AND_HEAP`] down by 2,936
-/// bytes on the ESP32-S3 and 2,992 on the ESP32-C3 — and that constant is what
-/// [`RADIO_HEAP_BYTES`] is a *subtraction* from, so the Wi-Fi driver's heap
-/// falls by the same amount. On the C3 that would have left 1,700 bytes over
-/// the measured announcement peak: the exact figure the plain ESP32 was dropped
-/// for on 2026-08-18, and inside that peak's own ~2,000-byte boot-to-boot
-/// spread.
+/// the connection task futures took about 3,000 bytes off the DRAM the Wi-Fi
+/// driver's heap is whatever-is-left of. Halving both buffers gives back
+/// `HTTP_TASKS × 1,024` = **4,096 bytes**, which more than paid for them.
 ///
-/// Halving both buffers gives back `HTTP_TASKS × 1,024` = 4,096 bytes, which
-/// returns the C3 to 5,796 bytes of margin — **exactly where it was before
-/// either screen existed**. Measured both ways; `docs/provenance.md` records
-/// the four figures.
+/// **The chip that forced it is gone and the figure does not move**, which is a
+/// decision rather than an omission. It was chosen for the ESP32-C3, dropped
+/// 2026-08-19; the argument is now made on the ESP32-S3's own numbers and it
+/// still holds. That board's heap is about 61,300 bytes against a measured
+/// announcement peak of 54,620 — a margin of roughly 6,700. Putting these back
+/// to 1,024 spends 4,096 of it and lands near **2,600**, which is *inside* the
+/// ~4,216-byte spread that peak itself showed between boots of one unchanged
+/// image. A margin inside its own noise is exactly what this project has twice
+/// dropped a chip for; it is not something to buy back with page-load latency
+/// nobody has complained about.
 ///
 /// What it costs is round trips on a LAN, and the trade was chosen in that
 /// direction deliberately: a page load that takes twenty extra sub-millisecond
@@ -154,11 +156,8 @@ const TCP_RX_BYTES: usize = 512;
 /// publishing retained discovery configs is a board that reboots and looks like
 /// a broker fault.
 ///
-/// It is still the figure to raise if the UI ever feels slow to load — and now
-/// the one to check first against `heap::warn_if_tight` before raising it.
-///
-/// [`DRAM_FOR_STACK_AND_HEAP`]: crate::heap
-/// [`RADIO_HEAP_BYTES`]: crate::heap::RADIO_HEAP_BYTES
+/// It is still the figure to raise if the UI ever feels slow to load — and the
+/// one to check first against `heap::warn_if_tight` before raising it.
 const TCP_TX_BYTES: usize = 512;
 
 /// The port. 80, because the UI's own `fetch` and `WebSocket` calls are

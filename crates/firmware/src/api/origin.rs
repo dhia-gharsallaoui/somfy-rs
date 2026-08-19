@@ -31,10 +31,15 @@
 //! free either way — a bare `403`, a static `&str` and the full `JsonBody` all
 //! measured 73,888.
 //!
-//! 6,048 bytes is not affordable. It comes out of the Wi-Fi heap, and on the
-//! ESP32-C3 that heap would fall from 55 KiB to 48 KiB against a worst
-//! announcement peak of 54,424 bytes — a board that panics part-way through
-//! publishing its discovery configs. See [`crate::heap::DRAM_FOR_STACK_AND_HEAP`].
+//! 6,048 bytes is not affordable, and it stayed unaffordable when the chip that
+//! made it obviously so was dropped. It comes out of the Wi-Fi heap, which on
+//! the ESP32-S3 is about 61,300 bytes against a measured announcement peak of
+//! 54,620 — a margin of roughly 6,700, so an empty pass-through layer would
+//! spend essentially all of it and leave the board inside that peak's own
+//! ~4,216-byte spread. (The original argument was made on the ESP32-C3, where
+//! the same 6,048 took a 55 KiB heap to 48 KiB; that chip went on 2026-08-19
+//! and the arithmetic is re-stated here on the one that remains rather than
+//! left pointing at a board nobody builds.) See [`crate::heap::heap_region`].
 //!
 //! # What that costs, and how it is contained
 //!

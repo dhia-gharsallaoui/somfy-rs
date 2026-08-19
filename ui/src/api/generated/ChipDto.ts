@@ -8,5 +8,12 @@
  * takes the update, reboots and does not come back —
  * [`crate::ApiErrorCode::ImageForAnotherChip`] is the device catching that
  * after the fact, and this is what lets the UI avoid it beforehand.
+ *
+ * **One variant since 2026-08-19**, when the ESP32-C3 was dropped, and it stays
+ * an enum rather than becoming a constant for two reasons: the wire shape does
+ * not change when a chip is added, and `somfy_ota::image::Chip` — which is the
+ * thing that *refuses* an image — deliberately keeps every chip this project
+ * has ever published an image for. The two lists are not the same list, and
+ * that is a property rather than an oversight.
  */
-export type ChipDto = "esp32S3" | "esp32C3";
+export type ChipDto = "esp32S3";

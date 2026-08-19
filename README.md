@@ -111,7 +111,8 @@ than to retrofit:
 
 - **A/B partitions** with the rolling-code region pinned where it already is, so
   moving to the new layout is a rename rather than a migration.
-- Per-chip heap and stack sizing, verified at boot.
+- Heap and stack sizing decided by the linker, not by a constant, and printed
+  at boot.
 - Feature-gated transports (`mqtt`, `http`, `ui`, `mdns`, `sntp`).
 
 ---
@@ -120,26 +121,33 @@ than to retrofit:
 
 | Chip | Status |
 |---|---|
-| **ESP32-S3** | **Hardware-proven.** The reference platform; everything below was measured on one. Carries every feature. |
-| ESP32-C3 | Builds and is budgeted; never run. Ships without mDNS and without SNTP — so it is reached by **IP address rather than by name**, and has no wall clock. Both are refused at compile time, with the measurement. |
+| **ESP32-S3** | **Hardware-proven.** The reference platform, and the only one built; everything below was measured on one. Carries every feature. |
 
-Plus a **CC1101** 433 MHz module. Pin maps are in `crates/firmware/src/chip.rs`;
-only the S3 map is verified.
+Plus a **CC1101** 433 MHz module. The pin map is in
+`crates/firmware/src/chip.rs`, verified against a working device.
 
-> **Note** — two chips were supported until they were measured, and both were
-> dropped rather than maintained, because **neither had ever booted this
-> firmware**. The ESP32-S2 (2026-08-17) has too little DRAM to hold the Wi-Fi
-> driver's heap and a bootable stack at once. The ESP32 (2026-08-18) could not
-> hold the web server at all, and even in its smallest build its heap margin over
-> the measured announcement peak was smaller than that peak's own boot-to-boot
-> variation. `docs/provenance.md` carries both sets of arithmetic.
+> **Note** — three other chips were supported until they were measured, and all
+> three were dropped rather than maintained, because **none of them had ever
+> booted this firmware**. The ESP32-S2 (2026-08-17) has too little DRAM to hold
+> the Wi-Fi driver's heap and a bootable stack at once. The ESP32 (2026-08-18)
+> could not hold the web server at all, and even in its smallest build its heap
+> margin over the measured announcement peak was smaller than that peak's own
+> boot-to-boot variation. The ESP32-C3 (2026-08-19) was the same judgement
+> applied consistently: it had needed three accommodations to stay — mDNS and
+> SNTP refused at compile time, and halved TCP buffers — and its last measured
+> margin over that same peak was **676 bytes**, against a peak read on an
+> ESP32-S3 because no C3 had ever run this to be read on.
+> `docs/provenance.md` carries all three sets of arithmetic, and what dropping
+> the C3 cost: it was the only RISC-V build, and RISC-V had caught a fault
+> nothing else did.
 
 ---
 
 ## Quick start
 
 ```bash
-# Toolchain (Xtensa needs espup; the C3 does not)
+# Toolchain (the ESP32-S3 is Xtensa, so espup is not optional — an editor
+# needs `source ~/export-esp.sh` too)
 cargo install espup && espup install && source ~/export-esp.sh
 cargo install espflash
 

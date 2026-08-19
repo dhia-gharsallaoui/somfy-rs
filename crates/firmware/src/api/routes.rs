@@ -1008,9 +1008,6 @@ impl Chunks for LogText {
 /// Which part this image was built for.
 #[cfg(feature = "chip-s3")]
 const THIS_CHIP: ChipDto = ChipDto::Esp32S3;
-/// See the `chip-s3` definition above.
-#[cfg(feature = "chip-c3")]
-const THIS_CHIP: ChipDto = ChipDto::Esp32C3;
 
 /// Everything the diagnostics screen reads.
 ///
@@ -1097,7 +1094,7 @@ async fn get_log(_from_this_device: FromThisDevice) -> impl IntoResponse {
 /// this device remembers about its own past, and an operator who has read a
 /// panic and wants the screen to stop showing it wants the lines that produced
 /// it gone too. Splitting them would also have cost a third route, which is not
-/// free — see [`crate::heap::DRAM_FOR_STACK_AND_HEAP`] for what a route costs in
+/// free — see [`crate::heap::heap_region`] for what a route costs in
 /// the connection task futures and which chip pays for it.
 ///
 /// `204` and not `404` when there was nothing to forget: the request is
