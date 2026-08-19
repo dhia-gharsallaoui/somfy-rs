@@ -159,7 +159,13 @@
 // here because these are the rows that go stale — one of them already did, and
 // the cost was a boot loop on the only hardware that exists.
 //
-//     RUSTFLAGS="-Zemit-stack-sizes -C link-arg=-Tlinkall.x" \
+//     # **No `-Tlinkall.x`.** This recipe used to carry one and it now fails the
+//     # link outright — "redefinition of memory region alias `ROTEXT`" — because
+//     # `build.rs` passes `-Tsomfy-link.x`, which includes linkall.x's lines
+//     # itself. `.cargo/config.toml` says the same thing from the other side.
+//     # RUSTFLAGS replaces `build.rustflags`, not the link args a build script
+//     # emits, so nothing else needs restating here.
+//     RUSTFLAGS="-Zemit-stack-sizes" \
 //       cargo build --release --features chip-s3 \
 //         --target xtensa-esp32s3-none-elf --bin firmware
 //     # frame sizes: a 4-byte address then a ULEB128 size, one entry per function
@@ -354,7 +360,48 @@
 /// are a record of measurements that were taken, not a claim about what is
 /// built today — and because the repeated finding they carry is that this row
 /// goes stale, which is about the reading rather than about the chip.
-const BOOT_CHAIN_BYTES: usize = 55_632;
+///
+/// **Re-read 2026-08-19 while adding the calibration entity, and it had gone
+/// stale a fifth time — by 720 bytes, again in the direction that boot-loops.**
+/// Walked on the ESP32-S3 with the commands at the top of this file (whose
+/// recipe was itself stale and is corrected there — the `-Tlinkall.x` it carried
+/// now fails the link outright):
+///
+/// | | recorded | measured |
+/// |---|---|---|
+/// | `main`, `Executor::run`, `run_inner` | 144 | 144 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 | 3,856 |
+/// | [`crate::start`] | 20,160 | 20,304 |
+/// | [`crate::tasks::state`] | 15,728 | 16,016 |
+/// | `UninitCell::write_in_place` | 15,744 | 16,032 |
+/// | **total** | **55,632** | **56,352** |
+///
+/// **None of it is the calibration entity's**, and that was checked rather than
+/// assumed: the same walk was run on the parent commit with this branch's
+/// changes stashed, and all five frames read *identically*. What the entity does
+/// add is 16 bytes on `Inventory::snapshot` (1,376 → 1,392) for the extra field
+/// per shade, and `snapshot` is a **sibling** of the state task under
+/// [`crate::start`] rather than a frame beneath it — 144 + 3,856 + 20,304 +
+/// 1,392 = 25,696, about 30 KB clear of this chain.
+///
+/// So this is the fifth consecutive reading to find the constant short, and the
+/// fourth to find it short by a number larger than the whole
+/// [`INTERRUPT_FRAMES_BYTES`] allowance. The live board's own
+/// `crate::stack_used` corroborates it exactly: it reports a high-water of
+/// **56,344**, which is eight bytes under the chain measured here and 712 bytes
+/// *over* the figure this constant claimed — so the "1,000 bytes of the
+/// requirement unspent" that boot line prints was measured against a number that
+/// was already wrong, and the true slack was −720 into the interrupt allowance.
+///
+/// **What it costs to be honest about it.** [`REQUIRED_STACK_BYTES`] becomes
+/// 56,352 + 1,712 = **58,064**, and the compile-time gate below wants
+/// `STACK_BUDGET_BYTES` ≥ 58,064 + [`STACK_MARGIN_FLOOR_BYTES`] = 66,256 against
+/// a budget of 66,280. **It fits by 24 bytes.** That is not comfortable and it
+/// should not be read as comfortable: the next thing to deepen this chain fails
+/// the build, and the two ways out are the ones named on the gate — make the
+/// chain shallower, or lower `STACK_BUDGET_BYTES` and give the difference to the
+/// heap, which has room now that the ESP32 and the ESP32-C3 are gone.
+const BOOT_CHAIN_BYTES: usize = 56_352;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.
 ///

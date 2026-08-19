@@ -27,3 +27,17 @@ ts-rs = { version = "10", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+# The *device's* JSON driver, as a dev-dependency only.
+#
+# `serde_json` proves a `Deserialize` impl is self-consistent; it does not prove
+# the firmware can read the bytes, because the firmware never links it. Every
+# body on this API arrives through picoserve's `Json` extractor, which is
+# `serde-json-core` — the same 0.6 the firmware pins. The two drivers differ in
+# ways the hand-written impls here are exposed to: `serde-json-core` supports no
+# `deserialize_any` at all, and its `from_slice` reports how much it consumed
+# rather than insisting it reached the end.
+#
+# `tests/calibration.rs` parses through both, and the calibration steps are why:
+# `POST /shades/{id}/calibrate` had never been driven by anything but the
+# TypeScript mock, which uses neither.
+serde-json-core = { version = "0.6", default-features = false }

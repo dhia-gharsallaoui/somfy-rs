@@ -109,7 +109,13 @@ export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () =
           },
         ] as Row[])
       : []),
-    { label: 'calib.startLag', field: 'startLagMs', step: LAG_STEP_S },
+    // The hint is the one asymmetry a guided run cannot fix and must not hide:
+    // the two curtain taps are a *difference*, so the operator's reaction time
+    // cancels out of the bands, while the start delay is a single tap and
+    // carries it whole. A measured lag is therefore worth less than a measured
+    // band, and this is the field where somebody is most likely to correct one
+    // by hand.
+    { label: 'calib.startLag', field: 'startLagMs', step: LAG_STEP_S, hint: 'calib.startLagHint' },
     { label: 'calib.ventBand', field: 'ventBandMs', step: BAND_STEP_S, hint: 'calib.ventBandHint' },
     { label: 'calib.closeBand', field: 'closeBandMs', step: BAND_STEP_S },
   ];

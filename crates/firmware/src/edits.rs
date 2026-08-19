@@ -37,7 +37,7 @@
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::String;
 use somfy_api::{CreateShadeDto, PatchShadeDto};
-use somfy_domain::{Registry, ShadeId};
+use somfy_domain::{CalibrationSource, Registry, ShadeId};
 
 use crate::tasks::Mutex;
 
@@ -205,6 +205,35 @@ pub enum ShadeEvent {
     AwaitingSetup {
         /// Shades in the registry whose pairing nobody has confirmed.
         count: u8,
+    },
+    /// Where one shade's two travel times came from.
+    ///
+    /// # Why the sources travel and not the state they render as
+    ///
+    /// Because this vocabulary is the seam between the state task and the
+    /// broker session, and the state task must not know what a broker is. The
+    /// mapping onto `somfy_mqtt::CalibrationState` is a presentation decision
+    /// and it is made on the far side; what crosses is the fact — two
+    /// provenances out of the shade table. `edits.rs` borrowing a constant from
+    /// `somfy-mqtt` is a boundary error this module has already made once.
+    ///
+    /// # Why it is not folded into `Added`
+    ///
+    /// [`Added`](ShadeEvent::Added) makes the broker republish a discovery
+    /// config and re-subscribe: seven packets. A calibration finishing is a
+    /// *reading* changing, and the entity that reports it already exists — so it
+    /// costs one retained publish, the same way
+    /// [`AwaitingSetup`](ShadeEvent::AwaitingSetup) does. Both travel on an
+    /// announcement anyway, because an announcement is where a fresh entity
+    /// needs its first value.
+    Calibration {
+        /// Which shade.
+        id: ShadeId,
+        /// Where its opening time came from.
+        up: CalibrationSource,
+        /// Where its closing time came from. Never derived from the one above:
+        /// closing is gravity-assisted and the two differ by about a tenth.
+        down: CalibrationSource,
     },
 }
 

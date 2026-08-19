@@ -570,6 +570,19 @@ export class World {
         return assertNever(command);
     }
 
+    // **An accepted command ends any calibration run on this shade, silently.**
+    // A shade holds exactly one activity on the device and
+    // `Controller::command_shade` overwrites it, so the run is gone and nothing
+    // says so — the operator finds out at their next tap, as `notCalibrating`.
+    // After the switch rather than before it, because the refusals above
+    // (`vent` with nothing to aim at) return before `Shade::handle` is reached
+    // and therefore leave the activity where it was.
+    //
+    // Modelled rather than left out because that refusal is a branch the
+    // calibration screen writes its own sentence for, and it is a branch nothing
+    // but the mock can reach without a shade, a window and a wall remote.
+    this.runs.delete(id);
+
     this.publish(shade, motion);
     return true;
   }

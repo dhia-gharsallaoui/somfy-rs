@@ -715,6 +715,13 @@ fn serve_request(
                             catalog.calibrated(now_ms);
                             false
                         })
+                        .inspect(|_| {
+                            // The provenance of one travel time has just become
+                            // `Measured`, and Home Assistant is showing the
+                            // opposite. One retained publish, not a
+                            // re-announcement — see `announce_calibration`.
+                            announce_calibration(events, machine.registry(), id);
+                        })
                 }
                 CalibrationStepDto::Cancel => machine.cancel_calibration(id).map(|()| false),
             };
@@ -1418,6 +1425,11 @@ fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
                     pairable: RemoteIdentity::is_allocated(shade.config.address),
                 },
             );
+            // After the announcement, because this is the value the entity the
+            // announcement just created needs. A shade that was renamed rather
+            // than recalibrated sends the same figure again, which costs one
+            // retained publish and is how a lost event recovers.
+            announce_calibration(events, registry, id);
         } else {
             crate::logln!(
                 "shades: ShadeId({}) is not announced — nobody has reported it working yet, so \
@@ -1444,6 +1456,35 @@ fn announce_shade(events: &EventSender, registry: &Registry, id: ShadeId) {
             count: crate::edits::awaiting_setup(registry),
         },
     );
+}
+
+/// Tell the broker session where one shade's travel times came from.
+///
+/// # Why this is separate from [`announce_shade`]
+///
+/// Because the two cost different amounts and happen at different rates. An
+/// announcement republishes three retained discovery configs and four
+/// subscriptions; this is one retained reading on an entity that already exists.
+/// A rename needs the first, a finished calibration needs only the second — and
+/// a guided run ends with the operator standing at the window, so it should not
+/// wait behind six packets it does not need.
+///
+/// Gated on the same confirmation, for the same reason: a shade nobody has
+/// reported working has no entities, so a reading for it would be a value with
+/// nowhere to land.
+fn announce_calibration(events: &EventSender, registry: &Registry, id: ShadeId) {
+    if let Some(shade) = registry.shade(id) {
+        if shade.config.pairing_state.is_confirmed() {
+            announce(
+                events,
+                ShadeEvent::Calibration {
+                    id,
+                    up: shade.config.up_time_source,
+                    down: shade.config.down_time_source,
+                },
+            );
+        }
+    }
 }
 
 /// Tell the broker session what changed, or say that nothing heard.

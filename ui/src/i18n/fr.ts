@@ -105,29 +105,57 @@ export const fr: Record<MessageKey, string> = {
     'Une course ne fait pas bouger le tablier sur toute sa durée. La première fraction de seconde sert à transmettre la commande au moteur et à le démarrer ; sur un volet à lames perforées, les premières secondes d’ouverture ne font qu’écarter les lames, et les dernières secondes de fermeture ne font que les resserrer. Ces trois durées font partie des temps ci-dessus, elles ne s’y ajoutent pas : les mesurer rend les positions intermédiaires plus justes sans changer la durée d’une course complète.',
   'calib.ventBandHint':
     'C’est aussi là que s’arrête la commande Aération. Laissée à zéro, la commande n’est pas proposée.',
+  'calib.startLagHint':
+    'La seule des trois valeurs qu’une mesure guidée estime moins bien : elle provient d’un seul appui et porte donc tout votre temps de réaction, alors que les durées de lames sont la différence de deux appuis et l’annulent en grande partie. Si une valeur mesurée ressemble davantage à un quart de seconde de vous qu’à un quart de seconde de moteur, corrigez-la ici.',
 
-  'calib.autoTitle': 'Mesurer automatiquement',
+  'calib.autoTitle': 'Mesurer avec l’appareil comme chronomètre',
   'calib.autoHint':
-    'L’appareil chronomètre le volet pendant que vous le regardez. Placez d’abord le volet à la butée opposée, lancez la mesure, puis appuyez au fur et à mesure. Rien n’est enregistré avant la fin, et annuler n’enregistre rien.',
+    'Placez-vous là où vous voyez le volet. L’appareil envoie la commande et tient le chronomètre ; c’est vous qui appuyez à chaque étape, et vos appuis sont la mesure. Rien n’est enregistré avant que vous appuyiez sur « Il s’est arrêté », et annuler n’enregistre rien.',
+  'calib.autoOneWay':
+    'L’appareil ne voit pas le volet. Les télécommandes Somfy ne font qu’émettre — aucun moteur ne répond jamais — donc il sait quand il a envoyé une commande, et rien de plus. C’est pourquoi il n’y a pas de barre de progression ici, et pourquoi chaque appui compte.',
+  'calib.autoCost':
+    'Ceci fait parcourir au volet toute sa course. Chaque sens demande deux courses complètes : une pour l’amener à la butée opposée, une pour être chronométrée. Faire les deux sens d’affilée en coûte trois plutôt que quatre, car chaque mesure se termine exactement là où l’autre doit commencer. Si une course complète n’est pas acceptable maintenant — un volet au-dessus d’un bureau, une chambre où quelqu’un dort, un store par grand vent — saisissez plutôt les temps à la main ci-dessus.',
   'calib.autoUp': 'Mesurer l’ouverture',
   'calib.autoDown': 'Mesurer la fermeture',
   'calib.autoUpPrep':
     'Fermez complètement le volet et attendez son arrêt. Lancez ensuite : le volet s’ouvrira et il vous sera demandé d’appuyer trois fois.',
   'calib.autoDownPrep':
     'Ouvrez complètement le volet et attendez son arrêt. Lancez ensuite : le volet se fermera et il vous sera demandé d’appuyer deux fois.',
-  'calib.autoStart': 'Lancer et ouvrir',
-  'calib.autoStartDown': 'Lancer et fermer',
+  'calib.autoUpWrites': 'Remplace Ouverture, Délai de démarrage et Écartement des lames.',
+  'calib.autoDownWrites': 'Remplace Fermeture, Délai de démarrage et Serrage des lames.',
   'calib.autoRunning': 'En cours — {elapsed} s',
+  'calib.autoWatch':
+    'Regardez le volet, pas cet écran. Appuyez dès qu’il bouge, appuyez de nouveau quand le tablier lui-même se met en mouvement, et appuyez sur « Il s’est arrêté » quand il atteint la butée et que le moteur se tait.',
   'calib.autoMarkMotion': 'Il a commencé à bouger',
   'calib.autoMarkCurtainUp': 'Le tablier commence à monter',
   'calib.autoMarkCurtainDown': 'Le tablier est arrivé en bas',
   'calib.autoFinish': 'Il s’est arrêté',
   'calib.autoCancel': 'Annuler',
+  'calib.autoCancelNote':
+    'Annuler n’enregistre rien, et n’arrête pas le volet : c’est une mesure que l’on abandonne, pas un mouvement. Utilisez Fermer ou Ouvrir ci-dessus une fois la mesure annulée.',
+  'calib.autoDoNotTouch':
+    'Pendant la mesure, ne commandez pas ce volet depuis ailleurs — les boutons ci-dessus, Home Assistant, ou une télécommande murale dans la maison. Chacun de ces gestes met fin à la mesure, et vous ne l’apprendrez qu’à votre appui suivant.',
   'calib.autoMarked': 'Noté.',
-  'calib.autoDone':
-    'Mesuré. Les temps ci-dessus ont été mis à jour, et le volet est à une butée : sa position est de nouveau exacte.',
+  'calib.autoDoneUp':
+    'L’ouverture a pris {seconds} s. Les temps ci-dessus ont été mis à jour, et le volet est à une butée : sa position est de nouveau exacte.',
+  'calib.autoDoneDown':
+    'La fermeture a pris {seconds} s. Les temps ci-dessus ont été mis à jour, et le volet est à une butée : sa position est de nouveau exacte.',
+  'calib.autoCheck':
+    'Vérifiez cette durée au chronomètre, ou simplement contre l’impression que vous en avez eue. Une valeur très éloignée signale une mesure que quelque chose a interrompue, et la refaire ne coûte rien de ce qui est déjà enregistré.',
+  'calib.autoNextDown':
+    'Le volet est maintenant complètement ouvert, c’est-à-dire exactement là où une mesure de fermeture doit commencer. La faire maintenant économise une course entière.',
+  'calib.autoNextUp':
+    'Le volet est maintenant complètement fermé, c’est-à-dire exactement là où une mesure d’ouverture doit commencer. La faire maintenant économise une course entière.',
   'calib.autoOptional':
-    'Chaque appui est facultatif — si vous en sautez un, la valeur correspondante reste inchangée.',
+    'Chaque appui est facultatif — si vous en sautez un, la valeur correspondante reste inchangée, ce qui vaut mieux qu’en enregistrer une moins bonne.',
+  'calib.autoSkipMotion':
+    'Les deux appuis sur le tablier forment une différence : votre temps de réaction s’annule donc en grande partie dans la durée des lames. Le délai de démarrage vient d’un seul appui et le porte entièrement — considérez-le comme indicatif. Et si vous sautez « Il a commencé à bouger », la durée des lames est mesurée depuis l’envoi de la commande et inclura donc le délai de démarrage.',
+  'calib.autoImplausible':
+    'L’appareil refuse d’enregistrer cela : soit la course a duré moins d’une seconde ou plus de trois minutes, soit vos appuis ne laissent aucune course entre eux. Rien n’a été modifié et la mesure est toujours ouverte — appuyez de nouveau sur « Il s’est arrêté » quand le volet s’arrête vraiment, ou annulez et recommencez.',
+  'calib.autoInterrupted':
+    'Cette mesure est terminée. Autre chose a commandé le volet — ces boutons, Home Assistant, ou une télécommande murale — ou cette page est restée ouverte trop longtemps. Rien n’a été enregistré. Remettez le volet à la butée opposée et recommencez.',
+  'calib.autoUnpaired':
+    'Aucun moteur ne répond encore à {name} : une mesure guidée chronométrerait un volet qui ne bouge pas. Terminez d’abord sa configuration. Les temps ci-dessus restent saisissables à la main.',
 
   'detail.linkedRemotes': 'Télécommandes associées',
   'detail.linkedRemotesPending': 'Pas encore implémenté.',

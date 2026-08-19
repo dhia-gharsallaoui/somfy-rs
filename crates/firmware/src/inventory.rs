@@ -71,7 +71,7 @@ use core::fmt::Write as _;
 
 use heapless::{String, Vec};
 use somfy_domain::{Registry, RemoteIdentity, ShadeId, MAX_SHADES};
-use somfy_mqtt::Pairing;
+use somfy_mqtt::{CalibrationState, Pairing};
 
 use crate::edits::MAX_NAME_LEN;
 
@@ -83,6 +83,22 @@ struct Entry {
     /// pairing button. See [`somfy_mqtt::Pairing`] for what a button on an
     /// imported shade would offer to do.
     pairing: Pairing,
+    /// Where its two travel times came from, as the calibration sensor reports
+    /// it.
+    ///
+    /// Held here rather than derived at publish time for the reason everything
+    /// else here is: the registry belongs to the state task. It is seeded from
+    /// the table at boot and moved by `crate::edits::ShadeEvent::Calibration`,
+    /// which is the same shape `name` and `pairing` already have.
+    ///
+    /// **`None` publishes nothing**, and that is the same rule
+    /// `Diagnostics::reading` and `Known::seen` already follow. A shade an
+    /// operator has just confirmed arrives on `ShadeEvent::Added` and its
+    /// provenance one event later, so for that moment this session genuinely
+    /// does not know — and Home Assistant showing `unknown` is what it does not
+    /// know, where a guessed "not calibrated" would be a claim about a table
+    /// nobody has read.
+    calibration: Option<CalibrationState>,
 }
 
 /// One boot's view of which shades exist, what they are called, which of them
@@ -134,6 +150,16 @@ impl Inventory {
                 Pairing::Withheld
             };
             inventory.insert(id, &shade.config.name, pairing);
+            // Seeded here rather than waited for: at boot the table *is* in
+            // hand, so a fresh broker session can publish every shade's
+            // provenance in its first announcement instead of leaving each one
+            // `unknown` until somebody edits it. The runtime figure arrives on
+            // `crate::edits::ShadeEvent::Calibration`, exactly as the
+            // awaiting-setup count does.
+            inventory.set_calibration(
+                id,
+                CalibrationState::of(shade.config.up_time_source, shade.config.down_time_source),
+            );
         }
         inventory
     }
@@ -178,8 +204,32 @@ impl Inventory {
                 id,
                 name: held,
                 pairing,
+                // Not known yet — see the field. It arrives on the
+                // `ShadeEvent::Calibration` that follows every announcement.
+                calibration: None,
             });
         }
+    }
+
+    /// Record where one shade's travel times came from.
+    ///
+    /// Silently ignores an id this inventory does not hold, which is the same
+    /// answer [`Inventory::pairing`] gives: a shade with no entities has nothing
+    /// to report a provenance on.
+    pub fn set_calibration(&mut self, id: ShadeId, state: CalibrationState) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.calibration = Some(state);
+        }
+    }
+
+    /// Where one shade's travel times came from, if this session has been told.
+    ///
+    /// `None` publishes nothing rather than a placeholder — see [`Entry`].
+    pub fn calibration(&self, id: ShadeId) -> Option<CalibrationState> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.calibration)
     }
 
     /// Forget one shade. Returns whether it was there.
