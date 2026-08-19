@@ -101,54 +101,42 @@ export const en = {
   'calib.bandsHint':
     'Not all of a travel moves the curtain. The first fraction of a second goes on getting the command to the motor and starting it; on a perforated shutter the first few seconds of opening only separate the slats, and the last few seconds of closing only squeeze them shut again. These three are parts of the times above, not extra time on top — measuring one makes part-open positions more accurate without changing how long a full travel takes.',
   'calib.ventBandHint':
-    'This is also where Vent stops. Leave it at zero and the Vent control is not offered.',
+    'This is also where Vent stops. Leave it at zero and the Vent control is not offered. To get a figure: close the shade fully, then open it and time how long the slats take to separate before the curtain starts to rise — it is a few seconds and you can watch it happen.',
   'calib.startLagHint':
-    'The one figure a guided run measures less well than the other two: it comes from a single tap, so it carries your reaction time whole, where the slat figures are the difference of two taps and mostly cancel it. If a measured value here looks like a quarter of a second of you rather than of the motor, correct it here.',
+    'The gap between the command going out and the motor actually turning. Short — a fraction of a second — and the guided measurement below does not try for it, because a single press at a moment that brief is mostly your own reaction time. Zero is a fair starting value.',
 
   'calib.autoTitle': 'Measure with the device timing it',
   'calib.autoHint':
-    'You stand where you can see the shade. The device sends the command and holds the stopwatch; you tap as each thing happens, and your taps are the measurement. Nothing is stored until you tap It has stopped, and cancelling stores nothing.',
-  'calib.autoOneWay':
-    'The device cannot see the shade. Somfy remotes only transmit — no motor ever reports back — so it knows when it sent a command and nothing else. That is why there is no progress bar here and why every tap matters.',
+    'Press to start, watch the shade, and press again when it stops. The device cannot see the shade — Somfy remotes only transmit and no motor reports back — so your second press is the measurement. But the first end of it is the device’s own clock, which is why this is more accurate than a stopwatch: a stopwatch carries your reaction time at both ends, this carries it at one. Nothing is stored until you press It has stopped, and cancelling stores nothing.',
   'calib.autoCost':
     'This moves the shade through its whole range. Each direction takes two full travels: one to get it to the far limit, one to be timed. Doing both in one visit costs three rather than four, because each run ends exactly where the other has to start. If a full travel is not acceptable right now — a shade over a desk, a sleeping room, an awning in wind — enter the times by hand above instead.',
   'calib.autoUp': 'Measure opening',
   'calib.autoDown': 'Measure closing',
   'calib.autoUpPrep':
-    'Close the shade fully and wait for it to stop. Then start: the shade will open, and you will be asked to tap three times.',
+    'Close the shade fully and wait for it to stop. Then start: the shade will open, and you press once when it stops. This replaces Opening above.',
   'calib.autoDownPrep':
-    'Open the shade fully and wait for it to stop. Then start: the shade will close, and you will be asked to tap twice.',
-  'calib.autoUpWrites': 'Replaces Opening, Start delay and Slat separation.',
-  'calib.autoDownWrites': 'Replaces Closing, Start delay and Slat compression.',
+    'Open the shade fully and wait for it to stop. Then start: the shade will close, and you press once when it stops. This replaces Closing above.',
   'calib.autoRunning': 'Running — {elapsed} s',
   'calib.autoWatch':
-    'Watch the shade, not this screen. Tap the moment it first stirs, tap again when the curtain itself starts to move, and tap It has stopped when it reaches the limit and the motor goes quiet.',
-  'calib.autoMarkMotion': 'It has started moving',
-  'calib.autoMarkCurtainUp': 'The curtain has started to rise',
-  'calib.autoMarkCurtainDown': 'The curtain has reached the bottom',
+    'Watch the shade, not this screen. Press the moment it reaches the limit and the motor goes quiet.',
   'calib.autoFinish': 'It has stopped',
   'calib.autoCancel': 'Cancel',
   'calib.autoCancelNote':
     'Cancel stores nothing, and it does not stop the shade — it is a measurement being abandoned, not a movement. Use Close or Open above once the run has been cancelled.',
   'calib.autoDoNotTouch':
-    'While this is running, do not command this shade from anywhere else — the controls above, Home Assistant, or a wall remote in the house. Any of those ends the measurement, and you will only be told at your next tap.',
-  'calib.autoMarked': 'Noted.',
+    'While this is running, do not command this shade from anywhere else — the controls above, Home Assistant, or a wall remote in the house. Any of those ends the measurement, and you will only be told when you press.',
   'calib.autoDoneUp':
-    'The opening run took {seconds} s. The times above have been updated, and the shade is at a limit, so its position is exact again.',
+    'The opening run took {seconds} s. Opening above has been updated, and the shade is at a limit, so its position is exact again.',
   'calib.autoDoneDown':
-    'The closing run took {seconds} s. The times above have been updated, and the shade is at a limit, so its position is exact again.',
+    'The closing run took {seconds} s. Closing above has been updated, and the shade is at a limit, so its position is exact again.',
   'calib.autoCheck':
-    'Check that against a stopwatch, or against how long the shade felt like it took. A figure that is wildly out is a run something interrupted, and running it again costs nothing already stored.',
+    'Check that figure against a stopwatch. If the two disagree by more than a second or two, you pressed early or something interrupted the run — measure it again, which costs nothing already stored. Nothing on the device can catch a wrong-but-plausible number, so this comparison is the only thing that can.',
   'calib.autoNextDown':
     'The shade is now fully open, which is exactly where a closing run has to start. Measuring it now saves a whole travel.',
   'calib.autoNextUp':
     'The shade is now fully closed, which is exactly where an opening run has to start. Measuring it now saves a whole travel.',
-  'calib.autoOptional':
-    'Each tap is optional — skip one and that value is left as it was, which is better than storing a worse one.',
-  'calib.autoSkipMotion':
-    'The two curtain taps are a difference, so your reaction time mostly cancels out of the slat figure. The start delay is one tap and carries it whole, so treat that one as indicative. And if you skip It has started moving, the slat figure is measured from the moment the command was sent, so it will include the start delay.',
   'calib.autoImplausible':
-    'The device will not store that: either the run was under a second or over three minutes, or the taps left no travel between them. Nothing has been changed and the run is still open — tap It has stopped again when the shade actually stops, or cancel and start over.',
+    'The device will not store that: the run was under a second, or over three minutes, or shorter than the start delay and slat figure entered above — which cannot both be true, so the stored ones win. Nothing has been changed and the run is still open: press It has stopped again when the shade actually stops, or cancel and start over.',
   'calib.autoInterrupted':
     'This run is over. Something else commanded the shade — these controls, Home Assistant, or a wall remote — or this page was left open too long. Nothing was stored. Put the shade back at the far limit and start again.',
   'calib.autoUnpaired':

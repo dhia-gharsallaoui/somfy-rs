@@ -14,11 +14,10 @@
 
 use heapless::Vec;
 use somfy_domain::{
-    round_dead_band_ms, round_start_lag_ms, CalibrationLeg, CalibrationMark, CalibrationOutcome,
-    CalibrationSource, Controller, DomainError, Motion, PlannedTx, Pos, Repeats, Shade,
-    ShadeCommand, ShadeConfig, ShadeId, StateDelta, TravelProfile, DELTA_CAPACITY, MAX_ACTIVITIES,
-    MAX_DEAD_BAND_MS, MAX_START_LAG_MS, MAX_TRAVEL_TIME_MS, ROUTE_VIA_LIMIT_RAW, STOP_REPEATS,
-    TX_CAPACITY,
+    round_dead_band_ms, round_start_lag_ms, CalibrationLeg, CalibrationOutcome, CalibrationSource,
+    Controller, DomainError, Motion, PlannedTx, Pos, Repeats, Shade, ShadeCommand, ShadeConfig,
+    ShadeId, StateDelta, TravelProfile, DELTA_CAPACITY, MAX_ACTIVITIES, MAX_DEAD_BAND_MS,
+    MAX_START_LAG_MS, MAX_TRAVEL_TIME_MS, ROUTE_VIA_LIMIT_RAW, STOP_REPEATS, TX_CAPACITY,
 };
 use somfy_rts::{Command, Frame};
 
@@ -139,10 +138,6 @@ impl Rig {
         self.controller
             .begin_calibration(self.id, leg, now_ms, &mut self.tx, &mut self.deltas)
             .expect("accepted");
-    }
-
-    fn mark(&mut self, mark: CalibrationMark, now_ms: u64) -> Result<(), DomainError> {
-        self.controller.mark_calibration(self.id, mark, now_ms)
     }
 
     fn finish(&mut self, now_ms: u64) -> Result<CalibrationOutcome, DomainError> {
@@ -357,11 +352,19 @@ fn an_implausible_run_leaves_the_shade_exactly_as_it_was() {
         "a run still going after three minutes is one somebody walked away from",
     );
 
+    // **The one refusal a hand-entered figure can now cause**, and the reason
+    // `checked_bands` survived the guided run losing its marks: the fixture's
+    // slat separation is longer than this traverse turned out to be, so the two
+    // numbers cannot both be true and the *stored* one wins by refusing the new
+    // one. Before 2026-08-19 this arrived as a mis-tapped mark; it arrives from
+    // the hand-entry panel now, and the arithmetic is the same.
     rig.begin(CalibrationLeg::Up, 0);
-    // A band longer than the traverse it is part of leaves nothing that lifts.
-    rig.mark(CalibrationMark::CurtainMoved, 9_000).unwrap();
+    assert!(
+        rig.shade().config.start_lag_ms as u64 + rig.shade().config.vent_band_ms as u64 > 2_000,
+        "the fixture has to carry bands longer than the traverse below for this to be the case it claims",
+    );
     assert_eq!(
-        rig.finish(8_000),
+        rig.finish(2_000),
         Err(DomainError::DeadBandTooLong),
         "reported as the specific rule it broke rather than as a generic refusal",
     );
@@ -374,12 +377,8 @@ fn an_implausible_run_leaves_the_shade_exactly_as_it_was() {
 }
 
 #[test]
-fn marking_or_finishing_without_a_run_is_refused() {
+fn finishing_or_cancelling_without_a_run_is_refused() {
     let mut rig = Rig::measured();
-    assert_eq!(
-        rig.mark(CalibrationMark::MotionBegan, 10),
-        Err(DomainError::NotCalibrating),
-    );
     assert_eq!(rig.finish(10).unwrap_err(), DomainError::NotCalibrating);
     assert_eq!(
         rig.controller.cancel_calibration(rig.id),
@@ -398,6 +397,8 @@ fn marking_or_finishing_without_a_run_is_refused() {
 ///
 /// Pinned here because the web UI now says this in words, and a claim in a
 /// screen with no test behind it is the kind that quietly stops being true.
+/// **The screen has exactly one press left to find out at**, which is what makes
+/// the warning it carries load-bearing rather than decorative.
 #[test]
 fn a_command_from_anywhere_else_ends_the_run_silently() {
     let mut rig = Rig::measured();
@@ -412,11 +413,7 @@ fn a_command_from_anywhere_else_ends_the_run_silently() {
         "the command took the shade's only activity slot",
     );
 
-    // Nothing said so at the time. It is said now, at the first tap after.
-    assert_eq!(
-        rig.mark(CalibrationMark::MotionBegan, 6_000),
-        Err(DomainError::NotCalibrating),
-    );
+    // Nothing said so at the time. It is said now, when they report the stop.
     assert_eq!(rig.finish(30_000).unwrap_err(), DomainError::NotCalibrating);
     assert_eq!(
         rig.shade().config,
@@ -436,17 +433,14 @@ fn beginning_a_second_run_replaces_the_first() {
     let mut rig = Rig::measured();
 
     rig.begin(CalibrationLeg::Up, 0);
-    rig.mark(CalibrationMark::MotionBegan, 500).unwrap();
     rig.begin(CalibrationLeg::Down, 1_000);
     assert!(rig.controller.is_calibrating(rig.id));
 
-    // The Down leg's traverse is timed from the *second* begin, and the first
-    // run's mark is gone with it — otherwise a 500 ms lag measured against a
-    // clock that no longer exists would be folded into this direction.
+    // The Down leg's traverse is timed from the *second* begin. Timing it from
+    // the first would report an extra second and store it as measured.
     let outcome = rig.finish(1_000 + DOWN_MS as u64).unwrap();
     assert_eq!(outcome.leg, CalibrationLeg::Down);
     assert_eq!(outcome.travel_ms, DOWN_MS);
-    assert_eq!(outcome.start_lag_ms, None, "no mark carried over");
     assert_eq!(
         rig.shade().config.up_time_source,
         CalibrationSource::Measured,
@@ -455,47 +449,51 @@ fn beginning_a_second_run_replaces_the_first() {
     assert_eq!(rig.shade().config.up_time_ms, UP_MS);
 }
 
-/// Skipping the *first* tap does not skip a number — it moves it.
+/// A run writes **one** number, and the hand-entered ones survive it untouched.
 ///
-/// With no `MotionBegan`, the band is measured against the **stored** start lag
-/// rather than a fresh one, so on a shade whose lag is still zero the whole
-/// command-to-motion delay lands inside the slat-separation figure. That is the
-/// right arithmetic (the band is what is left of the interval after the lag) and
-/// it is a surprising consequence, so the screen says it and this pins it.
+/// This is the shape of the flow since 2026-08-19, and it is the property that
+/// replaced a more intricate one. A run used to carry two further presses, which
+/// fixed the start lag and this leg's dead band; they were single presses at
+/// moments a fraction of a second wide, so each carried a whole reaction delay
+/// against the interval it defined — where the same delay is a fraction of a
+/// percent of a half-minute traverse.
+///
+/// What matters for the estate this came from is the *vent* band. The owner
+/// entered 4 s by hand and the vent command works from it, so a guided run that
+/// silently replaced it with a figure derived from a press would be a regression
+/// dressed as a measurement. It cannot: nothing here writes it.
 #[test]
-fn skipping_the_motion_tap_folds_the_start_delay_into_the_band() {
-    // Two shades, identical but for the stored lag.
-    let mut without = Rig::new(measured_config());
-    let mut with_lag = Rig::new(measured_config());
+fn a_run_measures_the_traverse_and_leaves_the_hand_entered_figures_alone() {
+    let mut rig = Rig::new(measured_config());
 
-    // Zero the lag on one of them; the fixture carries START_LAG_MS on both.
-    {
-        let shade = without.controller.registry.shade_mut(without.id).unwrap();
-        shade.config.start_lag_ms = 0;
-    }
+    // A traverse a fifth longer than the stored one, so a leak from any other
+    // field would be visible rather than coincidentally equal.
+    const MEASURED_UP_MS: u32 = 36_000;
+    rig.begin(CalibrationLeg::Up, 0);
+    let outcome = rig.finish(MEASURED_UP_MS as u64).unwrap();
 
-    const CURTAIN_AT_MS: u64 = 4_200;
-    for rig in [&mut without, &mut with_lag] {
-        rig.begin(CalibrationLeg::Up, 0);
-        rig.mark(CalibrationMark::CurtainMoved, CURTAIN_AT_MS)
-            .unwrap();
-        rig.finish(UP_MS as u64).unwrap();
-    }
+    assert_eq!(outcome.travel_ms, MEASURED_UP_MS);
+    assert_eq!(rig.shade().config.up_time_ms, MEASURED_UP_MS);
+    assert_eq!(
+        rig.shade().config.up_time_source,
+        CalibrationSource::Measured,
+    );
 
     assert_eq!(
-        without.shade().config.vent_band_ms,
-        round_dead_band_ms(CURTAIN_AT_MS as u32).unwrap(),
-        "with no lag stored, the band is the whole interval from the command",
+        rig.shade().config.start_lag_ms,
+        START_LAG_MS,
+        "the start delay is hand-entered and a run must not touch it",
     );
     assert_eq!(
-        with_lag.shade().config.vent_band_ms,
-        round_dead_band_ms(CURTAIN_AT_MS as u32 - START_LAG_MS as u32).unwrap(),
-        "with a lag stored, the band is what is left after it",
+        rig.shade().config.vent_band_ms,
+        VENT_BAND_MS,
+        "the slat separation is hand-entered, the vent command runs on it, and a \
+         run must not touch it",
     );
     assert_eq!(
-        without.shade().config.start_lag_ms,
+        rig.shade().config.close_band_ms,
         0,
-        "an untapped moment stores nothing rather than a worse value",
+        "and an Up run has nothing to say about the closing end either",
     );
 }
 

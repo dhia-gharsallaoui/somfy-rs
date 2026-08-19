@@ -25,17 +25,19 @@
  *
  * **Automatic measurement (R2)** is the second panel now. It is guided rather
  * than automatic in any deeper sense: nothing on the device can see the shade,
- * so a measurement is the device's clock and the operator's eye. Three numbers
- * come out of one Up traverse, which is what keeps the dead time and the dead
- * band from costing extra shade travel.
+ * so a measurement is the device's clock and the operator's eye. It measures one
+ * traverse per run and nothing else.
  *
- * **The dead bands (R5, R8)** are three more rows. The spec settled the
- * mechanism by elimination on 2026-08-17 — these motors complete full traverses
- * from three-frame bursts, which a motor reading burst length as a slat command
- * could not do — so it is mechanical, and the estimator subtracts it. They are
- * presented as *parts of* the travel times, because that is what they are:
- * measuring one makes part-open positions more accurate without changing how
- * long a full travel takes.
+ * **The dead bands (R5, R8)** are three more rows, and they are *only* editable
+ * here. The spec settled the mechanism by elimination on 2026-08-17 — these
+ * motors complete full traverses from three-frame bursts, which a motor reading
+ * burst length as a slat command could not do — so it is mechanical, and the
+ * estimator subtracts it. They are presented as *parts of* the travel times,
+ * because that is what they are: measuring one makes part-open positions more
+ * accurate without changing how long a full travel takes. That also makes them
+ * the one way a guided run can be refused for a reason other than its own
+ * length, since a traverse shorter than the figures entered here cannot be
+ * stored beside them.
  */
 import { useState } from 'preact/hooks';
 
@@ -109,12 +111,11 @@ export function TravelTimes({ shade, onSaved }: { shade: ShadeDto; onSaved: () =
           },
         ] as Row[])
       : []),
-    // The hint is the one asymmetry a guided run cannot fix and must not hide:
-    // the two curtain taps are a *difference*, so the operator's reaction time
-    // cancels out of the bands, while the start delay is a single tap and
-    // carries it whole. A measured lag is therefore worth less than a measured
-    // band, and this is the field where somebody is most likely to correct one
-    // by hand.
+    // These three have no `source`, and since 2026-08-19 that is a plain fact
+    // rather than a simplification: the guided run measures the two travel
+    // times and nothing else, so hand entry is the *only* way any of them gets
+    // a value. Their hints therefore have to say how to obtain one, which is
+    // what R9 means by hand entry being a route rather than a fallback.
     { label: 'calib.startLag', field: 'startLagMs', step: LAG_STEP_S, hint: 'calib.startLagHint' },
     { label: 'calib.ventBand', field: 'ventBandMs', step: BAND_STEP_S, hint: 'calib.ventBandHint' },
     { label: 'calib.closeBand', field: 'closeBandMs', step: BAND_STEP_S },

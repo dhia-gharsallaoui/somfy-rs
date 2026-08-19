@@ -401,6 +401,26 @@
 /// the build, and the two ways out are the ones named on the gate — make the
 /// chain shallower, or lower `STACK_BUDGET_BYTES` and give the difference to the
 /// heap, which has room now that the ESP32 and the ESP32-C3 are gone.
+///
+/// **Re-walked 2026-08-19 after the guided calibration lost its two `mark`
+/// presses, and it did not move.** That change took eight bytes out of
+/// `somfy_domain::Calibrating`, which lives in the four-entry activity table on
+/// the state machine — exactly the shape of change this chain is sensitive to,
+/// since the machine is materialised on this stack about five times. It did not
+/// reach a frame. The walk, on this commit, ESP32-S3 with `mqtt` + `ui`:
+///
+/// | | bytes |
+/// |---|---|
+/// | `main`, `Executor::run`, `run_inner` (48 each) | 144 |
+/// | `TaskStorage<__embassy_main_task>::poll` | 3,856 |
+/// | [`crate::start`] | 20,304 |
+/// | [`crate::tasks::state`], building the task token | 16,016 |
+/// | `UninitCell::write_in_place`, moving the future into its static | 16,032 |
+/// | **total** | **56,352** |
+///
+/// Recorded as a null result rather than left silent, because the reason to
+/// expect movement was a good one and "we looked and it did not" is the part
+/// that stops it being looked for again. The 24-byte margin above is unchanged.
 const BOOT_CHAIN_BYTES: usize = 56_352;
 
 /// The chain that brings up Wi-Fi, the web server and the broker session.

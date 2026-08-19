@@ -339,6 +339,57 @@ open, and the one place it went against the wording.
   places: the lag applies at the start of every move in either direction, the
   slat separation only when leaving the closed limit upward, and the slat
   compression only at the end of a full close. Three figures, not one.
+- **The guided run was cut back to one press per leg on 2026-08-19, and R5's
+  "fold a measured dead time into the R2 calibration" is the one line of this
+  document the implementation now goes against.** It is recorded here rather
+  than quietly, because the wording is unambiguous and the code no longer does
+  it.
+
+  What the run used to ask for was three presses per leg: the shade first
+  stirring (fixing `start_lag_ms`), the curtain separating from the slats
+  (fixing the leg's dead band), and the stop (fixing the traverse). The middle
+  two are gone; the traverse stays. The API's `mark` step, the domain's
+  `CalibrationMark`, and the mock's port of both went with them.
+
+  The argument, in the order it decided:
+
+  1. **The traverse is the number that mattered and it is the one the method is
+     good at.** A run is tens of seconds and only *one* of its ends is human —
+     the device knows exactly when it put the frame on the air — so a guided run
+     is more accurate than a stopwatch, which carries a reaction delay at both
+     ends. The estate's fault was 10 s stored against a real 30 s, and this is
+     what fixes it.
+  2. **The other two measured worst what they were for.** Each was a single
+     press against a moment a fraction of a second wide, so each carried a whole
+     reaction delay against the interval it defined. The screen already had to
+     say so, and a UI that has to warn you a number is mostly your own reaction
+     time is describing a measurement it should not be taking.
+  3. **Both are eyeball-able.** The slats visibly separate; the start lag is
+     short and constant. R9 makes hand entry a MUST for exactly these values,
+     and R8's own text says the vent's timing "inherits R9's hand-override".
+  4. **The cost of keeping the wire was not an unused enum variant.** It was a
+     live branch in `Shade::finish_calibration` writing three configuration
+     fields, plus a hand-written *reimplementation* of that branch in
+     `ui/mock/world.ts` that CI holds green — a second copy of the arithmetic,
+     for a step no client sends. `vent_band_ms` is the field the vent command
+     runs on and the owner has a working hand-entered value in it, so a second,
+     tap-derived writer for it with no caller was a hazard rather than an
+     option.
+
+  **What is lost, stated plainly.** There is now no path by which this device
+  measures a dead band itself, and `docs/provenance.md` records that none ever
+  did. **What would bring it back:** a surface that can *observe* the shade — a
+  power sensor on the motor is the only realistic one, and it could plausibly
+  see both the motor starting and the load stepping as the curtain takes weight.
+  If that is ever built, note it would want `begin`/`finish` timing first, which
+  the surviving wire already gives it.
+
+  **What survived and is load-bearing:** `ShadeConfig::checked_bands` still runs
+  on the finish. A hand-entered band and a freshly measured traverse are two
+  numbers that must agree, so a traverse shorter than the figures already stored
+  is refused rather than stored beside them — the only refusal left that is not
+  about the run's own length, and the one the screen's message now names.
+
 - **A limitation the requirements did not anticipate: at most four shades may be
   part-way through a multi-step movement at once** (`somfy_domain::MAX_ACTIVITIES`).
   The bound is forced by boot stack, not chosen — see that constant and

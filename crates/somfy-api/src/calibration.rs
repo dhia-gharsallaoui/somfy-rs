@@ -5,7 +5,7 @@
 //! Nothing here can see the shade. RTS is one-way, there is no encoder and no
 //! limit-switch feedback, so the only instrument available is a person watching
 //! the window and a clock. A calibration is therefore: send the traverse, let
-//! the operator say when things happened, and store the intervals.
+//! the operator say when it stopped, and store the interval.
 //!
 //! That is not a poor substitute for something better — it is the only
 //! measurement the physics permits, and it is what the requirements ask for.
@@ -13,37 +13,45 @@
 //! ever chosen, which is what made a 25%-open command move a shade about 1% on
 //! 2026-08-17.
 //!
-//! ## Three numbers from one traverse
+//! ## Why one press beats a stopwatch, rather than merely being easier
 //!
-//! The Up leg yields the traverse time, the start lag and the slat-separation
-//! band, because they are three moments of the same movement. That is what keeps
-//! the dead-time and dead-band requirements from costing any extra shade travel,
-//! which matters: R9 records that a sweep through the full range is not always
-//! acceptable — a shade over a desk, a sleeping room, an awning in wind.
+//! One end of this measurement is the device's own clock — it knows exactly when
+//! it put the frame on the air. So only the *stop* carries the operator's
+//! reaction delay, where timing the same traverse with a wristwatch carries it
+//! at both ends. That asymmetry is the whole reason to offer this flow beside
+//! the hand-entry fields rather than instead of them.
 //!
-//! ## The honest limit of the method
+//! ## What this flow deliberately does not measure
 //!
-//! A human tap lands a couple of hundred milliseconds after what it aims at. The
-//! band is the *difference* of two taps, so that delay cancels out of it; the
-//! start lag is a single tap and carries it whole. So a measured lag is worth
-//! less than a measured band, and both are worth less than a traverse, which is
-//! seconds long. This is why the hand-entry route of R9 exists beside this one
-//! rather than being replaced by it.
+//! The start lag and the two slat dead bands were measured here until
+//! 2026-08-19, through a `mark` step the operator pressed as the shade passed
+//! each moment. They are entered by hand now, through
+//! `PATCH /api/v1/shades/{id}`, which R9 of the position-accuracy spec already
+//! required as a MUST — so nothing became unmeasurable; two presses per leg
+//! went away. The reasoning is recorded in that spec's implementation-status
+//! section under `docs/specs/`.
+//!
+//! The short version is that those two marks measured worst the thing they
+//! existed for. Each was a *single* press against a moment a fraction of a
+//! second wide, so each carried a whole reaction delay against the interval it
+//! defined — the opposite of the traverse, where the same delay is a fraction of
+//! a percent of a half-minute. Both are also small enough to watch and type: the
+//! slats visibly separate.
 
 use serde::de::{Deserialize, Deserializer, Error as _};
 use serde::Deserialize as DeriveDeserialize;
-use somfy_domain::{CalibrationLeg, CalibrationMark};
+use somfy_domain::CalibrationLeg;
 
 /// Body of `POST /api/v1/shades/{id}/calibrate` — one step of a run.
 ///
-/// # Why one route with a step in the body rather than four routes
+/// # Why one route with a step in the body rather than three routes
 ///
 /// Two reasons, and the second is the binding one.
 ///
-/// A calibration is **one session**, not four resources. Begin, mark, finish and
-/// cancel are moments in a single conversation with an operator holding a
-/// stopwatch, and a run half-abandoned across separate endpoints is worse than
-/// no run at all.
+/// A calibration is **one session**, not three resources. Begin, finish and
+/// cancel are moments in a single conversation with an operator watching a
+/// window, and a run half-abandoned across separate endpoints is worse than no
+/// run at all.
 ///
 /// And the device hand-rolls its HTTP routing on a router that is a type per
 /// route wrapping the previous one. Every new *path shape* deepens a
@@ -58,13 +66,9 @@ use somfy_domain::{CalibrationLeg, CalibrationMark};
 ///   direction. **The caller is responsible for the shade being at the opposite
 ///   limit first**; nothing on the device can check that, because checking would
 ///   mean trusting the position estimate this run exists to replace.
-/// - `mark` — the operator reports a moment. `motionBegan` fixes the start lag;
-///   `curtainMoved` fixes the dead band at this leg's closed end. Both are
-///   optional. A repeated mark replaces the earlier one, so a mis-tap is
-///   corrected by tapping again.
 /// - `finish` — the operator reports the shade stopping. The interval since
-///   `begin` is the traverse time, the marks are carved out of it rather than
-///   added to it, and the estimate is re-anchored at the limit the run ended on.
+///   `begin` is the traverse time, and the estimate is re-anchored at the limit
+///   the run ended on.
 /// - `cancel` — abandon the run and store nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -83,7 +87,6 @@ use somfy_domain::{CalibrationLeg, CalibrationMark};
 )]
 pub enum CalibrationStepDto {
     Begin { leg: CalibrationLegDto },
-    Mark { mark: CalibrationMarkDto },
     Finish,
     Cancel,
 }
@@ -106,10 +109,10 @@ pub enum CalibrationStepDto {
 #[serde(rename_all = "camelCase")]
 pub enum CalibrationLegDto {
     /// A full traverse toward open, started at the closed limit. Measures
-    /// `upTimeMs`, and from its marks `startLagMs` and `ventBandMs`.
+    /// `upTimeMs`.
     Up,
     /// A full traverse toward closed, started at the open limit. Measures
-    /// `downTimeMs`, and from its mark `closeBandMs`.
+    /// `downTimeMs`.
     Down,
 }
 
@@ -123,55 +126,22 @@ impl CalibrationLegDto {
     }
 }
 
-/// A moment the operator reports during a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, DeriveDeserialize, serde::Serialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(
-    feature = "ts",
-    ts(
-        export,
-        export_to = "../../../ui/src/api/generated/",
-        rename_all = "camelCase"
-    )
-)]
-#[serde(rename_all = "camelCase")]
-pub enum CalibrationMarkDto {
-    /// The shade began to move at all.
-    MotionBegan,
-    /// The curtain itself began to move, as opposed to the slats: on the Up leg
-    /// the moment it starts to rise, on the Down leg the moment it reaches the
-    /// sill.
-    CurtainMoved,
-}
-
-impl CalibrationMarkDto {
-    /// Lower onto the domain's own mark.
-    pub fn to_domain(self) -> CalibrationMark {
-        match self {
-            CalibrationMarkDto::MotionBegan => CalibrationMark::MotionBegan,
-            CalibrationMarkDto::CurtainMoved => CalibrationMark::CurtainMoved,
-        }
-    }
-}
-
 /// Wire discriminant for [`CalibrationStepDto`]. Unit-only, so it deserializes
 /// from the bare step string with no `Content` buffer.
 #[derive(DeriveDeserialize)]
 #[serde(rename_all = "camelCase")]
 enum StepTag {
     Begin,
-    Mark,
     Finish,
     Cancel,
 }
 
-/// Flat wire form: the tag plus the two fields the steps between them carry.
+/// Flat wire form: the tag plus the one field a step between them carries.
 #[derive(DeriveDeserialize)]
 #[serde(rename_all = "camelCase")]
 struct CalibrationWire {
     step: StepTag,
     leg: Option<CalibrationLegDto>,
-    mark: Option<CalibrationMarkDto>,
 }
 
 impl<'de> Deserialize<'de> for CalibrationStepDto {
@@ -186,9 +156,6 @@ impl<'de> Deserialize<'de> for CalibrationStepDto {
             // the wrong way across its whole range.
             StepTag::Begin => CalibrationStepDto::Begin {
                 leg: wire.leg.ok_or_else(|| D::Error::missing_field("leg"))?,
-            },
-            StepTag::Mark => CalibrationStepDto::Mark {
-                mark: wire.mark.ok_or_else(|| D::Error::missing_field("mark"))?,
             },
             StepTag::Finish => CalibrationStepDto::Finish,
             StepTag::Cancel => CalibrationStepDto::Cancel,

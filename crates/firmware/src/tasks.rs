@@ -683,29 +683,25 @@ fn serve_request(
                 }
             }
         },
-        // A calibration is the one request whose four steps do different
-        // amounts of work: two of them transmit nothing, one queues a traverse,
-        // and one rewrites the shade's stored settings. They are one arm because
-        // they are one conversation — see `somfy_api::CalibrationStepDto`.
+        // A calibration is the one request whose three steps do different
+        // amounts of work: one queues a traverse, one rewrites the shade's
+        // stored settings, and one transmits nothing at all. They are one arm
+        // because they are one conversation — see
+        // `somfy_api::CalibrationStepDto`.
         rpc::Request::Calibrate(id, step) => {
             let outcome = match step {
                 CalibrationStepDto::Begin { leg } => machine
                     .begin_calibration(store, queue, id, leg.to_domain(), now_ms, emitted)
                     .map(|dispatch| report(&dispatch)),
-                CalibrationStepDto::Mark { mark } => machine
-                    .mark_calibration(id, mark.to_domain(), now_ms)
-                    .map(|()| false),
                 CalibrationStepDto::Finish => {
                     machine
                         .finish_calibration(id, now_ms, emitted)
                         .map(|measured| {
                             crate::logln!(
-                                "calibrate: ShadeId({}) {:?} leg measured {} ms, lag {:?}, band {:?}",
+                                "calibrate: ShadeId({}) {:?} leg measured {} ms",
                                 id.0,
                                 measured.leg,
                                 measured.travel_ms,
-                                measured.start_lag_ms,
-                                measured.band_ms,
                             );
                             // The settings changed, so the table on flash no
                             // longer matches the one in memory. Debounced like
@@ -736,10 +732,11 @@ fn serve_request(
                 ),
                 Err(error) => {
                     // Everything left is a run whose numbers this device will
-                    // not store — a traverse of zero or past three minutes, or
-                    // marks leaving no travel between them. Reported as one
-                    // code, because the operator's next action is the same for
-                    // all of them: run it again and watch the shade.
+                    // not store — a traverse of zero, or past three minutes, or
+                    // too short for the dead bands already entered against it.
+                    // Reported as one code, because the operator's next action
+                    // is the same for all of them: run it again and watch the
+                    // shade.
                     crate::logln!("calibrate: ShadeId({}) refused: {:?}", id.0, error);
                     (
                         rpc::Reply::Refused(ApiErrorCode::CalibrationImplausible.into()),

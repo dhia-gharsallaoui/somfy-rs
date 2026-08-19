@@ -14,8 +14,7 @@
 
 use crate::registry::{GroupId, Registry, ShadeId};
 use crate::shade::{
-    Activity, Calibrating, CalibrationLeg, CalibrationMark, CalibrationOutcome, PlannedTx,
-    ShadeCommand,
+    Activity, Calibrating, CalibrationLeg, CalibrationOutcome, PlannedTx, ShadeCommand,
 };
 use crate::{Direction, DomainError, Pos};
 use heapless::Vec;
@@ -372,18 +371,6 @@ impl Controller {
         Self::drain(&local, tx);
         self.emit_if_changed(id, deltas);
         Ok(())
-    }
-
-    /// Record a moment the operator reported during a run. Transmits nothing.
-    pub fn mark_calibration(
-        &mut self,
-        id: ShadeId,
-        mark: CalibrationMark,
-        now_ms: u64,
-    ) -> Result<(), DomainError> {
-        let mut run = self.run(id).ok_or(DomainError::NotCalibrating)?;
-        run.mark(mark, now_ms);
-        self.set_activity(id, Some(Activity::Calibrating(run)))
     }
 
     /// End a run and store what it measured. Transmits nothing — the traverse is
