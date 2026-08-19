@@ -19,7 +19,8 @@
 //! the same namespace — see [`crate::ConfigError::Overlap`].
 
 use crate::entity::{
-    ButtonDiscovery, Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, ShadeTopic,
+    ButtonDiscovery, CalibrationDiscovery, Component, CoverDiscovery, DeviceEntity,
+    DiagnosticDiscovery, ShadeTopic,
 };
 use crate::error::{ConfigError, Field};
 use crate::ident::{
@@ -329,6 +330,32 @@ impl MqttConfig {
             // Assistant domain (`button.` rather than `cover.`).
             object_id: ObjectId::for_shade(shade),
             unique_id: UniqueId::for_shade(&self.device_id, Component::Button, shade),
+            name,
+            device_id: self.device_id.as_str(),
+            configuration_url: self.configuration_url(),
+        }
+    }
+
+    /// The `sensor` discovery config for one shade's calibration state.
+    ///
+    /// Takes no `has_tilt` for the reason [`MqttConfig::button_discovery`] does
+    /// not: the topic it names exists on every shade. The tilt time has its own
+    /// provenance in the domain and is deliberately *not* folded into this
+    /// state — see `crate::CalibrationState`, whose subject is the two travel
+    /// times the position estimate is computed from.
+    pub fn calibration_discovery<'a>(
+        &'a self,
+        shade: ShadeId,
+        name: &'a str,
+    ) -> CalibrationDiscovery<'a> {
+        CalibrationDiscovery {
+            base: self.shade_base(shade),
+            availability: self.availability_topic(),
+            // The same object id the cover and the button use, and distinct for
+            // the same reason: `sensor.` is a third Home Assistant domain, and
+            // the component is a separate segment of the discovery topic.
+            object_id: ObjectId::for_shade(shade),
+            unique_id: UniqueId::for_shade(&self.device_id, Component::Sensor, shade),
             name,
             device_id: self.device_id.as_str(),
             configuration_url: self.configuration_url(),

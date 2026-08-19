@@ -98,12 +98,21 @@ pub const OFFLINE: &[u8] = b"offline";
 ///   every time it is pressed, and reports nothing because there is nothing
 ///   to report (RTS is one-way).
 ///
+/// - `Sensor` is where the shade's travel times came from
+///   ([`crate::CalibrationState`]). It is per-shade because it is the one thing
+///   here that explains the cover's own number: a position is
+///   `elapsed / travel_time`, and a shade still carrying the travel times it was
+///   born with reports a position that is fiction. A device-level count would
+///   answer "how many are wrong"; this sits in the same card as the entity it is
+///   about, which is what R7 asks for.
+///
 /// R7's fuller entity set is device-level, and [`DeviceEntity`] carries it.
 ///
 /// **This is the set a shade *can* own, and the set a retirement clears.** What
 /// one shade actually owns is [`Pairing::components`], which is a subset — see
 /// that type for why the two halves are deliberately no longer symmetric.
-pub const SHADE_COMPONENTS: [Component; 2] = [Component::Cover, Component::Button];
+pub const SHADE_COMPONENTS: [Component; 3] =
+    [Component::Cover, Component::Button, Component::Sensor];
 
 /// Whether a shade is offered a pairing button.
 ///

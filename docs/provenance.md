@@ -265,6 +265,7 @@ Two things still hold here:
 
 | Secrets are **write-only over the API**: no outbound type has a field a passphrase or a broker password could be written into | `somfy-api/src/settings.rs` (`WifiSettingsDto::psk_set`, `MqttSettingsDto::password_set`) | **The reference, as a counter-example, and it is the sharpest one in this document.** It returns both in the clear to unauthenticated callers: `WifiSettings::toJSON` emits `passphrase` (`src/ConfigSettings.cpp:637`), `MQTTSettings::toJSON` emits `password` (`src/ConfigSettings.cpp:351`), `/getSecurity` returns the admin password *and* the PIN (`src/ConfigSettings.cpp:572`), and `/scanaps` hands the Wi-Fi passphrase back inside a scan result (`src/Web.cpp:2265`). Its `Web::isAuthenticated` is defined and **never called** — authentication is enforced only in the browser's own JavaScript — and `server.enableCORS(true)` (`src/Web.cpp:1139`) makes all of it readable from any page a LAN browser visits. Design spec §7.3 names this screen as the moment an open API stops being an actuation risk and becomes a credential-disclosure one; this is what was done about it short of authentication, which the owner has deferred | Host-tested from both sides: `somfy-api/tests/settings.rs::a_full_settings_response_contains_neither_secret` serialises a fully-populated response built from distinctive secret values and asserts neither appears in the bytes, and `tests/ts_export.rs::no_settings_type_the_device_sends_has_a_field_a_secret_could_go_in` asserts the same of the *generated TypeScript*, so a field added later fails the contract the UI compiles against. Confirmed in a browser against the mock: `GET /api/v1/settings` answered `{"wifi":{"ssid":"example-other","pskSet":true},...,"passwordSet":true,...}` |
 | A rejection carries the **rule** and the **field** as two values, not one code per pair | `somfy-api/src/errors.rs` (`ApiErrorCode`, `SettingsFieldDto`, `ApiErrorDto::field`) | Requirements spec R3 — "refused at the point of entry with the field named" — read as pointing at the input rather than as a sentence. Eight settings fields against a dozen rules is ninety-six codes, most of which would read identically in both languages | Host-tested by `somfy-api/tests/settings.rs::every_wifi_rejection_names_its_field` and `every_mqtt_rejection_names_its_field` (twenty-one cases, including the three namespace combinations the reference could not escape). The wire form is pinned by `a_rejection_that_is_not_about_a_field_serialises_exactly_as_it_always_did`, so every pre-settings response is byte-identical |
+| The calibration endpoint's hand-written `Deserialize` is now parsed by the **device's own JSON driver** in tests, not only by `serde_json` | `somfy-api/tests/calibration.rs`, and the `serde-json-core` dev-dependency in `somfy-api/Cargo.toml` | Not derived. `POST /shades/{id}/calibrate` had been built, exported to TypeScript, modelled in the mock and rendered by the web UI, and **no Rust parser had ever seen a byte of it** — `tests/ts_export.rs` checks what `ts-rs` generates, which is a statement about `ts-rs`. The impl is hand-written to keep the firmware allocator-free (serde's internally-tagged deriving buffers into a `Content` value), so the two `missing_field` arms are typed code rather than derived code, and one of them is the whole difference between a refused request and a shade driven the wrong way across its range. `serde-json-core` is what picoserve's `Json` extractor is built on, so it is the only reader whose opinion decides whether the owner's first run reaches the domain | Both drivers, from one table, over the exact bytes `ui/src/api/client.ts` puts on the wire. Guards proved to fire by defaulting the missing `leg` to `Up`, by transposing `to_domain`, and by dropping the camelCase rename — each observed red, then restored |
 | `SETTINGS_JSON_MAX_BYTES` = **896**, from a measured worst case of 859 | `somfy-api/src/settings.rs` | Not derived. Measured the way `SHADE_JSON_MAX_BYTES` is, and for the same reason that figure exists: it was hand-counted once at 512 and was wrong by 160 bytes. The settings document is wider than a shade because three of its strings can hold arbitrary text — an SSID is whatever an access point broadcasts, a broker username whatever the broker was configured with — and control characters escape six bytes at a time | Host-tested from both sides by `the_settings_document_never_serialises_wider_than_the_declared_bound`: never under the bound, and never more than 128 bytes over it. An ordinary document is 204 bytes, pinned separately |
 
 ## somfy-cc1101
@@ -589,6 +590,74 @@ above, which exists for the C++ reference and its prose-searchable names.
    unsupported key is **dropped without a word** and the entity appears missing
    whatever that key carried. That is the failure mode to fear, and it is why
    every key this crate emits appears in the table above.
+
+### Calibration in Home Assistant — reported, never run
+
+**The per-shade `sensor` carrying `somfy_mqtt::CalibrationState` is the whole of
+what Home Assistant gets. There is deliberately no calibrate button and no
+calibration form.**
+
+The position-accuracy spec's R7 is a MUST and asks for a factory-default travel
+time to be surfaced as *uncalibrated* "in the import summary, in the API, and
+wherever the UI shows a shade's timings". Home Assistant shows something worse
+than the timings: it shows a **position computed from them**. On 2026-08-17
+three shades carried the reference firmware's compiled-in 10 s defaults, a
+request for 25% open moved one about 1%, and the cover entity reported 25%
+throughout. Nothing on the broker said otherwise.
+
+**Why the identity is free here, where a second per-shade button's is not.** An
+entity's identity is `(device, component, shade id)` —
+`somfy_mqtt::UniqueId::for_shade` takes the component — so a shade may own one
+entity per component and no more. That is why the vent command rides the cover's
+command topic as a fourth payload (`crates/firmware/src/mqtt.rs`, the
+`OPEN`/`CLOSE`/`STOP`/`VENT` decode) and why the add-a-shade form is
+device-level. `sensor` was the one component a shade did not already own.
+
+**Why the procedure is not offered, which is the part worth recording.**
+
+- **The measurement is a timed sequence and this surface cannot express one.**
+  Its entire content is which moments the operator reports and in what order. The
+  add-a-shade form survives MQTT because its steps are order-free and idempotent
+  — a name, a kind, two numbers, then Create. Here every control would be visible
+  and pressable at all times, in whatever order Home Assistant laid the card out,
+  with no way to disable one. "It has stopped" before "Start" is not a mis-tap to
+  correct, and "Start" twice is a shade driven across its whole range twice.
+- **The marks are optional and their absence is meaningful.** Skipping one leaves
+  that value as it was, which is better than a worse one. A row of
+  always-pressable buttons invites pressing all of them, and a wrong
+  slat-separation band is worse than none — it is what the vent command aims at.
+  The device can refuse an *implausible* run; it cannot refuse a plausible one
+  measured at the wrong instants.
+- **Hand entry fails on a sharper point.** The six figures are bound by one
+  constraint that spans them — a start lag and a dead band are *parts of* their
+  direction's travel time, so together they must leave some travel behind them
+  (`ShadeConfig::checked_bands`) — and separate `number` entities cannot express
+  a constraint that spans entities. Home Assistant would accept a band longer
+  than its traverse, the device would refuse it, and the operator would watch a
+  field snap back with no explanation.
+
+What is left is the loop `DeviceEntity::AwaitingSetup` already draws, for a
+second kind of unfinished business: Home Assistant says a shade's position is
+computed from numbers nobody chose, and the device block's `configuration_url`
+links to the assistant that fixes it — which validates all six together and shows
+one control at a time.
+
+**Reuse:** no new evaluation was opened. The field for Home Assistant discovery
+payload crates was swept exhaustively for the add-a-shade form (`CLAUDE.md`, the
+`text`/`number`/`select` row) and every candidate was eliminated on `no_std`,
+licence, or a missing topic builder — including the two that model `sensor`
+(`hamqtt` needs a heap and hardcodes both prefix and component; `hass-mqtt-discovery`
+is `std` and contains no discovery-topic construction at all). This change adds a
+variant to an enum and a payload builder beside three that already exist.
+
+| Item | Where it lives now | Derived from | Verified |
+|---|---|---|---|
+| `sensor` joins `SHADE_COMPONENTS`, so the entity is announced and retired by the same array | `somfy-mqtt/src/lifecycle.rs::SHADE_COMPONENTS` | Not derived. The R5 containment rule this crate already had | `somfy-mqtt/tests/calibration_sensor.rs::announcing_the_sensor_makes_it_removable`, and `the_state_is_retained_and_cleared_with_the_shade` |
+| The state is the **worst** of the two travel times' provenances; the tilt time is not an input | `somfy-mqtt/src/entity.rs::CalibrationState::of` | Not derived. The two travel times are measured independently and never mirrored (30 s up / 27 s down on this estate), so half a calibration must not read as a whole one. Tilt is excluded because `HAS_TILT` is `false` — see the R8 deviation below — and folding in a provenance nothing acts on would report every shade uncalibrated forever | `the_state_is_the_worst_of_the_two_travel_times`, exhaustive over all nine pairs |
+| Plain `sensor`: no `device_class`, `state_class`, `unit_of_measurement` or `options` | `somfy-mqtt/src/entity.rs::CalibrationDiscovery::write_into` | **Deliberately not** `device_class: "enum"`, which is the shape the feature exists for. That combination has rules (`options` required, `state_class` forbidden) which were **not** read against Home Assistant's source here, and getting them wrong makes Home Assistant discard the whole payload — the entity never appears, with no message. The plain shape is what `SetupEntity::NextStep` already publishes | `the_payload_is_the_plain_diagnostic_shape`. **Revisit** with the schema cited, if the three states ever want translating or validating on Home Assistant's side |
+| The three state strings are a wire format | `somfy-mqtt/src/entity.rs::CalibrationState::as_str` | Not derived. Same standing as `kind_label`'s option strings: Home Assistant publishes an entity's state verbatim and an automation compares against it | `every_calibration_state_is_distinct_and_fits`, against `MAX_STATE_LEN` |
+| A shade this broker session has not been told about publishes **nothing** rather than a placeholder | `crates/firmware/src/inventory.rs::Entry::calibration` | Not derived. The rule `Diagnostics::reading` and `Known::seen` already follow | The boot seed in `Inventory::snapshot` means this window exists only between `ShadeEvent::Added` and the `Calibration` that follows it |
+| `RETIRE_STEPS` / `ANNOUNCE_STEPS` now have the compile-time checks their own docs claimed | `crates/firmware/src/mqtt.rs` | Not derived. `heapless`'s `collect` **truncates**, so an overflow is a silently shorter plan — a retained config nothing clears, which is the R5 failure rather than anything that looks like a bug. Both were claimed and never written; the third `SHADE_COMPONENTS` member is what made them worth having | Each proved to fire by lowering it and observing the build refuse, then restoring |
 
 ### Deliberate deviation from R8 (tilt)
 

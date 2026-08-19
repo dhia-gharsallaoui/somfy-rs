@@ -91,10 +91,11 @@ use somfy_domain::{
     Direction, Pos, ShadeCommand, ShadeId, StateDelta, TiltMode, FACTORY_TILT_TIME_MS, MAX_SHADES,
 };
 use somfy_mqtt::{
-    reconfigure, Ask, Component, ConfigError, ConfigurationUrl, DeviceEntity, DeviceId,
-    DiscoveryPrefix, Effect, FormChange, MqttConfig, NodeId, Pairing, Payload, PublishedTopic,
-    Retention, Setup, SetupEntity, SetupInput, SetupMessage, SetupValue, ShadeTopic, StateRoot,
-    Step, MAX_DRAFT_NAME_LEN, MAX_KIND_LABEL_LEN, PAYLOAD_CAPACITY,
+    reconfigure, Ask, CalibrationState, Component, ConfigError, ConfigurationUrl, DeviceEntity,
+    DeviceId, DiscoveryPrefix, Effect, FormChange, MqttConfig, NodeId, Pairing, Payload,
+    PublishedTopic, Retention, Setup, SetupEntity, SetupInput, SetupMessage, SetupValue,
+    ShadeTopic, StateRoot, Step, TopicRole, MAX_DRAFT_NAME_LEN, MAX_KIND_LABEL_LEN,
+    PAYLOAD_CAPACITY,
 };
 use somfy_tasks::{Backoff, ControlCommand};
 
@@ -312,15 +313,65 @@ pub struct Broker {
 /// `somfy_mqtt::SHADE_COMPONENTS`, plus one per published topic.
 ///
 /// Collected rather than walked lazily, because the plan borrows the config and
-/// each step needs `&mut self` to execute. Ten is comfortably above the seven
+/// each step needs `&mut self` to execute. Ten is comfortably above the eight
 /// the current entity set produces, and a plan that outgrew it would silently
-/// clear fewer topics than it announced — so the assertion below is the check
-/// rather than the constant.
+/// clear fewer topics than it announced — `heapless`'s `collect` **truncates**,
+/// so an overflow here is not a panic, it is the retained orphan R5 exists to
+/// prevent. The assertion below is the check rather than the constant.
 const RETIRE_STEPS: usize = 10;
 
 /// Steps one shade's announcement costs: a discovery config per component it
-/// owns, plus one subscription per command topic.
+/// owns, plus one subscription per command topic. Seven today; same truncation
+/// hazard, same check below.
 const ANNOUNCE_STEPS: usize = 10;
+
+/// How many of a shade's topics the firmware publishes to.
+///
+/// Derived from `somfy_mqtt::ShadeTopic` rather than counted by hand, so a topic
+/// added there moves the bound with it. Counted for a **tilt-capable** shade,
+/// because that is what `retire_shade` clears: a retirement never asks whether a
+/// shade had tilt, since clearing a topic that was never published costs one
+/// packet and missing one leaves it on the broker forever.
+const PUBLISHED_SHADE_TOPICS: usize = count_shade_topics(TopicRole::Published);
+
+/// How many of a shade's topics the firmware subscribes to. Same derivation.
+const SUBSCRIBED_SHADE_TOPICS: usize = count_shade_topics(TopicRole::Subscribed);
+
+const fn count_shade_topics(role: TopicRole) -> usize {
+    let mut i = 0;
+    let mut count = 0;
+    while i < ShadeTopic::ALL.len() {
+        // `matches!` rather than `==`: a derived `PartialEq` is not callable in a
+        // `const fn`, and this has to be one — it is a term in the assertions
+        // below, which exist precisely so nobody has to run anything to find out.
+        let same = matches!(
+            (ShadeTopic::ALL[i].role(), role),
+            (TopicRole::Published, TopicRole::Published)
+                | (TopicRole::Subscribed, TopicRole::Subscribed)
+        );
+        if same {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+// The two checks the constants above claim to have. They were claimed and never
+// written, which mattered the moment `SHADE_COMPONENTS` grew a third member: a
+// plan that outgrows its buffer is silently *shorter*, so the failure would have
+// been a discovery config nothing ever cleared rather than anything that looked
+// like a bug.
+const _: () = assert!(
+    RETIRE_STEPS >= somfy_mqtt::SHADE_COMPONENTS.len() + PUBLISHED_SHADE_TOPICS,
+    "RETIRE_STEPS is too small for one shade's retirement, so `collect` would \
+     truncate it and leave retained topics on the broker",
+);
+const _: () = assert!(
+    ANNOUNCE_STEPS >= somfy_mqtt::SHADE_COMPONENTS.len() + SUBSCRIBED_SHADE_TOPICS,
+    "ANNOUNCE_STEPS is too small for one shade's announcement, so `collect` \
+     would truncate it and leave an entity unpublished or a topic unsubscribed",
+);
 
 /// Steps the add-a-shade form's announcement or retirement costs.
 ///
@@ -1142,6 +1193,18 @@ impl Broker {
                     self.publish_reading(&mut connection, DeviceEntity::AwaitingSetup, commands)
                         .await?;
                 }
+                // A reading changing on an entity that already exists, so this
+                // costs one retained publish rather than a re-announcement —
+                // see `ShadeEvent::Calibration`. Sent at once rather than at the
+                // next reconnect: an operator who has just finished a guided
+                // measurement is looking at the shade, and "measured" arriving
+                // days later is indistinguishable from it not having worked.
+                Some(Woken::Shade(ShadeEvent::Calibration { id, up, down })) => {
+                    self.inventory
+                        .set_calibration(id, CalibrationState::of(up, down));
+                    self.publish_calibration(&mut connection, id, commands)
+                        .await?;
+                }
                 Some(Woken::Delta(delta)) => {
                     self.known.record(&delta);
                     for state in self.known.of(delta.id) {
@@ -1207,8 +1270,34 @@ impl Broker {
                 ));
                 self.perform_one(connection, &publish, commands).await?;
             }
+            self.publish_calibration(connection, id, commands).await?;
         }
         Ok(())
+    }
+
+    /// One shade's calibration state, retained.
+    ///
+    /// **Not part of [`Known`]**, and the split is the point: `Known` holds what
+    /// the *deltas* said — a position and a direction that move every second a
+    /// shade is running — while this is a fact about the shade **table**, which
+    /// moves twice in a shade's lifetime. They arrive on different channels for
+    /// that reason, and a session that has been told neither publishes neither.
+    ///
+    /// A shade this session has not been told about publishes **nothing** rather
+    /// than a placeholder, the same rule [`Broker::publish_reading`] follows.
+    async fn publish_calibration<'buf, IO: minimq::Io>(
+        &mut self,
+        connection: &mut minimq::Connection<'_, 'buf, IO>,
+        id: ShadeId,
+        commands: &CommandSender,
+    ) -> Result<(), SessionEnd> {
+        let Some(state) = self.inventory.calibration(id) else {
+            return Ok(());
+        };
+        let topic = PublishedTopic::of(ShadeTopic::Calibration)
+            .expect("a shade's calibration state is a topic the firmware publishes");
+        let publish = Step::Send(self.config.state(id, topic, state.as_str().as_bytes()));
+        self.perform_one(connection, &publish, commands).await
     }
 
     /// The controller's own readings, retained, one per [`DeviceEntity`].
@@ -1709,7 +1798,7 @@ impl Broker {
         commands: &CommandSender,
     ) -> Result<(), SessionEnd> {
         // Collected first because the plan borrows `self.config` and
-        // `perform_one` takes `&mut self`. A shade's retirement is seven steps.
+        // `perform_one` takes `&mut self`. A shade's retirement is eight steps.
         let steps: Vec<Step<'static>, RETIRE_STEPS> = self.config.retire_shade(id).collect();
         for step in &steps {
             self.perform_one(connection, step, commands).await?;
@@ -1792,13 +1881,14 @@ fn pairing_of(bits: u32, id: ShadeId) -> Pairing {
 /// operation with `InflightExhausted`, and then does the same on every
 /// reconnect, at the backoff ceiling, forever.
 ///
-/// An announcement costs `1 + 5N + k` operations for `N` shades and the `k = 6`
+/// An announcement costs `1 + 6N + k` operations for `N` shades and the `k = 6`
 /// entries of `DeviceEntity::ALL` — `online`, then per shade a discovery config
-/// for each entry of `somfy_mqtt::SHADE_COMPONENTS` (a cover and a pairing
-/// button) and one subscription per command topic (direction, target, pair),
-/// then one discovery config per device entity. The firmware follows it with
-/// `N` names, `2N` state publishes and `k` readings, so a fresh session costs
-/// `1 + 8N + 2k` in all. **That is eleven with no shades provisioned at all** —
+/// for each entry of `somfy_mqtt::SHADE_COMPONENTS` (a cover, a pairing button
+/// and a calibration sensor) and one subscription per command topic (direction,
+/// target, pair), then one discovery config per device entity. The firmware
+/// follows it with `N` names, `2N` state publishes, `N` calibration states and
+/// `k` readings, so a fresh session costs `1 + 10N + 2k` in all.
+/// **That is eleven with no shades provisioned at all** —
 /// the ordinary state of a freshly flashed board — where in Task 3 the same
 /// burst was `1 + 6N` and needed two shades to exceed eight. The plan alone
 /// crosses eight at one shade.
@@ -1972,6 +2062,7 @@ async fn execute<'buf, IO: minimq::Io>(
                         .cover_discovery(shade, name, HAS_TILT)
                         .render(payload),
                     Component::Button => config.button_discovery(shade, name).render(payload),
+                    Component::Sensor => config.calibration_discovery(shade, name).render(payload),
                     // A shade owns an entity of each member of
                     // `SHADE_COMPONENTS`, and every member has an arm above, so
                     // this is unreachable. It is reported loudly rather than

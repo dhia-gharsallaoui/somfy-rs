@@ -397,6 +397,14 @@ pub enum ShadeTopic {
     /// `None` here and `tests/pair_button.rs` pins that no two topics claim one
     /// key.
     Pair,
+    /// Where the shade's travel times came from — see [`CalibrationState`].
+    ///
+    /// Carried by no key in the **cover** payload, for the same reason
+    /// [`ShadeTopic::Pair`] is not: [`ShadeTopic::State`] already claims
+    /// `state_topic` there, and a second topic claiming it would write the key
+    /// twice into one payload. [`CalibrationDiscovery`] names this topic
+    /// itself, exactly as [`ButtonDiscovery`] names the pairing one.
+    Calibration,
     /// Current tilt, where the shade has a tilt axis.
     TiltStatus,
     /// Tilt commands, where the shade has a tilt axis.
@@ -406,13 +414,14 @@ pub enum ShadeTopic {
 impl ShadeTopic {
     /// Every topic, in publish order. Tilt topics are last so that the set for
     /// a non-tilt shade is a prefix of the set for a tilt-capable one.
-    pub const ALL: [ShadeTopic; 8] = [
+    pub const ALL: [ShadeTopic; 9] = [
         ShadeTopic::Position,
         ShadeTopic::State,
         ShadeTopic::Name,
         ShadeTopic::Command,
         ShadeTopic::SetPosition,
         ShadeTopic::Pair,
+        ShadeTopic::Calibration,
         ShadeTopic::TiltStatus,
         ShadeTopic::TiltCommand,
     ];
@@ -435,6 +444,7 @@ impl ShadeTopic {
             ShadeTopic::Command => &["direction", "set"],
             ShadeTopic::SetPosition => &["target", "set"],
             ShadeTopic::Pair => &["pair", "set"],
+            ShadeTopic::Calibration => &["calibration"],
             ShadeTopic::TiltStatus => &["tilt"],
             ShadeTopic::TiltCommand => &["tilt", "set"],
         }
@@ -446,6 +456,7 @@ impl ShadeTopic {
             ShadeTopic::Position
             | ShadeTopic::State
             | ShadeTopic::Name
+            | ShadeTopic::Calibration
             | ShadeTopic::TiltStatus => TopicRole::Published,
             ShadeTopic::Command
             | ShadeTopic::SetPosition
@@ -466,6 +477,10 @@ impl ShadeTopic {
             // second `command_topic` here would be written twice into one cover
             // payload.
             ShadeTopic::Pair => None,
+            // Same rule, one key along: `ShadeTopic::State` already claims
+            // `state_topic` in the cover payload, so the calibration sensor
+            // names its own — see the variant's docs.
+            ShadeTopic::Calibration => None,
             ShadeTopic::TiltStatus => Some("tilt_status_topic"),
             ShadeTopic::TiltCommand => Some("tilt_command_topic"),
         }
@@ -731,6 +746,246 @@ impl ButtonDiscovery<'_> {
         // built from — see [`ShadeTopic::Pair`].
         write(out, ",\"command_topic\":\"~")?;
         for segment in ShadeTopic::Pair.segments() {
+            write(out, "/")?;
+            write(out, segment)?;
+        }
+        write(out, "\"")?;
+
+        write(out, "}")
+    }
+}
+
+/// What a calibration sensor is called, after the shade's own name.
+///
+/// A suffix, for the reason [`PAIR_NAME_SUFFIX`] is one: Home Assistant shows
+/// the entity name beside the *device* name, so thirty-two shades would
+/// otherwise present thirty-two entities called "Calibration".
+const CALIBRATION_NAME_SUFFIX: &str = " calibration";
+
+/// Where one shade's travel times came from, as Home Assistant reads it.
+///
+/// # Why Home Assistant is told this at all
+///
+/// Because Home Assistant is where the consequence lands. The cover reports a
+/// position, that position is `elapsed / travel_time`, and on 2026-08-17 three
+/// shades were found carrying the reference firmware's compiled-in 10 s
+/// defaults — so a request for 25% open moved a shade about 1% and the cover
+/// entity reported 25% throughout. R7 of the position-accuracy requirements is
+/// a MUST and names "wherever the UI shows a shade's timings"; Home Assistant
+/// shows a number *computed from* them, which is worse, and until now said
+/// nothing.
+///
+/// # These three strings are a wire format
+///
+/// Home Assistant publishes an entity's state verbatim and an automation
+/// compares against it, so changing one of these breaks somebody's automation
+/// in a way nothing here can detect — the same standing this crate already
+/// gives `crate::kind_label`'s option strings. They are also short by
+/// obligation: a `sensor` with no `device_class` runs its state through Home
+/// Assistant's `check_state_too_long`, which replaces an over-long value with
+/// `unknown` rather than truncating it (`crate::MAX_STATE_LEN`).
+///
+/// There is deliberately **no `device_class: "enum"`** and no `options` list,
+/// although this is exactly the shape that feature is for. A sensor carrying
+/// `enum` must also carry `options` and must *not* carry `state_class`, and
+/// getting that combination wrong makes Home Assistant discard the whole
+/// discovery payload — the entity simply never appears, which is the failure
+/// `crate::ConfigurationUrl` was written after. The plain shape below is the
+/// one `crate::SetupEntity::NextStep` already publishes and this device has
+/// already been observed to render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationState {
+    /// At least one travel time is still the value the shade was born with.
+    ///
+    /// The **worst** of the three wins, and that is the point: a shade whose Up
+    /// was measured and whose Down was never touched reports as uncalibrated,
+    /// because half a calibration is what produces a position that is right in
+    /// one direction and wrong in the other.
+    NotCalibrated,
+    /// Every travel time was chosen by an operator, and none was measured.
+    EnteredByHand,
+    /// Every travel time came from a guided run on this device.
+    Measured,
+}
+
+impl CalibrationState {
+    /// Every state, so a reader can enumerate them without a second list.
+    pub const ALL: [CalibrationState; 3] = [
+        CalibrationState::NotCalibrated,
+        CalibrationState::EnteredByHand,
+        CalibrationState::Measured,
+    ];
+
+    /// Bytes the longest state occupies.
+    pub const MAX_LEN: usize = longest_calibration_state();
+
+    /// The literal Home Assistant shows and an automation compares against.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CalibrationState::NotCalibrated => "not calibrated",
+            CalibrationState::EnteredByHand => "entered by hand",
+            CalibrationState::Measured => "measured",
+        }
+    }
+
+    /// The state one shade reports, from the provenance of its two travel times.
+    ///
+    /// # Why the worst of the two wins
+    ///
+    /// Because the position estimate uses both, and it is wrong as soon as
+    /// either is. The two are measured **independently and never mirrored** —
+    /// on the estate this came from, up takes 30 s and down 27 s, because
+    /// closing is gravity-assisted — so a shade whose Up was measured and whose
+    /// Down was never touched has a position that is right on the way up and a
+    /// tenth out on the way down. Reporting that as "measured" would be the
+    /// half-truth this entity exists to end.
+    ///
+    /// # Why the tilt time is not one of the inputs
+    ///
+    /// It is a different axis, and this device does not expose it: the cover's
+    /// discovery payload carries no tilt topics, because a tilt control backed
+    /// by nothing reads as a device fault. Folding a provenance nothing acts on
+    /// into this state would report every shade as uncalibrated forever.
+    pub const fn of(
+        up: somfy_domain::CalibrationSource,
+        down: somfy_domain::CalibrationSource,
+    ) -> CalibrationState {
+        use somfy_domain::CalibrationSource as Source;
+        match (up, down) {
+            (Source::FactoryDefault, _) | (_, Source::FactoryDefault) => {
+                CalibrationState::NotCalibrated
+            }
+            (Source::OperatorSupplied, _) | (_, Source::OperatorSupplied) => {
+                CalibrationState::EnteredByHand
+            }
+            (Source::Measured, Source::Measured) => CalibrationState::Measured,
+        }
+    }
+}
+
+const fn longest_calibration_state() -> usize {
+    let mut i = 0;
+    let mut max = 0;
+    while i < CalibrationState::ALL.len() {
+        let len = CalibrationState::ALL[i].as_str().len();
+        if len > max {
+            max = len;
+        }
+        i += 1;
+    }
+    max
+}
+
+/// A `sensor` discovery config for one shade's calibration state, as data.
+///
+/// # Why a per-shade entity here, where a second per-shade *button* was refused
+///
+/// Because the identity is free. An entity's identity in this crate is
+/// `(device, component, shade id)` — [`crate::UniqueId::for_shade`] takes the
+/// component — so a shade may own one entity of each component and no more.
+/// That is why the vent command rides the cover's command topic as a fourth
+/// payload instead of becoming a second button, and why the add-a-shade form is
+/// device-level. `sensor` is the one component a shade did **not** already own,
+/// so this collides with nothing and needs no new dimension in the identity
+/// every retained discovery config on the broker is keyed by.
+///
+/// # Why this is not a device-level count
+///
+/// [`DeviceEntity::AwaitingSetup`] is a count, and its docs give the reason: an
+/// entity per pending shade would be a control on a motor that has never heard
+/// this controller. **That argument does not reach here.** A shade with a
+/// calibration sensor is one an operator has already reported working, and the
+/// sensor claims nothing about a motor — it reports where three numbers in this
+/// device's own table came from, which is a fact about the table.
+///
+/// And the value of per-shade *is* the point: a count in the diagnostics section
+/// answers "how many things are wrong", while this sits in the same card as the
+/// cover whose position it explains. That adjacency is what R7 asks for.
+///
+/// # Why it has no command topic
+///
+/// Nothing here is settable from Home Assistant, and the omission is
+/// deliberate. Correcting the numbers means entering three of them under one
+/// constraint — a start lag and a dead band are *parts of* their direction's
+/// travel time, so together they must leave some travel behind them — and
+/// separate `number` entities cannot express a constraint that spans them. Home
+/// Assistant would accept a band longer than its traverse, the device would
+/// refuse it, and the operator would see a field that snapped back with no
+/// explanation. The web UI validates all six together and the device page's
+/// `configuration_url` links straight to it.
+#[derive(Debug, Clone)]
+pub struct CalibrationDiscovery<'a> {
+    /// The payload's `~`: this shade's state base, absolute and with no leading
+    /// slash.
+    pub base: Topic,
+    /// Absolute, and under the state root. See [`CoverDiscovery::availability`]
+    /// for why it can never be under the discovery prefix.
+    pub availability: Topic,
+    /// The discovery topic's last segment before `config`.
+    pub object_id: ObjectId,
+    /// The identity Home Assistant remembers this entity by.
+    pub unique_id: UniqueId,
+    /// The shade's name. A "calibration" suffix is appended when the payload is
+    /// rendered, so the field holds what the user actually typed.
+    pub name: &'a str,
+    /// The stable device identifier, for the payload's `device` block.
+    pub device_id: &'a str,
+    /// Where a person goes to configure this controller, for the same block.
+    pub configuration_url: Option<&'a str>,
+}
+
+impl CalibrationDiscovery<'_> {
+    /// Render the JSON Home Assistant reads.
+    ///
+    /// On failure `out` is left empty, for the same reason
+    /// [`CoverDiscovery::render`] leaves it empty.
+    pub fn render(&self, out: &mut String<PAYLOAD_CAPACITY>) -> Result<(), PayloadError> {
+        out.clear();
+        match self.write_into(out) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                out.clear();
+                Err(e)
+            }
+        }
+    }
+
+    fn write_into(&self, out: &mut String<PAYLOAD_CAPACITY>) -> Result<(), PayloadError> {
+        if self.name.len() > MAX_NAME_LEN {
+            return Err(PayloadError::TooLong);
+        }
+        write(out, "{")?;
+
+        write(out, "\"~\":")?;
+        write_json_string(out, self.base.as_str())?;
+
+        write(out, ",\"availability_topic\":")?;
+        write_json_string(out, self.availability.as_str())?;
+
+        write_object_id(out, self.device_id, &self.object_id)?;
+
+        write(out, ",\"unique_id\":")?;
+        write_json_string(out, self.unique_id.as_str())?;
+
+        // Two pieces, both escaped — see [`ButtonDiscovery::write_into`].
+        write(out, ",\"name\":\"")?;
+        write_json_escaped(out, self.name)?;
+        write_json_escaped(out, CALIBRATION_NAME_SUFFIX)?;
+        write(out, "\"")?;
+
+        // `diagnostic`, not `config`: this is a reading rather than a control,
+        // and it belongs beside the controller's own diagnostics rather than on
+        // the room card next to the shade's open and close.
+        write(out, ",\"entity_category\":\"diagnostic\"")?;
+
+        write_device_block(out, self.device_id, self.configuration_url)?;
+
+        // Relative to `~`, from the same table the firmware publishes from —
+        // see [`ShadeTopic::Calibration`]. No `device_class`, `state_class` or
+        // `unit_of_measurement`: see [`CalibrationState`] for why the plain
+        // shape is the deliberate one.
+        write(out, ",\"state_topic\":\"~")?;
+        for segment in ShadeTopic::Calibration.segments() {
             write(out, "/")?;
             write(out, segment)?;
         }
@@ -1038,8 +1293,53 @@ const WORST_COVER_PAYLOAD_LEN: usize = WORST_COMMON_LEN
     + 8 + MAX_NAME_LEN * 6 + 2
     // "position_open":0,"position_closed":100
     + 40
-    // ,"<key>":"~<relative>" for every topic, keys bounded by the longest.
-    + ShadeTopic::ALL.len() * (6 + 18 + 1 + ShadeTopic::MAX_RELATIVE_LEN);
+    // ,"<key>":"~<relative>" for every topic the payload names.
+    + KEYED_SHADE_TOPICS * (6 + MAX_PAYLOAD_KEY_LEN + 1 + ShadeTopic::MAX_RELATIVE_LEN);
+
+/// How many of [`ShadeTopic::ALL`] a cover payload actually names.
+///
+/// Three do not, and each for a stated reason: [`ShadeTopic::Name`] is for
+/// somebody reading the broker directly, and [`ShadeTopic::Pair`] and
+/// [`ShadeTopic::Calibration`] are named by the entities that own them.
+///
+/// This used to be `ShadeTopic::ALL.len()` — a deliberately loose bound, and it
+/// stayed comfortable until a ninth topic pushed [`WORST_COVER_PAYLOAD_LEN`]
+/// past [`PAYLOAD_CAPACITY`] and the assertion below refused to compile.
+/// Counting what the payload writes is both the honest arithmetic and the
+/// self-maintaining one: a keyed topic added later raises the bound, and a
+/// keyless one costs nothing, which is what actually happens to the bytes.
+const KEYED_SHADE_TOPICS: usize = keyed_shade_topics();
+
+const fn keyed_shade_topics() -> usize {
+    let mut i = 0;
+    let mut count = 0;
+    while i < ShadeTopic::ALL.len() {
+        if ShadeTopic::ALL[i].payload_key().is_some() {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Bytes the longest discovery-payload key occupies (`set_position_topic`, 18).
+///
+/// Derived rather than written down, so a longer key raises the bound with it.
+const MAX_PAYLOAD_KEY_LEN: usize = longest_payload_key();
+
+const fn longest_payload_key() -> usize {
+    let mut i = 0;
+    let mut max = 0;
+    while i < ShadeTopic::ALL.len() {
+        if let Some(key) = ShadeTopic::ALL[i].payload_key() {
+            if key.len() > max {
+                max = key.len();
+            }
+        }
+        i += 1;
+    }
+    max
+}
 
 /// The `button` payload budget, proven the same way.
 const WORST_BUTTON_PAYLOAD_LEN: usize = WORST_COMMON_LEN
@@ -1050,6 +1350,19 @@ const WORST_BUTTON_PAYLOAD_LEN: usize = WORST_COMMON_LEN
     + 28
     // ,"command_topic":"~<relative>"
     + 18 + 1 + ShadeTopic::MAX_RELATIVE_LEN + 1;
+
+/// The per-shade calibration `sensor` budget, proven the same way.
+///
+/// The same shape as [`WORST_BUTTON_PAYLOAD_LEN`] with a longer suffix, a longer
+/// `entity_category` and a `state_topic` in place of the `command_topic`.
+const WORST_CALIBRATION_PAYLOAD_LEN: usize = WORST_COMMON_LEN
+    // "name":"<name><suffix>", with every byte of the name escaped to six. The
+    // suffix is a literal in printable ASCII, so the escaper cannot expand it.
+    + 8 + MAX_NAME_LEN * 6 + CALIBRATION_NAME_SUFFIX.len() + 2
+    // "entity_category":"diagnostic",
+    + 32
+    // ,"state_topic":"~<relative>"
+    + 16 + 1 + ShadeTopic::MAX_RELATIVE_LEN + 1;
 
 /// The diagnostic payload budget, proven the same way.
 ///
@@ -1077,4 +1390,13 @@ const _: () = assert!(
 const _: () = assert!(
     PAYLOAD_CAPACITY >= WORST_DIAGNOSTIC_PAYLOAD_LEN,
     "PAYLOAD_CAPACITY is too small for the longest diagnostic payload this crate can build",
+);
+const _: () = assert!(
+    PAYLOAD_CAPACITY >= WORST_CALIBRATION_PAYLOAD_LEN,
+    "PAYLOAD_CAPACITY is too small for the longest calibration payload this crate can build",
+);
+const _: () = assert!(
+    CalibrationState::MAX_LEN <= crate::setup::MAX_STATE_LEN,
+    "a calibration state is longer than Home Assistant will hold, so the entity \
+     would read `unknown` instead of saying what it knows",
 );

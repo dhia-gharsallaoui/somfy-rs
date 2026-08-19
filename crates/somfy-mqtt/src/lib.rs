@@ -126,7 +126,8 @@
 //!
 //! ## The entity set, and what decides its contents (R7)
 //!
-//! A cover per shade, and [`DeviceEntity::ALL`] for the controller itself —
+//! A cover and a [`CalibrationState`] sensor per shade, and
+//! [`DeviceEntity::ALL`] for the controller itself —
 //! uptime, Wi-Fi signal, free heap, peak heap use, the number of damaged slots
 //! in the rolling-code region, and how many shades are part-way through being
 //! set up. All six are marked `entity_category: diagnostic` so they do not
@@ -181,6 +182,47 @@
 //! the far side of the same seam. `configuration_url` still links to the web
 //! assistant, which remains the fuller of the two surfaces.
 //!
+//! ## Calibration is *reported* here and never *run* here
+//!
+//! [`CalibrationState`] is a per-shade `sensor`, and it is the whole of what
+//! Home Assistant gets. There is no calibrate button and no calibration form,
+//! and the omission is a decision rather than a gap.
+//!
+//! **The measurement is a timed sequence, and this surface cannot express one.**
+//! A guided run is: send the traverse, then tap at the moment the shade starts
+//! moving, then at the moment the curtain begins to rise, then at the moment it
+//! stops. Its entire content is *which* moments and *in what order*. The
+//! add-a-shade form works over MQTT because its steps are order-free and
+//! idempotent — a name, a kind, two numbers, then Create — and pressing them in
+//! the wrong order costs nothing. Here every control would be visible and
+//! pressable at all times, in whatever order Home Assistant chose to lay the
+//! card out, with no way to disable one and no way to say "not yet" except a
+//! 255-character line the operator has to notice has changed. "It has stopped"
+//! before "Start" is not a mis-tap to correct; "Start" pressed twice is a shade
+//! driven across its whole range twice.
+//!
+//! And the marks are **optional, with their absence meaningful**: skipping one
+//! leaves that value as it was, which is better than a worse one. A row of
+//! always-pressable buttons invites pressing all of them, and a wrong
+//! slat-separation band is worse than none — it is what the vent command aims
+//! at. The device can refuse an *implausible* run; it cannot refuse a plausible
+//! one measured at the wrong instants.
+//!
+//! **Hand entry is refused here for a smaller and sharper reason.** The six
+//! figures are bound by one constraint that spans them — a start lag and a dead
+//! band are *parts of* their direction's travel time, so together they have to
+//! leave some travel behind them — and separate `number` entities cannot express
+//! a constraint that spans entities. Home Assistant would accept a band longer
+//! than its traverse, the device would refuse it, and the operator would watch a
+//! field snap back with no explanation.
+//!
+//! What is left is the loop [`DeviceEntity::AwaitingSetup`] already draws and
+//! that this sensor completes for a second kind of unfinished business: Home
+//! Assistant says a shade's position is computed from numbers nobody chose, and
+//! the device page's `configuration_url` links to the assistant that fixes it —
+//! which validates all six together, shows one control at a time, and is served
+//! by this device on the same network to the same phone.
+//!
 //! ## What is deliberately not here
 //!
 //! - **Any network code.** A socket, a client, a reconnect schedule and a
@@ -208,8 +250,9 @@ mod validate;
 
 pub use config::MqttConfig;
 pub use entity::{
-    ButtonDiscovery, Component, CoverDiscovery, DeviceEntity, DiagnosticDiscovery, PayloadError,
-    ShadeTopic, TopicRole, MAX_NAME_LEN, PAYLOAD_CAPACITY,
+    ButtonDiscovery, CalibrationDiscovery, CalibrationState, Component, CoverDiscovery,
+    DeviceEntity, DiagnosticDiscovery, PayloadError, ShadeTopic, TopicRole, MAX_NAME_LEN,
+    PAYLOAD_CAPACITY,
 };
 pub use error::{ConfigError, Field};
 pub use flow::{
