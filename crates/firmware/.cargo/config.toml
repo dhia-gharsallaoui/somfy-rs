@@ -16,16 +16,11 @@ build-std = ["core", "alloc"]
 [env]
 ESP_LOG = "info"
 
-# esp-hal's `rt` feature (on by default) copies a per-chip `linkall.x` into
-# OUT_DIR and adds it to the linker search path, but building against a
-# single crate cache still needs each target told to actually load it — the
-# entry point and `_stack_start_cpu0`/`_stack_end_cpu0` symbols esp-hal
-# expects come from that script.
-[target.xtensa-esp32s3-none-elf]
-rustflags = ["-C", "link-arg=-Tlinkall.x"]
-
-[target.xtensa-esp32-none-elf]
-rustflags = ["-C", "link-arg=-Tlinkall.x"]
-
-[target.riscv32imc-unknown-none-elf]
-rustflags = ["-C", "link-arg=-Tlinkall.x"]
+# **No `-Tlinkall.x` here, and that is deliberate.** esp-hal's `rt` feature
+# copies a per-chip `linkall.x` into OUT_DIR and adds it to the linker search
+# path, and a target normally has to be told to load it. This crate instead
+# passes `-Tsomfy-link.x` from `build.rs`, which includes linkall.x's four
+# lines itself and inserts one output section — the heap — immediately before
+# esp-hal's `.stack`. Loading both scripts would define every memory region
+# twice and fail the link. See `build.rs::reserve_stack_and_heap` and
+# `src/heap.rs`.

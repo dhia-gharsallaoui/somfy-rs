@@ -592,7 +592,7 @@ pub enum Step {
 /// `#[embassy_executor::task]` allocates its future as a `static` whether or
 /// not it is ever spawned, and the one this replaced measured **864 bytes** —
 /// almost all of it the [`crate::rpc::Request`] its confirm call held. Those
-/// bytes come out of [`crate::heap::DRAM_FOR_STACK_AND_HEAP`], and so out of
+/// bytes come out of [`crate::heap::heap_region`], and so out of
 /// the Wi-Fi driver's heap, on every boot of every board including the ones
 /// that will never take an update. Here the whole thing is a synchronous call
 /// from an arm that already exists: it costs the executor's stack for the

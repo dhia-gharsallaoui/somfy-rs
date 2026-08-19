@@ -557,9 +557,9 @@ fn start(spawner: Spawner) -> Result<Booted, StartError> {
     // Before anything else can allocate. `esp-rtos` is built with `alloc`
     // support so that the Wi-Fi driver's task stacks have somewhere to come
     // from, and that is true on a board with no credentials as much as on one
-    // with them. See `heap::RADIO_HEAP_BYTES` for the size and where it came
-    // from — it is a static, so it comes out of the same DRAM as the stack
-    // `check_stack_headroom` measures below.
+    // with them. See `heap::heap_region` for where the size comes from — the
+    // linker hands it out of the same DRAM as the stack `check_stack_headroom`
+    // measures below, which is why the two are decided together.
     heap::install_for_radio();
     // After the heap is installed and before the stack check below: a chip
     // can pass the stack check and still have too little heap left for the
