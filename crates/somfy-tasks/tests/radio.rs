@@ -1,5 +1,10 @@
-//! The radio loop, driven on the host: real wall-remote captures in one
-//! direction, a recording transmitter in the other.
+//! The radio loop, driven on the host: a wall remote's measured pulse timing in
+//! one direction, a recording transmitter in the other.
+//!
+//! The fixtures replayed here carry a physical remote's timing under a payload
+//! this project substituted — the original encoded that remote's own address.
+//! What this file needs from them is the timing, which is intact; see
+//! `../../somfy-rts/tests/fixtures/README.md`.
 //!
 //! No hardware and no executor. [`somfy_rmt::ReplayPulseSource`] stands in for
 //! the RMT receiver and never pends, so `embassy_futures::block_on` completes
@@ -142,8 +147,8 @@ fn queued_frame(command: Command) -> Frame {
 }
 
 #[test]
-fn a_real_capture_replays_into_a_decoded_frame() {
-    let pulses = capture::load_fixture(FIXTURES, "up_56bit_1.pulses");
+fn a_capture_replays_into_a_decoded_frame() {
+    let pulses = capture::load_fixture(FIXTURES, "anonymised_up_56bit_1.pulses");
     let requests: Requests = Requests::new();
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
     let log = RefCell::new(Vec::new());
@@ -170,9 +175,9 @@ fn a_real_capture_replays_into_a_decoded_frame() {
 #[test]
 fn a_spent_source_reports_finished_once_its_frame_is_out() {
     for (name, expected) in [
-        ("up_56bit_1.pulses", Command::Up),
-        ("down_56bit_1.pulses", Command::Down),
-        ("my_56bit_1.pulses", Command::My),
+        ("anonymised_up_56bit_1.pulses", Command::Up),
+        ("anonymised_down_56bit_1.pulses", Command::Down),
+        ("anonymised_my_56bit_1.pulses", Command::My),
     ] {
         let pulses = capture::load_fixture(FIXTURES, name);
         let requests: Requests = Requests::new();
@@ -200,7 +205,7 @@ fn a_spent_source_reports_finished_once_its_frame_is_out() {
 /// until the state task catches up.
 #[test]
 fn a_full_frame_channel_drops_the_frame_and_reports_it() {
-    let pulses = capture::load_fixture(FIXTURES, "up_56bit_1.pulses");
+    let pulses = capture::load_fixture(FIXTURES, "anonymised_up_56bit_1.pulses");
     let requests: Requests = Requests::new();
     // Depth 1, already full.
     let frames: FrameChannel<NoopRawMutex, 1> = FrameChannel::new();
@@ -439,7 +444,7 @@ fn a_radio_that_will_not_key_returns_to_receiving() {
 /// as long as somebody kept talking.
 #[test]
 fn a_pending_transmission_pre_empts_a_waiting_pulse() {
-    let pulses = capture::load_fixture(FIXTURES, "up_56bit_1.pulses");
+    let pulses = capture::load_fixture(FIXTURES, "anonymised_up_56bit_1.pulses");
     let requests: Requests = Requests::new();
     queue_up(&requests, 0);
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();
@@ -544,7 +549,7 @@ fn an_unencodable_request_never_keys_the_radio() {
 /// what the RMT receiver's seam between transactions actually looks like.
 #[test]
 fn a_capture_split_across_two_sources_still_decodes() {
-    let pulses = capture::load_fixture(FIXTURES, "up_56bit_1.pulses");
+    let pulses = capture::load_fixture(FIXTURES, "anonymised_up_56bit_1.pulses");
     let split = pulses.len() / 2;
     let requests: Requests = Requests::new();
     let frames: FrameChannel<NoopRawMutex, 4> = FrameChannel::new();

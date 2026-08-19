@@ -47,6 +47,8 @@
 //! whoever is holding the file, and the image's own digest is for whoever is
 //! about to run it.
 
+mod anonymise;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -104,6 +106,13 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+
+    if command.as_deref() == Some("anonymise-capture") {
+        let parsed = parse_anonymise_args(args.collect())?;
+        println!("xtask: {}", anonymise::run(&parsed)?);
+        return Ok(());
+    }
+
     let mut publish = false;
     let mut skip_ui = false;
     let mut only: Vec<String> = Vec::new();
@@ -182,7 +191,60 @@ fn run() -> Result<(), String> {
 
 /// What to type.
 const USAGE: &str = "usage: cargo run -p xtask -- release [--chip <esp32s3>]... \
-                     [--out <dir>] [--skip-ui] [--publish]";
+                     [--out <dir>] [--skip-ui] [--publish]\n       \
+                     cargo run -p xtask -- anonymise-capture --in <file.pulses> \
+                     --out <file.pulses> --address <0x00C0DE> --rolling-code <n> \
+                     [--captured <YYYY-MM-DD>]";
+
+/// Arguments for `anonymise-capture`, kept here so `anonymise` stays about the
+/// pulse trains rather than about the command line.
+fn parse_anonymise_args(args: Vec<String>) -> Result<anonymise::Args, String> {
+    let mut input = None;
+    let mut output = None;
+    let mut address = None;
+    let mut rolling_code = None;
+    let mut captured = None;
+
+    let mut rest = args.into_iter();
+    while let Some(arg) = rest.next() {
+        let value = |rest: &mut std::vec::IntoIter<String>| {
+            rest.next().ok_or_else(|| format!("{arg} needs a value"))
+        };
+        match arg.as_str() {
+            "--in" => input = Some(value(&mut rest)?),
+            "--out" => output = Some(value(&mut rest)?),
+            "--captured" => captured = Some(value(&mut rest)?),
+            "--address" => {
+                let raw = value(&mut rest)?;
+                let trimmed = raw.trim_start_matches("0x").trim_start_matches("0X");
+                let parsed = u32::from_str_radix(trimmed, 16)
+                    .map_err(|_| format!("--address '{raw}' is not 24-bit hex"))?;
+                if parsed == 0 || parsed > 0xFF_FFFF {
+                    return Err(format!(
+                        "--address 0x{parsed:X} is not a usable 24-bit address"
+                    ));
+                }
+                address = Some(parsed);
+            }
+            "--rolling-code" => {
+                let raw = value(&mut rest)?;
+                rolling_code = Some(
+                    raw.parse::<u16>()
+                        .map_err(|_| format!("--rolling-code '{raw}' is not a 16-bit number"))?,
+                );
+            }
+            other => return Err(format!("unknown argument '{other}'\n\n{USAGE}")),
+        }
+    }
+
+    Ok(anonymise::Args {
+        input: input.ok_or("--in is required")?,
+        output: output.ok_or("--out is required")?,
+        address: address.ok_or("--address is required")?,
+        rolling_code: rolling_code.ok_or("--rolling-code is required")?,
+        captured: captured.unwrap_or_else(|| "an unrecorded date".to_string()),
+    })
+}
 
 /// One built, verified, hashed image.
 struct Image {

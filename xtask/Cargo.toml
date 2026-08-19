@@ -18,3 +18,8 @@ sha2 = { version = "0.11", default-features = false }
 # cannot reach a release. It is a `no_std` library and builds for the host
 # unchanged, which is what makes the reuse free rather than clever.
 somfy-ota = { path = "../crates/somfy-ota" }
+# `anonymise-capture` rewrites a captured pulse train's payload. It decodes the
+# original and re-encodes the replacement through the **shipping** engine, so
+# the frame it rewrites is the frame the golden tests read back, and a rewritten
+# capture that would not decode fails here rather than in CI.
+somfy-rts = { path = "../crates/somfy-rts" }
