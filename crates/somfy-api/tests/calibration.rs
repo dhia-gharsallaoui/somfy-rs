@@ -13,9 +13,9 @@
 //! hand-written rather than derived. It exists to keep the firmware
 //! allocator-free — serde's own internally-tagged deriving buffers the map into
 //! a `Content` value first — so the flat [`CalibrationStepDto`] wire shape is
-//! reassembled by code somebody typed, including the two `missing_field` arms
-//! that are the whole difference between a refused request and a shade driven
-//! the wrong way across its range.
+//! reassembled by code somebody typed, including the `missing_field` arm that is
+//! the whole difference between a refused request and a shade driven the wrong
+//! way across its range.
 //!
 //! # Both drivers, deliberately
 //!
@@ -31,8 +31,8 @@
 //! `CalibrationStepDto` union. They are pasted rather than constructed so that a
 //! change on either side has to be made twice, on purpose.
 
-use somfy_api::{CalibrationLegDto, CalibrationMarkDto, CalibrationStepDto};
-use somfy_domain::{CalibrationLeg, CalibrationMark};
+use somfy_api::{CalibrationLegDto, CalibrationStepDto};
+use somfy_domain::CalibrationLeg;
 
 /// Parse with both drivers and assert they agree with each other and with
 /// `expected`.
@@ -73,7 +73,7 @@ fn neither(json: &str) {
     );
 }
 
-/// The six bodies the web UI can send, byte for byte.
+/// The four bodies the web UI can send, byte for byte.
 #[test]
 fn every_step_the_ui_sends_parses_on_both_drivers() {
     let cases = [
@@ -87,18 +87,6 @@ fn every_step_the_ui_sends_parses_on_both_drivers() {
             r#"{"step":"begin","leg":"down"}"#,
             CalibrationStepDto::Begin {
                 leg: CalibrationLegDto::Down,
-            },
-        ),
-        (
-            r#"{"step":"mark","mark":"motionBegan"}"#,
-            CalibrationStepDto::Mark {
-                mark: CalibrationMarkDto::MotionBegan,
-            },
-        ),
-        (
-            r#"{"step":"mark","mark":"curtainMoved"}"#,
-            CalibrationStepDto::Mark {
-                mark: CalibrationMarkDto::CurtainMoved,
             },
         ),
         (r#"{"step":"finish"}"#, CalibrationStepDto::Finish),
@@ -123,24 +111,23 @@ fn begin_without_a_leg_is_refused() {
     neither(r#"{"step":"begin","leg":null}"#);
 }
 
-/// A `mark` with no moment is refused for the same reason in a smaller way:
-/// there is no moment to default to, and storing the wrong one silently is how a
-/// calibration comes to record nonsense.
-#[test]
-fn mark_without_a_moment_is_refused() {
-    neither(r#"{"step":"mark"}"#);
-    neither(r#"{"step":"mark","mark":null}"#);
-}
-
 /// Unknown tags and unknown values, both of which a mistyped client produces.
+///
+/// **`mark` is in this list deliberately, and it is the only entry that was once
+/// real.** It was a step until 2026-08-19, so a browser tab left open across the
+/// update, or a script somebody wrote against the old shape, can still send one
+/// — and what it must get back is a refusal. Accepting it and ignoring it would
+/// let a caller believe it had recorded a slat figure this device never stored,
+/// which is the failure mode the whole panel exists to prevent.
 #[test]
 fn unknown_steps_legs_and_marks_are_refused() {
     neither(r#"{"step":"measure"}"#);
     neither(r#"{"step":"begin","leg":"sideways"}"#);
-    neither(r#"{"step":"mark","mark":"itStopped"}"#);
+    neither(r#"{"step":"mark","mark":"motionBegan"}"#);
+    neither(r#"{"step":"mark","mark":"curtainMoved"}"#);
+    neither(r#"{"step":"mark"}"#);
     // The tag is camelCase on the wire; the Rust spelling is not accepted.
     neither(r#"{"step":"Begin","leg":"up"}"#);
-    neither(r#"{"step":"mark","mark":"MotionBegan"}"#);
 }
 
 /// A body with no `step` at all — the shape a `POST` with an empty object makes.
@@ -160,14 +147,12 @@ fn a_body_with_no_step_is_refused() {
 #[test]
 fn a_field_belonging_to_another_step_is_ignored() {
     both(
-        r#"{"step":"finish","leg":"up","mark":"motionBegan"}"#,
+        r#"{"step":"finish","leg":"up"}"#,
         CalibrationStepDto::Finish,
     );
     both(
-        r#"{"step":"begin","leg":"up","mark":"curtainMoved"}"#,
-        CalibrationStepDto::Begin {
-            leg: CalibrationLegDto::Up,
-        },
+        r#"{"step":"cancel","leg":"down"}"#,
+        CalibrationStepDto::Cancel,
     );
 }
 
@@ -181,29 +166,15 @@ fn the_tag_may_arrive_after_the_field_it_selects() {
             leg: CalibrationLegDto::Down,
         },
     );
-    both(
-        r#"{"mark":"curtainMoved","step":"mark"}"#,
-        CalibrationStepDto::Mark {
-            mark: CalibrationMarkDto::CurtainMoved,
-        },
-    );
 }
 
 /// The lowering onto the domain, exhaustively.
 ///
-/// Small, and it is the half that decides which direction a motor runs and which
-/// of three numbers a tap lands in — a transposition here would be invisible on
-/// the wire and visible only at a window.
+/// Two lines, and they decide which way a motor runs across its whole range — a
+/// transposition here would be invisible on the wire and visible only at a
+/// window.
 #[test]
-fn legs_and_marks_lower_onto_the_domain_without_transposing() {
+fn legs_lower_onto_the_domain_without_transposing() {
     assert_eq!(CalibrationLegDto::Up.to_domain(), CalibrationLeg::Up);
     assert_eq!(CalibrationLegDto::Down.to_domain(), CalibrationLeg::Down);
-    assert_eq!(
-        CalibrationMarkDto::MotionBegan.to_domain(),
-        CalibrationMark::MotionBegan
-    );
-    assert_eq!(
-        CalibrationMarkDto::CurtainMoved.to_domain(),
-        CalibrationMark::CurtainMoved
-    );
 }

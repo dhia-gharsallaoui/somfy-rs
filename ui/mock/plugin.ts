@@ -583,29 +583,30 @@ type CalibrationStep = CalibrationStepDto['step'];
  */
 const KNOWN_STEPS: Record<CalibrationStep, true> = {
   begin: true,
-  mark: true,
   finish: true,
   cancel: true,
 };
 
 /**
  * Shape-check an inbound calibration step, as `somfy-api`'s hand-written
- * `Deserialize` does: `begin` without a leg and `mark` without a mark are
- * malformed rather than defaulted — guessing a direction would drive a shade the
- * wrong way across its whole range.
+ * `Deserialize` does: `begin` without a leg is malformed rather than defaulted —
+ * guessing a direction would drive a shade the wrong way across its whole range.
+ *
+ * A `mark` step falls through to `undefined` here, which is the answer the
+ * device gives too. It was real until 2026-08-19, so a tab left open across the
+ * update can still send one, and a mock that quietly accepted it would let the
+ * UI be developed against a device that does not exist.
  */
 function parseCalibrationStep(value: unknown): CalibrationStepDto | undefined {
   if (typeof value !== 'object' || value === null) return undefined;
-  const { step, leg, mark } = value as { step?: unknown; leg?: unknown; mark?: unknown };
+  const { step, leg } = value as { step?: unknown; leg?: unknown };
   if (typeof step !== 'string' || !(step in KNOWN_STEPS)) return undefined;
 
   switch (step as CalibrationStep) {
     case 'begin':
       return leg === 'up' || leg === 'down' ? { step: 'begin', leg } : undefined;
-    case 'mark':
-      return mark === 'motionBegan' || mark === 'curtainMoved' ? { step: 'mark', mark } : undefined;
     default:
-      return { step: step as Exclude<CalibrationStep, 'begin' | 'mark'> };
+      return { step: step as Exclude<CalibrationStep, 'begin'> };
   }
 }
 
@@ -643,6 +644,24 @@ function parseCreateShade(value: unknown): CreateShadeDto | undefined {
   };
 }
 
+/** Every numeric field the generated {@link PatchShadeDto} carries. */
+type PatchableNumber = Exclude<keyof PatchShadeDto, 'name'>;
+
+/**
+ * The numeric half of {@link parsePatchShade}'s drift gate — see the argument
+ * there for why this is a total record and not an array.
+ */
+const PATCHABLE_NUMBERS: Record<PatchableNumber, true> = {
+  kind: true,
+  tiltMode: true,
+  upTimeMs: true,
+  downTimeMs: true,
+  tiltTimeMs: true,
+  startLagMs: true,
+  ventBandMs: true,
+  closeBandMs: true,
+};
+
 /**
  * Shape-check a patch body.
  *
@@ -652,6 +671,20 @@ function parseCreateShade(value: unknown): CreateShadeDto | undefined {
  * the create parser — and unknown keys are ignored rather than refused, which
  * is what keeps a client sending back a whole `ShadeDto` (address, id and all)
  * from being rejected outright while still not being able to change them.
+ *
+ * **That leniency is also how three fields went missing here for as long as
+ * they existed.** `startLagMs`, `ventBandMs` and `closeBandMs` were absent from
+ * the list below, so every patch carrying one was answered `200` with the field
+ * silently dropped — indistinguishable, to a client, from a device that had
+ * accepted it. `World.patchShade` handles all three and always did; nothing ever
+ * reached it. Found on 2026-08-19, when the guided run stopped measuring them
+ * and this became the *only* way any of them gets a value.
+ *
+ * {@link PATCHABLE_NUMBERS} is a **total** record over `keyof PatchShadeDto`
+ * minus `name`, the same drift gate as {@link KNOWN_ACTIONS} and
+ * {@link ERROR_STATUS} above: a numeric field added in Rust and regenerated
+ * fails `tsc` here rather than being quietly ignored again. A plain array would
+ * have compiled fine while missing three, which is exactly what it did.
  */
 function parsePatchShade(value: unknown): PatchShadeDto | undefined {
   if (typeof value !== 'object' || value === null) return undefined;
@@ -663,8 +696,7 @@ function parsePatchShade(value: unknown): PatchShadeDto | undefined {
     patch.name = body['name'];
   }
 
-  const numbers = ['kind', 'tiltMode', 'upTimeMs', 'downTimeMs', 'tiltTimeMs'] as const;
-  for (const field of numbers) {
+  for (const field of Object.keys(PATCHABLE_NUMBERS) as PatchableNumber[]) {
     if (!(field in body) || body[field] === undefined) continue;
     const candidate = body[field];
     if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 0) {

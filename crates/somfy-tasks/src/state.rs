@@ -56,8 +56,8 @@ use embassy_sync::pubsub::PubSubChannel;
 use heapless::Vec;
 use somfy_domain::DomainError;
 use somfy_domain::{
-    CalibrationLeg, CalibrationMark, CalibrationOutcome, Controller, FrameWidth, GroupId,
-    PlannedTx, Registry, ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY, TX_CAPACITY,
+    CalibrationLeg, CalibrationOutcome, Controller, FrameWidth, GroupId, PlannedTx, Registry,
+    ShadeCommand, ShadeId, StateDelta, DELTA_CAPACITY, TX_CAPACITY,
 };
 use somfy_rts::Frame;
 use somfy_store::{
@@ -360,18 +360,6 @@ impl StateMachine {
         self.controller
             .begin_calibration(id, leg, now_ms, &mut planned, deltas)?;
         Ok(self.dispatch(store, queue, &planned))
-    }
-
-    /// Record a moment the operator reported. Takes neither store nor queue,
-    /// because a mark transmits nothing — the same way the signature of
-    /// [`StateMachine::on_rx_frame`] states its contract.
-    pub fn mark_calibration(
-        &mut self,
-        id: ShadeId,
-        mark: CalibrationMark,
-        now_ms: u64,
-    ) -> Result<(), DomainError> {
-        self.controller.mark_calibration(id, mark, now_ms)
     }
 
     /// End a run and store what it measured. Transmits nothing.

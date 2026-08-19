@@ -92,8 +92,8 @@ pub use pairing::{
 };
 pub use registry::{GroupId, Registry, RoomId, ShadeId, MAX_GROUPS, MAX_ROOMS, MAX_SHADES};
 pub use shade::{
-    Activity, Calibrating, CalibrationLeg, CalibrationMark, CalibrationOutcome, PlannedTx, Repeats,
-    Shade, ShadeCommand, MAX_LINKED_REMOTES, MAX_TRAVEL_TIME_MS, ROUTE_VIA_LIMIT_RAW, STOP_REPEATS,
+    Activity, Calibrating, CalibrationLeg, CalibrationOutcome, PlannedTx, Repeats, Shade,
+    ShadeCommand, MAX_LINKED_REMOTES, MAX_TRAVEL_TIME_MS, ROUTE_VIA_LIMIT_RAW, STOP_REPEATS,
 };
 pub use tilt::tilt_first;
 pub use types::{

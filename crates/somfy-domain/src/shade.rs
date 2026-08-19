@@ -20,7 +20,7 @@
 
 use crate::motion::{Motion, MotionSnapshot};
 use crate::pairing::PAIR_REPEATS;
-use crate::types::{round_dead_band_ms, round_start_lag_ms, CalibrationSource};
+use crate::types::CalibrationSource;
 use crate::{Direction, DomainError, FrameWidth, Pos, ShadeConfig};
 use heapless::Vec;
 use somfy_rts::Command;
@@ -288,80 +288,24 @@ pub enum Activity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationLeg {
     /// A full traverse toward open, started at the closed limit. Measures
-    /// `up_time_ms`, and from its marks `start_lag_ms` and `vent_band_ms`.
+    /// `up_time_ms`.
     Up,
     /// A full traverse toward closed, started at the open limit. Measures
-    /// `down_time_ms`, and from its mark `close_band_ms`.
+    /// `down_time_ms`.
     Down,
 }
 
-/// A moment an operator reports during a calibration run.
+/// A calibration run in progress: which direction, and when the frame went out.
 ///
-/// **These are what makes the dead time and the dead bands measured rather than
-/// assumed**, and they cost no extra shade movement: both are observations of a
-/// traverse that is being timed anyway.
-///
-/// A human tap lands a couple of hundred milliseconds after what it aims at, and
-/// that matters differently for the two:
-/// [`vent_band_ms`](crate::ShadeConfig::vent_band_ms) is the *difference* of two
-/// taps, so the operator's reaction delay cancels out of it, while
-/// [`start_lag_ms`](crate::ShadeConfig::start_lag_ms) is a single tap and
-/// carries it. That is the honest limit of this method and the reason a start
-/// lag may be entered by hand instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CalibrationMark {
-    /// The shade has begun to move at all. Fixes the start lag.
-    MotionBegan,
-    /// The curtain itself has begun to move, as opposed to the slats.
-    ///
-    /// On the [`Up`](CalibrationLeg::Up) leg that is the moment the curtain
-    /// starts to rise, near the beginning — everything before it is slat
-    /// separation. On the [`Down`](CalibrationLeg::Down) leg it is the moment
-    /// the curtain reaches the sill, near the end: everything *after* it is the
-    /// slats compressing.
-    CurtainMoved,
-}
-
-/// A calibration run in progress.
+/// Two fields, and that is the whole of it. Until 2026-08-19 there were two
+/// more — the moments an operator reported the shade first stirring and the
+/// curtain separating from the slats, which fixed
+/// [`start_lag_ms`](crate::ShadeConfig::start_lag_ms) and the dead bands. They
+/// are entered by hand now; see [`Shade::finish_calibration`] for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Calibrating {
     leg: CalibrationLeg,
     started_ms: u64,
-    /// Milliseconds after `started_ms` at which the operator reported motion, or
-    /// [`UNMARKED`] if they have not.
-    ///
-    /// An offset in a `u32` rather than an absolute `u64`, and a sentinel rather
-    /// than an `Option`, for the same reason [`Activity::Anchoring`] carries a
-    /// flag instead of a `Pos`: this type is carried in a table the boot stack
-    /// holds several copies of, and the interval it describes is bounded by
-    /// [`MAX_TRAVEL_TIME_MS`] — three minutes, against a `u32`'s forty-nine days.
-    motion_began_at: u32,
-    /// The same, for the moment the curtain itself moved.
-    curtain_moved_at: u32,
-}
-
-/// "The operator has not reported this moment."
-///
-/// A sentinel rather than an `Option` because it is unreachable as a value: a
-/// run is refused past [`MAX_TRAVEL_TIME_MS`], which is three minutes.
-const UNMARKED: u32 = u32::MAX;
-
-impl Calibrating {
-    /// Record a moment the operator reported.
-    ///
-    /// A repeated mark replaces the earlier one, so a mis-tap is corrected by
-    /// tapping again rather than by starting the run over.
-    ///
-    /// Stored as an offset from the start rather than as a clock reading, which
-    /// is also the only place the clock could go wrong: a mark that arrives
-    /// *before* the run began saturates to zero instead of wrapping.
-    pub fn mark(&mut self, mark: CalibrationMark, now_ms: u64) {
-        let at = clamp_u32(now_ms.saturating_sub(self.started_ms));
-        match mark {
-            CalibrationMark::MotionBegan => self.motion_began_at = at,
-            CalibrationMark::CurtainMoved => self.curtain_moved_at = at,
-        }
-    }
 }
 
 /// What a finished calibration run stored.
@@ -371,11 +315,6 @@ pub struct CalibrationOutcome {
     pub leg: CalibrationLeg,
     /// The traverse time now stored for that direction.
     pub travel_ms: u32,
-    /// A new start lag, if [`CalibrationMark::MotionBegan`] was reported.
-    pub start_lag_ms: Option<u16>,
-    /// A new dead band for this leg's end of the travel, if
-    /// [`CalibrationMark::CurtainMoved`] was reported.
-    pub band_ms: Option<u16>,
 }
 
 pub struct Shade {
@@ -720,12 +659,12 @@ impl Shade {
     ///
     /// Nothing on this device can see the shade. The only instrument available
     /// is a person watching it and a clock, so a calibration is: send the
-    /// traverse, let the operator say when things happened, and store the
-    /// intervals. Three numbers come out of one run of the
-    /// [`Up`](CalibrationLeg::Up) leg — the traverse time, the start lag and the
-    /// slat-separation band — because they are three moments of the same
-    /// movement, which is what keeps R5's dead time and R8's dead band from
-    /// costing any extra travel.
+    /// traverse, let the operator say when it stopped, and store the interval.
+    ///
+    /// One end of that interval is *this device's* clock, which is what makes
+    /// the run worth using at all: only the stop carries the operator's reaction
+    /// delay, where timing the same traverse with a wristwatch carries it at
+    /// both ends.
     ///
     /// The caller is responsible for the shade being at the **opposite** limit
     /// first, and can get it there with an ordinary Close or Open; the domain
@@ -757,8 +696,6 @@ impl Shade {
         Activity::Calibrating(Calibrating {
             leg,
             started_ms: now_ms,
-            motion_began_at: UNMARKED,
-            curtain_moved_at: UNMARKED,
         })
     }
 
@@ -768,16 +705,33 @@ impl Shade {
     /// traverse time is the whole interval since the command went out — which is
     /// what a stopwatch measures and what
     /// [`ShadeConfig::up_time_ms`](crate::ShadeConfig::up_time_ms) has always
-    /// meant. The lag and the band are carved *out* of it rather than added to
-    /// it, so a shade whose traverse was already right stays right.
+    /// meant. The lag and the bands are *parts of* that interval rather than
+    /// additions to it, so a traverse that grows or shrinks does not move them.
     ///
     /// The run ends at a physical limit by construction, so this is also an
     /// endpoint resynchronisation: the estimate is snapped there and the
     /// accumulated doubt cleared.
     ///
+    /// # One number, where there used to be three
+    ///
+    /// Until 2026-08-19 a run also carried two `mark` presses, which fixed
+    /// [`start_lag_ms`](crate::ShadeConfig::start_lag_ms) and this leg's dead
+    /// band. They were dropped, and the reason is that they measured worst the
+    /// thing they were for: each was a *single* press against a moment a
+    /// fraction of a second wide, so each carried a whole reaction delay against
+    /// the interval it defined — where the same delay is a fraction of a percent
+    /// of a half-minute traverse. Both values are entered by hand instead, which
+    /// R9 of the position-accuracy spec already required as a MUST.
+    ///
+    /// So the arithmetic below is the traverse and nothing else. What the marks
+    /// *did* leave behind is the [`checked_bands`](ShadeConfig::checked_bands)
+    /// call: a hand-entered band and a freshly measured traverse are two numbers
+    /// that have to agree, and a 30 s slat separation on a shade that turns out
+    /// to open in 8 s is refused here rather than stored.
+    ///
     /// Refused, storing nothing, if the result would not be a shade this crate
-    /// would accept: a traverse of zero or over [`MAX_TRAVEL_TIME_MS`], or marks
-    /// that do not leave a lifting phase behind them.
+    /// would accept: a traverse of zero, or over [`MAX_TRAVEL_TIME_MS`], or one
+    /// too short for the bands already stored against it.
     pub fn finish_calibration(
         &mut self,
         run: Calibrating,
@@ -789,28 +743,6 @@ impl Shade {
         }
         let travel_ms = elapsed as u32;
 
-        // The start lag is a single tap and carries the operator's reaction
-        // delay; the band is the gap between two taps, so the delay cancels.
-        let start_lag_ms = match run.motion_began_at {
-            UNMARKED => None,
-            at => Some(round_start_lag_ms(at).ok_or(DomainError::CalibrationImplausible)?),
-        };
-        let lag_now = start_lag_ms.unwrap_or(self.config.start_lag_ms) as u64;
-
-        let raw_band_ms = match (run.leg, run.curtain_moved_at) {
-            (_, UNMARKED) => None,
-            // Up: everything from the command to the curtain rising is lag plus
-            // slat separation, so the band is what is left after the lag.
-            (CalibrationLeg::Up, at) => Some(at.saturating_sub(lag_now as u32)),
-            // Down: everything from the curtain reaching the sill to the motor
-            // stopping is the slats compressing.
-            (CalibrationLeg::Down, at) => Some(clamp_u32(elapsed).saturating_sub(at)),
-        };
-        let band_ms = match raw_band_ms {
-            Some(ms) => Some(round_dead_band_ms(ms).ok_or(DomainError::CalibrationImplausible)?),
-            None => None,
-        };
-
         // Applied to a copy first, so a run whose numbers do not survive
         // validation leaves the shade exactly as it was.
         let mut next = self.config.clone();
@@ -818,20 +750,11 @@ impl Shade {
             CalibrationLeg::Up => {
                 next.up_time_ms = travel_ms;
                 next.up_time_source = CalibrationSource::Measured;
-                if let Some(band) = band_ms {
-                    next.vent_band_ms = band;
-                }
             }
             CalibrationLeg::Down => {
                 next.down_time_ms = travel_ms;
                 next.down_time_source = CalibrationSource::Measured;
-                if let Some(band) = band_ms {
-                    next.close_band_ms = band;
-                }
             }
-        }
-        if let Some(lag) = start_lag_ms {
-            next.start_lag_ms = lag;
         }
         next.checked_bands()?;
 
@@ -844,8 +767,6 @@ impl Shade {
         Ok(CalibrationOutcome {
             leg: run.leg,
             travel_ms,
-            start_lag_ms,
-            band_ms,
         })
     }
 
@@ -1335,13 +1256,4 @@ impl Shade {
         });
         debug_assert!(pushed.is_ok(), "PlannedTx buffer overflow: out not drained");
     }
-}
-
-/// Narrow a millisecond interval to `u32`, saturating.
-///
-/// Every interval here is bounded by [`MAX_TRAVEL_TIME_MS`] before it is stored,
-/// so the saturation is unreachable in practice; it exists so that a clock that
-/// has jumped produces a refused calibration rather than a wrapped one.
-fn clamp_u32(ms: u64) -> u32 {
-    ms.min(u32::MAX as u64) as u32
 }

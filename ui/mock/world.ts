@@ -106,20 +106,16 @@ export type CreateResult = { ok: ShadeDto } | { error: ApiErrorCode };
 export type PairResult = 'accepted' | { error: ApiErrorCode };
 
 /**
- * A calibration run in progress: when it started, and whichever moments the
- * operator has reported so far.
- *
  * `somfy_domain`'s `MAX_TRAVEL_TIME_MS`, restated: three minutes is the ceiling
  * deployed controllers already enforce on a hand-entered travel time, and a run
  * still going after that is one where somebody walked away.
  */
 const MAX_TRAVEL_TIME_MS = 180_000;
 
+/** A calibration run in progress: which direction, and when the frame went out. */
 interface CalibrationRun {
   leg: 'up' | 'down';
   startedMs: number;
-  motionBeganMs?: number;
-  curtainMovedMs?: number;
 }
 
 export class World {
@@ -312,18 +308,16 @@ export class World {
    * run.
    *
    * The run is real rather than faked: `begin` sends the traverse and stamps a
-   * start time, the marks are stamped as they arrive, and `finish` turns the
-   * intervals into the same three numbers the device stores. That matters
-   * because the thing being exercised is a **conversation with timing in it** —
-   * a screen that can only be checked against a stub is a screen nobody has
-   * checked.
+   * start time, and `finish` turns the interval into the number the device
+   * stores. That matters because the thing being exercised is a **conversation
+   * with timing in it** — a screen that can only be checked against a stub is a
+   * screen nobody has checked.
    *
-   * What it does not reproduce is the arithmetic's edges: the device refuses a
-   * traverse of zero or over three minutes, and refuses marks that leave no
-   * travel behind them. Those are refusals the UI has to render, so they are
-   * modelled; the rounding is modelled too, because a value that reads back
-   * different from what was typed is exactly the surprise a mock exists to
-   * surface early.
+   * Both refusals the UI has to render are modelled: a traverse of zero or over
+   * three minutes, and one too short for the dead bands already entered against
+   * it — which is the only way a hand-entered figure and a measured one can
+   * contradict each other, and the one the screen's implausible message now
+   * names.
    */
   calibrate(id: number, step: CalibrationStepDto): { ok: true } | { error: ApiErrorCode } {
     const shade = this.shades.get(id);
@@ -339,14 +333,6 @@ export class World {
         this.publish(shade, motion);
         return { ok: true };
 
-      case 'mark': {
-        const run = this.runs.get(id);
-        if (!run) return { error: 'notCalibrating' };
-        if (step.mark === 'motionBegan') run.motionBeganMs = now;
-        else run.curtainMovedMs = now;
-        return { ok: true };
-      }
-
       case 'finish': {
         const run = this.runs.get(id);
         if (!run) return { error: 'notCalibrating' };
@@ -355,37 +341,22 @@ export class World {
           return { error: 'calibrationImplausible' };
         }
 
-        const lag =
-          run.motionBeganMs === undefined
-            ? shade.startLagMs
-            : roundTo(run.motionBeganMs - run.startedMs, START_LAG_RESOLUTION_MS);
-        const band =
-          run.curtainMovedMs === undefined
-            ? undefined
-            : roundTo(
-                run.leg === 'up'
-                  ? run.curtainMovedMs - run.startedMs - lag
-                  : now - run.curtainMovedMs,
-                DEAD_BAND_RESOLUTION_MS,
-              );
-
         // Applied to a copy first, so a run whose numbers do not survive
         // validation leaves the shade exactly as it was — `Shade::finish_calibration`.
-        const next: StoredShade = { ...shade, startLagMs: lag };
+        const next: StoredShade = { ...shade };
         if (run.leg === 'up') {
           next.upTimeMs = elapsed;
           next.upTimeSource = 'measured';
-          if (band !== undefined) next.ventBandMs = band;
         } else {
           next.downTimeMs = elapsed;
           next.downTimeSource = 'measured';
-          if (band !== undefined) next.closeBandMs = band;
         }
+        // `ShadeConfig::checked_bands`: the hand-entered start delay and slat
+        // figures are *parts of* the travel time, so a traverse that turns out
+        // shorter than they claim is refused rather than stored beside them.
         if (
-          lag < 0 ||
-          (band !== undefined && band < 0) ||
-          lag + next.ventBandMs >= next.upTimeMs ||
-          lag + next.closeBandMs >= next.downTimeMs
+          next.startLagMs + next.ventBandMs >= next.upTimeMs ||
+          next.startLagMs + next.closeBandMs >= next.downTimeMs
         ) {
           return { error: 'calibrationImplausible' };
         }

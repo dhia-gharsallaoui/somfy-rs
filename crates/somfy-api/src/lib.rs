@@ -97,7 +97,7 @@ mod settings;
 mod shades;
 mod system;
 
-pub use calibration::{CalibrationLegDto, CalibrationMarkDto, CalibrationStepDto};
+pub use calibration::{CalibrationLegDto, CalibrationStepDto};
 pub use commands::CommandDto;
 pub use entities::{
     AddressOrigin, CalibrationSource, GroupDto, PairingState, RoomDto, ShadeDto,

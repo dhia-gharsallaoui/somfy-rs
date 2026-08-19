@@ -344,13 +344,18 @@ fn calibration_step_matches_step_tagged_wire() {
         ts.contains(r#"{ "step": "begin", leg: CalibrationLegDto, }"#),
         "begin must require a leg:\n{ts}"
     );
-    assert!(
-        ts.contains(r#"{ "step": "mark", mark: CalibrationMarkDto, }"#),
-        "mark must require a mark:\n{ts}"
-    );
     for bare in [r#"{ "step": "finish" }"#, r#"{ "step": "cancel" }"#] {
         assert!(ts.contains(bare), "CalibrationStepDto lost {bare}:\n{ts}");
     }
+
+    // Three steps and no more. `mark` was a fourth until 2026-08-19, and this
+    // is what keeps its removal from the *wire* honest: a union that still
+    // carried it would let the mock and a stale tab go on describing a
+    // measurement the device no longer takes.
+    assert!(
+        !ts.contains(r#""step": "mark""#),
+        "the mark step is gone from the domain; it must be gone from the wire:\n{ts}"
+    );
 
     // The two directions are separate values, because they are measured
     // separately and never mirrored — 30 s up against 27 s down on the estate
@@ -360,14 +365,6 @@ fn calibration_step_matches_step_tagged_wire() {
         assert!(
             leg.contains(value),
             "CalibrationLegDto lost {value}:\n{leg}"
-        );
-    }
-
-    let mark = read("CalibrationMarkDto.ts");
-    for value in [r#""motionBegan""#, r#""curtainMoved""#] {
-        assert!(
-            mark.contains(value),
-            "CalibrationMarkDto lost {value}:\n{mark}"
         );
     }
 }
