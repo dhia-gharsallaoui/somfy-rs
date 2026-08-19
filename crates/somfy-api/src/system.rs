@@ -102,9 +102,12 @@ pub const MAX_PANIC_TEXT_LEN: usize = 160;
 /// one a real board answers with, with no panic recorded — is 246.
 ///
 /// **It was 896 before the substitution above admitted only escape-free
-/// characters**, and the 256 bytes that change gave back are spent four times
-/// over: it is a kilobyte of ESP32-C3 Wi-Fi heap, on the chip whose margin over
-/// the measured announcement peak is the tightest in the matrix.
+/// characters**, and the 256 bytes that change gave back were spent four times
+/// over: at the time it was a kilobyte of ESP32-C3 Wi-Fi heap, on the chip whose
+/// margin over the measured announcement peak was the tightest in the matrix.
+/// That chip was dropped on 2026-08-19 and the ESP32-S3 has room, so the saving
+/// is no longer load-bearing — but the substitution that produced it is, because
+/// it is also what keeps the *bound* provable rather than guessed at.
 pub const SYSTEM_JSON_MAX_BYTES: usize = 640;
 
 /// Longest JSON a [`RestoreReportDto`] serialises to, in bytes.
@@ -124,6 +127,13 @@ pub const RESTORE_JSON_MAX_BYTES: usize = 384;
 /// takes the update, reboots and does not come back —
 /// [`crate::ApiErrorCode::ImageForAnotherChip`] is the device catching that
 /// after the fact, and this is what lets the UI avoid it beforehand.
+///
+/// **One variant since 2026-08-19**, when the ESP32-C3 was dropped, and it stays
+/// an enum rather than becoming a constant for two reasons: the wire shape does
+/// not change when a chip is added, and `somfy_ota::image::Chip` — which is the
+/// thing that *refuses* an image — deliberately keeps every chip this project
+/// has ever published an image for. The two lists are not the same list, and
+/// that is a property rather than an oversight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -136,21 +146,20 @@ pub const RESTORE_JSON_MAX_BYTES: usize = 384;
 )]
 #[serde(rename_all = "camelCase")]
 pub enum ChipDto {
-    /// ESP32-S3 — Xtensa, the author's own board.
+    /// ESP32-S3 — Xtensa, the author's own board, and the only one built.
     Esp32S3,
-    /// ESP32-C3 — RISC-V, reached by IP rather than by name and with no wall
-    /// clock. See `firmware::heap` for what it refuses and why.
-    Esp32C3,
 }
 
 /// Why the device started.
 ///
-/// **Coarser than the silicon's own reset reason, and deliberately.** The
-/// ESP32-S3 and ESP32-C3 spell the same causes with different variant names —
-/// `CpuSw` against `Cpu0Sw`, `CpuMwdt0` against `Cpu0Mwdt0` — so a faithful
-/// mirror would be two enums and a `#[cfg]` on the wire. What a person needs is
-/// which of six things happened, and every one of those six has an action
-/// behind it.
+/// **Coarser than the silicon's own reset reason, and deliberately.** Espressif
+/// parts spell the same causes with different variant names — the ESP32-S3's
+/// `CpuSw` against the ESP32-C3's `Cpu0Sw`, `CpuMwdt0` against `Cpu0Mwdt0` — so
+/// a faithful mirror would be an enum per chip and a `#[cfg]` on the wire. Only
+/// the S3 is built today (the C3 went on 2026-08-19), which makes that a reason
+/// this shape is *cheap to keep* rather than a reason to abandon it: what a
+/// person needs is which of six things happened, and every one of those six has
+/// an action behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(

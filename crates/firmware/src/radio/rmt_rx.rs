@@ -69,19 +69,19 @@ pub const MEMSIZE_BLOCKS: u8 = 2;
 /// Deriving the length from the reservation makes that unrepresentable instead
 /// of merely avoided.
 ///
-/// The ESP32-S3 and ESP32-C3 *can* wrap, so a larger buffer would be legal
-/// there and would let one reception carry more than the reserved RAM. It is
-/// deliberately not taken: a single Somfy frame fits comfortably, and one
-/// buffer size across every chip is one fewer thing that behaves differently
-/// on the boards nobody has in front of them.
+/// The ESP32-S3 *can* wrap, so a larger buffer would be legal here and would let
+/// one reception carry more than the reserved RAM. It is deliberately not taken:
+/// a single Somfy frame fits comfortably, and deriving the length from the
+/// reservation keeps the "cannot exceed it" case unrepresentable on any part
+/// this might later be built for, rather than merely avoided on this one.
 ///
 /// ## What a reception longer than this costs
 ///
-/// Not a truncation — a **loss**, and the two chips differ. On the ESP32-S3 and
-/// ESP32-C3 esp-hal's reader marks the transaction failed as soon as the buffer
-/// fills, and `receive` resolves to `Error::ReceiverError` with the pulses
-/// already copied out discarded; the whole burst is dropped. On the ESP32
-/// reception simply stops when channel RAM is full and what fits is returned.
+/// Not a truncation — a **loss**. On the ESP32-S3 esp-hal's reader marks the
+/// transaction failed as soon as the buffer fills, and `receive` resolves to
+/// `Error::ReceiverError` with the pulses already copied out discarded; the
+/// whole burst is dropped. (Parts differ here: the ESP32, built until
+/// 2026-08-18, simply stopped when channel RAM was full and returned what fit.)
 ///
 /// Two situations reach it, neither of them a 56-bit reception as things stand:
 ///
@@ -93,7 +93,7 @@ pub const MEMSIZE_BLOCKS: u8 = 2;
 ///   `somfy_rmt::IDLE_THRESHOLD_US`**, which would merge its first frame and
 ///   its repeat into one reception: 100 symbols for a representative 56-bit
 ///   payload and 124 in the worst case, against the 96 this constant is on the
-///   ESP32-S3 and ESP32-C3. The ESP32 reserves 128 and would take it. Nothing has measured that gap — the threshold's upper bound is
+///   ESP32-S3. Nothing has measured that gap — the threshold's upper bound is
 ///   inferred from *our* transmitter — which is what makes capturing a real
 ///   repeat frame worth doing on air.
 pub const RX_SYMBOLS: usize = MEMSIZE_BLOCKS as usize * esp_hal::rmt::CHANNEL_RAM_SIZE;
@@ -106,8 +106,8 @@ pub const RX_SYMBOLS: usize = MEMSIZE_BLOCKS as usize * esp_hal::rmt::CHANNEL_RA
 // `MAX_SYMBOLS` is checked here rather than a figure restated in this file, and
 // `somfy-rmt` pins it on the host from *both* directions' worst cases — 95
 // symbols each, transmit and receive, arrived at by different arithmetic. Note
-// what that leaves: on the chips where two blocks is exactly 96, this passes
-// with **one symbol** to spare, so the guard establishes that a worst-case
+// what that leaves: two blocks is exactly 96 on this chip, so this passes
+// with **one symbol** to spare, and the guard establishes that a worst-case
 // reception fits and nothing more. It is not a margin. Any change that could
 // add a recorded entry — a wider frame, a glitch filter turned off differently,
 // or the peripheral recording something beyond one entry per edge plus a
@@ -120,10 +120,10 @@ const _: () = assert!(
 
 // `somfy-rmt` picks the idle threshold and asserts it against both ends of the
 // window it has to sit in, but it cannot see the register the value is written
-// to — and that register is *narrower on some chips than others*: 16 bits on
-// the ESP32, 15 on the ESP32-S3 and ESP32-C3. So the host crate
-// states the narrowest field it believes exists, and this is where that belief
-// meets esp-hal's own per-chip constant, on all four builds. A threshold past
+// to, and that register is *narrower on some chips than others*: 15 bits on the
+// ESP32-S3, 16 on the ESP32 and ESP32-S2 this project used to build. So the host
+// crate states the narrowest field it believes exists, and this is where that
+// belief meets esp-hal's own per-chip constant. A threshold past
 // the field would be rejected at run time by `configure_rx`, which surfaces as
 // a receiver that never starts rather than as a bad number.
 const _: () = assert!(

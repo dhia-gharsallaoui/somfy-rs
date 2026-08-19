@@ -20,7 +20,8 @@ a register followed by `callx8`, so the callee's name appears as a resolved
 literal rather than as a branch target.
 
 `nm`/`readelf` are taken from `PATH`, so `source ~/export-esp.sh` first for an
-Xtensa image. For a RISC-V one, pass the tool prefix as the third argument.
+Xtensa image. The prefix is the third argument if it ever needs to be
+something other than `xtensa-esp-elf-`.
 """
 
 import subprocess

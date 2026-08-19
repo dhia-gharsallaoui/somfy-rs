@@ -62,11 +62,12 @@ struct Target {
     triple: &'static str,
     /// The arguments that select this chip's **shipping** feature set.
     ///
-    /// Spelled out per chip rather than derived, because they are not derivable:
-    /// the ESP32-C3 ships `mqtt,ui` and no more, since `heap.rs` refuses it
-    /// `mdns` and `sntp`. **These must agree with the shipping rows of
-    /// `.github/workflows/ci.yml`** — a release built from a feature set CI
-    /// never builds is a release nobody has linted.
+    /// Spelled out rather than derived, and kept that way with one chip left,
+    /// because a chip's shipping set has never been derivable: the ESP32-C3 —
+    /// built here until 2026-08-19 — shipped `mqtt,ui` and no more, because
+    /// `heap.rs` refused it `mdns` and `sntp`. **These must agree with the
+    /// shipping rows of `.github/workflows/ci.yml`** — a release built from a
+    /// feature set CI never builds is a release nobody has linted.
     features: &'static [&'static str],
     /// What the image's `chip_id` has to say, checked through the same enum the
     /// firmware compares against.
@@ -74,20 +75,16 @@ struct Target {
 }
 
 /// The chips a release carries.
-const TARGETS: &[Target] = &[
-    Target {
-        espflash: "esp32s3",
-        triple: "xtensa-esp32s3-none-elf",
-        features: &["--features", "chip-s3"],
-        chip: Chip::Esp32S3,
-    },
-    Target {
-        espflash: "esp32c3",
-        triple: "riscv32imc-unknown-none-elf",
-        features: &["--no-default-features", "--features", "chip-c3,mqtt,ui"],
-        chip: Chip::Esp32C3,
-    },
-];
+///
+/// One, since the ESP32-C3 was dropped on 2026-08-19. It stays a table rather
+/// than becoming a constant because the shape — build, verify, hash, name — is
+/// the part worth keeping, and `--chip` is still how a release is narrowed.
+const TARGETS: &[Target] = &[Target {
+    espflash: "esp32s3",
+    triple: "xtensa-esp32s3-none-elf",
+    features: &["--features", "chip-s3"],
+    chip: Chip::Esp32S3,
+}];
 
 /// The manifest format's own version.
 ///
@@ -184,7 +181,7 @@ fn run() -> Result<(), String> {
 }
 
 /// What to type.
-const USAGE: &str = "usage: cargo run -p xtask -- release [--chip <esp32s3|esp32c3>]... \
+const USAGE: &str = "usage: cargo run -p xtask -- release [--chip <esp32s3>]... \
                      [--out <dir>] [--skip-ui] [--publish]";
 
 /// One built, verified, hashed image.
@@ -513,9 +510,13 @@ mod tests {
                 bytes: 1_276_112,
                 sha256: "ab".repeat(32),
             },
+            // A second, synthetic entry. `TARGETS` has held one chip since
+            // 2026-08-19, and this test is about the separator *between* array
+            // members — which one entry cannot exercise at all — so the
+            // fixture keeps two on purpose rather than tracking the matrix.
             Image {
-                chip: "esp32c3",
-                asset: "somfy-rs-0.2.0-esp32c3.bin".to_string(),
+                chip: "esp32c6",
+                asset: "somfy-rs-0.2.0-esp32c6.bin".to_string(),
                 bytes: 1_100_000,
                 sha256: "cd".repeat(32),
             },

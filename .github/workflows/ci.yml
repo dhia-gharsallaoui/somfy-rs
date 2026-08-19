@@ -95,64 +95,57 @@ jobs:
       - name: bundle size against the 200 KB gzipped budget (design spec §8)
         run: bun run size
 
-  # Two chips × five service features, and this builds seven of it. The choice
-  # is deliberate, because *silent* partial coverage is the thing this project
+  # One chip × five service features, and this builds five of it. The choice is
+  # deliberate, because *silent* partial coverage is the thing this project
   # keeps being bitten by — five CI holes so far, every one of them a
   # configuration nobody built.
   #
-  # **It was nine rows over three chips until 2026-08-18**, when the ESP32 was
-  # dropped: it had never booted this firmware, was already excluded from the web
-  # server, and its one buildable configuration left its Wi-Fi heap 1,700 bytes
-  # above the measured announcement peak — inside that peak's own ~2,000-byte
-  # spread. Its two rows went with it. `docs/provenance.md` carries the
+  # **It was nine rows over three chips until 2026-08-18** and seven over two
+  # until 2026-08-19. The ESP32 went first, then the ESP32-C3; neither had ever
+  # booted this firmware, and `docs/provenance.md` carries both sets of
   # arithmetic beside the ESP32-S2's, dropped the same way on 2026-08-17.
+  #
+  # **What the C3's two rows were worth, since losing them is the cost of this
+  # change and not a rounding.** They were the only RISC-V build anywhere in this
+  # repository, and RISC-V caught a fault nothing else did —
+  # `AtomicU32::fetch_add` does not exist on `riscv32imc`. Nothing in CI will
+  # catch the next one of those. What replaces it is not a job: it is that five
+  # places in `crates/firmware` keep a `blocking_mutex` where an atomic would be
+  # natural, and `docs/provenance.md` records that they are kept deliberately.
+  # `edge-mdns`, `domain` and `sntpc` are also no longer built for RISC-V by
+  # anything, which was already true before this change — the C3 refused the
+  # features that pull them.
   #
   # What each row buys:
   #
-  # - **The shipping build, per chip.** What a user flashes.
-  # - **Radio only, per chip.** The structural test: if the core compiles with
-  #   every service off, then no transport logic leaked into `somfy-domain`,
+  # - **The shipping build.** What a user flashes.
+  # - **Radio only.** The structural test: if the core compiles with every
+  #   service off, then no transport logic leaked into `somfy-domain`,
   #   `somfy-tasks`, `edits` or the state task. It found two couplings the first
   #   time it was run, and both were fixed rather than gated — see
   #   `crates/firmware/Cargo.toml`.
-  # - **`http` alone, on one chip.** `ui` off *and* `mqtt` off at once, and now
-  #   `mdns` and `sntp` off as well — which is what proves the web server is
-  #   separable from the thing that advertises it, not merely optional together
-  #   with it.
-  # - **`mdns` alone, on one chip.** It pulls `http` in with it and nothing else,
-  #   so this is the row that proves the responder does not depend on `ui` or on
-  #   a broker — and it is the only row that builds `edge-mdns` without
-  #   `picoserve`'s UI routes beside it.
-  # - **`sntp` alone, on one chip.** The strongest of the structural rows,
-  #   because `sntp` implies *nothing*: it builds the resolver, the socket
-  #   accounting in `net::SOCKETS` and the wall clock with no other network
-  #   service in the image at all.
+  # - **`http` alone.** `ui` off *and* `mqtt` off at once, and `mdns` and `sntp`
+  #   off as well — which is what proves the web server is separable from the
+  #   thing that advertises it, not merely optional together with it.
+  # - **`mdns` alone.** It pulls `http` in with it and nothing else, so this is
+  #   the row that proves the responder does not depend on `ui` or on a broker —
+  #   and it is the only row that builds `edge-mdns` without `picoserve`'s UI
+  #   routes beside it.
+  # - **`sntp` alone.** The strongest of the structural rows, because `sntp`
+  #   implies *nothing*: it builds the resolver, the socket accounting in
+  #   `net::SOCKETS` and the wall clock with no other network service in the
+  #   image at all.
   #
   # What is deliberately not covered, and why:
   #
-  # - **The ESP32-C3 with `mdns` or `sntp`.** Neither can be built: that chip has
-  #   the DRAM for the web server but not for a responder or a clock on top of
-  #   it, and `heap.rs` refuses both with a `compile_error!` naming the
-  #   measurement. Those refusals are load-bearing rather than advisory — they
-  #   are what keeps `heap::DRAM_FOR_STACK_AND_HEAP` a per-chip *maximum*, since
-  #   it is measured at the largest set each chip can build. Both were proved to
-  #   fire by hand rather than by a job, because a CI step whose success is a
-  #   compilation *failure* inverts every other row here.
-  # - **Feature interactions on the ESP32-C3 beyond that.** They are
-  #   architecture-independent — the same modules, the same statics — and the
-  #   ESP32-S3 rows cover them. What the C3 is in the matrix *for* is the RISC-V
-  #   code path, which its two rows exercise, and which has caught a real fault
-  #   nothing else would have (`AtomicU32::fetch_add` does not exist on
-  #   `riscv32imc`). Note that `edge-mdns`, `domain` and `sntpc` are **no longer
-  #   built for RISC-V by any row**, since the C3 refuses the features that pull
-  #   them — a coverage loss the ESP32-S3 rows do not make up, and the one thing
-  #   this change costs.
   # - **`ui` without `mqtt` as its own row.** The shipping build covers `ui` on
   #   and the `http` row covers it off, so the module selection in `api/mod.rs`
   #   is exercised both ways already.
   # - **`mdns` and `sntp` together without `mqtt`.** They share nothing but
   #   `net::SOCKETS`, which every row's `StackResources<SOCKETS>` already sizes,
   #   and the shipping row builds both.
+  # - **Any second instruction set.** There is one chip. See above for what that
+  #   costs.
   firmware:
     runs-on: ubuntu-latest
     strategy:
@@ -174,15 +167,6 @@ jobs:
           - label: s3 (radio only)
             target: xtensa-esp32s3-none-elf
             args: --no-default-features --features chip-s3
-          # The C3's shipping build is NOT `--features chip-c3`: the default
-          # feature set includes `mdns` and `sntp`, which `heap.rs` refuses on
-          # that chip. Spelled out so this row is the image a C3 would run.
-          - label: c3 (mqtt + ui — its shipping build; mdns and sntp refused)
-            target: riscv32imc-unknown-none-elf
-            args: --no-default-features --features chip-c3,mqtt,ui
-          - label: c3 (radio only)
-            target: riscv32imc-unknown-none-elf
-            args: --no-default-features --features chip-c3
     steps:
       - uses: actions/checkout@v4
       - uses: esp-rs/xtensa-toolchain@v1.5

@@ -12,9 +12,8 @@
 //! nothing else may).
 //!
 //! That split is deliberate. `crates/firmware` is excluded from the root
-//! workspace and builds only for Xtensa and RISC-V, so nothing in this file can
-//! be tested on a host — which is exactly why nothing in this file decides
-//! anything.
+//! workspace and builds only for Xtensa, so nothing in this file can be tested
+//! on a host — which is exactly why nothing in this file decides anything.
 //!
 //! # Why a revert is a reboot
 //!
@@ -99,10 +98,11 @@ const APPLY_SETTLE_MS: u64 = 500;
 /// Everything one trial needs, behind one lock.
 ///
 /// **A `blocking_mutex` around a `RefCell` rather than atomics**, for the reason
-/// `crate::net::SIGNAL_DBM` gives: `riscv32imc` — the ESP32-C3's target — has no
-/// atomic read-modify-write, and a `WifiTrial` is not `Copy` in any case. No
-/// borrow is held across an await, because none of the functions below is
-/// `async`, so there is no path on which the `RefCell` can panic.
+/// `crate::net::SIGNAL_DBM` gives — and here the second half of that reason is
+/// the load-bearing one on its own: a `WifiTrial` is not `Copy`, so atomics were
+/// never the shape for it regardless of the chip. No borrow is held across an
+/// await, because none of the functions below is `async`, so there is no path on
+/// which the `RefCell` can panic.
 struct Slot {
     /// A candidate the web server has asked to try and [`crate::net`] has not
     /// applied yet. Held here rather than sent on a channel because the answer

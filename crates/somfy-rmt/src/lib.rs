@@ -44,10 +44,12 @@ pub const MAX_TICKS: u32 = 32_767;
 /// Maximum ticks in an RMT **idle-threshold** field.
 ///
 /// A different register from the duration field above, and narrower on some
-/// chips than on others: 16 bits on the ESP32 and ESP32-S2, 15 on the ESP32-S3
-/// and ESP32-C3. This is the narrowest of them, so a threshold that fits here
-/// fits everywhere. The firmware asserts it against `esp-hal`'s own per-chip
-/// constant rather than trusting this number on its own.
+/// Espressif parts than on others: 16 bits on the ESP32 and ESP32-S2, 15 on the
+/// ESP32-S3 and ESP32-C3. This is the narrowest of them, so a threshold that
+/// fits here fits everywhere — which is worth keeping as a host-side bound even
+/// though the firmware builds for the ESP32-S3 alone today, since this crate is
+/// deliberately chip-agnostic. The firmware asserts it against `esp-hal`'s own
+/// per-chip constant rather than trusting this number on its own.
 pub const MAX_IDLE_THRESHOLD_TICKS: u32 = 32_767;
 
 /// How long the air must stay quiet before the receiver calls a transmission

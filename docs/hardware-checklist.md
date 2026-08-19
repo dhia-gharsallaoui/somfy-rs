@@ -1167,31 +1167,34 @@ which could not hold it. There is no build of this firmware without a broker
 session any more. `crates/firmware/Cargo.toml` keeps the arithmetic that
 justified it.
 
-Since then the heap is **per chip**, derived by subtracting a fixed stack
-budget from the DRAM each chip has to divide, so both numbers below move
-together and both are printed on every boot:
+Since 2026-08-19 the division is made by the **linker**, not by a constant:
+`crates/firmware/build.rs` reserves a fixed stack budget at the top of DRAM and
+gives the heap everything the statics left below it. So the stack is the same in
+every build and the heap absorbs every difference, and both numbers are printed
+on every boot.
 
-| chip | build measured | heap | main stack | required |
-|---|---|---|---|---|
-| ESP32-S3 | `mqtt`+`ui`+`mdns`+`sntp` | 64 KiB = 65,536 | 66,724 | 57,120 |
-| ESP32-C3 | `mqtt`+`ui` | 59 KiB = 60,416 | 66,448 | 57,120 |
+| build | heap | main stack | required |
+|---|---|---|---|
+| `mqtt`+`ui`+`mdns`+`sntp` (shipping) | 61,336 | 66,280 | 57,344 |
+| `http` alone | 90,904 | 66,280 | 57,344 |
+| `mdns` alone | 85,976 | 66,280 | 57,344 |
+| `sntp` alone | 178,936 | 66,280 | 57,344 |
+| radio only | 181,832 | 66,280 | 57,344 |
 
-Read on 2026-08-18 from the release ELFs; the ESP32-S3 row was confirmed on the
-board, which printed `stack: 66724 bytes available, 57120 required` — the ELF
-figure exactly. `crates/firmware/src/heap.rs` carries the derivation and the
-commands that regenerate the table.
+Read on 2026-08-19 from the linked ELFs with
+`readelf -S | grep -E '\.heap |\.stack '`.
+`crates/firmware/src/heap.rs` carries the derivation.
 
-**The `build measured` column is not decoration.** Each row is measured with the
-largest feature set that chip is *permitted* to build, which is what makes one
-figure per chip sound — a smaller build leaves the residue on the stack, the
-safe direction. The ESP32-C3 is permitted less than the S3: `mdns` and `sntp`
-are refused there by `compile_error!`, so a C3 is reached by IP address rather
-than by a `.local` name and has no wall clock.
+**What changed, and why it matters when you are reading a boot line.** The table
+used to be one row per chip, each measured with the largest feature set that
+chip was *permitted* to build — and a smaller build then left the residue unused
+on the stack. It also went stale after six consecutive merges and once stopped a
+board booting. There is no constant left to be stale: if the boot line disagrees
+with this table, the tree has moved, and the answer is `readelf`, not arithmetic.
 
-**The ESP32 row is gone.** That chip was dropped on 2026-08-18 — it had never
-booted this firmware, could not link the web server, and its one buildable
-configuration left its heap 1,700 bytes above the announcement peak, inside that
-peak's own spread. The ESP32-S2 went the same way on 2026-08-17.
+**Three chip rows are gone.** The ESP32-S2 went on 2026-08-17, the ESP32 on
+2026-08-18 and the ESP32-C3 on 2026-08-19. None of the three had ever booted this
+firmware; `docs/provenance.md` carries all three sets of arithmetic.
 
 **The line worth reading is `heap: session announced`.** It is printed one line
 after the burst of retained discovery configs that produces the heap's peak;
@@ -1662,7 +1665,7 @@ is marked bootable until the last byte has arrived and been checked.
 | Response | Body | What happened |
 |---|---|---|
 | `400` | `{"code":"imageNotFirmware"}` | Not an ESP-IDF app image. Almost always the ELF instead of the output of `espflash save-image`. |
-| `400` | `{"code":"imageForAnotherChip"}` | An image for one of the other two chips this project builds for. |
+| `400` | `{"code":"imageForAnotherChip"}` | An image for a chip this is not. `somfy_ota::image::Chip` keeps every part this project has ever published an image for — including the ESP32 and ESP32-C3, dropped 2026-08-18 and 2026-08-19 — precisely so that one is refused by name. |
 | `400` | `{"code":"imageDamaged"}` | The upload was short, long, or a byte of it changed on the way — the length, the one-byte checksum or **the image's own SHA-256** disagreed. Try again; the console line says which. |
 | `413` | `{"code":"imageTooLarge"}` | Larger than the 2,031,616-byte slot. Refused from `Content-Length`, before any flash is touched. |
 | `409` | `{"code":"updateInProgress"}` | Another upload holds the session. Wait for it, or for its socket to time out. |
@@ -1717,7 +1720,7 @@ and is the one the device checks. Both are correct and they are different
 numbers; `xtask`'s module docs say so at more length.
 
 **The device does not read this file.** It cannot: TLS does not fit in its DRAM,
-which is measured on `heap::DRAM_FOR_STACK_AND_HEAP` and in
+which is measured on `heap::heap_region` and in
 `docs/provenance.md`. The manifest is for a person, or for a browser — which has
 TLS — deciding what to install and then uploading it by step 2 above.
 
@@ -1739,8 +1742,8 @@ Three ways, in descending order of what they cost.
 
 ### What this procedure does not establish
 
-- **That the update path works on the ESP32-C3.** The upload endpoint exists in
-  that build and has never run. Its heap arithmetic changed on 2026-08-18:
+- ~~**That the update path works on the ESP32-C3.**~~ Void — that chip was
+  dropped on 2026-08-19. For the record, its heap arithmetic on 2026-08-18 was:
   refusing `mdns` and `sntp` on that chip took its Wi-Fi heap from 52,224 bytes
   — 2,396 *below* the worst announcement peak ever measured — to 60,416, which
   is 5,796 above it. That is about 2.9× the peak's own boot-to-boot spread, so
@@ -1913,9 +1916,9 @@ espflash flash --port /dev/ttyUSB0 --erase-parts otadata \
   — and the design deliberately does not depend on it. If it *is* enabled it
   agrees with everything above; `crates/somfy-ota/src/verdict.rs` carries why
   the two readings converge.
-- **Anything about the ESP32-C3.** It has the web server, the upload route and
-  the boot-side roll-back, and no hardware. (The ESP32, which had the roll-back
-  and no way to be sent an update over the network, was dropped on 2026-08-18.)
+- **Anything about a chip other than the ESP32-S3.** There is no other chip:
+  the ESP32-S2, the ESP32 and the ESP32-C3 went on 2026-08-17, 2026-08-18 and
+  2026-08-19 respectively, none of them ever having booted this firmware.
 
 ---
 
@@ -1955,8 +1958,10 @@ remains, with the settled parts marked.
    and `crate::stack_used` printing a smaller number than
    `REQUIRED_STACK_BYTES` on the boot *after* a restore is the only thing that
    confirms it.
-4. **The ESP32-C3's Wi-Fi heap.** 57,344 bytes against a 54,620-byte peak
-   measured on a different chip. See `heap::DRAM_FOR_STACK_AND_HEAP`.
+4. **The ESP32-S3's Wi-Fi heap against the announcement peak.** About 61,336
+   bytes against a measured 54,620, and the peak's own boot-to-boot spread is
+   ~4,216. `heap::warn_if_tight` prints the comparison; watch
+   `heap: session announced`. See `heap::heap_region`.
 
 ### 1. Prove the panic record survives
 
@@ -2123,10 +2128,10 @@ because there is nobody at a terminal — so the check is yours, at the shades.
   It needs an installation with roughly twenty or more shades to produce one,
   and the check is `Content-Length` against a constant, before any flash is
   touched.
-- **That the boot-time parse fits on a chip other than the ESP32-S3.** The
-  52,528-byte chain was walked on Xtensa. The ESP32-C3's frames are
-  `addi sp, sp, -N` rather than `entry a1, N` and were not read; the inference
-  that they are no deeper is the same one `heap::BOOT_CHAIN_BYTES` already
-  makes, and it is an inference.
-- **Anything at all about the ESP32-C3.** Both screens build for it and no
-  ESP32-C3 has ever run this firmware.
+- ~~**That the boot-time parse fits on a chip other than the ESP32-S3.**~~
+  Closed on 2026-08-19: there is no other chip. The 52,528-byte chain was walked
+  on Xtensa and Xtensa is now the only instruction set built, so the inference
+  `heap::BOOT_CHAIN_BYTES` used to carry about un-walked RISC-V frames is retired
+  rather than still owed.
+- **Anything at all about a chip other than the ESP32-S3.** There is no other
+  chip since 2026-08-19.
