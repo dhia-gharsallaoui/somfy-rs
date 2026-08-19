@@ -1,0 +1,108 @@
+# Anonymised wall-remote capture — derived from a real one, not itself one.
+#
+# REAL, verbatim from a capture taken 2026-08-15 from a physical Somfy wall remote,
+# received by an ESP32-S3 + CC1101 running ESPSomfy-RTS v2.5.6:
+#   - the first 7 durations below: the wake-up HIGH, the silence after it,
+#     2 hardware-sync halves and the software-sync HIGH, exactly as measured;
+#   - the key byte 0xAE and the command (My), neither of which names a remote;
+#   - every half-symbol deviation from the nominal 640 µs used in the body: each is
+#     one of the 42 deviations this same capture produced on its own single
+#     half-symbol segments (-26..45 µs), applied in measured order and
+#     cycled to cover the frame.
+#
+# SYNTHETIC, because the original's pulse train encoded a real remote's address and
+# its rolling code at the moment of capture:
+#   - address 0x00C0DE — this project's bring-up address, not a remote's;
+#   - rolling code 2;
+#   - and so, downstream of those, the checksum, the obfuscation chain, the 56 bits
+#     themselves, and the merged-segment structure that follows from them.
+#
+# WHAT THIS FILE THEREFORE CANNOT SHOW: that our checksum and de-obfuscation agree
+# with Somfy's. Those bits are ours now. It still pins them against *change*, since
+# the bytes are frozen here, but that is regression cover, not interoperability.
+#
+# Rewritten 2026-08-19 by `cargo run -p xtask -- anonymise-capture`. The method, and
+# what it does and does not preserve, is in fixtures/README.md. Do not hand-edit:
+# the durations are evidence and the original is gone.
+#
+# command=My bits=56 hwsync=4 pulseCount=77 (the original was
+# 84; an edge count follows from the payload bits, so it moved with them)
+# body total 72002 µs against the original's 72006 µs
+# durations-only, one per line; see fixtures/README.md
+10216
+17711
+2492
+2551
+2488
+2522
+4795
+1293
+1273
+1271
+1269
+1295
+659
+614
+667
+622
+1288
+1308
+1294
+1299
+624
+645
+1280
+1273
+657
+637
+1285
+1293
+1299
+1294
+636
+646
+1293
+1293
+628
+645
+1271
+1269
+1295
+1273
+667
+622
+1288
+1308
+1294
+632
+667
+1269
+1280
+1273
+657
+637
+1285
+1293
+1299
+633
+661
+636
+646
+1293
+631
+662
+628
+645
+1271
+1269
+1295
+659
+614
+1289
+1288
+1308
+1294
+1299
+1269
+1280
+1273

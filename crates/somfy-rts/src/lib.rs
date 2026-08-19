@@ -38,10 +38,13 @@
 //!
 //! The suite runs entirely on the host: software TX/RX loopback, per-layer unit
 //! tests, and property tests. Golden fixtures under `tests/fixtures/` pin the
-//! engine against pulses actually captured from real transmissions; a
-//! checked-in *synthetic* capture exercises the loader on every CI run, while
-//! the real-device captures (and their three `#[ignore]`d tests) are pending one
-//! capture session on a running device — see `tests/fixtures/README.md`.
+//! engine against **timing measured from a physical wall remote** — the wake-up
+//! pulse, the gap after it, the sync structure and the half-symbol jitter, none
+//! of which this crate's own renderer produces. Their *payload* is substituted:
+//! the original encoded that remote's own address, so it was replaced on
+//! 2026-08-19. A separate checked-in *synthetic* fixture exercises the loader
+//! and the encode side. Read `tests/fixtures/README.md` before relying on
+//! either — it says exactly which numbers are measured and which are not.
 
 #![cfg_attr(not(test), no_std)]
 

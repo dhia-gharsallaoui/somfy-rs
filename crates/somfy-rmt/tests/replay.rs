@@ -1,11 +1,15 @@
 //! Replaying captured pulse trains through [`ReplayPulseSource`] into
 //! `somfy_rts::RxDecoder`.
 //!
-//! The three `up`/`down`/`my` captures are real recordings taken from a
-//! physical Somfy wall remote, so these tests measure the trait against what
-//! hardware actually produces rather than against a stream written to match the
-//! implementation. A source that only ever replayed synthetic pulses could not
-//! catch a mismatch between the two.
+//! The three `up`/`down`/`my` fixtures carry a physical Somfy wall remote's
+//! **measured timing** — the wake-up, the gap, the sync structure and the
+//! half-symbol jitter — under a payload this project substituted, because the
+//! original payload was that remote's own address. See
+//! `../../somfy-rts/tests/fixtures/README.md` for what is measured and what is
+//! not. The timing is the half that matters here: these tests measure the trait
+//! against durations hardware actually produced rather than against a stream
+//! written to match the implementation, and a source that only ever replayed
+//! this crate's own nominal pulses could not catch a mismatch between the two.
 //!
 //! The pump helper below is deliberately generic over [`PulseSource`]: the
 //! radio task will be written the same way, so exercising the bound here is
@@ -24,7 +28,9 @@ use somfy_rmt::{PulseSource, ReplayPulseSource};
 use somfy_rts::{decode56, Command, Frame, Pulse, RxDecoder};
 
 /// The captures live in `somfy-rts`, next to the decoder they were taken to
-/// pin. They are read-only here.
+/// pin. They are read-only here — and must stay so: they are derived files that
+/// cannot be regenerated, because the originals they came from were destroyed
+/// on purpose.
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../somfy-rts/tests/fixtures");
 
 /// Drive a future to completion on the host.
@@ -75,30 +81,45 @@ fn replay_one(name: &str) -> Frame {
 }
 
 #[test]
-fn real_up_capture_replays_as_up() {
-    assert_eq!(replay_one("up_56bit_1.pulses").command, Command::Up);
+fn captured_up_replays_as_up() {
+    assert_eq!(
+        replay_one("anonymised_up_56bit_1.pulses").command,
+        Command::Up
+    );
 }
 
 #[test]
-fn real_down_capture_replays_as_down() {
-    assert_eq!(replay_one("down_56bit_1.pulses").command, Command::Down);
+fn captured_down_replays_as_down() {
+    assert_eq!(
+        replay_one("anonymised_down_56bit_1.pulses").command,
+        Command::Down
+    );
 }
 
 #[test]
-fn real_my_capture_replays_as_my() {
-    assert_eq!(replay_one("my_56bit_1.pulses").command, Command::My);
+fn captured_my_replays_as_my() {
+    assert_eq!(
+        replay_one("anonymised_my_56bit_1.pulses").command,
+        Command::My
+    );
 }
 
-/// All three captures came from the same physical remote, so they must decode
-/// to one address. Asserting they agree — rather than pinning the value — keeps
-/// the real remote's address out of this source file while still catching a
-/// replay path that corrupted or reordered pulses, which would move the address
-/// as readily as it moved the command.
+/// All three fixtures were written with one substituted address, so they must
+/// decode to one address here. Asserting they agree rather than pinning the
+/// value: the point is to catch a replay path that corrupted or reordered
+/// pulses, which would move the address as readily as it moved the command, and
+/// the literal is pinned once already, in `somfy-rts`' own golden tests.
+///
+/// This test predates the anonymisation and was originally worded to keep a
+/// *real* remote's address out of this source file. That reason is gone —
+/// there is no real address left anywhere in the repository — but the
+/// assertion is unchanged and still earns its place, so the note stays rather
+/// than the history being tidied away.
 #[test]
-fn the_three_captures_replay_to_a_single_remote_address() {
-    let up = replay_one("up_56bit_1.pulses");
-    let down = replay_one("down_56bit_1.pulses");
-    let my = replay_one("my_56bit_1.pulses");
+fn the_three_captures_replay_to_a_single_address() {
+    let up = replay_one("anonymised_up_56bit_1.pulses");
+    let down = replay_one("anonymised_down_56bit_1.pulses");
+    let my = replay_one("anonymised_my_56bit_1.pulses");
     assert_eq!(up.address, down.address);
     assert_eq!(up.address, my.address);
 }
@@ -108,7 +129,7 @@ fn the_three_captures_replay_to_a_single_remote_address() {
 /// where the decoder happened to shrug it off.
 #[test]
 fn replay_yields_the_capture_verbatim() {
-    let pulses = support::load_fixture(FIXTURES, "up_56bit_1.pulses");
+    let pulses = support::load_fixture(FIXTURES, "anonymised_up_56bit_1.pulses");
     let mut source = ReplayPulseSource::new(&pulses);
     let mut seen: std::vec::Vec<Pulse> = std::vec::Vec::new();
     while let Some(pulse) = block_on(source.next_pulse()) {

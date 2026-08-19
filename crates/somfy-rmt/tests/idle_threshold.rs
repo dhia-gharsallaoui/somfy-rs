@@ -11,6 +11,12 @@
 //! These tests model the hardware rule on the host and run committed
 //! wall-remote captures through it, so the choice is settled against what a
 //! physical remote actually emits rather than against what this crate emits.
+//!
+//! The fixtures were anonymised on 2026-08-19 — their payload is substituted,
+//! their timing is not. **Everything this file turns on survived intact**: the
+//! split points are decided by the wake-up pulse and the ~17.7 ms gap after it,
+//! and those two durations were copied across verbatim. See
+//! `../../somfy-rts/tests/fixtures/README.md`.
 
 // The captures live in `somfy-rts`, next to the decoder they were taken to pin,
 // and are shared with its own golden tests so both crates reconstruct levels
@@ -27,14 +33,14 @@ use somfy_rts::{
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../somfy-rts/tests/fixtures");
 
-/// Captures taken from the physical wall remote. The synthetic fixture is
-/// excluded on purpose: it is rendered from this project's own transmit
+/// The fixtures whose timing came off the physical wall remote. The synthetic
+/// one is excluded on purpose: it is rendered from this project's own transmit
 /// constants, so it can only confirm that the threshold agrees with `TIMINGS` —
 /// which is the reasoning this file exists to replace.
-const REAL_CAPTURES: [&str; 3] = [
-    "up_56bit_1.pulses",
-    "down_56bit_1.pulses",
-    "my_56bit_1.pulses",
+const CAPTURED_TIMING: [&str; 3] = [
+    "anonymised_up_56bit_1.pulses",
+    "anonymised_down_56bit_1.pulses",
+    "anonymised_my_56bit_1.pulses",
 ];
 
 /// The threshold the design spec originally specified, derived from
@@ -133,8 +139,8 @@ fn first_plus_repeat() -> std::vec::Vec<Pulse> {
 /// The property that matters most: a real remote's frame arrives as one
 /// reception, not two.
 #[test]
-fn no_real_capture_is_split_by_the_chosen_threshold() {
-    for name in REAL_CAPTURES {
+fn no_capture_is_split_by_the_chosen_threshold() {
+    for name in CAPTURED_TIMING {
         let pulses = capture(name);
         let bursts = bursts(&pulses, IDLE_THRESHOLD_US);
         assert_eq!(
@@ -168,8 +174,8 @@ fn no_real_capture_is_split_by_the_chosen_threshold() {
 /// not a bound, and a compile-time assertion resting on it would have been
 /// asserting something the committed fixtures already contradict.
 #[test]
-fn the_specs_original_threshold_would_split_every_real_capture() {
-    for name in REAL_CAPTURES {
+fn the_specs_original_threshold_would_split_every_capture() {
+    for name in CAPTURED_TIMING {
         let pulses = capture(name);
         let bursts = bursts(&pulses, SPEC_THRESHOLD_US);
         assert_eq!(bursts.len(), 2, "{name}");

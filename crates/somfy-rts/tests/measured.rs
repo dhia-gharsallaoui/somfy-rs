@@ -10,9 +10,19 @@
 //! are pinned here as named values rather than left implicit in the files.
 //!
 //! These tests are the *derivation* of [`MEASURED_MAX_INTRA_FRAME_SEGMENT_US`]. If
-//! a capture is ever re-taken (see `fixtures/README.md` — the committed ones
-//! must be replaced before this repository goes public), they fail rather than
-//! quietly let the constant describe a remote nobody has any more.
+//! a capture is ever re-taken, they fail rather than quietly let the constant
+//! describe a remote nobody has any more.
+//!
+//! # The captures were anonymised on 2026-08-19, and this file is why they were
+//! # not simply deleted
+//!
+//! Their pulse trains encoded the transmitting remote's own address, which is
+//! not publishable. The payload was therefore replaced and the timing kept —
+//! and the wake-up pulse, the silence after it and the sync structure, which is
+//! everything this file measures, were **copied across verbatim**. So every
+//! number asserted below is still a number a physical remote produced.
+//! `fixtures/README.md` records the method; the alternative was deleting the
+//! only evidence a shipping firmware constant has.
 
 mod support;
 
@@ -21,17 +31,17 @@ use support::load_fixture;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
-/// Every capture taken from the physical wall remote.
+/// Every capture whose timing came off the physical wall remote.
 ///
 /// `synthetic_up_56bit.pulses` is deliberately absent: it is rendered from this
 /// crate's own [`TIMINGS`], so measuring it would only re-measure the constants
 /// this file exists to distrust. It also carries a trailing `INTER_FRAME_GAP`,
 /// which is the *separator between* transmissions and would be counted here as
 /// if it sat inside one.
-const REAL_CAPTURES: [&str; 3] = [
-    "up_56bit_1.pulses",
-    "down_56bit_1.pulses",
-    "my_56bit_1.pulses",
+const CAPTURED_TIMING: [&str; 3] = [
+    "anonymised_up_56bit_1.pulses",
+    "anonymised_down_56bit_1.pulses",
+    "anonymised_my_56bit_1.pulses",
 ];
 
 fn capture(name: &str) -> std::vec::Vec<Pulse> {
@@ -45,7 +55,7 @@ fn capture(name: &str) -> std::vec::Vec<Pulse> {
 /// reception when no *edge* arrives for long enough, so a long HIGH counts
 /// exactly as a long LOW does.
 fn measured_max_segment() -> u32 {
-    REAL_CAPTURES
+    CAPTURED_TIMING
         .iter()
         .flat_map(|name| capture(name))
         .map(|pulse| pulse.micros)
@@ -54,7 +64,7 @@ fn measured_max_segment() -> u32 {
 }
 
 fn measured_max(high: bool) -> u32 {
-    REAL_CAPTURES
+    CAPTURED_TIMING
         .iter()
         .flat_map(|name| capture(name))
         .filter(|pulse| pulse.high == high)
@@ -119,7 +129,7 @@ fn each_real_capture_holds_exactly_one_long_low_and_it_is_the_wakeup_gap() {
     // at the top of the decoder's tolerance window.
     let in_family_max = TIMINGS::HW_SYNC_HALF + TIMINGS::HW_SYNC_HALF / 4;
 
-    for name in REAL_CAPTURES {
+    for name in CAPTURED_TIMING {
         let long: std::vec::Vec<usize> = capture(name)
             .iter()
             .enumerate()
@@ -128,6 +138,69 @@ fn each_real_capture_holds_exactly_one_long_low_and_it_is_the_wakeup_gap() {
             .collect();
 
         assert_eq!(long, std::vec![1], "{name}: long LOWs at {long:?}");
+    }
+}
+
+/// The guard against the one way anonymising these files could have destroyed
+/// them: leaving behind this crate's own renderer's output under a capture's
+/// name.
+///
+/// A fixture like that would decode, pass every other test in this workspace,
+/// and validate nothing `synthetic_up_56bit.pulses` does not — it would be
+/// decoration. The evidence that it did not happen is simply that the numbers
+/// are still *wrong* in the way real hardware is wrong: [`render_pulses`] emits
+/// `HALF_SYMBOL` and `HW_SYNC_HALF` exactly, and a transmitter with a real
+/// oscillator never does.
+///
+/// Both halves of the file are checked, because they were preserved by
+/// different means (see `fixtures/README.md`): the preamble was copied across
+/// verbatim, and the body was rebuilt from this same capture's own measured
+/// half-symbol deviations.
+#[test]
+fn the_captures_still_carry_a_real_transmitters_timing_rather_than_our_own_constants() {
+    // A rendered body scores exactly zero here. The three captures score 1,747
+    // (up), 888 (my) and 1,929 (down) µs — `my` is the low one because its
+    // measured deviations are the most tightly clustered of the three, so more
+    // of them cancel inside a merged segment. The floor is two-thirds of that
+    // smallest figure: low enough that it is not a second re-measurement of the
+    // files, high enough that nominal output cannot reach it.
+    const MIN_BODY_DRIFT_US: u32 = 600;
+
+    for name in CAPTURED_TIMING {
+        let pulses = capture(name);
+        let sync = pulses
+            .iter()
+            .position(|pulse| {
+                pulse.high
+                    && pulse.micros.abs_diff(TIMINGS::SW_SYNC_HIGH) <= TIMINGS::SW_SYNC_HIGH / 4
+            })
+            .unwrap_or_else(|| panic!("{name}: no software sync"));
+
+        for (index, pulse) in pulses[..=sync].iter().enumerate() {
+            let nominal = match index {
+                0 => TIMINGS::WAKEUP_HIGH,
+                1 => TIMINGS::WAKEUP_LOW,
+                i if i == sync => TIMINGS::SW_SYNC_HIGH,
+                _ => TIMINGS::HW_SYNC_HALF,
+            };
+            assert_ne!(
+                pulse.micros, nominal,
+                "{name}: preamble segment {index} is exactly what we would have rendered"
+            );
+        }
+
+        let drift: u32 = pulses[sync + 1..]
+            .iter()
+            .map(|pulse| {
+                let halves = (pulse.micros + TIMINGS::HALF_SYMBOL / 2) / TIMINGS::HALF_SYMBOL;
+                pulse.micros.abs_diff(halves * TIMINGS::HALF_SYMBOL)
+            })
+            .sum();
+        assert!(
+            drift > MIN_BODY_DRIFT_US,
+            "{name}: the body drifts only {drift} µs from nominal, which is what a rendered \
+             frame would look like"
+        );
     }
 }
 

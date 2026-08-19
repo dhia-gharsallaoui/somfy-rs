@@ -175,5 +175,22 @@ Flashing the wrong one destroys the working device and the reference receiver in
 a single action.
 
 Never modify `crates/somfy-rts/tests/fixtures/*.pulses` or
-`crates/somfy-migrate/tests/fixtures/*.backup`: real hardware captures and a
-real user's private device data.
+`crates/somfy-migrate/tests/fixtures/*.backup`.
+
+- **`*.backup`** is a real user's private device data — radio addresses and
+  rolling codes for the whole estate. Gitignored, never committed.
+- **`anonymised_*.pulses`** are *derived* from real wall-remote captures. On
+  **2026-08-19** the three originals were anonymised and deleted from the
+  working tree, because their pulse trains encoded the transmitting remote's own
+  24-bit address and this repository is public: the pulse train *is* the frame.
+  The preamble timings and the half-symbol jitter are still measured; the
+  address, rolling code and therefore the 56 bits are substituted. **Do not edit
+  the derived files either** — they cannot be regenerated, the originals having
+  been destroyed on purpose. `crates/somfy-rts/tests/fixtures/README.md` records
+  the method, what was preserved, what was lost, and what residual exposure
+  remains; `docs/pre-public-checklist.md` item 1 records the decision and the
+  history rewrite that is still outstanding.
+- A **new** capture must be anonymised with
+  `cargo run -p xtask -- anonymise-capture` before it goes anywhere near a
+  commit, and the raw file must never be staged, not even on a branch intended
+  to be rewritten later.

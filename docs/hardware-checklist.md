@@ -316,9 +316,16 @@ Two rules follow:
   else is a proxy.
 - Also confirm the line **rests low** when idle, not merely that it is quiet.
 
-And note that a whole 56-bit frame is about **89 merged edges**, not ~180 — the
-larger figure counts half-symbols. The committed golden captures are the
-reference: `up_56bit_1.pulses` is 89 pulses, `down_56bit_1.pulses` is 97.
+And note that a whole 56-bit frame is somewhere in the **high 70s to high 90s of
+merged edges**, not ~180 — the larger figure counts half-symbols. The exact
+count is a property of the payload bits, not of the protocol: a first frame is
+seven preamble segments plus 112 half-symbols, and how many of those halves merge
+into full-symbol segments depends entirely on how often the bit pattern changes.
+
+The three real captures measured 89, 97 and 84. The committed fixtures that
+replaced them measure 92, 98 and 77 — same timing, substituted payload, hence
+different counts (`crates/somfy-rts/tests/fixtures/README.md`). Use the range,
+not any single figure.
 
 ### Creating discriminating conditions
 
